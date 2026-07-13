@@ -1,0 +1,43 @@
+# Rust
+/target
+/crate/target
+/crate/wasm-poc/target/
+.cargo-home/
+
+# wasm lab build artifact — crate/wasm-poc/build.sh regenerates it
+/site/wasm/abgen_poc.wasm
+
+# Generated C/C++ build artifacts (cmake out-of-source builds in the vendored
+# third_party crates). Must never be committed: the cmake cache bakes an
+# absolute path, so a stale copy breaks the build in a new location (incl. the
+# nix sandbox). cmake regenerates these from source.
+crate/third_party/draco_decoder/third_party/draco/build/
+crate/third_party/**/build/
+**/CMakeCache.txt
+**/CMakeFiles/
+*.a
+*.o
+
+# Per-checkout tool config (machine-local unity paths; see
+# pipeline/abgencompare/toolconfig.py)
+/abgen-compare.json
+
+# Runtime caches / output / env
+/abgen-serve-cache
+/data
+/runs
+/content
+*.log
+*.env
+.env
+.env.*
+
+# Nix
+/result
+/result-*
+
+# Editor / OS noise
+__pycache__/
+.DS_Store
+*.swp
+node_modules/

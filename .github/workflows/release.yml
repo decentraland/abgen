@@ -1,0 +1,237 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bin: abgen
+          - name: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            bin: abgen
+          - name: x86_64-pc-windows-gnu
+            runner: ubuntu-22.04
+            target: x86_64-pc-windows-gnu
+            bin: abgen.exe
+          - name: aarch64-pc-windows-gnullvm
+            runner: ubuntu-22.04
+            target: aarch64-pc-windows-gnullvm
+            bin: abgen.exe
+          - name: aarch64-apple-darwin
+            runner: macos-14
+            target: aarch64-apple-darwin
+            bin: abgen
+          - name: x86_64-apple-darwin
+            # the last free Intel image; scheduled to live through August 2027
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            bin: abgen
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable @ 2026-07-08
+        with:
+          toolchain: "1.97.0"
+          targets: ${{ matrix.target }}
+
+      - name: install mingw cross toolchain
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++-mingw-w64-x86-64-posix cmake
+          cat > /tmp/mingw-toolchain.cmake <<'EOF'
+          set(CMAKE_SYSTEM_NAME Windows)
+          set(CMAKE_SYSTEM_PROCESSOR x86_64)
+          set(CMAKE_C_COMPILER x86_64-w64-mingw32-gcc-posix)
+          set(CMAKE_CXX_COMPILER x86_64-w64-mingw32-g++-posix)
+          set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+          EOF
+          {
+            echo "CMAKE_TOOLCHAIN_FILE=/tmp/mingw-toolchain.cmake"
+            echo "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc-posix"
+            echo "CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc-posix"
+            echo "CXX_x86_64_pc_windows_gnu=x86_64-w64-mingw32-g++-posix"
+            echo "AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar"
+          } >> "$GITHUB_ENV"
+
+      - name: install llvm-mingw cross toolchain
+        if: matrix.target == 'aarch64-pc-windows-gnullvm'
+        run: |
+          curl -fsSL -o llvm-mingw.tar.xz https://github.com/mstorsjo/llvm-mingw/releases/download/20260616/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64.tar.xz
+          echo "534b92e067b22a6b4441f48ae9240a3341b17825d04d577eab0cf85c44b4deda  llvm-mingw.tar.xz" | sha256sum -c
+          sudo tar -xJf llvm-mingw.tar.xz -C /opt && rm llvm-mingw.tar.xz
+          cat > /tmp/aarch64-mingw-toolchain.cmake <<'EOF'
+          set(CMAKE_SYSTEM_NAME Windows)
+          set(CMAKE_SYSTEM_PROCESSOR aarch64)
+          set(CMAKE_C_COMPILER aarch64-w64-mingw32-clang)
+          set(CMAKE_CXX_COMPILER aarch64-w64-mingw32-clang++)
+          set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+          EOF
+          # drop the import libs so lld can only resolve libc++/libunwind statically:
+          # the explicit -lc++ the cc crate emits would otherwise bind to the DLLs
+          sudo rm /opt/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64/aarch64-w64-mingw32/lib/libc++.dll.a \
+                  /opt/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64/aarch64-w64-mingw32/lib/libunwind.dll.a
+          echo "/opt/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
+          {
+            echo "CMAKE_TOOLCHAIN_FILE=/tmp/aarch64-mingw-toolchain.cmake"
+            echo "CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER=aarch64-w64-mingw32-clang"
+            echo "CC_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-clang"
+            echo "CXX_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-clang++"
+            echo "AR_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-ar"
+          } >> "$GITHUB_ENV"
+
+      - name: reproducibility environment
+        run: |
+          rustflags="--remap-path-prefix $PWD=/build --remap-path-prefix $HOME=/home"
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
+            rustflags="$rustflags -C link-arg=-Wl,--no-insert-timestamp"
+          fi
+          if [ "${{ matrix.target }}" = "aarch64-pc-windows-gnullvm" ]; then
+            # crt-static folds the unwinder in; lld links deterministically
+            rustflags="$rustflags -C target-feature=+crt-static -C link-arg=-Wl,--no-insert-timestamp"
+          fi
+          {
+            echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)"
+            echo "RUSTFLAGS=$rustflags"
+            echo "CFLAGS=-ffile-prefix-map=$PWD=/build"
+            echo "CXXFLAGS=-ffile-prefix-map=$PWD=/build"
+          } >> "$GITHUB_ENV"
+
+      - name: build (twice + bit-identical; windows-x64 once)
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} --bin abgen
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
+            echo "windows-gnu: built once; mingw ld has residual link-order non-determinism the bit-identical gate cannot pass"
+            exit 0
+          fi
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" /tmp/build-1
+          rm -rf target
+          cargo build --release --locked --target ${{ matrix.target }} --bin abgen
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" /tmp/build-2
+          h1=$(shasum -a 256 /tmp/build-1 | cut -d' ' -f1)
+          h2=$(shasum -a 256 /tmp/build-2 | cut -d' ' -f1)
+          echo "build-1: $h1"
+          echo "build-2: $h2"
+          test "$h1" = "$h2"
+
+      - name: assemble archive (binary + template + shader)
+        run: |
+          dist="abgen-${GITHUB_REF_NAME:-dev}-${{ matrix.name }}"
+          mkdir -p "$dist/shader"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$dist/"
+          cp -R template "$dist/template"
+          cp crate/shader/scene_ignore_windows "$dist/shader/"
+          cp LICENSE README.md "$dist/"
+          # windows loads these DLLs from the exe directory, keeping the archive self-contained
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
+            for dll in libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
+              cp "$(x86_64-w64-mingw32-g++-posix -print-file-name=$dll)" "$dist/"
+            done
+          fi
+          # deterministic tar needs GNU tar; macOS runners ship it as gtar
+          TAR=tar; command -v gtar >/dev/null && TAR=gtar
+          "$TAR" --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="@${SOURCE_DATE_EPOCH}" -czf "$dist.tar.gz" "$dist"
+          shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
+
+      - name: smoke test the unpacked archive
+        if: ${{ !contains(matrix.target, 'windows') }}
+        run: |
+          dist="abgen-${GITHUB_REF_NAME:-dev}-${{ matrix.name }}"
+          rm -rf /tmp/smoke && mkdir /tmp/smoke
+          tar -xzf "$dist.tar.gz" -C /tmp/smoke
+          cd "/tmp/smoke/$dist"
+          ./abgen --version
+          HTTP_SERVER_PORT=5199 ./abgen &
+          server=$!
+          for _ in $(seq 1 40); do
+            curl -sf http://127.0.0.1:5199/readyz && ok=1 && break
+            sleep 0.5
+          done
+          kill "$server" || true
+          test "${ok:-0}" = 1
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            abgen-*.tar.gz
+            abgen-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: checksums
+        run: |
+          cd dist
+          cat ./*.sha256 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "abgen $GITHUB_REF_NAME" \
+            --notes "Reproducible builds: the linux and macOS binaries were each built twice from a clean tree in CI and required bit-identical before publishing; the windows binary is built once (mingw's linker has a residual link-order non-determinism). Toolchain: rust 1.97.0 (pinned), \`--locked\` against the committed Cargo.lock, \`SOURCE_DATE_EPOCH\` from the tagged commit. Each archive is self-contained: the \`abgen\` server binary plus the \`template/\` and \`shader/\` assets it needs, resolved from the binary's own directory (\`ABGEN_ROOT\`/\`ABGEN_SHADER_BUNDLE\` override). Runtime requirements - Linux (x64 and arm64): glibc >= 2.35 and libstdc++6/libgcc_s (present on any machine that runs node). Windows x64: none, the mingw runtime DLLs ship in the archive next to the exe. Windows arm64: none, a single static exe (llvm-mingw/libc++). macOS (Apple Silicon and Intel): system libraries only. Optional everywhere: libturbojpeg (bit-parity JPEG decode with the upstream ab-cdn pipeline; without it JPEG textures decode through a pure-Rust fallback - valid output, not guaranteed byte-identical to upstream bundles). The same binaries publish to npm as \`@dcl/abgen\` (per-platform packages as optionalDependencies; \`npx @dcl/abgen\` runs the server)." \
+            dist/*.tar.gz dist/SHA256SUMS.txt
+
+  npm:
+    needs: build
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      # npm --provenance attests the packages against this workflow run
+      id-token: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: publish npm packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN secret not configured - skipping npm publish"
+            exit 0
+          fi
+          bash npm/publish.sh "${GITHUB_REF_NAME#v}" dist

@@ -1,0 +1,144 @@
+[package]
+name = "abgen"
+version = "0.9.9"
+edition = "2021"
+description = "Decentraland asset-bundle converter + ab-cdn-compatible JIT server — clean-room reimplementation of asset-bundle-converter."
+license = "AGPL-3.0-or-later"
+
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+name = "abgen"
+path = "src/lib.rs"
+
+[[bin]]
+name = "abgen"
+path = "src/bin/abgen.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "abgen-build"
+path = "src/bin/abgen-build.rs"
+
+[[bin]]
+name = "abgen-corpus"
+path = "src/bin/abgen-corpus/main.rs"
+
+[[bin]]
+name = "abgen-verify"
+path = "src/bin/abgen-verify.rs"
+
+[[bin]]
+name = "abgen-lod"
+path = "src/bin/abgen-lod/main.rs"
+
+[[example]]
+name = "texdump"
+path = "examples/texdump.rs"
+
+[[example]]
+name = "matdump"
+path = "examples/matdump.rs"
+
+[[example]]
+name = "crndump"
+path = "examples/crndump.rs"
+
+[[example]]
+name = "objdump"
+path = "examples/objdump.rs"
+
+[[example]]
+name = "texcmp"
+path = "examples/texcmp.rs"
+
+[[example]]
+name = "texcmp2"
+path = "examples/texcmp2.rs"
+
+[[example]]
+name = "texpng"
+path = "examples/texpng.rs"
+
+[[example]]
+name = "jpegprobe"
+path = "examples/jpegprobe.rs"
+
+[[example]]
+name = "loddump"
+path = "examples/loddump.rs"
+
+[[example]]
+name = "lodaabb"
+path = "examples/lodaabb.rs"
+
+[[example]]
+name = "atlasprobe"
+path = "examples/atlasprobe.rs"
+
+[features]
+default = ["server"]
+gpu = []
+gpu-wgpu = ["gpu", "dep:wgpu"]
+gpu-all = ["gpu-wgpu"]
+server = [
+    "dep:tokio",
+    "dep:axum",
+    "dep:tower-http",
+    "dep:tokio-util",
+    "dep:moka",
+    "dep:tracing-subscriber",
+    "dep:metrics",
+    "dep:metrics-exporter-prometheus",
+    "dep:dcl-contents",
+]
+content-db = ["server", "dep:sqlx", "dcl-contents/pg"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip", "raw_value"] }
+psd = "0.3"
+libc = "0.2"
+rayon = "1"
+num_cpus = "1"
+anyhow = "1"
+brotli = "8"
+sha1 = "0.11"
+sha2 = "0.11"
+hmac = "0.13"
+libm = "=0.2.16"
+draco_decoder = { path = "third_party/draco_decoder" }
+texpresso = "2"
+crunch_ffi = { path = "third_party/crunch" }
+libjpeg9c = { path = "third_party/libjpeg9c" }
+texture2ddecoder = "0.1"
+wgpu = { version = "=30.0.0", optional = true, default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12"] }
+chrono = "0.4"
+tracing = "0.1"
+
+tokio = { version = "1", features = ["full"], optional = true }
+axum = { version = "0.8", optional = true }
+metrics = { version = "0.24", optional = true }
+metrics-exporter-prometheus = { version = "0.18", default-features = false, optional = true }
+tower-http = { version = "0.7", features = ["trace"], optional = true }
+tokio-util = { version = "0.7", features = ["io"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
+moka = { version = "0.12", features = ["future"], optional = true }
+
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "json"], optional = true }
+dcl-contents = { path = "dcl-contents", optional = true, default-features = false }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+image = "0.25"
+ureq = "3"
+memmap2 = "0.9"
+meshopt = "=0.6.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif", "tga"] }
+
+[target.'cfg(all(not(target_os = "windows"), not(target_arch = "wasm32")))'.dependencies]
+mimalloc = { version = "0.1.52", default-features = false }

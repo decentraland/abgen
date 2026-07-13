@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LOD PARITY LIGHTBOX</title>
+<style>
+:root{
+  --bg:#0d0c10; --panel:#16151b; --panel2:#1c1b22; --line:#2a2833;
+  --ink:#e6e2f4; --dim:#9c96b2; --faint:#6f6a85;
+  --pass:#3ddc84; --info:#38b6c9; --warn:#e8a13c; --fail:#e8425f;
+  --oursonly:#a78bda; --accent:#ff6a2b;
+  font-size:15px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:"Berkeley Mono","IBM Plex Mono","JetBrains Mono",ui-monospace,"SF Mono",Menlo,monospace}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:99;
+  background:repeating-linear-gradient(0deg,transparent 0 2px,rgba(0,0,0,.12) 2px 3px);opacity:.3}
+header{position:sticky;top:0;z-index:50;background:linear-gradient(180deg,#141318 0%,#111016 100%);
+  border-bottom:1px solid var(--line);padding:10px 18px 10px}
+.masthead{display:flex;align-items:baseline;gap:18px;flex-wrap:wrap}
+h1{margin:0;font-size:15px;font-weight:700;letter-spacing:.35em;text-transform:uppercase}
+h1 .x{color:var(--accent)}
+.gen{color:var(--faint);font-size:11px;letter-spacing:.08em}
+.gen a{color:var(--accent);text-decoration:none}
+.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 0 0}
+input[type=search]{background:var(--panel);border:1px solid var(--line);color:var(--ink);
+  padding:5px 10px;font:inherit;font-size:12px;min-width:260px;border-radius:2px}
+.grp{display:flex;border:1px solid var(--line);border-radius:2px;overflow:hidden}
+.grp button{border:0;padding:5px 10px;font:inherit;font-size:11px;cursor:pointer;
+  text-transform:uppercase;color:var(--dim);background:var(--panel)}
+.grp button.on{background:var(--ink);color:var(--bg);font-weight:700}
+.count{color:var(--faint);font-size:11px}
+main{padding:14px 18px;display:grid;gap:12px;
+  grid-template-columns:repeat(auto-fill,minmax(430px,1fr))}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:3px;overflow:hidden}
+.card>.hd{display:flex;gap:8px;align-items:baseline;padding:8px 10px 6px;border-bottom:1px solid var(--line)}
+.card .ttl{font-weight:700;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.card .ptr{color:var(--dim);font-size:11px;white-space:nowrap}
+.badge{font-size:10px;font-weight:700;padding:2px 7px;border-radius:2px;letter-spacing:.05em;white-space:nowrap}
+.b-pass{background:var(--pass);color:#08110b}
+.b-warn{background:var(--warn);color:#191204}
+.b-fail{background:var(--fail);color:#1b060a}
+.b-ours{background:var(--oursonly);color:#120b1e}
+.imgs{display:flex;gap:1px;background:var(--line)}
+.imgs .col{flex:1;background:var(--panel2);text-align:center;padding:6px 4px 4px}
+.imgs .lbl{font-size:10px;color:var(--faint);letter-spacing:.15em;text-transform:uppercase;margin-bottom:4px}
+.imgs img{width:100%;max-width:200px;image-rendering:pixelated;background:
+  repeating-conic-gradient(#26242e 0 25%,#1c1b22 0 50%) 0 0/16px 16px;border:1px solid var(--line);cursor:zoom-in}
+.imgs .none{color:var(--faint);font-size:11px;padding:40px 0}
+.stats{display:flex;gap:14px;padding:7px 10px;font-size:11px;color:var(--dim);flex-wrap:wrap}
+.stats b{color:var(--ink)}
+.stats .occ-hi b{color:var(--pass)}
+.stats .occ-lo b{color:var(--warn)}
+details{border-top:1px solid var(--line)}
+summary{cursor:pointer;padding:6px 10px;font-size:11px;color:var(--dim);letter-spacing:.08em;
+  text-transform:uppercase;user-select:none}
+summary:hover{color:var(--ink)}
+table{width:100%;border-collapse:collapse;font-size:11px}
+td{padding:3px 10px;border-top:1px solid var(--line);vertical-align:top;word-break:break-all}
+td.s{width:44px;font-weight:700;white-space:nowrap}
+td.s.PASS{color:var(--pass)} td.s.FAIL{color:var(--fail)} td.s.INFO{color:var(--info)}
+td.n{width:190px;color:var(--dim);white-space:nowrap}
+.links{padding:7px 10px;font-size:11px;display:flex;gap:14px;flex-wrap:wrap}
+.links a{color:var(--accent);text-decoration:none}
+.links a:hover{text-decoration:underline}
+#zoom{position:fixed;inset:0;background:rgba(6,5,9,.93);display:none;z-index:200;
+  align-items:center;justify-content:center;flex-direction:column;gap:10px;cursor:zoom-out}
+#zoom img{max-width:88vw;max-height:80vh;image-rendering:pixelated;border:1px solid var(--line);
+  background:repeating-conic-gradient(#26242e 0 25%,#1c1b22 0 50%) 0 0/24px 24px}
+#zoom .cap{color:var(--dim);font-size:12px}
+.empty{grid-column:1/-1;color:var(--faint);padding:40px;text-align:center}
+</style>
+</head>
+<body>
+<header>
+  <div class="masthead">
+    <h1>LOD PARITY <span class="x">LIGHTBOX</span></h1>
+    <span class="gen" id="gen">loading…</span>
+    <span class="gen"><a href="/index.html">&larr; AB parity runs</a></span>
+  </div>
+  <div class="controls">
+    <input type="search" id="q" placeholder="filter: id / title / parcel">
+    <div class="grp" id="fprod">
+      <button data-v="all" class="on">all</button>
+      <button data-v="prod">with prod</button>
+      <button data-v="ours">ours-only</button>
+      <button data-v="drift">drift</button>
+    </div>
+    <div class="grp" id="fsort">
+      <button data-v="fails" class="on">sort: fails</button>
+      <button data-v="ratio">tri ratio</button>
+      <button data-v="occ">occupancy</button>
+      <button data-v="id">id</button>
+    </div>
+    <span class="count" id="count"></span>
+  </div>
+</header>
+<main id="grid"><div class="empty">loading dataset…</div></main>
+<div id="zoom" onclick="this.style.display='none'"><img id="zi"><div class="cap" id="zc"></div></div>
+<script>
+/* run resolution: ?run= wins; else newest from /api/runs lod list (server adds
+   it post-restart); else probe known datasets so a stale server still works */
+let RUN = new URLSearchParams(location.search).get('run') || '';
+let LODRUNS = [];
+const R = p => `/r/${RUN}/${p}`;
+let DATA = null, fProd = 'all', fSort = 'fails', q = '';
+
+async function resolveRun(){
+  try{
+    const d = await fetch('/api/runs').then(r => r.json());
+    LODRUNS = d.lod || [];
+  }catch(e){}
+  if (!RUN && LODRUNS.length) RUN = LODRUNS[0].id;
+  if (!RUN) {
+    for (const cand of ['lod-20260709', 'lod-20260708']) {
+      try{
+        const r = await fetch(`/r/${cand}/lod-data.json`, {method:'HEAD'});
+        if (r.ok) { RUN = cand; break; }
+      }catch(e){}
+    }
+  }
+  if (!RUN) RUN = 'lod-20260708';
+  if (LODRUNS.length > 1) {
+    const grp = document.createElement('div');
+    grp.className = 'grp';
+    for (const lr of LODRUNS) {
+      const b = document.createElement('button');
+      b.textContent = lr.id;
+      b.title = `${lr.scenes} scenes · ${lr.with_prod} with prod · ${lr.match} match · ${lr.generated || ''}`;
+      b.classList.toggle('on', lr.id === RUN);
+      b.onclick = () => { location.search = '?run=' + encodeURIComponent(lr.id); };
+      grp.appendChild(b);
+    }
+    document.querySelector('.controls').appendChild(grp);
+  }
+}
+
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const kb = n => n == null ? '—' : (n/1024).toFixed(1) + 'k';
+const pct = v => v == null ? '—' : (v*100).toFixed(1) + '%';
+
+function triRatio(s){
+  if (!s.prod || !s.prod.tris || !s.ours.tris) return null;
+  return s.ours.tris / s.prod.tris;
+}
+function occOf(side){
+  const t = side && side.textures && side.textures[0];
+  return t ? t.occupancy : null;
+}
+function badge(s){
+  if (!s.prod) return ['b-ours','OURS-ONLY'];
+  const r = triRatio(s);
+  const rOk = r == null || (r >= 0.6 && r <= 1.05);
+  if (rOk && s.fails === 0) return ['b-pass','MATCH'];
+  if (rOk) return ['b-warn', s.fails + ' DIFF'];
+  return ['b-fail','RATIO ' + (r==null?'?':r.toFixed(2))];
+}
+function drift(s){
+  if (!s.prod) return false;
+  const r = triRatio(s);
+  return (r != null && (r < 0.6 || r > 1.05)) || (s.fails||0) > 8;
+}
+function imgCol(side, label, sceneId){
+  const t = side && side.textures && side.textures[0];
+  const im = t && t.imgs && t.imgs.mip0;
+  if (!im) return `<div class="col"><div class="lbl">${label}</div><div class="none">no atlas</div></div>`;
+  const cap = `${esc(sceneId)} — ${label} ${t.w}x${t.h} fmt=${t.fmt} mips=${t.mips} occ=${pct(t.occupancy)}`;
+  return `<div class="col"><div class="lbl">${label} · occ ${pct(t.occupancy)}</div>
+    <img loading="lazy" src="${R('img/'+encodeURIComponent(im))}" data-cap="${esc(cap)}"
+      onclick="zoom(this)"></div>`;
+}
+function mipRows(side){
+  if (!side || !side.textures) return '';
+  return side.textures.map(t => (t.levels||[]).map(l =>
+    `mip${l.i} ${l.w}x${l.h} luma=${l.meanLuma.toFixed(1)} nearBlack=${(l.nearBlack*100).toFixed(2)}%`
+  ).join(' · ')).join('<br>');
+}
+function card(s){
+  const [bc, bt] = badge(s);
+  const r = triRatio(s);
+  const oo = occOf(s.ours), po = occOf(s.prod);
+  const title = s.title || s.id.slice(0, 28) + '…';
+  const ptr = s.base || (s.pointers && s.pointers[0]) || '';
+  const checks = (s.checks||[]).map(c =>
+    `<tr><td class="s ${c.s}">${c.s}</td><td class="n">${esc(c.name)}</td><td>${esc(c.detail)}</td></tr>`).join('');
+  return `<div class="card">
+    <div class="hd"><span class="ttl" title="${esc(s.id)}">${esc(title)}</span>
+      <span class="ptr">${esc(ptr)}${s.pointers && s.pointers.length>1 ? ' +'+(s.pointers.length-1):''}</span>
+      <span class="badge ${bc}">${bt}</span></div>
+    <div class="imgs">${imgCol(s.ours,'ours',s.id)}${imgCol(s.prod,'prod',s.id)}</div>
+    <div class="stats">
+      <span>tris <b>${s.ours.tris ?? '—'}</b> / ${s.prod ? (s.prod.tris ?? '—') : '—'}
+        ${r != null ? '(<b>'+r.toFixed(3)+'</b>)' : ''}</span>
+      <span class="${oo!=null&&po!=null&&oo>=po-0.02?'occ-hi':'occ-lo'}">occ <b>${pct(oo)}</b> / ${pct(po)}</span>
+      <span>size <b>${kb(s.ours.size)}</b> / ${s.prod ? kb(s.prod.size) : '—'}</span>
+      ${s.fails != null ? `<span>fails <b>${s.fails}</b></span>` : ''}
+    </div>
+    ${s.checks && s.checks.length ? `<details><summary>${s.checks.length} structural checks</summary>
+      <table>${checks}</table></details>` : ''}
+    <details><summary>mips &amp; links</summary>
+      <div class="stats" style="display:block;line-height:1.7">
+        <div>ours: ${mipRows(s.ours) || '—'}</div>
+        <div>prod: ${mipRows(s.prod) || '—'}</div>
+      </div>
+      <div class="links">
+        <a href="${esc(DATA.ours_base + s.id + '_1_' + DATA.platform)}">ours bundle</a>
+        ${s.prod ? `<a href="${esc(DATA.prod_base + s.id + '_1_' + DATA.platform)}">prod bundle</a>` : ''}
+        ${s.ours.sha ? `<span class="gen">ours sha ${esc(s.ours.sha)}</span>` : ''}
+        ${s.prod && s.prod.sha ? `<span class="gen">prod sha ${esc(s.prod.sha)}</span>` : ''}
+      </div>
+    </details>
+  </div>`;
+}
+function render(){
+  if (!DATA) return;
+  let rows = DATA.scenes.slice();
+  if (q) {
+    const needle = q.toLowerCase();
+    rows = rows.filter(s => (s.id + ' ' + (s.title||'') + ' ' + (s.pointers||[]).join(' ')).toLowerCase().includes(needle));
+  }
+  if (fProd === 'prod') rows = rows.filter(s => s.prod);
+  if (fProd === 'ours') rows = rows.filter(s => !s.prod);
+  if (fProd === 'drift') rows = rows.filter(drift);
+  const key = {
+    fails: s => -(s.fails ?? -1),
+    ratio: s => { const r = triRatio(s); return r == null ? 9 : Math.abs(1 - r) * -1 - 1; },
+    occ: s => occOf(s.ours) ?? 2,
+    id: s => s.id,
+  }[fSort];
+  rows.sort((a,b) => { const ka = key(a), kb2 = key(b); return ka < kb2 ? -1 : ka > kb2 ? 1 : 0; });
+  if (fSort === 'ratio') rows.reverse();
+  document.getElementById('count').textContent =
+    `${rows.length}/${DATA.scenes.length} scenes · ${DATA.stats.with_prod} with prod · ${DATA.stats.ours_only} ours-only`;
+  document.getElementById('grid').innerHTML =
+    rows.map(card).join('') || '<div class="empty">nothing matches</div>';
+}
+function zoom(el){
+  document.getElementById('zi').src = el.src;
+  document.getElementById('zc').textContent = el.dataset.cap;
+  document.getElementById('zoom').style.display = 'flex';
+}
+for (const [id, setter] of [['fprod', v => fProd = v], ['fsort', v => fSort = v]]) {
+  document.getElementById(id).addEventListener('click', e => {
+    const b = e.target.closest('button'); if (!b) return;
+    for (const x of b.parentNode.children) x.classList.toggle('on', x === b);
+    setter(b.dataset.v); render();
+  });
+}
+document.getElementById('q').addEventListener('input', e => { q = e.target.value.trim(); render(); });
+resolveRun().then(() => fetch(R('lod-data.json'))).then(r => {
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}).then(d => {
+  DATA = d;
+  document.getElementById('gen').textContent =
+    `run ${RUN} · generated ${d.generated} · platform ${d.platform}`;
+  render();
+}).catch(e => {
+  document.getElementById('grid').innerHTML =
+    `<div class="empty">no dataset at /r/${esc(RUN)}/lod-data.json (${esc(e.message)}) — generate with pipeline/lodsite.py</div>`;
+});
+</script>
+</body>
+</html>

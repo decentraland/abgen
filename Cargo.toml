@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crate", "crate/dcl-contents"]
+exclude = [
+    "crate/third_party/draco_decoder",
+    "crate/third_party/crunch",
+    "crate/third_party/libjpeg9c",
+    "crate/kernel-ptx",
+    "crate/wasm-poc",
+]

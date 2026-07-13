@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>ABGEN WASM LAB</title>
+<style>
+:root{
+  --bg:#0d0c10; --panel:#16151b; --panel2:#1c1b22; --line:#2a2833;
+  --ink:#e6e2f4; --dim:#9c96b2; --faint:#6f6a85;
+  --ok:#3ddc84; --info:#38b6c9; --warnc:#e8a13c; --fail:#e8425f;
+  --accent:#ff6a2b;
+  font-size:15px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:"Berkeley Mono","IBM Plex Mono","JetBrains Mono",ui-monospace,"SF Mono",Menlo,monospace}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:99;
+  background:repeating-linear-gradient(0deg,transparent 0 2px,rgba(0,0,0,.12) 2px 3px);opacity:.3}
+
+header{position:sticky;top:0;z-index:50;background:linear-gradient(180deg,#141318 0%,#111016 100%);
+  border-bottom:1px solid var(--line);padding:10px 18px}
+.masthead{display:flex;align-items:baseline;gap:18px;flex-wrap:wrap}
+h1{margin:0;font-size:15px;font-weight:700;letter-spacing:.35em;text-transform:uppercase}
+h1 .x{color:var(--accent)}
+.gen{color:var(--faint);font-size:11px;letter-spacing:.08em}
+.gen a{color:var(--accent);text-decoration:none}
+.gen b{color:var(--dim);font-weight:400}
+
+#proc{border-bottom:1px solid var(--line);background:linear-gradient(180deg,#121118,var(--bg));
+  padding:10px 18px;display:flex;align-items:stretch;overflow-x:auto;gap:0}
+.stage{flex:1 1 0;min-width:180px;background:var(--panel);border:1px solid var(--line);border-radius:3px;
+  padding:8px 10px;display:flex;flex-direction:column;gap:5px}
+.stage.live{border-color:var(--accent)}
+.sno{font-size:10px;font-weight:700;letter-spacing:.2em;text-transform:uppercase;color:var(--accent)}
+.sup{font-size:11px;line-height:1.45;color:var(--dim)}
+.sstat{font-size:11px;line-height:1.5;color:var(--faint);margin-top:auto}
+.sstat b{color:var(--ink);font-weight:700}
+.sarrow{align-self:center;color:var(--faint);padding:0 5px;font-size:13px;flex:0 0 auto}
+
+main{display:grid;grid-template-columns:minmax(340px,4fr) minmax(420px,6fr);gap:14px;padding:14px 18px 60px}
+@media (max-width:900px){main{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:3px;padding:12px}
+.ptitle{font-size:11px;font-weight:700;letter-spacing:.24em;text-transform:uppercase;color:var(--dim);margin:0 0 10px}
+.ptitle .x{color:var(--accent)}
+
+#drop{border:1px dashed var(--faint);border-radius:3px;padding:26px 14px;text-align:center;color:var(--dim);
+  cursor:pointer;transition:all .12s;font-size:12px;letter-spacing:.06em;line-height:1.8}
+#drop.over,#drop:hover{border-color:var(--accent);color:var(--ink);background:rgba(255,106,43,.05)}
+#drop b{color:var(--accent)}
+#filetable{width:100%;border-collapse:collapse;margin-top:10px;font-size:11px}
+#filetable td{padding:3px 6px;border-top:1px solid var(--line);color:var(--dim);word-break:break-all}
+#filetable td.sz{text-align:right;white-space:nowrap;color:var(--faint)}
+.kind{display:inline-block;border-radius:2px;padding:0 6px;font-size:9px;letter-spacing:.12em;
+  text-transform:uppercase;font-weight:700;color:var(--bg)}
+.k-model{background:var(--accent)} .k-image{background:var(--info)} .k-scene{background:var(--ok)}
+.k-other{background:var(--faint)}
+
+.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}
+.grplab{color:var(--faint);font-size:10px;letter-spacing:.18em;text-transform:uppercase}
+.grp{display:flex;border:1px solid var(--line);border-radius:2px;overflow:hidden}
+.grp button{all:unset;cursor:pointer;padding:3px 10px;font-size:11px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--dim);background:var(--panel2)}
+.grp button.on{background:var(--accent);color:var(--bg);font-weight:700}
+.chip{cursor:pointer;user-select:none;border:1px solid var(--line);border-radius:2px;
+  padding:3px 9px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);
+  background:var(--panel2)}
+.chip.on{background:var(--ink);color:var(--bg);font-weight:700}
+
+#convert{all:unset;cursor:pointer;display:block;width:100%;text-align:center;margin-top:14px;
+  background:var(--accent);color:var(--bg);font-weight:700;letter-spacing:.24em;text-transform:uppercase;
+  padding:10px 0;border-radius:3px;font-size:13px}
+#convert:disabled,#convert.off{opacity:.35;cursor:default}
+#reset{all:unset;cursor:pointer;display:block;width:100%;text-align:center;margin-top:8px;
+  color:var(--faint);font-size:10px;letter-spacing:.2em;text-transform:uppercase;padding:4px 0}
+#reset:hover{color:var(--ink)}
+
+#feed{background:var(--panel2);border:1px solid var(--line);border-radius:3px;padding:8px 10px;
+  height:340px;overflow-y:auto;font-size:11.5px;line-height:1.7}
+#feed .t{color:var(--faint);margin-right:8px}
+#feed .l-note{color:var(--faint)}
+#feed .l-info{color:var(--dim)}
+#feed .l-start{color:var(--ink)}
+#feed .l-ok{color:var(--ok)}
+#feed .l-warn{color:var(--warnc)}
+#feed .l-err{color:var(--fail)}
+#feed b{color:var(--accent);font-weight:700}
+
+#outputs{margin-top:12px}
+.out{display:flex;gap:10px;align-items:baseline;border-top:1px solid var(--line);padding:6px 2px;font-size:11.5px}
+.out .nm{word-break:break-all;color:var(--ink);flex:1}
+.out .sz{color:var(--faint);white-space:nowrap}
+.out a{color:var(--accent);text-decoration:none;letter-spacing:.1em;text-transform:uppercase;font-size:10px;
+  border:1px solid var(--line);border-radius:2px;padding:2px 8px;white-space:nowrap}
+.out a:hover{border-color:var(--accent)}
+#sum{margin-top:10px;font-size:11px;color:var(--dim);letter-spacing:.04em}
+#sum b{color:var(--ink)}
+
+#caveats{margin:0 18px 40px;border:1px solid var(--line);border-radius:3px;background:var(--panel);
+  padding:12px 14px;font-size:11px;color:var(--faint);line-height:1.8}
+#caveats b{color:var(--dim);letter-spacing:.18em;text-transform:uppercase;font-size:10px}
+#caveats span{color:var(--warnc)}
+</style>
+</head>
+<body>
+<header>
+  <div class="masthead">
+    <h1>ABGEN<span class="x">·</span>WASM LAB</h1>
+    <span class="gen">the abgen converter core compiled to wasm32 — glTF → Unity asset bundle, entirely in this tab</span>
+    <span class="gen"><b>nothing is uploaded; files never leave the browser</b></span>
+    <span class="gen"><a href="../index.html">← parity lightbox</a></span>
+  </div>
+</header>
+
+<div id="proc">
+  <div class="stage" id="st0">
+    <div class="sno">01 · Upload</div>
+    <div class="sup">glb / gltf / textures, or a zip of a scene, wearable or emote</div>
+    <div class="sstat" id="ss0">waiting for files</div>
+  </div>
+  <div class="sarrow">→</div>
+  <div class="stage" id="st1">
+    <div class="sno">02 · Parse</div>
+    <div class="sup">GLB container → accessors → RH→LH handedness, winding, tangents, skinning</div>
+    <div class="sstat" id="ss1">—</div>
+  </div>
+  <div class="sarrow">→</div>
+  <div class="stage" id="st2">
+    <div class="sno">03 · Encode</div>
+    <div class="sup">linear-space mips, alpha bleed, BC7 / DXT / crunched-CRN compression (CPU, one file per worker)</div>
+    <div class="sstat" id="ss2">—</div>
+  </div>
+  <div class="sarrow">→</div>
+  <div class="stage" id="st3">
+    <div class="sno">04 · Serialize</div>
+    <div class="sup">SerializedFile type trees → UnityFS container, 128 KiB LZ4HC blocks</div>
+    <div class="sstat" id="ss3">—</div>
+  </div>
+</div>
+
+<main>
+  <div class="panel">
+    <p class="ptitle">Input<span class="x">·</span>entity</p>
+    <div id="drop">drop <b>.glb</b> / <b>.gltf</b> / textures / <b>.zip</b> here<br>or click to pick files</div>
+    <input id="pick" type="file" multiple style="display:none">
+    <table id="filetable"></table>
+    <div class="controls">
+      <span class="grplab">platform</span>
+      <div class="grp" id="platgrp">
+        <button data-v="windows" class="on">windows</button><button data-v="mac">mac</button><button data-v="webgl">webgl</button>
+      </div>
+    </div>
+    <div class="controls">
+      <span class="grplab">entity</span>
+      <div class="grp" id="etgrp">
+        <button data-v="" class="on">auto</button><button data-v="wearable">wearable</button><button data-v="emote">emote</button><button data-v="scene">scene</button>
+      </div>
+      <span class="chip on" id="magenta" title="missing textures become a magenta placeholder instead of failing the build">tolerate missing refs</span>
+      <span class="chip on" id="lodchip" title="also bake a LOD1 bundle: merge + ISS placements + texture atlas + DCL/Scene_TexArray binding + self-gate (the module also does parcel crop and meshopt tri-cap decimation; this page bakes with those off)">bake lod1</span>
+    </div>
+    <button id="convert" disabled>convert</button>
+    <button id="reset">clear</button>
+  </div>
+
+  <div class="panel">
+    <p class="ptitle">Conversion<span class="x">·</span>feed</p>
+    <div id="feed"></div>
+    <div id="outputs"></div>
+    <div id="sum"></div>
+  </div>
+</main>
+
+<div id="caveats">
+  <b>the real codecs, compiled to wasm</b> — IJG libjpeg 9c, crnlib (crunched DXT5 normal maps) and the
+  draco decoder are statically linked into this module via a wasi-libc/libc++ toolchain. Bundles built here are
+  byte-identical to the native binary from the same tree under the libjpeg-9c GLB decode profile (the byte gate
+  pins ABGEN_JPEG_GLB_9C=1; the native production default decodes GLB JPEGs with turbojpeg, the closer match to
+  the Unity oracle): every byte-path transcendental routes through one shared libm, and the gate (12 fixtures
+  across windows/mac/webgl — LOD1 bakes with meshopt decimation, parcel crop and ISS placements on windows/mac,
+  plus a corrupt-JPEG recovery pair) passes with zero diffs. Files convert one per worker on a pool; a
+  malformed image fails only its own file through real setjmp recovery, exactly like native, and a worker that
+  traps anyway is terminated and respawned so the rest of the run completes. Remaining gaps vs the native
+  fleet:
+  <span>encode is CPU (SIMD128 in the BC7 partition estimator, startup-qualified byte-equal to scalar) —
+  native uses AVX-512 or a bit-exact CUDA/wgpu GPU lane; WebGPU here is a documented follow-up</span> ·
+  <span>gltfpack decimation and placements acquisition via the Node manifest-builder stay native-only</span>.
+  Every produced bundle is a real UnityFS archive, structurally validated (E0–E9) before download.
+</div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,31 @@
+{
+  "name": "@dcl/abgen",
+  "version": "0.0.0-dev",
+  "description": "Decentraland asset-bundle converter + ab-cdn-compatible JIT server. Installs the prebuilt abgen binary for your platform.",
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/decentraland/abgen.git"
+  },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "bin": {
+    "abgen": "bin/abgen.js"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "bin/abgen.js"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@dcl/abgen-linux-x64": "0.0.0-dev",
+    "@dcl/abgen-linux-arm64": "0.0.0-dev",
+    "@dcl/abgen-win32-x64": "0.0.0-dev",
+    "@dcl/abgen-win32-arm64": "0.0.0-dev",
+    "@dcl/abgen-darwin-arm64": "0.0.0-dev",
+    "@dcl/abgen-darwin-x64": "0.0.0-dev"
+  }
+}

@@ -1,0 +1,8 @@
+Copy the harness scripts from harness/ into this folder before running Unity:
+
+  AbProjectSetup.cs     one-shot project configuration (URP + linear color space)
+  AbVisualCompare.cs    still-image + inventory capture
+  AbAnimCapture.cs      animation frame-series capture
+
+(The pipeline's `install_scripts()` helper in pipeline/harness_contract.py does this
+copy for you.) See harness/README.md for the full contract.
