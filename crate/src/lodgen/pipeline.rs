@@ -55,6 +55,7 @@ pub fn acquire_placements(
     iss: &str,
     manifest_builder: Option<&str>,
     workdir: Option<&Path>,
+    catalyst: &str,
 ) -> Result<Vec<placements::Placement>> {
     let iss_bytes: Option<Vec<u8>> = match iss {
         "off" => None,
@@ -109,7 +110,12 @@ pub fn acquire_placements(
                 }
             };
             let Some(manifest_path) =
-                placements::run_manifest_builder(&run_coords, Path::new(&tool_dir), &work_dir)?
+                placements::run_manifest_builder(
+                    &run_coords,
+                    Path::new(&tool_dir),
+                    &work_dir,
+                    catalyst,
+                )?
             else {
                 eprintln!(
                     "manifest-builder: scene ran to completion but emitted no manifest \
@@ -477,6 +483,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         &params.iss,
         params.manifest_builder.as_deref(),
         mb_workdir.as_deref(),
+        &params.catalyst,
     )?;
     let placements_ms = t.elapsed().as_millis();
     log.push(format!("placements: {}", placements.len()));

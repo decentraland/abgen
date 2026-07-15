@@ -39,8 +39,23 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         if entry.file_type()?.is_dir() {
             copy_tree(&sp, &dp)?;
         } else {
+            if let Ok(meta) = std::fs::metadata(&dp) {
+                let mut perms = meta.permissions();
+                if perms.readonly() {
+                    perms.set_readonly(false);
+                    let _ = std::fs::set_permissions(&dp, perms);
+                }
+            }
             std::fs::copy(&sp, &dp)
                 .with_context(|| format!("copy {} -> {}", sp.display(), dp.display()))?;
+            let mut perms = std::fs::metadata(&dp)
+                .with_context(|| format!("stat {}", dp.display()))?
+                .permissions();
+            if perms.readonly() {
+                perms.set_readonly(false);
+                std::fs::set_permissions(&dp, perms)
+                    .with_context(|| format!("chmod {}", dp.display()))?;
+            }
         }
     }
     Ok(())
@@ -73,10 +88,16 @@ pub const MANIFEST_BUILDER_DONE_MARKER: &str = "Finished running frames!";
 
 static MANIFEST_BUILDER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+pub fn catalyst_base(content_url: &str) -> &str {
+    let trimmed = content_url.trim_end_matches('/');
+    trimmed.strip_suffix("/content").unwrap_or(trimmed)
+}
+
 pub fn run_manifest_builder(
     coords: &str,
     tool_dir: &Path,
     work_dir: &Path,
+    catalyst: &str,
 ) -> Result<Option<PathBuf>> {
     let _serialized = MANIFEST_BUILDER_LOCK
         .lock()
@@ -101,7 +122,11 @@ pub fn run_manifest_builder(
         run_npm(work_dir, &["run", "build"])?;
     }
     let coords_arg = format!("--coords={coords}");
-    let stdout = run_npm(work_dir, &["run", "start", &coords_arg, "--overwrite"])?;
+    let catalyst_arg = format!("--catalyst={}", catalyst_base(catalyst));
+    let stdout = run_npm(
+        work_dir,
+        &["run", "start", &coords_arg, &catalyst_arg, "--overwrite"],
+    )?;
     let out_dir = work_dir.join(MANIFEST_OUTPUT_DIR);
     if let Some(rest) = stdout.split("scene id:").nth(1) {
         let scene_id: String = rest
@@ -143,5 +168,30 @@ pub fn run_manifest_builder(
             out_dir.display(),
             stdout
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::catalyst_base;
+
+    #[test]
+    fn catalyst_base_strips_content_suffix() {
+        assert_eq!(
+            catalyst_base("https://peer.decentraland.org/content"),
+            "https://peer.decentraland.org"
+        );
+        assert_eq!(
+            catalyst_base("https://peer.decentraland.org/content/"),
+            "https://peer.decentraland.org"
+        );
+        assert_eq!(
+            catalyst_base("http://127.0.0.1:5141"),
+            "http://127.0.0.1:5141"
+        );
+        assert_eq!(
+            catalyst_base("https://worlds-content-server.decentraland.org/world/name"),
+            "https://worlds-content-server.decentraland.org/world/name"
+        );
     }
 }
