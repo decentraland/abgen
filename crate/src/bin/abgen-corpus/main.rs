@@ -19,8 +19,8 @@ mod sources;
 
 use build::{build_bundle_at, run_fused_entity_ids, write_cdn_manifest, BuildCounters};
 use sources::{
-    fetch_ids_into_store, from_collection_urn, from_entity_ids, from_live_reference,
-    from_reference, manifest_from_ids,
+    fetch_ids_into_store, from_collection_urn, from_live_reference, from_reference,
+    manifest_from_ids,
 };
 
 const DEFAULT_LAMBDAS_URL: &str = "http://localhost:5141/lambdas";
@@ -83,7 +83,7 @@ pub(crate) struct EffectiveToggles {
 
     /// Canonical `{hash}_{depsdigest}_{platform}` naming for glb/gltf
     /// bundles (upstream asset-reuse parity). Default ON (ab-cdn runs
-    /// asset-reuse since v49); ABGEN_ASSET_REUSE=0 opts out for parity runs
+    /// asset-reuse since v49); ABGEN_DEPS_DIGEST=0 opts out for parity runs
     /// against pre-v49 reference trees.
     pub(crate) asset_reuse: bool,
 }
@@ -103,6 +103,13 @@ fn usage_text() -> &'static str {
          abgen-corpus --entity-ids <ids.txt> <out-dir> \\\n               \
              [--platform windows|mac] [--content-dir <dir>] [--cdn-layout] \\\n               \
              [--fetch-missing] [--content-server-url <url>] [-j JOBS]\n  \
+         abgen-corpus --pointer <x,y | urn | entityId> <out-dir> \\\n               \
+             [--platform windows|mac] [--content-dir <dir>] [--cdn-layout] \\\n               \
+             [--fetch-missing] [--no-deps-digest] [-j JOBS]\n               \
+             (single-target convenience: resolves the pointer via the content\n               \
+              server, then behaves like --entity-ids with that one entity;\n               \
+              with --cdn-layout also copies manifests to the production CDN\n               \
+              naming <out>/manifest/<entity>_<platform>.json)\n  \
          abgen-corpus --collection-urn <urn> <out-dir> \\\n               \
              [--lambdas-url <url>] [--platform windows|mac] [--content-dir <dir>] \\\n               \
              [--fetch-missing] [-j JOBS]\n  \
@@ -209,6 +216,11 @@ fn usage_text() -> &'static str {
          default rebuilds/overwrites every bundle (golden/determinism workflows\n  \
          rely on that).\n\
          \n\
+         --no-deps-digest: legacy {hash}_{platform} glb names instead of the\n  \
+         canonical {hash}_{depsdigest}_{platform} (for consumers that request\n  \
+         bundles by bare content hash, or pre-v49 parity). Equivalent to\n  \
+         ABGEN_DEPS_DIGEST=0.\n\
+         \n\
          --gpu: enable the GPU BC7/BC5 encode path (needs a binary built with\n  \
          --features gpu; exits 2 otherwise).\n\
          \n\
@@ -279,6 +291,8 @@ fn run() -> Result<()> {
     let mut skip_existing = false;
     let mut force = false;
     let mut fetch_missing = false;
+    let mut no_deps_digest = false;
+    let mut pointer_target: Option<String> = None;
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -363,6 +377,10 @@ fn run() -> Result<()> {
                 i += 1;
                 entity_ids_path = Some(argv.get(i).cloned().unwrap_or_else(|| usage()));
             }
+            "--pointer" => {
+                i += 1;
+                pointer_target = Some(argv.get(i).cloned().unwrap_or_else(|| usage()));
+            }
             "--worlds-url" => {
                 i += 1;
                 worlds_url_flag = Some(argv.get(i).cloned().unwrap_or_else(|| usage()));
@@ -382,6 +400,9 @@ fn run() -> Result<()> {
             }
             "--skip-existing" => {
                 skip_existing = true;
+            }
+            "--no-deps-digest" => {
+                no_deps_digest = true;
             }
             "--fetch-missing" => {
                 fetch_missing = true;
@@ -423,13 +444,17 @@ fn run() -> Result<()> {
         eprintln!("error: --cdn-layout is incompatible with --flat / --collection-urn");
         usage();
     }
-    if cdn_layout && entity_ids_path.is_none() && worlds.is_empty() {
-        eprintln!("error: --cdn-layout currently requires --entity-ids or --world");
+    if cdn_layout && entity_ids_path.is_none() && pointer_target.is_none() && worlds.is_empty() {
+        eprintln!("error: --cdn-layout currently requires --entity-ids, --pointer or --world");
         usage();
     }
-    if fetch_missing && entity_ids_path.is_none() && collection_urn.is_none() {
+    if fetch_missing
+        && entity_ids_path.is_none()
+        && pointer_target.is_none()
+        && collection_urn.is_none()
+    {
         eprintln!(
-            "error: --fetch-missing requires --entity-ids or --collection-urn \
+            "error: --fetch-missing requires --entity-ids, --pointer or --collection-urn \
              (--world always fetches)"
         );
         usage();
@@ -456,10 +481,10 @@ fn run() -> Result<()> {
             );
             usage();
         }
-        if !(cdn_layout && entity_ids_path.is_some()) {
+        if !(cdn_layout && (entity_ids_path.is_some() || pointer_target.is_some())) {
             eprintln!(
-                "error: --platform with a comma list requires --entity-ids --cdn-layout \
-                 (the fused encode-once pass)"
+                "error: --platform with a comma list requires --entity-ids/--pointer \
+                 --cdn-layout (the fused encode-once pass)"
             );
             usage();
         }
@@ -468,6 +493,16 @@ fn run() -> Result<()> {
         && (entity_ids_path.is_some() || from_ref.is_some() || collection_urn.is_some())
     {
         eprintln!("error: --world conflicts with --entity-ids/--from-reference/--collection-urn");
+        usage();
+    }
+    if pointer_target.is_some()
+        && (entity_ids_path.is_some()
+            || !worlds.is_empty()
+            || from_ref.is_some()
+            || collection_urn.is_some()
+            || live_mode.is_some())
+    {
+        eprintln!("error: --pointer conflicts with the other entity-source modes");
         usage();
     }
     if cdn_layout {
@@ -501,7 +536,8 @@ fn run() -> Result<()> {
                 v38_compat: set_v38 || (!parity_mode && BuildOpts::env_v38_compat()),
                 v38_timestamp: BuildOpts::env_v38_timestamp(),
                 magenta_missing: BuildOpts::env_magenta_missing(),
-                asset_reuse: abgen::clihelp::env_bool("ABGEN_ASSET_REUSE", true),
+                asset_reuse: !no_deps_digest
+                    && abgen::clihelp::env_bool("ABGEN_DEPS_DIGEST", true),
             }
         }
         Err(msg) => {
@@ -537,7 +573,7 @@ fn run() -> Result<()> {
             from_live_reference(Path::new(live_ref), &cdir, &platform, per_vintage, toggles)?;
         live_sample_summary = Some(summary);
         (m, out_root)
-    } else if let Some(ids_path) = entity_ids_path {
+    } else if entity_ids_path.is_some() || pointer_target.is_some() {
         if positional.len() != 1 {
             usage();
         }
@@ -545,15 +581,24 @@ fn run() -> Result<()> {
         let cdir = content_dir
             .or_else(|| std::env::var(ABGEN_CONTENT_ROOT_ENV).ok())
             .unwrap_or_else(|| DEFAULT_CONTENT_ROOT.to_string());
-        if cdn_layout {
+        let ids: Vec<String> = if let Some(ids_path) = &entity_ids_path {
             let raw =
-                std::fs::read_to_string(&ids_path).with_context(|| format!("read {ids_path}"))?;
-            let ids: Vec<String> = raw
-                .lines()
+                std::fs::read_to_string(ids_path).with_context(|| format!("read {ids_path}"))?;
+            raw.lines()
                 .map(|l| l.trim())
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .map(|l| l.to_string())
-                .collect();
+                .collect()
+        } else {
+            let target = pointer_target.as_deref().unwrap();
+            let client = abgen::catalyst::CatalystClient::from_args(&content_server_url, None);
+            let scene = client
+                .resolve_scene(target)
+                .with_context(|| format!("resolve --pointer {target:?}"))?;
+            eprintln!("pointer {target:?} -> entity {}", scene.entity_id);
+            vec![scene.entity_id]
+        };
+        if cdn_layout {
             let store = LocalContentStore::new(&cdir);
             if fetch_missing {
                 fetch_ids_into_store(&store, &content_server_url, &ids);
@@ -583,6 +628,23 @@ fn run() -> Result<()> {
                 "reconcile: divergent={} rebuilt={} relinked={} errs={}",
                 o.reconcile.divergent, o.reconcile.rebuilt, o.reconcile.relinked, o.reconcile.errs
             );
+            // Single-target convenience: also emit the manifests under the
+            // production CDN naming (manifest/<entity>_<platform>.json).
+            if pointer_target.is_some() {
+                let man_dir = out_root.join("manifest");
+                std::fs::create_dir_all(&man_dir)?;
+                for id in &ids {
+                    for plat in &platforms {
+                        let src = out_root.join(id).join(format!("{plat}.manifest.json"));
+                        if src.is_file() {
+                            let dst = man_dir.join(format!("{id}_{plat}.json"));
+                            std::fs::copy(&src, &dst)?;
+                            eprintln!("manifest: {}", dst.display());
+                            eprintln!("bundles:  {}", out_root.join(id).join(plat).display());
+                        }
+                    }
+                }
+            }
             let n_errs = o.errs + o.manifest_errs + o.reconcile.errs;
             let total = o.built + o.skipped + o.errs;
             println!(
@@ -594,14 +656,11 @@ fn run() -> Result<()> {
             }
             return Ok(());
         }
-        let m = from_entity_ids(
-            &ids_path,
-            &cdir,
-            &platform,
-            cdn_layout,
-            fetch_missing.then_some(content_server_url.as_str()),
-            toggles,
-        )?;
+        let store = LocalContentStore::new(&cdir);
+        if fetch_missing {
+            fetch_ids_into_store(&store, &content_server_url, &ids);
+        }
+        let m = manifest_from_ids(&ids, &cdir, &platform, cdn_layout, toggles)?;
         (m, out_root)
     } else if !worlds.is_empty() {
         if positional.len() != 1 {

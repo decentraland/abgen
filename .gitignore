@@ -27,6 +27,7 @@ crate/third_party/**/build/
 /data
 /runs
 /content
+/out
 *.log
 *.env
 .env

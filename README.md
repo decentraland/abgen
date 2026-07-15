@@ -161,7 +161,7 @@ Enabled when `ABGEN_S3_BUCKET` is non-empty (or `ABGEN_USE_SPACE=1`):
 ### Asset-reuse mode (upstream converter parity)
 ON by default — the ab-cdn deployment has run asset-reuse since v49. Scene glb/gltf bundles use
 the upstream converter's canonical naming and shared bucket layout (applies to the JIT server
-and `abgen-corpus`). Set `ABGEN_ASSET_REUSE=0` to fall back to legacy `{hash}_{platform}` names
+and `abgen-corpus`). Set `ABGEN_DEPS_DIGEST=0` to fall back to legacy `{hash}_{platform}` names
 and entity-scoped space keys — needed only for parity runs against pre-v49 reference trees
 (e.g. `--live-mode` sampling of v15–v41 vintages, whose manifests list non-digest names).
 - glb/gltf bundles are named `{hash}_{depsdigest}_{platform}` — the digest is a 128-bit hash of

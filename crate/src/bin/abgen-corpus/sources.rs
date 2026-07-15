@@ -215,26 +215,6 @@ fn metadata_deps_for_glb(
     out
 }
 
-pub(crate) fn from_entity_ids(
-    ids_path: &str,
-    content_dir: &str,
-    platform: &str,
-    cdn_layout: bool,
-    fetch_from: Option<&str>,
-    toggles: EffectiveToggles,
-) -> Result<Manifest> {
-    let raw = std::fs::read_to_string(ids_path).with_context(|| format!("read {ids_path}"))?;
-    let ids: Vec<String> = raw
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| l.to_string())
-        .collect();
-    if let Some(csu) = fetch_from {
-        fetch_ids_into_store(&LocalContentStore::new(content_dir), csu, &ids);
-    }
-    manifest_from_ids(&ids, content_dir, platform, cdn_layout, toggles)
-}
 
 pub(crate) fn contents_base_url(content_server_url: &str) -> String {
     format!("{}/contents/", content_server_url.trim_end_matches('/'))

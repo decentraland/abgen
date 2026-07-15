@@ -483,6 +483,28 @@ pub(crate) fn run_fused_entity_ids(
         errs: &errs,
         skipped: &skipped,
     };
+    // Per-bundle heartbeat: the per-entity progress line above only fires
+    // every 5000 entities, so a single big scene (hundreds of bundles) sits
+    // silent for minutes. Prints at most every 2s while bundles complete.
+    let last_print_ms = std::sync::atomic::AtomicU64::new(0);
+    let heartbeat = || {
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
+        let last = last_print_ms.load(Ordering::Relaxed);
+        if elapsed_ms.saturating_sub(last) >= 2000
+            && last_print_ms
+                .compare_exchange(last, elapsed_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let b = built.load(Ordering::Relaxed);
+            let s = skipped.load(Ordering::Relaxed);
+            let e = errs.load(Ordering::Relaxed);
+            eprintln!(
+                "  build: {} bundles done (built={b} skipped={s} errs={e}, {:.0}s)",
+                b + s + e,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+    };
     let primary = &platforms[0];
 
     ids.par_iter().for_each(|ent_id| {
@@ -565,6 +587,7 @@ pub(crate) fn run_fused_entity_ids(
                     &counters,
                 );
             }
+            heartbeat();
         });
         for (pi, plat) in platforms.iter().enumerate() {
             match write_cdn_manifest(
