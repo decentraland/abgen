@@ -158,6 +158,23 @@ Enabled when `ABGEN_S3_BUCKET` is non-empty (or `ABGEN_USE_SPACE=1`):
 - `ABGEN_FALLBACK_VERSION` (default `v41`) - extra version prefix tried on space-cache lookups
 - `ABGEN_WORLDS_CONTENT_URL` - worlds-content-server fallback for entity/content fetches that miss the primary source (default public worlds server; `0`/`off`/empty disables)
 
+### Asset-reuse mode (upstream converter parity)
+ON by default — the ab-cdn deployment has run asset-reuse since v49. Scene glb/gltf bundles use
+the upstream converter's canonical naming and shared bucket layout (applies to the JIT server
+and `abgen-corpus`). Set `ABGEN_ASSET_REUSE=0` to fall back to legacy `{hash}_{platform}` names
+and entity-scoped space keys — needed only for parity runs against pre-v49 reference trees
+(e.g. `--live-mode` sampling of v15–v41 vintages, whose manifests list non-digest names).
+- glb/gltf bundles are named `{hash}_{depsdigest}_{platform}` — the digest is a 128-bit hash of
+  the glb's resolved `(file, hash)` dependency pairs (`.bin` + textures), so a glb whose
+  dependency set changes lands at a new name/key; textures stay `{hash}_{platform}`
+- space keys move from entity-scoped `{version}/{entity}/{bundle}` to the shared
+  `{version}/assets/{bundle}` layout (entity-scoped keys remain a read fallback)
+- before building, the space is HEAD-probed at the canonical key; hits are listed in the entity
+  manifest without rebuilding, so bundles are converted once across entities
+- a glb whose deps can't be resolved is skipped (upstream skipped-assets semantics) unless
+  `ABGEN_MAGENTA_MISSING` is on, in which case unresolvable deps are dropped from the digest and
+  the build substitutes placeholder textures
+
 ### Registry index eager build
 On `POST /entities/active|versions`, entities missing a converted bundle are queued for conversion; the
 request waits up to the deadline, builds finish in the background. Knobs: `ABGEN_INDEX_EAGER_BUILD`

@@ -80,6 +80,12 @@ pub(crate) struct EffectiveToggles {
     pub(crate) v38_compat: bool,
     pub(crate) v38_timestamp: i64,
     pub(crate) magenta_missing: bool,
+
+    /// Canonical `{hash}_{depsdigest}_{platform}` naming for glb/gltf
+    /// bundles (upstream asset-reuse parity). Default ON (ab-cdn runs
+    /// asset-reuse since v49); ABGEN_ASSET_REUSE=0 opts out for parity runs
+    /// against pre-v49 reference trees.
+    pub(crate) asset_reuse: bool,
 }
 
 const BIN_NAME: &str = "abgen-corpus";
@@ -495,6 +501,7 @@ fn run() -> Result<()> {
                 v38_compat: set_v38 || (!parity_mode && BuildOpts::env_v38_compat()),
                 v38_timestamp: BuildOpts::env_v38_timestamp(),
                 magenta_missing: BuildOpts::env_magenta_missing(),
+                asset_reuse: abgen::clihelp::env_bool("ABGEN_ASSET_REUSE", true),
             }
         }
         Err(msg) => {
@@ -526,7 +533,8 @@ fn run() -> Result<()> {
         let cdir = content_dir
             .or_else(|| std::env::var(ABGEN_CONTENT_ROOT_ENV).ok())
             .unwrap_or_else(|| DEFAULT_CONTENT_ROOT.to_string());
-        let (m, summary) = from_live_reference(Path::new(live_ref), &cdir, &platform, per_vintage)?;
+        let (m, summary) =
+            from_live_reference(Path::new(live_ref), &cdir, &platform, per_vintage, toggles)?;
         live_sample_summary = Some(summary);
         (m, out_root)
     } else if let Some(ids_path) = entity_ids_path {
@@ -592,6 +600,7 @@ fn run() -> Result<()> {
             &platform,
             cdn_layout,
             fetch_missing.then_some(content_server_url.as_str()),
+            toggles,
         )?;
         (m, out_root)
     } else if !worlds.is_empty() {
@@ -625,7 +634,7 @@ fn run() -> Result<()> {
         if ids.is_empty() {
             return Err(anyhow!("--world resolved no scene entities"));
         }
-        let m = manifest_from_ids(&ids, &cdir, &platform, cdn_layout)?;
+        let m = manifest_from_ids(&ids, &cdir, &platform, cdn_layout, toggles)?;
         (m, out_root)
     } else if let Some(urn) = collection_urn {
         if positional.len() != 1 {

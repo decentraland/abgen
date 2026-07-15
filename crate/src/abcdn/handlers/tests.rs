@@ -253,6 +253,16 @@ fn flat_target_table() {
         super::flat_target("v41/Qmhash_webgl"),
         Some(("Qmhash".to_string(), "webgl".to_string()))
     );
+    // Canonical glb names carry a deps digest — owner resolution gets the
+    // bare content hash.
+    assert_eq!(
+        super::flat_target("v41/Qmhash_0123abcd_windows"),
+        Some(("Qmhash".to_string(), "windows".to_string()))
+    );
+    assert_eq!(
+        super::flat_target("v41/Qmhash_0123abcd_mac.br"),
+        Some(("Qmhash".to_string(), "mac".to_string()))
+    );
     assert_eq!(super::flat_target("v41/Qmhash"), None);
     assert_eq!(super::flat_target("v41/_windows"), None);
     assert_eq!(super::flat_target("manifest/Qmhash_windows"), None);

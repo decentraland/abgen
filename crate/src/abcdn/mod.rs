@@ -90,6 +90,18 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
             "ab-cdn S3 space cache ENABLED (read-through + write-back)"
         );
     }
+    if crate::clihelp::env_bool("ABGEN_ASSET_REUSE", true) {
+        tracing::info!(
+            "asset-reuse mode ON (default): canonical glb names \
+             ({{hash}}_{{depsdigest}}_{{platform}}), shared {{version}}/assets/ space layout, \
+             pre-build probe"
+        );
+    } else {
+        tracing::warn!(
+            "asset-reuse mode DISABLED (ABGEN_ASSET_REUSE=0): legacy {{hash}}_{{platform}} \
+             names + entity-scoped space keys — only for parity against pre-v49 references"
+        );
+    }
 
     let live_proxy = crate::live::Proxy::new(pcfg);
     let ab_date = live_proxy.date().to_string();

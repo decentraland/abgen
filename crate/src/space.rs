@@ -355,6 +355,35 @@ impl Space {
         }
     }
 
+    /// Existence probe via a signed HEAD — no body transfer, unlike `get`.
+    /// 404/403 map to `Ok(false)` (403 covers buckets that deny HEAD on
+    /// missing keys); transport errors stay errors so callers can decide
+    /// whether a failed probe should block or fall through to building.
+    pub fn head(&self, key: &str) -> Result<bool> {
+        let c = self.creds()?;
+        let payload_hash = sha256_hex(b"");
+        let (date, amz) = timestamps();
+        let auth = self.authorize(&c, "HEAD", key, &payload_hash, &amz, &date);
+        let url = format!("{}://{}{}", self.scheme, self.host, self.path(key));
+        let mut req = agent()
+            .head(&url)
+            .header("x-amz-date", &amz)
+            .header("x-amz-content-sha256", &payload_hash)
+            .header("Authorization", &auth);
+        if let Some(token) = &c.session_token {
+            req = req.header("x-amz-security-token", token);
+        }
+        match req.call() {
+            Ok(r) => Ok(r.status().as_u16() == 200),
+            Err(ureq::Error::StatusCode(404)) => Ok(false),
+            Err(ureq::Error::StatusCode(403)) => {
+                warn_once_403(key);
+                Ok(false)
+            }
+            Err(e) => Err(crate::anyhow!("space HEAD {key}: {e}")),
+        }
+    }
+
     pub fn get_status(&self, key: &str) -> Result<u16> {
         match self.call_get(key)? {
             Ok(r) => Ok(r.status().as_u16()),

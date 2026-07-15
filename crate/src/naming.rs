@@ -261,8 +261,20 @@ pub fn resolve_uri_to_content_file(uri: &str, glb_file: &str) -> Result<String> 
     Ok(normalized)
 }
 
+/// Extensions that participate in a glb/gltf deps digest — buffers plus the
+/// texture formats the upstream converter classifies as inputs. Mirrors
+/// `GLB_DEP_EXTENSIONS` in the consumer-server (`asset-reuse.ts`): a resolved
+/// dep outside this set is excluded from the digest even though it still had
+/// to resolve against the entity content map.
+pub const GLB_DEP_EXTENSIONS: [&str; 11] = [
+    ".bin", ".jpg", ".png", ".jpeg", ".tga", ".gif", ".bmp", ".psd", ".tiff", ".iff", ".ktx",
+];
+
 pub fn compute_deps_digest(deps: &[(String, String)]) -> String {
-    let mut ordered: Vec<&(String, String)> = deps.iter().collect();
+    let mut ordered: Vec<&(String, String)> = deps
+        .iter()
+        .filter(|(f, _)| GLB_DEP_EXTENSIONS.contains(&file_extension(f).as_str()))
+        .collect();
     ordered.sort_by(|a, b| (a.0.as_str(), a.1.as_str()).cmp(&(b.0.as_str(), b.1.as_str())));
     let payload: Vec<[&str; 2]> = ordered
         .iter()
@@ -331,6 +343,17 @@ pub fn deps_digest_for_glb(
     Ok(compute_deps_digest(&deps))
 }
 
+/// Split a bundle-name stem (platform suffix already removed) into
+/// `(content_hash, deps_digest)`. Content hashes (Qm…/bafk…) never contain
+/// `_`, so the first `_` separates the hash from the digest of a canonical
+/// glb/gltf name; plain names return `(stem, None)`.
+pub fn split_bundle_stem(stem: &str) -> (&str, Option<&str>) {
+    match stem.split_once('_') {
+        Some((h, d)) if !h.is_empty() && !d.is_empty() => (h, Some(d)),
+        _ => (stem, None),
+    }
+}
+
 pub fn canonical_filename(
     hash: &str,
     ext: &str,
@@ -380,6 +403,32 @@ mod tests {
             canonical_filename("h", ".png", "mac", None).unwrap(),
             "h_mac"
         );
+    }
+
+    #[test]
+    fn deps_digest_filters_non_dep_extensions() {
+        // Upstream `computeDepsDigest` filters to GLB_DEP_EXTENSIONS before
+        // hashing, so a resolved ref outside the set must not perturb the
+        // digest — including the empty digest for a glb whose only ref is
+        // filtered out.
+        let base = compute_deps_digest(&[("a/b.bin".to_string(), "hashX".to_string())]);
+        let with_extra = compute_deps_digest(&[
+            ("a/b.bin".to_string(), "hashX".to_string()),
+            ("a/env.ktx2".to_string(), "hashY".to_string()),
+        ]);
+        assert_eq!(base, with_extra);
+        assert_eq!(
+            compute_deps_digest(&[("only.ktx2".to_string(), "hashY".to_string())]),
+            compute_deps_digest(&[])
+        );
+    }
+
+    #[test]
+    fn split_bundle_stem_variants() {
+        assert_eq!(split_bundle_stem("Qmhash"), ("Qmhash", None));
+        assert_eq!(split_bundle_stem("Qmhash_dig"), ("Qmhash", Some("dig")));
+        assert_eq!(split_bundle_stem("_dig"), ("_dig", None));
+        assert_eq!(split_bundle_stem("Qmhash_"), ("Qmhash_", None));
     }
 
     #[test]

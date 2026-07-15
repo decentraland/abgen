@@ -70,6 +70,12 @@ struct EntityCtx {
     scene: Scene,
     content_by_file: HashMap<String, String>,
     scan: EntityScan,
+
+    /// glb/gltf content hash → deps digest (upstream `computeDepsDigest`
+    /// parity). Absent entries mean digest computation failed for that glb
+    /// (unfetchable bytes, malformed glTF, or unresolvable dep refs when not
+    /// running magenta-tolerant).
+    deps_digests: HashMap<String, String>,
 }
 
 pub struct Proxy {
@@ -95,6 +101,13 @@ pub struct Proxy {
     v38_compat: bool,
     v38_timestamp: i64,
     magenta_missing: bool,
+
+    /// Upstream asset-reuse parity: glb/gltf bundles get canonical
+    /// `{hash}_{depsdigest}_{platform}` names, space keys move to the shared
+    /// `{version}/assets/{name}` layout, and builds probe the space before
+    /// converting. Off = legacy `{hash}_{platform}` names under
+    /// `{version}/{entity}/` keys.
+    asset_reuse: bool,
 }
 
 impl Proxy {
@@ -144,6 +157,29 @@ impl Proxy {
         let content_by_file = scene.content_by_file();
         let scan = scan_entity(&self.content, &content_by_file, &self.uri_cache);
 
+        // When running magenta-tolerant, unresolvable deps are dropped from
+        // the digest instead of failing the glb — the build will substitute
+        // placeholder textures anyway, and the resulting name stays unique.
+        let mut deps_digests: HashMap<String, String> = HashMap::new();
+        for c in &scene.content {
+            let (is_glb, _) = is_convertible(&c.file);
+            if !is_glb || deps_digests.contains_key(&c.hash) {
+                continue;
+            }
+            let digest = self.content.fetch_mmap(&c.hash).and_then(|bytes| {
+                naming::deps_digest_for_glb(&bytes, &c.file, &content_by_file, self.magenta_missing)
+            });
+            match digest {
+                Ok(d) => {
+                    deps_digests.insert(c.hash.clone(), d);
+                }
+                Err(e) => eprintln!(
+                    "warn: {cid}: deps digest for {} ({}): {e:#}",
+                    c.file, c.hash
+                ),
+            }
+        }
+
         {
             let mut idx = self.hash_index.lock().unwrap();
             for c in &scene.content {
@@ -157,6 +193,7 @@ impl Proxy {
             scene,
             content_by_file,
             scan,
+            deps_digests,
         });
         let mut g = self.entities.lock().unwrap();
         bounded_reserve(&mut g, self.entity_cap, cid);
@@ -187,9 +224,10 @@ impl Proxy {
     }
 
     fn build(&self, ctx: &EntityCtx, bundle_name: &str) -> Result<Vec<u8>> {
-        let (hash, platform) = bundle_name
+        let (stem, platform) = bundle_name
             .rsplit_once('_')
             .ok_or_else(|| anyhow!("bundle name {bundle_name:?} has no _<platform> suffix"))?;
+        let (hash, req_digest) = naming::split_bundle_stem(stem);
 
         let item = match ctx
             .scene
@@ -227,6 +265,20 @@ impl Proxy {
         let (is_glb, is_image) = is_convertible(&file);
         if !is_glb && !is_image {
             bail!("content {file} (hash {hash}) is not a convertible glb/image");
+        }
+        if let Some(req_digest) = req_digest {
+            if !is_glb {
+                bail!("bundle name {bundle_name:?} carries a deps digest but {file} is not glb/gltf");
+            }
+            match ctx.deps_digests.get(hash) {
+                Some(d) if d == req_digest => {}
+                Some(d) => bail!(
+                    "deps digest mismatch for {file} (hash {hash}): requested {req_digest}, computed {d}"
+                ),
+                None => bail!(
+                    "deps digest unavailable for {file} (hash {hash}): dependency resolution failed at entity scan"
+                ),
+            }
         }
 
         self.ensure_content(hash)?;
@@ -356,6 +408,13 @@ impl Proxy {
         format!("{version}/{cid}/{file}")
     }
 
+    /// Shared cross-entity layout used by the upstream converter when asset
+    /// reuse is on: bundles live under `{version}/assets/{canonical_name}`
+    /// instead of per-entity prefixes.
+    fn asset_bundle_key(version: &str, file: &str) -> String {
+        format!("{version}/assets/{file}")
+    }
+
     pub fn space_configured(&self) -> bool {
         self.space.is_some()
     }
@@ -409,16 +468,55 @@ impl Proxy {
             versions.push(self.fallback_version.as_str());
         }
         for ver in versions {
-            let key = Self::bundle_key(ver, cid, file);
-            match Self::space_get_timed(space, &key) {
-                Ok(Some(b)) => return Some(b),
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(key = %key, error = %format!("{e:#}"), "space get failed; trying next version");
+            // In asset-reuse mode the shared layout is authoritative; the
+            // entity-scoped key stays as a fallback so objects written before
+            // the layout switch remain servable.
+            let mut keys: Vec<String> = Vec::new();
+            if self.asset_reuse {
+                keys.push(Self::asset_bundle_key(ver, file));
+            }
+            keys.push(Self::bundle_key(ver, cid, file));
+            for key in keys {
+                match Self::space_get_timed(space, &key) {
+                    Ok(Some(b)) => return Some(b),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(key = %key, error = %format!("{e:#}"), "space get failed; trying next key");
+                    }
                 }
             }
         }
         None
+    }
+
+    /// HEAD-probe the shared assets layout for an already-built bundle.
+    /// Only meaningful in asset-reuse mode; errors count as a miss so a
+    /// flaky probe degrades to building rather than serving nothing.
+    fn space_probe_asset(&self, file: &str) -> bool {
+        if !self.asset_reuse {
+            return false;
+        }
+        let Some(space) = self.space.as_ref() else {
+            return false;
+        };
+        let key = Self::asset_bundle_key(&self.version, file);
+        let t = std::time::Instant::now();
+        let r = space.head(&key);
+        let result = match &r {
+            Ok(true) => "hit",
+            Ok(false) => "miss",
+            Err(_) => "error",
+        };
+        metrics::histogram!("abgen_space_request_duration_seconds", "op" => "head", "result" => result)
+            .record(t.elapsed().as_secs_f64());
+        match r {
+            Ok(hit) => hit,
+            Err(e) => {
+                metrics::counter!("abgen_space_errors_total", "op" => "head").increment(1);
+                tracing::warn!(key = %key, error = %format!("{e:#}"), "space probe failed; building locally");
+                false
+            }
+        }
     }
 
     pub fn space_get_key(&self, key: &str) -> Option<Vec<u8>> {
@@ -461,11 +559,12 @@ impl Proxy {
     }
 
     pub fn space_put_bundle(&self, cid: &str, file: &str, bytes: &[u8]) {
-        self.space_put_key(
-            &Self::bundle_key(&self.version, cid, file),
-            bytes,
-            "application/octet-stream",
-        );
+        let key = if self.asset_reuse {
+            Self::asset_bundle_key(&self.version, file)
+        } else {
+            Self::bundle_key(&self.version, cid, file)
+        };
+        self.space_put_key(&key, bytes, "application/octet-stream");
     }
 
     pub fn space_put_manifest(&self, stem: &str, bytes: &[u8]) {
@@ -495,8 +594,35 @@ impl Proxy {
             if !CONVERTIBLE_EXTS.iter().any(|e| lf.ends_with(e)) {
                 continue;
             }
-            let bundle_name = format!("{}_{}", c.hash, platform);
+            let (is_glb, _) = is_convertible(&c.file);
+            let bundle_name = if self.asset_reuse && is_glb {
+                match ctx.deps_digests.get(&c.hash) {
+                    Some(d) => format!("{}_{d}_{platform}", c.hash),
+                    None => {
+                        // Mirrors the upstream converter, which forwards
+                        // digest-less glbs to Unity as skipped instead of
+                        // building them under a mis-aligned name.
+                        tracing::error!(
+                            entity = %cid,
+                            file = %c.file,
+                            hash = %c.hash,
+                            "no deps digest — glb omitted from manifest, exitCode will be non-zero"
+                        );
+                        failed.push(format!("{}_{platform}", c.hash));
+                        continue;
+                    }
+                }
+            } else {
+                format!("{}_{platform}", c.hash)
+            };
             if !seen.insert(bundle_name.clone()) {
+                continue;
+            }
+            if self.space_probe_asset(&bundle_name) {
+                // Already converted and uploaded (by this or another entity
+                // sharing the asset) — list it in the manifest and let the
+                // space read-through serve the bytes.
+                built.push(bundle_name);
                 continue;
             }
             let dst = pdir.join(&bundle_name);
@@ -602,6 +728,12 @@ pub struct ProxyConfig {
     pub fallback_version: String,
     pub use_space: bool,
 
+    /// Canonical glb naming + shared assets space layout + build probe
+    /// (upstream asset-reuse parity). Default ON — the ab-cdn deployment has
+    /// run asset-reuse since v49. ABGEN_ASSET_REUSE=0 opts out for parity
+    /// runs against pre-v49 reference trees.
+    pub asset_reuse: bool,
+
     pub template_root: Option<String>,
 }
 
@@ -617,6 +749,7 @@ impl Default for ProxyConfig {
             magenta_missing: false,
             fallback_version: "v41".to_string(),
             use_space: false,
+            asset_reuse: true,
             template_root: None,
         }
     }
@@ -633,6 +766,7 @@ impl Proxy {
         let v38_compat = !cfg.parity || BuildOpts::env_v38_compat();
         let v38_timestamp = BuildOpts::env_v38_timestamp();
         let magenta_missing = cfg.magenta_missing || BuildOpts::env_magenta_missing();
+        let asset_reuse = crate::clihelp::env_bool("ABGEN_ASSET_REUSE", cfg.asset_reuse);
         if let Some(root) = cfg.template_root.as_deref().filter(|s| !s.is_empty()) {
             let env_root = std::env::var("ABGEN_ROOT").unwrap_or_default();
             if env_root.trim() != root {
@@ -701,6 +835,7 @@ impl Proxy {
             v38_compat,
             v38_timestamp,
             magenta_missing,
+            asset_reuse,
         })
     }
 
@@ -723,6 +858,16 @@ pub mod stub {
         read_only: bool,
         cache_dir: &std::path::Path,
     ) -> Arc<super::Proxy> {
+        stub_proxy_at_reuse(host, catalyst_url, read_only, cache_dir, false)
+    }
+
+    pub fn stub_proxy_at_reuse(
+        host: &str,
+        catalyst_url: &str,
+        read_only: bool,
+        cache_dir: &std::path::Path,
+        asset_reuse: bool,
+    ) -> Arc<super::Proxy> {
         let space = crate::space::Space::with_static_creds(
             "http",
             host,
@@ -738,6 +883,7 @@ pub mod stub {
             cache_dir: cache_dir.to_string_lossy().into_owned(),
             version: "v41".to_string(),
             fallback_version: "v40".to_string(),
+            asset_reuse,
             ..Default::default()
         };
         super::Proxy::new_with_space(cfg, Some(Arc::new(space)))
@@ -869,6 +1015,77 @@ mod tests {
         let ro = stub_proxy(&host_ro, true, "keys-ro");
         ro.space_put_key("v41/never_windows", b"X", "application/octet-stream");
         assert!(seen_ro.lock().unwrap().is_empty());
+    }
+
+    fn stub_proxy_reuse(host: &str, tag: &str) -> Arc<Proxy> {
+        super::stub::stub_proxy_at_reuse(
+            host,
+            "http://127.0.0.1:9",
+            false,
+            &temp_cache(tag),
+            true,
+        )
+    }
+
+    #[test]
+    fn asset_reuse_puts_and_gets_shared_assets_layout() {
+        let (host, seen) = super::stub::serve(vec![(
+            "/v40/assets/Qmhash_dig_windows".to_string(),
+            200,
+            b"SHARED".to_vec(),
+        )]);
+        let proxy = stub_proxy_reuse(&host, "reuse-layout");
+        proxy.space_put_bundle("bafkcid", "Qmhash_dig_windows", b"B");
+        // Shared layout probed first per version, entity-scoped key kept as a
+        // fallback for objects written before the layout switch.
+        let got = proxy.space_get_bundle("bafkcid", "Qmhash_dig_windows");
+        assert_eq!(got.as_deref(), Some(&b"SHARED"[..]));
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec![
+                "PUT /v41/assets/Qmhash_dig_windows".to_string(),
+                "GET /v41/assets/Qmhash_dig_windows".to_string(),
+                "GET /v41/bafkcid/Qmhash_dig_windows".to_string(),
+                "GET /v40/assets/Qmhash_dig_windows".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn asset_reuse_probe_heads_shared_key() {
+        let (host, seen) = super::stub::serve(vec![(
+            "/v41/assets/Qmhit_dig_windows".to_string(),
+            200,
+            Vec::new(),
+        )]);
+        let proxy = stub_proxy_reuse(&host, "reuse-probe");
+        assert!(proxy.space_probe_asset("Qmhit_dig_windows"));
+        assert!(!proxy.space_probe_asset("Qmmiss_dig_windows"));
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec![
+                "HEAD /v41/assets/Qmhit_dig_windows".to_string(),
+                "HEAD /v41/assets/Qmmiss_dig_windows".to_string(),
+            ]
+        );
+
+        // Legacy mode never probes: entity-scoped bundles are always rebuilt
+        // locally, so a HEAD would be wasted.
+        let (host2, seen2) = super::stub::serve(vec![]);
+        let legacy = stub_proxy(&host2, false, "legacy-probe");
+        assert!(!legacy.space_probe_asset("Qmhit_dig_windows"));
+        assert!(seen2.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_mode_keeps_entity_scoped_puts() {
+        let (host, seen) = super::stub::serve(vec![]);
+        let proxy = stub_proxy(&host, false, "legacy-put");
+        proxy.space_put_bundle("bafkcid", "Qmhash_windows", b"B");
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(log, vec!["PUT /v41/bafkcid/Qmhash_windows".to_string()]);
     }
 
     #[test]
