@@ -25,6 +25,18 @@ pub fn fetch_iss(scene_id: &str) -> Result<Option<Vec<u8>>> {
     }
 }
 
+fn writable(mut perms: std::fs::Permissions) -> std::fs::Permissions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(perms.mode() | 0o200);
+    }
+    #[cfg(not(unix))]
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    perms
+}
+
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst).with_context(|| format!("mkdir {}", dst.display()))?;
     for entry in std::fs::read_dir(src).with_context(|| format!("read dir {}", src.display()))? {
@@ -40,20 +52,18 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
             copy_tree(&sp, &dp)?;
         } else {
             if let Ok(meta) = std::fs::metadata(&dp) {
-                let mut perms = meta.permissions();
+                let perms = meta.permissions();
                 if perms.readonly() {
-                    perms.set_readonly(false);
-                    let _ = std::fs::set_permissions(&dp, perms);
+                    let _ = std::fs::set_permissions(&dp, writable(perms));
                 }
             }
             std::fs::copy(&sp, &dp)
                 .with_context(|| format!("copy {} -> {}", sp.display(), dp.display()))?;
-            let mut perms = std::fs::metadata(&dp)
+            let perms = std::fs::metadata(&dp)
                 .with_context(|| format!("stat {}", dp.display()))?
                 .permissions();
             if perms.readonly() {
-                perms.set_readonly(false);
-                std::fs::set_permissions(&dp, perms)
+                std::fs::set_permissions(&dp, writable(perms))
                     .with_context(|| format!("chmod {}", dp.display()))?;
             }
         }

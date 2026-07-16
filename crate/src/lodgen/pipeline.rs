@@ -109,13 +109,12 @@ pub fn acquire_placements(
                     PathBuf::from(home).join(".cache/abgen-lod/manifest-builder")
                 }
             };
-            let Some(manifest_path) =
-                placements::run_manifest_builder(
-                    &run_coords,
-                    Path::new(&tool_dir),
-                    &work_dir,
-                    catalyst,
-                )?
+            let Some(manifest_path) = placements::run_manifest_builder(
+                &run_coords,
+                Path::new(&tool_dir),
+                &work_dir,
+                catalyst,
+            )?
             else {
                 eprintln!(
                     "manifest-builder: scene ran to completion but emitted no manifest \
