@@ -268,7 +268,9 @@ impl Proxy {
         }
         if let Some(req_digest) = req_digest {
             if !is_glb {
-                bail!("bundle name {bundle_name:?} carries a deps digest but {file} is not glb/gltf");
+                bail!(
+                    "bundle name {bundle_name:?} carries a deps digest but {file} is not glb/gltf"
+                );
             }
             match ctx.deps_digests.get(hash) {
                 Some(d) if d == req_digest => {}
@@ -730,7 +732,7 @@ pub struct ProxyConfig {
 
     /// Canonical glb naming + shared assets space layout + build probe
     /// (upstream asset-reuse parity). Default ON — the ab-cdn deployment has
-    /// run asset-reuse since v49. ABGEN_ASSET_REUSE=0 opts out for parity
+    /// run asset-reuse since v49. ABGEN_DEPS_DIGEST=0 opts out for parity
     /// runs against pre-v49 reference trees.
     pub asset_reuse: bool,
 
@@ -766,7 +768,7 @@ impl Proxy {
         let v38_compat = !cfg.parity || BuildOpts::env_v38_compat();
         let v38_timestamp = BuildOpts::env_v38_timestamp();
         let magenta_missing = cfg.magenta_missing || BuildOpts::env_magenta_missing();
-        let asset_reuse = crate::clihelp::env_bool("ABGEN_ASSET_REUSE", cfg.asset_reuse);
+        let asset_reuse = crate::clihelp::env_bool("ABGEN_DEPS_DIGEST", cfg.asset_reuse);
         if let Some(root) = cfg.template_root.as_deref().filter(|s| !s.is_empty()) {
             let env_root = std::env::var("ABGEN_ROOT").unwrap_or_default();
             if env_root.trim() != root {
@@ -1018,13 +1020,7 @@ mod tests {
     }
 
     fn stub_proxy_reuse(host: &str, tag: &str) -> Arc<Proxy> {
-        super::stub::stub_proxy_at_reuse(
-            host,
-            "http://127.0.0.1:9",
-            false,
-            &temp_cache(tag),
-            true,
-        )
+        super::stub::stub_proxy_at_reuse(host, "http://127.0.0.1:9", false, &temp_cache(tag), true)
     }
 
     #[test]

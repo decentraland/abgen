@@ -228,14 +228,43 @@ pub fn fetch_scene_into_store(
                 .collect()
         })
         .unwrap_or_default();
+    // Progress heartbeat: large scenes (1000+ content files) otherwise sit
+    // silent for minutes and look hung. Prints at most every 2s, and only
+    // while downloads are actually happening — fully-cached entities stay
+    // quiet.
+    let t0 = std::time::Instant::now();
+    let total = hashes.len();
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let downloaded = std::sync::atomic::AtomicUsize::new(0);
+    let last_print_ms = std::sync::atomic::AtomicU64::new(0);
+    use std::sync::atomic::Ordering;
     let fetched: usize = hashes
         .par_iter()
-        .map(|hash| match fetch_to_store(store, &scene.base_url, hash) {
-            Ok(new) => usize::from(new),
-            Err(e) => {
-                eprintln!("{}: {hash}: {e:#}", scene.entity_id);
-                0
+        .map(|hash| {
+            let new = match fetch_to_store(store, &scene.base_url, hash) {
+                Ok(new) => usize::from(new),
+                Err(e) => {
+                    eprintln!("{}: {hash}: {e:#}", scene.entity_id);
+                    0
+                }
+            };
+            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+            let dl = downloaded.fetch_add(new, Ordering::Relaxed) + new;
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
+            let last = last_print_ms.load(Ordering::Relaxed);
+            if dl > 0
+                && elapsed_ms.saturating_sub(last) >= 2000
+                && last_print_ms
+                    .compare_exchange(last, elapsed_ms, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                eprintln!(
+                    "fetch-missing: {}: {d}/{total} content files ({dl} downloaded, {:.0}s)",
+                    scene.entity_id,
+                    t0.elapsed().as_secs_f64()
+                );
             }
+            new
         })
         .sum();
     Ok((fetched, hashes.len()))

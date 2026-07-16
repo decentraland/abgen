@@ -483,6 +483,28 @@ pub(crate) fn run_fused_entity_ids(
         errs: &errs,
         skipped: &skipped,
     };
+    // Per-bundle heartbeat: the per-entity progress line above only fires
+    // every 5000 entities, so a single big scene (hundreds of bundles) sits
+    // silent for minutes. Prints at most every 2s while bundles complete.
+    let last_print_ms = std::sync::atomic::AtomicU64::new(0);
+    let heartbeat = || {
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
+        let last = last_print_ms.load(Ordering::Relaxed);
+        if elapsed_ms.saturating_sub(last) >= 2000
+            && last_print_ms
+                .compare_exchange(last, elapsed_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let b = built.load(Ordering::Relaxed);
+            let s = skipped.load(Ordering::Relaxed);
+            let e = errs.load(Ordering::Relaxed);
+            eprintln!(
+                "  build: {} bundles done (built={b} skipped={s} errs={e}, {:.0}s)",
+                b + s + e,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+    };
     let primary = &platforms[0];
 
     ids.par_iter().for_each(|ent_id| {
@@ -565,6 +587,7 @@ pub(crate) fn run_fused_entity_ids(
                     &counters,
                 );
             }
+            heartbeat();
         });
         for (pi, plat) in platforms.iter().enumerate() {
             match write_cdn_manifest(
@@ -667,10 +690,8 @@ mod tests {
     }
 
     fn store_with_entity(tag: &str, content: serde_json::Value) -> LocalContentStore {
-        let dir = std::env::temp_dir().join(format!(
-            "abgen-corpus-derive-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("abgen-corpus-derive-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = LocalContentStore::new(&dir);
         let entity = serde_json::json!({"type": "scene", "content": content});
@@ -707,14 +728,24 @@ mod tests {
         store.write("Qmtex", b"PNG").unwrap();
         let cache = abgen::glbscan::UriCache::new();
 
-        let legacy =
-            derive_one_entity(&store, "bafyentity", "windows", &cache, toggles(false, false))
-                .unwrap();
+        let legacy = derive_one_entity(
+            &store,
+            "bafyentity",
+            "windows",
+            &cache,
+            toggles(false, false),
+        )
+        .unwrap();
         assert_eq!(glb_names(&legacy), vec!["Qmglb_windows".to_string()]);
 
-        let reuse =
-            derive_one_entity(&store, "bafyentity", "windows", &cache, toggles(true, false))
-                .unwrap();
+        let reuse = derive_one_entity(
+            &store,
+            "bafyentity",
+            "windows",
+            &cache,
+            toggles(true, false),
+        )
+        .unwrap();
         let digest = abgen::naming::compute_deps_digest(&[
             ("a.bin".to_string(), "Qmbin".to_string()),
             ("t.png".to_string(), "Qmtex".to_string()),
@@ -742,9 +773,14 @@ mod tests {
 
         // Strict: unresolvable "a.bin" skips the glb (upstream skipped-assets
         // semantics) but leaves the rest of the entity intact.
-        let strict =
-            derive_one_entity(&store, "bafyentity", "windows", &cache, toggles(true, false))
-                .unwrap();
+        let strict = derive_one_entity(
+            &store,
+            "bafyentity",
+            "windows",
+            &cache,
+            toggles(true, false),
+        )
+        .unwrap();
         assert!(glb_names(&strict).is_empty());
         assert!(strict
             .bundles
@@ -755,10 +791,11 @@ mod tests {
         let tolerant =
             derive_one_entity(&store, "bafyentity", "windows", &cache, toggles(true, true))
                 .unwrap();
-        let digest = abgen::naming::compute_deps_digest(&[(
-            "t.png".to_string(),
-            "Qmtex".to_string(),
-        )]);
-        assert_eq!(glb_names(&tolerant), vec![format!("Qmglb_{digest}_windows")]);
+        let digest =
+            abgen::naming::compute_deps_digest(&[("t.png".to_string(), "Qmtex".to_string())]);
+        assert_eq!(
+            glb_names(&tolerant),
+            vec![format!("Qmglb_{digest}_windows")]
+        );
     }
 }

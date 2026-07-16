@@ -90,7 +90,7 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
             "ab-cdn S3 space cache ENABLED (read-through + write-back)"
         );
     }
-    if crate::clihelp::env_bool("ABGEN_ASSET_REUSE", true) {
+    if crate::clihelp::env_bool("ABGEN_DEPS_DIGEST", true) {
         tracing::info!(
             "asset-reuse mode ON (default): canonical glb names \
              ({{hash}}_{{depsdigest}}_{{platform}}), shared {{version}}/assets/ space layout, \
@@ -98,7 +98,7 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
         );
     } else {
         tracing::warn!(
-            "asset-reuse mode DISABLED (ABGEN_ASSET_REUSE=0): legacy {{hash}}_{{platform}} \
+            "asset-reuse mode DISABLED (ABGEN_DEPS_DIGEST=0): legacy {{hash}}_{{platform}} \
              names + entity-scoped space keys — only for parity against pre-v49 references"
         );
     }
