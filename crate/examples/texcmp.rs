@@ -204,6 +204,85 @@ fn extract_textures(path: &str) -> Result<Vec<Tex>, String> {
     Ok(out)
 }
 
+/// Detect Unity's AG-swizzled normal-map packing (DXT5nm convention carried
+/// into BC7): R pinned to ~255 across the image, X riding in a varying alpha,
+/// B a copy of G. Raw-decoded it looks pink; a plain normal map looks blue —
+/// both render identically through UnpackNormalmapRGorAG (X = R×A), so a
+/// packing difference alone must not count as a pixel difference.
+fn ag_swizzled(rgba: &[u8]) -> bool {
+    let n = rgba.len() / 4;
+    if n == 0 {
+        return false;
+    }
+    let (mut r_hi, mut a_varies, mut bg_close) = (0usize, 0usize, 0usize);
+    for p in rgba.chunks_exact(4) {
+        if p[0] >= 250 {
+            r_hi += 1;
+        }
+        if p[3] <= 250 {
+            a_varies += 1;
+        }
+        if (p[2] as i32 - p[1] as i32).unsigned_abs() <= 4 {
+            bg_close += 1;
+        }
+    }
+    r_hi * 100 >= n * 99 && a_varies * 100 >= n * 50 && bg_close * 100 >= n * 90
+}
+
+/// Re-express a normal map as reconstructed vectors `(X, Y, √(1−X²−Y²), 255)`
+/// regardless of input packing, so two packings of the same normals compare
+/// equal and real normal differences still surface.
+fn unpack_normals(rgba: &[u8], swizzled: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rgba.len());
+    for p in rgba.chunks_exact(4) {
+        let (x, y) = if swizzled { (p[3], p[1]) } else { (p[0], p[1]) };
+        let fx = x as f32 / 127.5 - 1.0;
+        let fy = y as f32 / 127.5 - 1.0;
+        let fz = (1.0 - fx * fx - fy * fy).max(0.0).sqrt();
+        let z = ((fz * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+        out.extend_from_slice(&[x, y, z, 255]);
+    }
+    out
+}
+
+/// Angular deviation between two reconstructed-normal buffers:
+/// `(max_degrees, ppm_of_pixels_tilted_more_than_NORMAL_ANGLE_DEG)`.
+/// Channel deltas overstate normal-map noise perceptually; what matters is
+/// how far normals tilt and over how much area.
+fn normal_angle_stats(a: &[u8], b: &[u8]) -> (f64, f64) {
+    let threshold_dot = NORMAL_ANGLE_DEG.to_radians().cos();
+    let mut worst_dot = 1.0f64;
+    let mut over = 0usize;
+    let n = (a.len() / 4).max(1);
+    for (pa, pb) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        let v = |p: &[u8]| {
+            let x = p[0] as f64 / 127.5 - 1.0;
+            let y = p[1] as f64 / 127.5 - 1.0;
+            let z = p[2] as f64 / 127.5 - 1.0;
+            let len = (x * x + y * y + z * z).sqrt().max(1e-6);
+            (x / len, y / len, z / len)
+        };
+        let (ax, ay, az) = v(pa);
+        let (bx, by, bz) = v(pb);
+        let dot = (ax * bx + ay * by + az * bz).clamp(-1.0, 1.0);
+        if dot < worst_dot {
+            worst_dot = dot;
+        }
+        if dot < threshold_dot {
+            over += 1;
+        }
+    }
+    (worst_dot.acos().to_degrees(), over as f64 * 1e6 / n as f64)
+}
+
+/// Normal-map imperceptibility, mirroring the render amnesty shape
+/// ("Δ>8 ≤200ppm"): pixels whose normal tilts more than NORMAL_ANGLE_DEG
+/// must cover at most NORMAL_ANGLE_AMNESTY_PPM of the image. BC-encoder
+/// block noise sits well inside this; an actually different normal map
+/// blows past it over broad areas.
+const NORMAL_ANGLE_DEG: f64 = 5.0;
+const NORMAL_ANGLE_AMNESTY_PPM: f64 = 200.0;
+
 fn rank(class: &str) -> i32 {
     match class {
         "identical" => 0,
@@ -406,6 +485,29 @@ fn process(task: &serde_json::Value) -> serde_json::Value {
                         t.name
                     ));
                 } else {
+                    // Normal-map awareness: if either side carries the AG
+                    // swizzle, compare reconstructed normal vectors instead
+                    // of raw channels — the packings render identically, so
+                    // only actual normal differences may count.
+                    let (sw_ours, sw_up) = (ag_swizzled(ra), ag_swizzled(rb));
+                    let (norm_a, norm_b);
+                    let (ra, rb): (&Vec<u8>, &Vec<u8>) = if sw_ours || sw_up {
+                        norm_a = unpack_normals(ra, sw_ours);
+                        norm_b = unpack_normals(rb, sw_up);
+                        let pack = |s: bool| if s { "ag" } else { "plain" };
+                        notes.push(format!(
+                            "normal-map:{}:packing ours={} upstream={}",
+                            t.name,
+                            pack(sw_ours),
+                            pack(sw_up)
+                        ));
+                        tex["normalPacking"] = serde_json::json!({
+                            "ours": pack(sw_ours), "upstream": pack(sw_up),
+                        });
+                        (&norm_a, &norm_b)
+                    } else {
+                        (ra, rb)
+                    };
                     let n = wa * ha;
                     let mut px: i64 = 0;
                     let mut mcd: i64 = 0;
@@ -432,6 +534,14 @@ fn process(task: &serde_json::Value) -> serde_json::Value {
                         .map(|s| (s / n as f64 * 10000.0).round() / 10000.0)
                         .collect();
                     let mean_max = means.iter().cloned().fold(0.0, f64::max);
+                    let normal_angle: Option<(f64, f64)> = if sw_ours || sw_up {
+                        let (deg, over_ppm) = normal_angle_stats(ra, rb);
+                        tex["maxNormalAngleDeg"] = ((deg * 100.0).round() / 100.0).into();
+                        tex["normalAngleOverPpm"] = ((over_ppm * 10.0).round() / 10.0).into();
+                        Some((deg, over_ppm))
+                    } else {
+                        None
+                    };
                     tclass = if px == 0 {
                         "identical-decode".into()
                     } else if ppm <= 200.0 {
@@ -441,6 +551,14 @@ fn process(task: &serde_json::Value) -> serde_json::Value {
                         notes.push(format!(
                             "imperceptible-by=maxChannelDelta:{}:mcd={mcd} ppm={:.0}",
                             t.name, ppm
+                        ));
+                        "imperceptible".into()
+                    } else if normal_angle.is_some_and(|(_, over)| over <= NORMAL_ANGLE_AMNESTY_PPM)
+                    {
+                        let (deg, over) = normal_angle.unwrap_or((0.0, 0.0));
+                        notes.push(format!(
+                            "imperceptible-by=normalAngle:{}:>{NORMAL_ANGLE_DEG}deg at {over:.0}ppm (max {deg:.2}deg)",
+                            t.name
                         ));
                         "imperceptible".into()
                     } else {
