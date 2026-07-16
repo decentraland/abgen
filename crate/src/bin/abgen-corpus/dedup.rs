@@ -422,7 +422,7 @@ fn build_candidate(
                     .iter()
                     .min()
                     .ok_or_else(|| anyhow::anyhow!("variant has no claimants"))?;
-                let entry = derive_one_entity(store, rep, platform, uri_cache)
+                let entry = derive_one_entity(store, rep, platform, uri_cache, toggles)
                     .ok_or_else(|| anyhow::anyhow!("re-derive of {rep} failed"))?;
                 let spec = entry
                     .bundles

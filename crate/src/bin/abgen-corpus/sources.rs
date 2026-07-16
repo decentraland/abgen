@@ -1,5 +1,5 @@
 use crate::build::{derive_one_entity, load_entity_json, IMAGE_EXTS};
-use crate::{BundleSpec, ContentItem, EntityEntry, Manifest};
+use crate::{BundleSpec, ContentItem, EffectiveToggles, EntityEntry, Manifest};
 use abgen::glbscan::file_ext_lower;
 use abgen::hashes;
 use abgen::local_store::LocalContentStore;
@@ -221,6 +221,7 @@ pub(crate) fn from_entity_ids(
     platform: &str,
     cdn_layout: bool,
     fetch_from: Option<&str>,
+    toggles: EffectiveToggles,
 ) -> Result<Manifest> {
     let raw = std::fs::read_to_string(ids_path).with_context(|| format!("read {ids_path}"))?;
     let ids: Vec<String> = raw
@@ -232,7 +233,7 @@ pub(crate) fn from_entity_ids(
     if let Some(csu) = fetch_from {
         fetch_ids_into_store(&LocalContentStore::new(content_dir), csu, &ids);
     }
-    manifest_from_ids(&ids, content_dir, platform, cdn_layout)
+    manifest_from_ids(&ids, content_dir, platform, cdn_layout, toggles)
 }
 
 pub(crate) fn contents_base_url(content_server_url: &str) -> String {
@@ -302,6 +303,7 @@ pub(crate) fn manifest_from_ids(
     content_dir: &str,
     platform: &str,
     keep_shared_bundles: bool,
+    toggles: EffectiveToggles,
 ) -> Result<Manifest> {
     let store = LocalContentStore::new(content_dir);
     let missing = AtomicUsize::new(0);
@@ -323,7 +325,7 @@ pub(crate) fn manifest_from_ids(
                     secs,
                 );
             }
-            let entry = derive_one_entity(&store, ent_id, platform, &uri_cache);
+            let entry = derive_one_entity(&store, ent_id, platform, &uri_cache, toggles);
             if entry.is_none() {
                 missing.fetch_add(1, Ordering::Relaxed);
             }
@@ -456,6 +458,7 @@ pub(crate) fn from_live_reference(
     content_dir: &str,
     platform: &str,
     per_vintage: usize,
+    toggles: EffectiveToggles,
 ) -> Result<(Manifest, serde_json::Value)> {
     let ents = scan_live_reference(ref_dir, platform)?;
     if ents.is_empty() {
@@ -499,7 +502,7 @@ pub(crate) fn from_live_reference(
         .map(|e| (e.entity_id.as_str(), &e.files))
         .collect();
 
-    let mut m = manifest_from_ids(&ids, content_dir, platform, true)?;
+    let mut m = manifest_from_ids(&ids, content_dir, platform, true, toggles)?;
     let mut dropped_entities = 0usize;
     for e in &mut m.entities {
         if let Some(files) = allowed.get(e.entity_id.as_str()) {

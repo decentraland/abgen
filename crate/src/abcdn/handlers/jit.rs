@@ -547,10 +547,13 @@ pub(super) fn flat_target(path: &str) -> Option<(String, String)> {
         return None;
     }
     let raw = segs[1].strip_suffix(".br").unwrap_or(segs[1]);
-    let (bare, platform) = raw.rsplit_once('_')?;
-    if bare.is_empty() || !resolver::is_platform(platform) {
+    let (stem, platform) = raw.rsplit_once('_')?;
+    if stem.is_empty() || !resolver::is_platform(platform) {
         return None;
     }
+    // Canonical glb names are `{hash}_{depsdigest}_{platform}` — owner-entity
+    // resolution needs the bare content hash, not the digest-qualified stem.
+    let (bare, _digest) = crate::naming::split_bundle_stem(stem);
     Some((bare.to_string(), platform.to_string()))
 }
 

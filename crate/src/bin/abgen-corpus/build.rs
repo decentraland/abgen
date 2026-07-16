@@ -349,6 +349,7 @@ pub(crate) fn derive_one_entity(
     ent_id: &str,
     platform: &str,
     uri_cache: &abgen::glbscan::UriCache,
+    toggles: EffectiveToggles,
 ) -> Option<EntityEntry> {
     let entity = load_entity_json(store, ent_id)?;
     let entity_type = entity
@@ -391,7 +392,28 @@ pub(crate) fn derive_one_entity(
         if !store.exists(&c.hash) {
             continue;
         }
-        let bundle_name = format!("{}_{platform}", c.hash);
+        let bundle_name = if toggles.asset_reuse && is_glb {
+            // Magenta-tolerant runs drop unresolvable deps from the digest
+            // (the build substitutes placeholders); strict runs skip the glb
+            // entirely, mirroring the upstream converter's skipped-assets
+            // handling for missing deps.
+            let digest = store.fetch_mmap(&c.hash).ok().and_then(|bytes| {
+                abgen::naming::deps_digest_for_glb(
+                    &bytes,
+                    &c.file,
+                    &content_by_file,
+                    toggles.magenta_missing,
+                )
+                .map_err(|e| eprintln!("skip {ent_id}/{}: deps digest: {e:#}", c.file))
+                .ok()
+            });
+            match digest {
+                Some(d) => format!("{}_{d}_{platform}", c.hash),
+                None => continue,
+            }
+        } else {
+            format!("{}_{platform}", c.hash)
+        };
         if !local_seen.insert(bundle_name.clone()) {
             continue;
         }
@@ -476,7 +498,7 @@ pub(crate) fn run_fused_entity_ids(
                 errs.load(Ordering::Relaxed),
             );
         }
-        let entry = match derive_one_entity(store, ent_id, primary, &uri_cache) {
+        let entry = match derive_one_entity(store, ent_id, primary, &uri_cache, toggles) {
             Some(e) => e,
             None => return,
         };
@@ -627,4 +649,116 @@ pub(crate) const IMAGE_EXTS: [&str; 3] = [".png", ".jpg", ".jpeg"];
 pub(crate) fn load_entity_json(store: &LocalContentStore, cid: &str) -> Option<serde_json::Value> {
     let bytes = store.fetch(cid).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn toggles(asset_reuse: bool, magenta_missing: bool) -> EffectiveToggles {
+        EffectiveToggles {
+            collection_mode: false,
+            real_textures: false,
+            v38_compat: false,
+            v38_timestamp: 0,
+            magenta_missing,
+            asset_reuse,
+        }
+    }
+
+    fn store_with_entity(tag: &str, content: serde_json::Value) -> LocalContentStore {
+        let dir = std::env::temp_dir().join(format!(
+            "abgen-corpus-derive-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = LocalContentStore::new(&dir);
+        let entity = serde_json::json!({"type": "scene", "content": content});
+        store
+            .write("bafyentity", entity.to_string().as_bytes())
+            .unwrap();
+        store
+    }
+
+    fn glb_names(entry: &EntityEntry) -> Vec<String> {
+        entry
+            .bundles
+            .iter()
+            .filter(|b| b.cid == "Qmglb")
+            .map(|b| b.bundle_name.clone())
+            .collect()
+    }
+
+    const GLTF_JSON: &str = r#"{"asset":{"version":"2.0"},
+        "images":[{"uri":"t.png"}],"buffers":[{"uri":"a.bin"}]}"#;
+
+    #[test]
+    fn derive_names_glbs_canonically_in_asset_reuse_mode() {
+        let store = store_with_entity(
+            "canonical",
+            serde_json::json!([
+                {"file": "m.gltf", "hash": "Qmglb"},
+                {"file": "a.bin", "hash": "Qmbin"},
+                {"file": "t.png", "hash": "Qmtex"},
+            ]),
+        );
+        store.write("Qmglb", GLTF_JSON.as_bytes()).unwrap();
+        store.write("Qmbin", b"BIN").unwrap();
+        store.write("Qmtex", b"PNG").unwrap();
+        let cache = abgen::glbscan::UriCache::new();
+
+        let legacy =
+            derive_one_entity(&store, "bafyentity", "windows", &cache, toggles(false, false))
+                .unwrap();
+        assert_eq!(glb_names(&legacy), vec!["Qmglb_windows".to_string()]);
+
+        let reuse =
+            derive_one_entity(&store, "bafyentity", "windows", &cache, toggles(true, false))
+                .unwrap();
+        let digest = abgen::naming::compute_deps_digest(&[
+            ("a.bin".to_string(), "Qmbin".to_string()),
+            ("t.png".to_string(), "Qmtex".to_string()),
+        ]);
+        assert_eq!(glb_names(&reuse), vec![format!("Qmglb_{digest}_windows")]);
+        // Textures stay hash-keyed: leaves have no inbound dep refs.
+        assert!(reuse
+            .bundles
+            .iter()
+            .any(|b| b.bundle_name == "Qmtex_windows"));
+    }
+
+    #[test]
+    fn derive_skips_glb_with_missing_dep_unless_magenta_tolerant() {
+        let store = store_with_entity(
+            "missing-dep",
+            serde_json::json!([
+                {"file": "m.gltf", "hash": "Qmglb"},
+                {"file": "t.png", "hash": "Qmtex"},
+            ]),
+        );
+        store.write("Qmglb", GLTF_JSON.as_bytes()).unwrap();
+        store.write("Qmtex", b"PNG").unwrap();
+        let cache = abgen::glbscan::UriCache::new();
+
+        // Strict: unresolvable "a.bin" skips the glb (upstream skipped-assets
+        // semantics) but leaves the rest of the entity intact.
+        let strict =
+            derive_one_entity(&store, "bafyentity", "windows", &cache, toggles(true, false))
+                .unwrap();
+        assert!(glb_names(&strict).is_empty());
+        assert!(strict
+            .bundles
+            .iter()
+            .any(|b| b.bundle_name == "Qmtex_windows"));
+
+        // Magenta-tolerant: digest over the resolvable subset.
+        let tolerant =
+            derive_one_entity(&store, "bafyentity", "windows", &cache, toggles(true, true))
+                .unwrap();
+        let digest = abgen::naming::compute_deps_digest(&[(
+            "t.png".to_string(),
+            "Qmtex".to_string(),
+        )]);
+        assert_eq!(glb_names(&tolerant), vec![format!("Qmglb_{digest}_windows")]);
+    }
 }
