@@ -394,7 +394,14 @@ fn cmd_placements(argv: &[String]) -> Result<i32> {
         .with_context(|| format!("resolve scene {target:?}"))?;
     eprintln!("scene entity: {}", ent.entity_id);
 
-    let list = acquire_placements(&ent, coords.as_deref(), &iss, manifest_builder, workdir)?;
+    let list = acquire_placements(
+        &ent,
+        coords.as_deref(),
+        &iss,
+        manifest_builder,
+        workdir,
+        &catalyst,
+    )?;
     println!("{}", serde_json::to_string_pretty(&list)?);
     Ok(0)
 }
@@ -405,6 +412,7 @@ fn acquire_placements(
     iss: &str,
     manifest_builder: Option<String>,
     workdir: Option<String>,
+    catalyst: &str,
 ) -> Result<Vec<placements::Placement>> {
     abgen::lodgen::acquire_placements(
         ent,
@@ -412,6 +420,7 @@ fn acquire_placements(
         iss,
         manifest_builder.as_deref(),
         workdir.map(PathBuf::from).as_deref(),
+        catalyst,
     )
 }
 
@@ -525,6 +534,7 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
         &iss,
         manifest_builder,
         workdir,
+        &catalyst,
     )?;
     eprintln!("placements: {}", list.len());
 
