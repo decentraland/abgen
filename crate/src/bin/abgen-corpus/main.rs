@@ -536,8 +536,7 @@ fn run() -> Result<()> {
                 v38_compat: set_v38 || (!parity_mode && BuildOpts::env_v38_compat()),
                 v38_timestamp: BuildOpts::env_v38_timestamp(),
                 magenta_missing: BuildOpts::env_magenta_missing(),
-                asset_reuse: !no_deps_digest
-                    && abgen::clihelp::env_bool("ABGEN_DEPS_DIGEST", true),
+                asset_reuse: !no_deps_digest && abgen::clihelp::env_bool("ABGEN_DEPS_DIGEST", true),
             }
         }
         Err(msg) => {

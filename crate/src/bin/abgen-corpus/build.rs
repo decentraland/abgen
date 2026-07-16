@@ -690,10 +690,8 @@ mod tests {
     }
 
     fn store_with_entity(tag: &str, content: serde_json::Value) -> LocalContentStore {
-        let dir = std::env::temp_dir().join(format!(
-            "abgen-corpus-derive-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("abgen-corpus-derive-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = LocalContentStore::new(&dir);
         let entity = serde_json::json!({"type": "scene", "content": content});
@@ -730,14 +728,24 @@ mod tests {
         store.write("Qmtex", b"PNG").unwrap();
         let cache = abgen::glbscan::UriCache::new();
 
-        let legacy =
-            derive_one_entity(&store, "bafyentity", "windows", &cache, toggles(false, false))
-                .unwrap();
+        let legacy = derive_one_entity(
+            &store,
+            "bafyentity",
+            "windows",
+            &cache,
+            toggles(false, false),
+        )
+        .unwrap();
         assert_eq!(glb_names(&legacy), vec!["Qmglb_windows".to_string()]);
 
-        let reuse =
-            derive_one_entity(&store, "bafyentity", "windows", &cache, toggles(true, false))
-                .unwrap();
+        let reuse = derive_one_entity(
+            &store,
+            "bafyentity",
+            "windows",
+            &cache,
+            toggles(true, false),
+        )
+        .unwrap();
         let digest = abgen::naming::compute_deps_digest(&[
             ("a.bin".to_string(), "Qmbin".to_string()),
             ("t.png".to_string(), "Qmtex".to_string()),
@@ -765,9 +773,14 @@ mod tests {
 
         // Strict: unresolvable "a.bin" skips the glb (upstream skipped-assets
         // semantics) but leaves the rest of the entity intact.
-        let strict =
-            derive_one_entity(&store, "bafyentity", "windows", &cache, toggles(true, false))
-                .unwrap();
+        let strict = derive_one_entity(
+            &store,
+            "bafyentity",
+            "windows",
+            &cache,
+            toggles(true, false),
+        )
+        .unwrap();
         assert!(glb_names(&strict).is_empty());
         assert!(strict
             .bundles
@@ -778,10 +791,11 @@ mod tests {
         let tolerant =
             derive_one_entity(&store, "bafyentity", "windows", &cache, toggles(true, true))
                 .unwrap();
-        let digest = abgen::naming::compute_deps_digest(&[(
-            "t.png".to_string(),
-            "Qmtex".to_string(),
-        )]);
-        assert_eq!(glb_names(&tolerant), vec![format!("Qmglb_{digest}_windows")]);
+        let digest =
+            abgen::naming::compute_deps_digest(&[("t.png".to_string(), "Qmtex".to_string())]);
+        assert_eq!(
+            glb_names(&tolerant),
+            vec![format!("Qmglb_{digest}_windows")]
+        );
     }
 }

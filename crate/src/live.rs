@@ -268,7 +268,9 @@ impl Proxy {
         }
         if let Some(req_digest) = req_digest {
             if !is_glb {
-                bail!("bundle name {bundle_name:?} carries a deps digest but {file} is not glb/gltf");
+                bail!(
+                    "bundle name {bundle_name:?} carries a deps digest but {file} is not glb/gltf"
+                );
             }
             match ctx.deps_digests.get(hash) {
                 Some(d) if d == req_digest => {}
@@ -1018,13 +1020,7 @@ mod tests {
     }
 
     fn stub_proxy_reuse(host: &str, tag: &str) -> Arc<Proxy> {
-        super::stub::stub_proxy_at_reuse(
-            host,
-            "http://127.0.0.1:9",
-            false,
-            &temp_cache(tag),
-            true,
-        )
+        super::stub::stub_proxy_at_reuse(host, "http://127.0.0.1:9", false, &temp_cache(tag), true)
     }
 
     #[test]

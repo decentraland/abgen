@@ -215,7 +215,6 @@ fn metadata_deps_for_glb(
     out
 }
 
-
 pub(crate) fn contents_base_url(content_server_url: &str) -> String {
     format!("{}/contents/", content_server_url.trim_end_matches('/'))
 }
