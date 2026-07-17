@@ -14,12 +14,17 @@ runs/<run-id>/            run-id = <UTC ts>-<slug>; immutable once COMPLETE exis
 │   ├── pairs.jsonl       pairing result (run-relative paths)
 │   ├── bytediff.jsonl    per-pair byte diff
 │   ├── structure.jsonl   per-pair objdump structural diff (pid/CAB-normalized)
+│   ├── iddiff.jsonl      per-pair RAW CAB/pid identity agreement (analyze.id_diff)
 │   ├── texcmp.jsonl      raw texcmp rows (texture pairs)
 │   ├── amp-metrics.json  render amplitude bands  {"<pair>":{"a0":[...],...,"wh":[W,H]}}
+│   ├── selftest.json     negative-control battery result (--selftest)
+│   ├── verdict.json      in-run simval gate result (--verdict)
 │   └── matrix.jsonl      APPEND-ONLY classified rows; newest-wins per pair (rev)
-├── jobs/                 harness inputs + logs (render mode)
+├── jobs/                 harness inputs + logs (render mode; jobs/selftest/ scratch)
 ├── site-data.json        site rows for this run
 └── COMPLETE              immutability marker (refuse to touch the run once present)
+Standalone re-gates write a SIBLING runs/<id>.gate.json (verdict.py), never
+inside a COMPLETE run.
 """
 import datetime
 import json

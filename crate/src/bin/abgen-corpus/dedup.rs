@@ -1,4 +1,4 @@
-use crate::build::{build_one, bundle_tmp_path, derive_one_entity};
+use crate::build::{build_one, bundle_tmp_path, derive_one_entity, link_or_copy_atomic};
 use crate::{BundleSpec, EffectiveToggles};
 use abgen::local_store::LocalContentStore;
 use abgen::naming;
@@ -515,12 +515,9 @@ pub(crate) fn reconcile_divergent(
         }
         rebuilt.fetch_add(1, Ordering::Relaxed);
         for p in &paths {
-            let t2 = bundle_tmp_path(p);
-            let staged = std::fs::hard_link(&tmp, &t2).is_ok() || std::fs::copy(&tmp, &t2).is_ok();
-            if staged && std::fs::rename(&t2, p).is_ok() {
+            if link_or_copy_atomic(&tmp, p) {
                 relinked.fetch_add(1, Ordering::Relaxed);
             } else {
-                let _ = std::fs::remove_file(&t2);
                 errs.fetch_add(1, Ordering::Relaxed);
                 eprintln!("reconcile {name}: relink {} failed", p.display());
             }

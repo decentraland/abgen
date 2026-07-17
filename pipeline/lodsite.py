@@ -180,6 +180,8 @@ def main():
     ap.add_argument('--platform', default='windows')
     ap.add_argument('--jobs', type=int, default=8)
     ap.add_argument('--limit', type=int, default=0)
+    ap.add_argument('--renders-dir', default='',
+                    help='dir with <scene>-{ours,prod}-a0.png Unity renders to embed')
     args = ap.parse_args()
 
     for tool in (ABGEN_LOD, ATLASPROBE):
@@ -220,6 +222,8 @@ def main():
                'ours': {'size': os.path.getsize(ours), 'sha': sha256(ours)[:16]},
                'prod': None, 'checks': [], 'fails': None}
         row['ours'].update(probe(ours, imgdir))
+        if row['ours'].get('probe_tris'):
+            row['ours']['tris'] = row['ours']['probe_tris']
         if has_prod:
             row['prod'] = {'size': os.path.getsize(prod), 'sha': sha256(prod)[:16]}
             row['prod'].update(probe(prod, imgdir))
@@ -229,6 +233,14 @@ def main():
             pv, pt = mesh_totals(rows, 'prod')
             row['ours'].update({'verts': ov, 'tris': ot})
             row['prod'].update({'verts': pv, 'tris': pt})
+        if args.renders_dir:
+            for side in ('ours', 'prod'):
+                src = os.path.join(args.renders_dir, f'{scene}-{side}-a0.png')
+                if row[side] is not None and os.path.isfile(src):
+                    fname = f'{scene}-{side}-render.png'
+                    with open(src, 'rb') as fi, open(os.path.join(imgdir, fname), 'wb') as fo:
+                        fo.write(fi.read())
+                    row[side]['render'] = fname
         out_scenes.append(row)
         if (i + 1) % 10 == 0:
             print(f'  {i + 1}/{len(scenes)}')

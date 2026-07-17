@@ -165,7 +165,9 @@ def cmd_run(args):
         "win_staging": args.win_staging,
         "tags": args.tag or [],
         "description": args.description,
-        "labels": {"upstream": "upstream ab-cdn", "ours": "abgen"},
+        "tier": args.tier,
+        "labels": {"upstream": args.upstream_label or "upstream ab-cdn",
+                   "ours": "abgen"},
         "thresholds": {"imperceptible_ppm": 200, "amnesty": {"delta_gt": 8, "ppm": 200}},
         "rendered": False,
     }
@@ -195,7 +197,8 @@ def cmd_run(args):
 
     # 2. ours side (local abgen JIT server) + 3. upstream side (ab-cdn)
     ours_summaries, upstream_summaries = [], []
-    with LocalServer(run_dir, args.content, prefer_url=args.abgen_url, log=log) as srv:
+    with LocalServer(run_dir, args.content, prefer_url=args.abgen_url, log=log,
+                     force_spawn=args.fresh_ours) as srv:
         for m in meta_rows:
             ours_summaries.append(
                 fetch_side(srv.url, "ours", m["entity"], args.platform, run_dir, log)
@@ -239,7 +242,7 @@ def cmd_run(args):
     # 5. headless analysis — ALWAYS runs (headless.py, shared with watch mode)
     ts = now_iso()
     matrix, byte_rows, struct_rows = headless_matrix_rows(
-        run_dir, run_id, args.platform, pairs, log, ts)
+        run_dir, run_id, args.platform, pairs, log, ts, tier=args.tier)
     append_jsonl(os.path.join(run_dir, "analysis", "bytediff.jsonl"), byte_rows)
     append_jsonl(os.path.join(run_dir, "analysis", "structure.jsonl"), struct_rows)
     append_jsonl(os.path.join(run_dir, "analysis", "matrix.jsonl"), matrix)
@@ -322,10 +325,38 @@ def cmd_run(args):
                 log(f"render: {len(rrows)} rev-2 matrix rows "
                     f"({len(results)} rendered, "
                     f"{len(rrows) - len(results)} skipped-identical)")
+            animated = [r for r in to_render if r["kind"] == "animated"]
+            if animated:
+                from abgencompare.motion import motion_rows
+                mrows = motion_rows(run_dir, animated)
+                if mrows:
+                    append_jsonl(os.path.join(run_dir, "analysis", "motion.jsonl"),
+                                 mrows)
+                    ok = [m for m in mrows if m["frames"]]
+                    worst = max((m["maeMean"] for m in ok), default=None)
+                    log(f"motion: {len(mrows)} animated pair(s), "
+                        f"{len(ok)} with frame series, worst maeMean={worst}")
         else:
             log("render: no renderable pairs")
 
-    # 7. site data + completion
+    # 7. optional negative-control battery + gate verdict — both must land
+    # BEFORE the COMPLETE marker (runmodel immutability)
+    if args.selftest:
+        from abgencompare.selftest import run_selftest
+        st = run_selftest(run_dir, pairs, args.platform, log)
+        write_json(os.path.join(run_dir, "analysis", "selftest.json"), st,
+                   indent=1)
+        log(f"selftest: all_detected={st['all_detected']} "
+            f"skipped={st['skipped']} blindspots={len(st['blindspots'])}")
+    if args.verdict:
+        from abgencompare.verdict import evaluate_run
+        v = evaluate_run(run_dir, tier=args.tier)
+        write_json(os.path.join(run_dir, "analysis", "verdict.json"), v,
+                   indent=1)
+        log("verdict: pass=%s %s" % (v["pass"], " ".join(
+            f"{k}={m['status']}" for k, m in sorted(v["metrics"].items()))))
+
+    # 8. site data + completion
     sd = build_run_sitedata(run_dir, run_id, config)
     write_json(os.path.join(run_dir, "site-data.json"), sd)
     log(f"site-data: {sd['stats']['pairs']} rows, labels={sd['stats']['labels']}")
@@ -434,6 +465,23 @@ def main():
     r.add_argument("--abgen-url",
                    help="existing local abgen server to reuse "
                         "(default probes http://127.0.0.1:5147, else spawns)")
+    r.add_argument("--fresh-ours", action="store_true",
+                   help="always spawn a scratch-out_root abgen server (skip "
+                        "the healthy-server probe) — required for determinism "
+                        "runs, which must not be satisfied by a warm cache")
+    r.add_argument("--tier", choices=["prod", "local"], default="prod",
+                   help="gate tier: prod = vs production converter output "
+                        "(normalized comparison), local = vs det-guid local "
+                        "converter (raw CAB/pid identity gated)")
+    r.add_argument("--selftest", action="store_true",
+                   help="run the in-run negative-control battery after "
+                        "analysis (analysis/selftest.json, before COMPLETE)")
+    r.add_argument("--verdict", action="store_true",
+                   help="evaluate the simval gates after analysis "
+                        "(analysis/verdict.json, before COMPLETE)")
+    r.add_argument("--upstream-label",
+                   help="display label for the upstream side "
+                        "(default 'upstream ab-cdn')")
     r.add_argument("--tag", action="append",
                    help="free-form row tag (repeatable; site renders tag chips)")
     r.add_argument("--description", help="run description shown on the site")

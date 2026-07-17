@@ -74,6 +74,11 @@ pub fn run_with_deadline(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd.spawn().with_context(|| format!("spawn {label}"))?;
     let mut out_pipe = child.stdout.take();
     let mut err_pipe = child.stderr.take();
@@ -98,6 +103,10 @@ pub fn run_with_deadline(
         }
         if let Some(d) = deadline {
             if started.elapsed() > d {
+                #[cfg(unix)]
+                unsafe {
+                    libc::killpg(child.id() as i32, libc::SIGKILL);
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = out_h.join();

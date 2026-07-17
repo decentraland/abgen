@@ -173,6 +173,32 @@ impl ContentComponent {
         self.hydrate(rows).await
     }
 
+    pub async fn resolve_world_scenes(
+        &self,
+        world_name: &str,
+    ) -> Result<Vec<ActiveEntity>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                d.id,
+                d.entity_id,
+                d.entity_type,
+                date_part('epoch', d.entity_timestamp) * 1000 AS ts,
+                d.entity_pointers,
+                d.entity_metadata,
+                d.deployer_address
+            FROM deployments d
+            WHERE d.deleter_deployment IS NULL
+              AND d.entity_type = 'scene'
+              AND lower(d.entity_metadata->'worldConfiguration'->>'name') = $1
+            "#,
+        )
+        .bind(world_name.to_lowercase())
+        .fetch_all(&self.pool)
+        .await?;
+        self.hydrate(rows).await
+    }
+
     async fn hydrate(
         &self,
         rows: Vec<sqlx::postgres::PgRow>,
@@ -215,7 +241,7 @@ impl ContentComponent {
 
         let dep_ids: Vec<i32> = by_entity.values().map(|e| e.deployment_id).collect();
         let files = sqlx::query(
-            "SELECT deployment, key, content_hash FROM content_files WHERE deployment = ANY($1)",
+            "SELECT deployment, key, content_hash FROM content_files WHERE deployment = ANY($1) ORDER BY ctid",
         )
         .bind(&dep_ids)
         .fetch_all(&self.pool)
@@ -230,8 +256,7 @@ impl ContentComponent {
             });
         }
         for ent in by_entity.values_mut() {
-            if let Some(mut c) = by_dep.remove(&ent.deployment_id) {
-                c.sort_by(|a, b| a.file.cmp(&b.file));
+            if let Some(c) = by_dep.remove(&ent.deployment_id) {
                 ent.content = c;
             }
         }
@@ -251,7 +276,6 @@ impl EntitySource for ContentComponent {
     }
 
     async fn resolve_world(&self, world_name: &str) -> Result<Vec<ActiveEntity>, ApiError> {
-        let name = world_name.to_string();
-        Ok(ContentComponent::resolve_pointers(self, std::slice::from_ref(&name)).await?)
+        Ok(ContentComponent::resolve_world_scenes(self, world_name).await?)
     }
 }

@@ -71,12 +71,19 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_npm(work_dir: &Path, args: &[&str]) -> Result<String> {
+const NPM_DEFAULT_DEADLINE_S: u64 = 540;
+
+fn run_npm(work_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String> {
     let mut cmd = std::process::Command::new("npm");
     cmd.args(args).current_dir(work_dir);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let deadline = crate::lodgen::simplify::subproc_deadline()
+        .or(Some(std::time::Duration::from_secs(NPM_DEFAULT_DEADLINE_S)));
     let out = crate::lodgen::simplify::run_with_deadline(
         cmd,
-        crate::lodgen::simplify::subproc_deadline(),
+        deadline,
         &format!("npm {args:?} in {}", work_dir.display()),
     )?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -128,14 +135,17 @@ pub fn run_manifest_builder(
     };
     if !installed {
         copy_tree(tool_dir, work_dir)?;
-        run_npm(work_dir, &["ci", "--ignore-scripts"])?;
-        run_npm(work_dir, &["run", "build"])?;
+        run_npm(work_dir, &["ci", "--ignore-scripts"], &[])?;
+        run_npm(work_dir, &["run", "build"], &[])?;
     }
-    let coords_arg = format!("--coords={coords}");
-    let catalyst_arg = format!("--catalyst={}", catalyst_base(catalyst));
     let stdout = run_npm(
         work_dir,
-        &["run", "start", &coords_arg, &catalyst_arg, "--overwrite"],
+        &["run", "start"],
+        &[
+            ("npm_config_coords", coords),
+            ("npm_config_catalyst", catalyst_base(catalyst)),
+            ("npm_config_overwrite", "true"),
+        ],
     )?;
     let out_dir = work_dir.join(MANIFEST_OUTPUT_DIR);
     if let Some(rest) = stdout.split("scene id:").nth(1) {

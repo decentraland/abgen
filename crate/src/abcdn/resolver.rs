@@ -54,7 +54,45 @@ pub fn binary_path(root: &Path, entity: &str, filename: &str) -> Option<PathBuf>
     }
     let name_for_platform = filename.strip_suffix(".br").unwrap_or(filename);
     let platform = platform_of(name_for_platform);
-    Some(root.join(entity).join(platform).join(filename))
+    let candidate = root.join(entity).join(platform).join(filename);
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+    if let Some(hit) = digest_qualified_alias(&candidate, filename) {
+        return Some(hit);
+    }
+    Some(candidate)
+}
+
+fn digest_qualified_alias(candidate: &Path, filename: &str) -> Option<PathBuf> {
+    let is_br = filename.ends_with(".br");
+    let raw = filename.strip_suffix(".br").unwrap_or(filename);
+    if crate::naming::bundle_name_has_digest(raw) {
+        return None;
+    }
+    let (platform, bare) = split_platform(raw);
+    if bare == raw {
+        return None;
+    }
+    let prefix = format!("{}_", bare.to_lowercase());
+    let suffix = format!("_{platform}{}", if is_br { ".br" } else { "" }).to_lowercase();
+    let dir = candidate.parent()?;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let lower = name.to_lowercase();
+        let Some(mid) = lower
+            .strip_prefix(&prefix)
+            .and_then(|r| r.strip_suffix(&suffix))
+        else {
+            continue;
+        };
+        if mid.len() == 32 && mid.bytes().all(|b| b.is_ascii_hexdigit()) && entry.path().is_file() {
+            return Some(entry.path());
+        }
+    }
+    None
 }
 
 pub fn lod_path(root: &Path, level: &str, filename: &str) -> Option<PathBuf> {

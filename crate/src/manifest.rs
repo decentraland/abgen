@@ -20,34 +20,36 @@ pub fn exit_code_for_failures(failures: usize) -> i32 {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 #[cfg(not(target_arch = "wasm32"))]
-pub fn write_corpus_manifest(
-    out_root: &Path,
-    entity_id: &str,
-    platform: &str,
-    built: &[String],
-    ab_version: &str,
-    content_server_url: &str,
-    exit_code: i32,
-    date: &str,
-) -> Result<PathBuf> {
-    let mut files: Vec<String> = built.to_vec();
+pub struct CorpusManifestSpec<'a> {
+    pub out_root: &'a Path,
+    pub entity_id: &'a str,
+    pub platform: &'a str,
+    pub built: &'a [String],
+    pub ab_version: &'a str,
+    pub content_server_url: &'a str,
+    pub exit_code: i32,
+    pub date: &'a str,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_corpus_manifest(m: &CorpusManifestSpec) -> Result<PathBuf> {
+    let mut files: Vec<String> = m.built.to_vec();
     files.sort();
     files.dedup();
     files.push("dcl".to_string());
     let manifest = serde_json::json!({
-        "version": ab_version,
+        "version": m.ab_version,
         "files": files,
-        "exitCode": exit_code,
-        "contentServerUrl": content_server_url,
-        "date": date,
+        "exitCode": m.exit_code,
+        "contentServerUrl": m.content_server_url,
+        "date": m.date,
     });
-    let dir = out_root.join(entity_id);
+    let dir = m.out_root.join(m.entity_id);
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{platform}.manifest.json"));
+    let path = dir.join(format!("{}.manifest.json", m.platform));
     let text = serde_json::to_string_pretty(&manifest)?;
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let tmp = crate::tmppath::tmp_sibling(&path);
     std::fs::write(&tmp, &text)?;
     std::fs::rename(&tmp, &path)?;
     Ok(path)
@@ -152,16 +154,16 @@ mod tests {
             "QmA_deadbeef_windows".to_string(),
             "QmB_deadbeef_windows".to_string(),
         ];
-        let p = write_corpus_manifest(
-            &tmp,
-            "entityZ",
-            "windows",
-            &built,
-            "v41",
-            "http://cs",
-            0,
-            TEST_DATE,
-        )
+        let p = write_corpus_manifest(&CorpusManifestSpec {
+            out_root: &tmp,
+            entity_id: "entityZ",
+            platform: "windows",
+            built: &built,
+            ab_version: "v41",
+            content_server_url: "http://cs",
+            exit_code: 0,
+            date: TEST_DATE,
+        })
         .unwrap();
         assert_eq!(p, tmp.join("entityZ").join("windows.manifest.json"));
         let first = std::fs::read_to_string(&p).unwrap();
@@ -176,16 +178,16 @@ mod tests {
         );
 
         let second = std::fs::read_to_string(
-            write_corpus_manifest(
-                &tmp,
-                "entityZ",
-                "windows",
-                &built,
-                "v41",
-                "http://cs",
-                0,
-                TEST_DATE,
-            )
+            write_corpus_manifest(&CorpusManifestSpec {
+                out_root: &tmp,
+                entity_id: "entityZ",
+                platform: "windows",
+                built: &built,
+                ab_version: "v41",
+                content_server_url: "http://cs",
+                exit_code: 0,
+                date: TEST_DATE,
+            })
             .unwrap(),
         )
         .unwrap();
@@ -199,16 +201,16 @@ mod tests {
             std::env::temp_dir().join(format!("abgen_corpus_exitcode_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let built = vec!["QmA_deadbeef_windows".to_string()];
-        let p = write_corpus_manifest(
-            &tmp,
-            "entityZ",
-            "windows",
-            &built,
-            "v41",
-            "http://cs",
-            exit_code_for_failures(3),
-            TEST_DATE,
-        )
+        let p = write_corpus_manifest(&CorpusManifestSpec {
+            out_root: &tmp,
+            entity_id: "entityZ",
+            platform: "windows",
+            built: &built,
+            ab_version: "v41",
+            content_server_url: "http://cs",
+            exit_code: exit_code_for_failures(3),
+            date: TEST_DATE,
+        })
         .unwrap();
         let m: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
@@ -229,16 +231,16 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("abgen_corpus_date_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let built: Vec<String> = Vec::new();
-        let p = write_corpus_manifest(
-            &tmp,
-            "entityZ",
-            "mac",
-            &built,
-            "v41",
-            "http://cs",
-            0,
-            TEST_DATE,
-        )
+        let p = write_corpus_manifest(&CorpusManifestSpec {
+            out_root: &tmp,
+            entity_id: "entityZ",
+            platform: "mac",
+            built: &built,
+            ab_version: "v41",
+            content_server_url: "http://cs",
+            exit_code: 0,
+            date: TEST_DATE,
+        })
         .unwrap();
         let m: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();

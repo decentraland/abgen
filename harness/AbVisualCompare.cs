@@ -295,12 +295,14 @@ public static class AbVisualCompare
 
             // AnimationClip inventory (all kinds). Emote bundles pack clips as sub-assets of an
             // AnimatorController (not top-level), so also pull RuntimeAnimatorController.animationClips.
-            var clipSet = new Dictionary<int, AnimationClip>();
-            foreach (AnimationClip c0 in all.OfType<AnimationClip>()) clipSet[c0.GetInstanceID()] = c0;
+            // reference-keyed dedup: GetInstanceID() is obsolete-as-error on
+            // Unity 6000.5+, and same instance <=> same id anyway
+            var clipSet = new HashSet<AnimationClip>();
+            foreach (AnimationClip c0 in all.OfType<AnimationClip>()) clipSet.Add(c0);
             foreach (RuntimeAnimatorController rac in all.OfType<RuntimeAnimatorController>())
                 foreach (AnimationClip c0 in rac.animationClips)
-                    if (c0 != null) clipSet[c0.GetInstanceID()] = c0;
-            var clipList = clipSet.Values.OrderBy(c2 => c2.name, StringComparer.Ordinal).ToList();
+                    if (c0 != null) clipSet.Add(c0);
+            var clipList = clipSet.OrderBy(c2 => c2.name, StringComparer.Ordinal).ToList();
             foreach (AnimationClip c2 in clipList)
             {
                 // GetCurveBindings returns [] for bundle-loaded (runtime-optimized) clips, so read

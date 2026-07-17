@@ -112,10 +112,7 @@ fn collect_linear_texture_hashes(
         };
         let ext = if fl.ends_with(".gltf") { "gltf" } else { "glb" };
         let resolve_fn = |uri: &str| -> Option<Vec<u8>> {
-            let key = naming::resolve_uri_to_content_file(uri, f)
-                .ok()?
-                .to_lowercase();
-            let hh = content_by_file.get(&key)?;
+            let hh = naming::uri_content_hash(uri, f, content_by_file)?;
             store.fetch(hh).ok()
         };
         let resolve: abgen::gltf::Resolve = Some(&resolve_fn);
@@ -128,10 +125,7 @@ fn collect_linear_texture_hashes(
         };
         let image_hash = |idx: usize| -> Option<String> {
             let uri = scene.image_uri.get(idx).and_then(|o| o.as_ref())?;
-            let key = naming::resolve_uri_to_content_file(uri, f)
-                .ok()?
-                .to_lowercase();
-            content_by_file.get(&key).cloned()
+            naming::uri_content_hash(uri, f, content_by_file).cloned()
         };
         let mut normal_idx: HashSet<usize> = HashSet::new();
         let mut other_idx: HashSet<usize> = HashSet::new();
@@ -483,9 +477,19 @@ pub(crate) fn from_live_reference(
 
     let mut m = manifest_from_ids(&ids, content_dir, platform, true, toggles)?;
     let mut dropped_entities = 0usize;
+    let nodeps_norm = |name: &str| -> String {
+        let (platform_suffix, base) = ["_windows", "_mac", "_linux", "_webgl"]
+            .iter()
+            .find_map(|s| name.strip_suffix(s).map(|b| (*s, b)))
+            .unwrap_or(("", name));
+        let (hash, _) = abgen::naming::split_bundle_stem(base);
+        format!("{}{platform_suffix}", hash.to_lowercase())
+    };
     for e in &mut m.entities {
         if let Some(files) = allowed.get(e.entity_id.as_str()) {
-            e.bundles.retain(|b| files.contains(&b.bundle_name));
+            let want: HashSet<String> = files.iter().map(|f| nodeps_norm(f)).collect();
+            e.bundles
+                .retain(|b| want.contains(&nodeps_norm(&b.bundle_name)));
         }
     }
     m.entities.retain(|e| {

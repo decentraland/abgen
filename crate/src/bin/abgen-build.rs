@@ -243,10 +243,7 @@ fn run() -> Result<()> {
     let store: Option<LocalContentStore> = content_dir.as_deref().map(LocalContentStore::new);
     let resolve_fn = |uri: &str| -> Option<Vec<u8>> {
         let s = store.as_ref()?;
-        let key = naming::resolve_uri_to_content_file(uri, &effective_source)
-            .ok()?
-            .to_lowercase();
-        let h = content_by_file.get(&key)?;
+        let h = naming::uri_content_hash(uri, &effective_source, &content_by_file)?;
         s.fetch(h).ok()
     };
     let resolve: abgen::gltf::Resolve = if store.is_some() && !content_by_file.is_empty() {
@@ -256,10 +253,7 @@ fn run() -> Result<()> {
     };
 
     let resolve_hash_fn = |uri: &str| -> Option<String> {
-        let key = naming::resolve_uri_to_content_file(uri, &effective_source)
-            .ok()?
-            .to_lowercase();
-        content_by_file.get(&key).cloned()
+        naming::uri_content_hash(uri, &effective_source, &content_by_file).cloned()
     };
     let resolve_hash: Option<abgen::builder::ResolveHash> =
         if !content_by_file.is_empty() && source_file.is_some() {

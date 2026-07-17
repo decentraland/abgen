@@ -56,6 +56,8 @@ pub mod space;
 pub mod tangents;
 pub mod texprofile;
 #[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod tmppath;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod worlds;
 
 pub mod bc5_pure;
@@ -83,8 +85,11 @@ pub mod validate;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod wearables;
 
-#[cfg(feature = "server")]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod abcdn;
+
+#[cfg(all(feature = "content-db", not(target_arch = "wasm32")))]
+pub mod registry;
 
 pub use anyhow::{anyhow, bail, Context, Result};
 
@@ -98,13 +103,19 @@ pub fn enable_gpu() -> std::result::Result<(), String> {
     Err("this binary was built without the gpu feature (rebuild with --features gpu)".to_string())
 }
 
+pub struct GpuStatus {
+    pub backend: &'static str,
+    pub qualified: bool,
+    pub reason: Option<String>,
+}
+
 #[cfg(feature = "gpu")]
-pub fn gpu_status() -> Option<(&'static str, bool, Option<String>)> {
+pub fn gpu_status() -> Option<GpuStatus> {
     gpu::gpu_status()
 }
 
 #[cfg(not(feature = "gpu"))]
-pub fn gpu_status() -> Option<(&'static str, bool, Option<String>)> {
+pub fn gpu_status() -> Option<GpuStatus> {
     None
 }
 

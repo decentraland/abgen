@@ -81,10 +81,6 @@ pub(crate) struct EffectiveToggles {
     pub(crate) v38_timestamp: i64,
     pub(crate) magenta_missing: bool,
 
-    /// Canonical `{hash}_{depsdigest}_{platform}` naming for glb/gltf
-    /// bundles (upstream asset-reuse parity). Default ON (ab-cdn runs
-    /// asset-reuse since v49); ABGEN_DEPS_DIGEST=0 opts out for parity runs
-    /// against pre-v49 reference trees.
     pub(crate) asset_reuse: bool,
 }
 
@@ -627,8 +623,6 @@ fn run() -> Result<()> {
                 "reconcile: divergent={} rebuilt={} relinked={} errs={}",
                 o.reconcile.divergent, o.reconcile.rebuilt, o.reconcile.relinked, o.reconcile.errs
             );
-            // Single-target convenience: also emit the manifests under the
-            // production CDN naming (manifest/<entity>_<platform>.json).
             if pointer_target.is_some() {
                 let man_dir = out_root.join("manifest");
                 std::fs::create_dir_all(&man_dir)?;

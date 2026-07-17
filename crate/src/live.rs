@@ -6,8 +6,8 @@ use crate::naming;
 use crate::space::Space;
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const CONVERTIBLE_EXTS: [&str; 5] = [".glb", ".gltf", ".png", ".jpg", ".jpeg"];
 
@@ -71,10 +71,6 @@ struct EntityCtx {
     content_by_file: HashMap<String, String>,
     scan: EntityScan,
 
-    /// glb/gltf content hash → deps digest (upstream `computeDepsDigest`
-    /// parity). Absent entries mean digest computation failed for that glb
-    /// (unfetchable bytes, malformed glTF, or unresolvable dep refs when not
-    /// running magenta-tolerant).
     deps_digests: HashMap<String, String>,
 }
 
@@ -101,30 +97,58 @@ pub struct Proxy {
     v38_compat: bool,
     v38_timestamp: i64,
     magenta_missing: bool,
-
-    /// Upstream asset-reuse parity: glb/gltf bundles get canonical
-    /// `{hash}_{depsdigest}_{platform}` names, space keys move to the shared
-    /// `{version}/assets/{name}` layout, and builds probe the space before
-    /// converting. Off = legacy `{hash}_{platform}` names under
-    /// `{version}/{entity}/` keys.
+    jit_cache: OnceLock<Arc<crate::abcdn::jitcache::JitDiskCache>>,
     asset_reuse: bool,
 }
 
 impl Proxy {
+    fn jit(&self) -> Option<&Arc<crate::abcdn::jitcache::JitDiskCache>> {
+        self.jit_cache.get().filter(|c| c.enabled())
+    }
+
+    pub fn set_jit_cache(&self, c: Arc<crate::abcdn::jitcache::JitDiskCache>) {
+        let _ = self.jit_cache.set(c);
+    }
+
+    pub(crate) fn cache_roots(&self) -> (&Path, &Path) {
+        (self.content.root(), self.bundle_dir.as_path())
+    }
+
+    fn record_content(&self, hash: &str, len: usize) {
+        if len == 0 {
+            return;
+        }
+        if let Some(c) = self.jit() {
+            c.record(&format!("c:{hash}"), self.content.path_of(hash), len as u64);
+        }
+    }
+
     fn ensure_content(&self, hash: &str) -> Result<()> {
         if self.content.exists(hash) {
+            if let Some(c) = self.jit() {
+                c.touch(&format!("c:{hash}"));
+            }
             return Ok(());
         }
         if let Some(local) = &self.local {
             if let Ok(b) = local.fetch(hash) {
-                return self.content.write(hash, &b);
+                if !b.is_empty() {
+                    self.content.write(hash, &b)?;
+                    self.record_content(hash, b.len());
+                    return Ok(());
+                }
             }
         }
         let bytes = self
             .catalyst
             .fetch_content(hash)
             .with_context(|| format!("fetch content {hash}"))?;
-        self.content.write(hash, &bytes)
+        if bytes.is_empty() {
+            bail!("fetch content {hash}: empty payload");
+        }
+        self.content.write(hash, &bytes)?;
+        self.record_content(hash, bytes.len());
+        Ok(())
     }
 
     fn entity_ctx(&self, cid: &str) -> Result<Arc<EntityCtx>> {
@@ -157,9 +181,6 @@ impl Proxy {
         let content_by_file = scene.content_by_file();
         let scan = scan_entity(&self.content, &content_by_file, &self.uri_cache);
 
-        // When running magenta-tolerant, unresolvable deps are dropped from
-        // the digest instead of failing the glb — the build will substitute
-        // placeholder textures anyway, and the resulting name stays unique.
         let mut deps_digests: HashMap<String, String> = HashMap::new();
         for c in &scene.content {
             let (is_glb, _) = is_convertible(&c.file);
@@ -205,21 +226,35 @@ impl Proxy {
         let entity_dir = self.bundle_dir.join(cid);
         let cache_path = entity_dir.join(bundle_name);
         if let Ok(b) = std::fs::read(&cache_path) {
+            if let Some(c) = self.jit() {
+                c.touch(&format!("b:{cid}"));
+            }
             return Ok(b);
         }
         let lock = self.bundle_locks.get(&format!("{cid}/{bundle_name}"));
         let _g = lock.lock().unwrap();
         if let Ok(b) = std::fs::read(&cache_path) {
+            if let Some(c) = self.jit() {
+                c.touch(&format!("b:{cid}"));
+            }
             return Ok(b);
         }
+
+        let _pin = self.jit().and_then(|c| c.pin(&format!("b:{cid}")));
 
         let ctx = self.entity_ctx(cid)?;
         let data = self.build(&ctx, bundle_name)?;
 
         std::fs::create_dir_all(&entity_dir).ok();
-        let tmp = cache_path.with_extension(format!("tmp.{}", std::process::id()));
+        let tmp = crate::tmppath::tmp_sibling(&cache_path);
         std::fs::write(&tmp, &data).with_context(|| format!("write {}", tmp.display()))?;
         std::fs::rename(&tmp, &cache_path).ok();
+        if let Some(c) = self.jit() {
+            let bytes = crate::abcdn::jitcache::dir_size(&entity_dir);
+            if bytes > 0 {
+                c.record(&format!("b:{cid}"), entity_dir.clone(), bytes);
+            }
+        }
         Ok(data)
     }
 
@@ -284,7 +319,13 @@ impl Proxy {
         }
 
         self.ensure_content(hash)?;
-        let glb = self.content.fetch(hash)?;
+        let glb = match self.content.fetch(hash) {
+            Ok(b) => b,
+            Err(_) => {
+                self.ensure_content(hash)?;
+                self.content.fetch(hash)?
+            }
+        };
 
         let m_deps = if is_glb {
             ctx.scan
@@ -305,31 +346,25 @@ impl Proxy {
         let standalone_normal = is_image && ctx.scan.normal_refs.contains(hash);
 
         let content_by_file = &ctx.content_by_file;
-        let sf_bytes = file.clone();
         let resolve_fn = |uri: &str| -> Option<Vec<u8>> {
-            let key = naming::resolve_uri_to_content_file(uri, &sf_bytes)
-                .ok()?
-                .to_lowercase();
-            let h = content_by_file.get(&key)?;
+            let h = naming::uri_content_hash(uri, &file, content_by_file)?;
             if let Err(e) = self.ensure_content(h) {
                 eprintln!("warn: resolve {uri} (hash {h}): {e:#}");
             }
-            self.content.fetch(h).ok()
+            self.content.fetch(h).ok().or_else(|| {
+                let _ = self.ensure_content(h);
+                self.content.fetch(h).ok()
+            })
         };
         let resolve: crate::gltf::Resolve = if !content_by_file.is_empty() {
             Some(&resolve_fn)
         } else {
             None
         };
-        let sf_hash = file.clone();
         let resolve_hash_fn = |uri: &str| -> Option<String> {
-            let key = naming::resolve_uri_to_content_file(uri, &sf_hash)
-                .ok()?
-                .to_lowercase();
-            content_by_file.get(&key).cloned()
+            naming::uri_content_hash(uri, &file, content_by_file).cloned()
         };
-        type HashResolver<'a> = &'a dyn Fn(&str) -> Option<String>;
-        let resolve_hash: Option<HashResolver<'_>> = if !content_by_file.is_empty() {
+        let resolve_hash: Option<crate::builder::ResolveHash> = if !content_by_file.is_empty() {
             Some(&resolve_hash_fn)
         } else {
             None
@@ -410,9 +445,6 @@ impl Proxy {
         format!("{version}/{cid}/{file}")
     }
 
-    /// Shared cross-entity layout used by the upstream converter when asset
-    /// reuse is on: bundles live under `{version}/assets/{canonical_name}`
-    /// instead of per-entity prefixes.
     fn asset_bundle_key(version: &str, file: &str) -> String {
         format!("{version}/assets/{file}")
     }
@@ -470,11 +502,8 @@ impl Proxy {
             versions.push(self.fallback_version.as_str());
         }
         for ver in versions {
-            // In asset-reuse mode the shared layout is authoritative; the
-            // entity-scoped key stays as a fallback so objects written before
-            // the layout switch remain servable.
             let mut keys: Vec<String> = Vec::new();
-            if self.asset_reuse {
+            if self.asset_reuse && naming::bundle_name_has_digest(file) {
                 keys.push(Self::asset_bundle_key(ver, file));
             }
             keys.push(Self::bundle_key(ver, cid, file));
@@ -491,11 +520,8 @@ impl Proxy {
         None
     }
 
-    /// HEAD-probe the shared assets layout for an already-built bundle.
-    /// Only meaningful in asset-reuse mode; errors count as a miss so a
-    /// flaky probe degrades to building rather than serving nothing.
     fn space_probe_asset(&self, file: &str) -> bool {
-        if !self.asset_reuse {
+        if !self.asset_reuse || !naming::bundle_name_has_digest(file) {
             return false;
         }
         let Some(space) = self.space.as_ref() else {
@@ -561,7 +587,7 @@ impl Proxy {
     }
 
     pub fn space_put_bundle(&self, cid: &str, file: &str, bytes: &[u8]) {
-        let key = if self.asset_reuse {
+        let key = if self.asset_reuse && naming::bundle_name_has_digest(file) {
             Self::asset_bundle_key(&self.version, file)
         } else {
             Self::bundle_key(&self.version, cid, file)
@@ -597,33 +623,34 @@ impl Proxy {
                 continue;
             }
             let (is_glb, _) = is_convertible(&c.file);
-            let bundle_name = if self.asset_reuse && is_glb {
+            let case_hash = if platform == "mac" {
+                c.hash.to_lowercase()
+            } else {
+                c.hash.clone()
+            };
+            let bare_name = format!("{case_hash}_{platform}");
+            let digest_naming = self.asset_reuse && is_glb && ctx.scene.entity_type == "scene";
+            let bundle_name = if digest_naming {
                 match ctx.deps_digests.get(&c.hash) {
-                    Some(d) => format!("{}_{d}_{platform}", c.hash),
+                    Some(d) => format!("{case_hash}_{d}_{platform}"),
                     None => {
-                        // Mirrors the upstream converter, which forwards
-                        // digest-less glbs to Unity as skipped instead of
-                        // building them under a mis-aligned name.
                         tracing::error!(
                             entity = %cid,
                             file = %c.file,
                             hash = %c.hash,
                             "no deps digest — glb omitted from manifest, exitCode will be non-zero"
                         );
-                        failed.push(format!("{}_{platform}", c.hash));
+                        failed.push(bare_name);
                         continue;
                     }
                 }
             } else {
-                format!("{}_{platform}", c.hash)
+                bare_name.clone()
             };
             if !seen.insert(bundle_name.clone()) {
                 continue;
             }
             if self.space_probe_asset(&bundle_name) {
-                // Already converted and uploaded (by this or another entity
-                // sharing the asset) — list it in the manifest and let the
-                // space read-through serve the bytes.
                 built.push(bundle_name);
                 continue;
             }
@@ -631,10 +658,16 @@ impl Proxy {
             let existed = dst.is_file();
             match self.bundle(cid, &bundle_name) {
                 Ok(bytes) => {
-                    let tmp = dst.with_extension(format!("tmp.{}", std::process::id()));
+                    let tmp = crate::tmppath::tmp_sibling(&dst);
                     std::fs::write(&tmp, &bytes)
                         .with_context(|| format!("write {}", tmp.display()))?;
                     std::fs::rename(&tmp, &dst).ok();
+                    if bundle_name != bare_name {
+                        let alias = pdir.join(&bare_name);
+                        if !alias.exists() {
+                            std::fs::hard_link(&dst, &alias).ok();
+                        }
+                    }
                     if !existed {
                         self.space_put_bundle(cid, &bundle_name, &bytes);
                     }
@@ -661,16 +694,17 @@ impl Proxy {
                 }
             }
         }
-        let manifest_path = crate::manifest::write_corpus_manifest(
-            out_root,
-            cid,
-            platform,
-            &built,
-            &self.version,
-            content_server_url,
-            crate::manifest::exit_code_for_failures(failed.len() + tolerated),
-            &self.date,
-        )?;
+        let manifest_path =
+            crate::manifest::write_corpus_manifest(&crate::manifest::CorpusManifestSpec {
+                out_root,
+                entity_id: cid,
+                platform,
+                built: &built,
+                ab_version: &self.version,
+                content_server_url,
+                exit_code: crate::manifest::exit_code_for_failures(failed.len() + tolerated),
+                date: &self.date,
+            })?;
         if self.space_configured() {
             match std::fs::read(&manifest_path) {
                 Ok(mbytes) => self.space_put_manifest(&format!("{cid}_{platform}"), &mbytes),
@@ -730,10 +764,6 @@ pub struct ProxyConfig {
     pub fallback_version: String,
     pub use_space: bool,
 
-    /// Canonical glb naming + shared assets space layout + build probe
-    /// (upstream asset-reuse parity). Default ON — the ab-cdn deployment has
-    /// run asset-reuse since v49. ABGEN_DEPS_DIGEST=0 opts out for parity
-    /// runs against pre-v49 reference trees.
     pub asset_reuse: bool,
 
     pub template_root: Option<String>,
@@ -837,6 +867,7 @@ impl Proxy {
             v38_compat,
             v38_timestamp,
             magenta_missing,
+            jit_cache: OnceLock::new(),
             asset_reuse,
         })
     }
@@ -1026,24 +1057,27 @@ mod tests {
     #[test]
     fn asset_reuse_puts_and_gets_shared_assets_layout() {
         let (host, seen) = super::stub::serve(vec![(
-            "/v40/assets/Qmhash_dig_windows".to_string(),
+            "/v40/assets/Qmhash_0123456789abcdef0123456789abcdef_windows".to_string(),
             200,
             b"SHARED".to_vec(),
         )]);
         let proxy = stub_proxy_reuse(&host, "reuse-layout");
-        proxy.space_put_bundle("bafkcid", "Qmhash_dig_windows", b"B");
-        // Shared layout probed first per version, entity-scoped key kept as a
-        // fallback for objects written before the layout switch.
-        let got = proxy.space_get_bundle("bafkcid", "Qmhash_dig_windows");
+        proxy.space_put_bundle(
+            "bafkcid",
+            "Qmhash_0123456789abcdef0123456789abcdef_windows",
+            b"B",
+        );
+        let got =
+            proxy.space_get_bundle("bafkcid", "Qmhash_0123456789abcdef0123456789abcdef_windows");
         assert_eq!(got.as_deref(), Some(&b"SHARED"[..]));
         let log = seen.lock().unwrap().clone();
         assert_eq!(
             log,
             vec![
-                "PUT /v41/assets/Qmhash_dig_windows".to_string(),
-                "GET /v41/assets/Qmhash_dig_windows".to_string(),
-                "GET /v41/bafkcid/Qmhash_dig_windows".to_string(),
-                "GET /v40/assets/Qmhash_dig_windows".to_string(),
+                "PUT /v41/assets/Qmhash_0123456789abcdef0123456789abcdef_windows".to_string(),
+                "GET /v41/assets/Qmhash_0123456789abcdef0123456789abcdef_windows".to_string(),
+                "GET /v41/bafkcid/Qmhash_0123456789abcdef0123456789abcdef_windows".to_string(),
+                "GET /v40/assets/Qmhash_0123456789abcdef0123456789abcdef_windows".to_string(),
             ]
         );
     }
@@ -1051,27 +1085,25 @@ mod tests {
     #[test]
     fn asset_reuse_probe_heads_shared_key() {
         let (host, seen) = super::stub::serve(vec![(
-            "/v41/assets/Qmhit_dig_windows".to_string(),
+            "/v41/assets/Qmhit_0123456789abcdef0123456789abcdef_windows".to_string(),
             200,
             Vec::new(),
         )]);
         let proxy = stub_proxy_reuse(&host, "reuse-probe");
-        assert!(proxy.space_probe_asset("Qmhit_dig_windows"));
-        assert!(!proxy.space_probe_asset("Qmmiss_dig_windows"));
+        assert!(proxy.space_probe_asset("Qmhit_0123456789abcdef0123456789abcdef_windows"));
+        assert!(!proxy.space_probe_asset("Qmmiss_0123456789abcdef0123456789abcdef_windows"));
         let log = seen.lock().unwrap().clone();
         assert_eq!(
             log,
             vec![
-                "HEAD /v41/assets/Qmhit_dig_windows".to_string(),
-                "HEAD /v41/assets/Qmmiss_dig_windows".to_string(),
+                "HEAD /v41/assets/Qmhit_0123456789abcdef0123456789abcdef_windows".to_string(),
+                "HEAD /v41/assets/Qmmiss_0123456789abcdef0123456789abcdef_windows".to_string(),
             ]
         );
 
-        // Legacy mode never probes: entity-scoped bundles are always rebuilt
-        // locally, so a HEAD would be wasted.
         let (host2, seen2) = super::stub::serve(vec![]);
         let legacy = stub_proxy(&host2, false, "legacy-probe");
-        assert!(!legacy.space_probe_asset("Qmhit_dig_windows"));
+        assert!(!legacy.space_probe_asset("Qmhit_0123456789abcdef0123456789abcdef_windows"));
         assert!(seen2.lock().unwrap().is_empty());
     }
 
@@ -1096,6 +1128,66 @@ mod tests {
         bounded_reserve(&mut m, 2, "c");
         assert_eq!(m.len(), 2);
         assert!(m.contains_key("c"));
+    }
+
+    #[test]
+    fn content_build_cache_is_lru_bounded_and_self_heals() {
+        use crate::abcdn::jitcache::JitDiskCache;
+
+        let cache_dir = temp_cache("jit-content-bound");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let local_dir = cache_dir.join("src-local");
+        let local = LocalContentStore::new(&local_dir);
+        for h in ["hasha", "hashb", "hashc"] {
+            local.write(h, &[0u8; 100]).unwrap();
+        }
+
+        let cfg = ProxyConfig {
+            catalyst_url: "http://127.0.0.1:9".to_string(),
+            local_root: Some(local_dir.to_string_lossy().into_owned()),
+            cache_dir: cache_dir.to_string_lossy().into_owned(),
+            version: "v41".to_string(),
+            fallback_version: "v40".to_string(),
+            ..Default::default()
+        };
+        let proxy = Proxy::new(cfg);
+        let cache = JitDiskCache::new(250);
+        proxy.set_jit_cache(cache.clone());
+
+        let content = LocalContentStore::new(proxy.cache_roots().0);
+
+        proxy.ensure_content("hasha").unwrap();
+        proxy.ensure_content("hashb").unwrap();
+        proxy.ensure_content("hasha").unwrap();
+        proxy.ensure_content("hashc").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+
+        assert!(
+            cache.total_bytes() <= 250,
+            "content cache must stay within budget: {}",
+            cache.total_bytes()
+        );
+        assert!(content.exists("hasha"), "hasha was touched, must survive");
+        assert!(content.exists("hashc"), "hashc is newest, must survive");
+        assert!(
+            !content.exists("hashb"),
+            "hashb is LRU, must be evicted off disk"
+        );
+
+        proxy.ensure_content("hashb").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(
+            content.exists("hashb"),
+            "evicted hashb must self-heal (refetch) on next ensure_content"
+        );
+        assert!(
+            cache.total_bytes() <= 250,
+            "still bounded after self-heal: {}",
+            cache.total_bytes()
+        );
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
     #[test]

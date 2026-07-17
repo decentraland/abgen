@@ -25,7 +25,10 @@ pub async fn get_world_manifest(
         if ent.entity_type != "scene" {
             continue;
         }
-        if ent.world_name() != Some(world_name.as_str()) {
+        if ent
+            .world_name()
+            .is_none_or(|n| !n.eq_ignore_ascii_case(&world_name))
+        {
             continue;
         }
         if denylist.contains(&ent.entity_id) {

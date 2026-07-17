@@ -57,7 +57,8 @@ def server_health(url):
 class LocalServer:
     """Context manager: .url usable after __enter__; spawned process reaped."""
 
-    def __init__(self, run_dir, content_url, prefer_url=None, log=print):
+    def __init__(self, run_dir, content_url, prefer_url=None, log=print,
+                 force_spawn=False):
         self.run_dir = run_dir
         self.content_url = content_url
         self.prefer_url = prefer_url or "http://127.0.0.1:5147"
@@ -65,13 +66,18 @@ class LocalServer:
         self.proc = None
         self.url = None
         self.spawned = False
+        self.force_spawn = force_spawn
 
     def __enter__(self):
-        h = server_health(self.prefer_url)
-        if h and h[0] == 200:
-            self.url = self.prefer_url
-            self.log(f"ours-server: reusing healthy abgen server at {self.url}")
-            return self
+        if self.force_spawn:
+            # determinism runs must NOT be satisfied by a warm shared cache
+            self.log("ours-server: force_spawn — skipping healthy-server probe")
+        else:
+            h = server_health(self.prefer_url)
+            if h and h[0] == 200:
+                self.url = self.prefer_url
+                self.log(f"ours-server: reusing healthy abgen server at {self.url}")
+                return self
         self.spawn()
         return self
 
