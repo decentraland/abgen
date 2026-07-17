@@ -124,6 +124,12 @@ pub fn maybe_enable_gpu_from_env() {
         return;
     }
     let explicit = clihelp::env_bool("ABGEN_GPU", false);
+    if !explicit && gpu::auto_defaults_to_cpu() {
+        eprintln!(
+            "abgen-gpu: macOS default is CPU (integrated Metal is slower than the CPU for BC7); set ABGEN_GPU=1 or ABGEN_GPU_BACKEND=wgpu to force the GPU"
+        );
+        return;
+    }
     if let Err(e) = enable_gpu() {
         if explicit {
             eprintln!("error: ABGEN_GPU set but no GPU available: {e}");
@@ -147,6 +153,12 @@ pub fn arm_gpu_explicit() {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn arm_gpu_default() {
     if gpu::backend_is_off() {
+        return;
+    }
+    if gpu::auto_defaults_to_cpu() {
+        eprintln!(
+            "abgen-gpu: macOS default is CPU (integrated Metal is slower than the CPU for BC7); pass --gpu or set ABGEN_GPU_BACKEND=wgpu to force the GPU"
+        );
         return;
     }
     if let Err(e) = enable_gpu() {

@@ -268,6 +268,11 @@ pub fn backend_is_off() -> bool {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+pub fn auto_defaults_to_cpu() -> bool {
+    cfg!(target_os = "macos") && matches!(parse_backend_sel(), Ok(BackendSel::Auto))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn gpu_status() -> Option<crate::GpuStatus> {
     RESOLVED
         .get()
