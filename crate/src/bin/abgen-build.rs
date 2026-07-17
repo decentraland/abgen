@@ -95,9 +95,9 @@ fn usage_text() -> &'static str {
         \x20                          with a 256x256 magenta MISSING placeholder\n\
         \x20                          instead of failing/dropping them (also via\n\
         \x20                          ABGEN_MAGENTA_MISSING).\n\
-        --gpu                         enable the GPU BC7/BC5 encode path (needs a\n\
-        \x20                          binary built with --features gpu; exits 2\n\
-        \x20                          otherwise).\n\
+        --gpu                         force the GPU BC7/BC5 encode path; exit\n\
+        \x20                          non-zero if no GPU arms. Without it, auto-try\n\
+        \x20                          GPU then warn and fall back to CPU.\n\
         --help, -h                    print this help. --version, -V print the version."
 }
 
@@ -114,6 +114,7 @@ fn run() -> Result<()> {
     let mut magenta_missing = false;
     let mut expect_hash: Option<String> = None;
     let mut expect_hash_file: Option<String> = None;
+    let mut gpu_flag = false;
 
     let mut i = 0;
     while i < argv.len() {
@@ -177,12 +178,7 @@ fn run() -> Result<()> {
                     std::process::exit(2);
                 }));
             }
-            "--gpu" => {
-                if let Err(e) = abgen::enable_gpu() {
-                    eprintln!("error: --gpu: {e}");
-                    std::process::exit(2);
-                }
-            }
+            "--gpu" => gpu_flag = true,
             "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
             "-V" | "--version" => abgen::clihelp::print_version(BIN_NAME),
             other if other.starts_with("--") => {
@@ -191,6 +187,12 @@ fn run() -> Result<()> {
             other => positional.push(other.to_string()),
         }
         i += 1;
+    }
+
+    if gpu_flag {
+        abgen::arm_gpu_explicit();
+    } else {
+        abgen::arm_gpu_default();
     }
 
     if positional.len() != 4 {

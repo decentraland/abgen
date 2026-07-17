@@ -21,7 +21,6 @@ pub enum ApiError {
     #[error("not implemented: {0}")]
     NotImplemented(String),
 
-    #[cfg(feature = "pg")]
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 
@@ -64,7 +63,6 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized(m) => (401, m.clone()),
             ApiError::Forbidden(m) => (403, m.clone()),
             ApiError::NotImplemented(m) => (501, m.clone()),
-            #[cfg(feature = "pg")]
             ApiError::Database(e) => {
                 tracing::error!(error = %e, "sqlx error");
                 (500, "database error".to_string())

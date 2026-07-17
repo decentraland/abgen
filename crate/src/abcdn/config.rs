@@ -19,8 +19,6 @@ pub struct Config {
     pub manifest_content_server_url: String,
 
     pub abgen_root: Option<String>,
-
-    #[cfg(feature = "content-db")]
     pub content_database_url: Option<String>,
 }
 
@@ -63,13 +61,10 @@ impl Config {
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
-            #[cfg(feature = "content-db")]
             content_database_url: content_connection_string(),
         })
     }
 }
-
-#[cfg(feature = "content-db")]
 fn content_connection_string() -> Option<String> {
     if let Ok(url) = env::var("CONTENT_PG_CONNECTION_STRING") {
         if !url.trim().is_empty() {
@@ -92,8 +87,6 @@ fn content_connection_string() -> Option<String> {
         pct(&password),
     ))
 }
-
-#[cfg(feature = "content-db")]
 fn pct(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {

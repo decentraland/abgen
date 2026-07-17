@@ -77,7 +77,6 @@ fn main() {
     }
 }
 
-#[cfg(feature = "gpu")]
 fn run_gpu(args: &[String]) -> i32 {
     match abgen::gpuhost::harness::run(args) {
         Ok(code) => code,
@@ -86,12 +85,6 @@ fn run_gpu(args: &[String]) -> i32 {
             2
         }
     }
-}
-
-#[cfg(not(feature = "gpu"))]
-fn run_gpu(_args: &[String]) -> i32 {
-    eprintln!("abgen-verify gpu: built without the gpu feature");
-    2
 }
 
 fn run() -> Result<()> {

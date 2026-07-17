@@ -7,7 +7,6 @@ use std::time::Duration;
 use super::jitcache::JitDiskCache;
 use super::lodjit::LodJit;
 use crate::catalyst::CatalystClient;
-#[cfg(feature = "content-db")]
 use dcl_contents::content::ContentComponent;
 use moka::future::Cache;
 
@@ -61,8 +60,6 @@ pub struct AppStateInner {
     pub ab_version: String,
 
     pub ab_date: String,
-
-    #[cfg(feature = "content-db")]
     pub content_db: Option<ContentComponent>,
 
     pub contents_registry: Option<dcl_contents::registry::RegistryAppState>,
@@ -130,7 +127,6 @@ impl AppStateInner {
             templates_missing,
             ab_version,
             ab_date,
-            #[cfg(feature = "content-db")]
             content_db: None,
             contents_registry: None,
             catalyst_url,
@@ -228,8 +224,6 @@ impl AppStateInner {
         }
         self.jit_cache.record(key, path.to_path_buf(), bytes);
     }
-
-    #[cfg(feature = "content-db")]
     pub fn with_content_db(mut self, content_db: Option<ContentComponent>) -> Self {
         self.content_db = content_db;
         self

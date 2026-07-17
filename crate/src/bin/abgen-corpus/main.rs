@@ -217,8 +217,8 @@ fn usage_text() -> &'static str {
          bundles by bare content hash, or pre-v49 parity). Equivalent to\n  \
          ABGEN_DEPS_DIGEST=0.\n\
          \n\
-         --gpu: enable the GPU BC7/BC5 encode path (needs a binary built with\n  \
-         --features gpu; exits 2 otherwise).\n\
+         --gpu: force the GPU BC7/BC5 encode path; exit non-zero if no GPU arms.\n  \
+         Without it, auto-try GPU then warn and fall back to CPU.\n\
          \n\
          --help/-h prints this help; --version/-V prints the version."
 }
@@ -289,6 +289,7 @@ fn run() -> Result<()> {
     let mut fetch_missing = false;
     let mut no_deps_digest = false;
     let mut pointer_target: Option<String> = None;
+    let mut gpu_flag = false;
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -341,10 +342,7 @@ fn run() -> Result<()> {
                 flat_output = true;
             }
             "--gpu" => {
-                if let Err(e) = abgen::enable_gpu() {
-                    eprintln!("error: --gpu: {e}");
-                    std::process::exit(2);
-                }
+                gpu_flag = true;
             }
             "--cdn-layout" => {
                 cdn_layout = true;
@@ -414,6 +412,12 @@ fn run() -> Result<()> {
             other => positional.push(other.to_string()),
         }
         i += 1;
+    }
+
+    if gpu_flag {
+        abgen::arm_gpu_explicit();
+    } else {
+        abgen::arm_gpu_default();
     }
 
     if live_mode.is_some() {

@@ -829,6 +829,7 @@ fn cmd_generate(argv: &[String]) -> Result<i32> {
     let mut params = abgen::lodgen::GenerateParams::default();
     let mut scene: Option<String> = None;
     let mut out: Option<String> = None;
+    let mut gpu_flag = false;
 
     let mut i = 0usize;
     while i < argv.len() {
@@ -942,12 +943,17 @@ fn cmd_generate(argv: &[String]) -> Result<i32> {
                 params.keep_glb = true;
             }
             "--gpu" => {
-                abgen::enable_gpu().map_err(|e| anyhow!("--gpu: {e}"))?;
+                gpu_flag = true;
             }
             "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
             other => bail!("unknown generate arg {other:?}"),
         }
         i += 1;
+    }
+    if gpu_flag {
+        abgen::arm_gpu_explicit();
+    } else {
+        abgen::arm_gpu_default();
     }
     params.scene = scene.ok_or_else(|| anyhow!("generate needs --scene <pointer|entityId>"))?;
     params.out_dir = out.ok_or_else(|| anyhow!("generate needs --out DIR"))?;

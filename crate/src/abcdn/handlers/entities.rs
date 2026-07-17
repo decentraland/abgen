@@ -91,7 +91,6 @@ async fn fetch_entities(
     state: &AppState,
     pointers: &[String],
 ) -> Result<Vec<ResolvedEntity>, Response> {
-    #[cfg(feature = "content-db")]
     if let Some(cdb) = &state.content_db {
         return match cdb.resolve_pointers(pointers).await {
             Ok(ents) => Ok(ents

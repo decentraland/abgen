@@ -141,7 +141,6 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
     }
     let live_proxy = Some(live_proxy);
 
-    #[cfg(feature = "content-db")]
     let content_db = match &cfg.content_database_url {
         Some(url) => match sqlx::postgres::PgPoolOptions::new()
             .max_connections(8)
@@ -159,12 +158,9 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
         },
         None => None,
     };
-    #[cfg(feature = "content-db")]
     let db_source: Option<Arc<dyn dcl_contents::registry::EntitySource>> = content_db
         .clone()
         .map(|c| Arc::new(c) as Arc<dyn dcl_contents::registry::EntitySource>);
-    #[cfg(not(feature = "content-db"))]
-    let db_source: Option<Arc<dyn dcl_contents::registry::EntitySource>> = None;
     let registry_source: Arc<dyn dcl_contents::registry::EntitySource> = match db_source {
         Some(source) => {
             tracing::info!("registry routes: content DB");
@@ -321,7 +317,6 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
     .with_worlds_content_url(crate::worlds::content_fallback_from_env())
     .with_jit(jit_root, jit_cache, roots_distinct)
     .with_registry_state(Some(contents_registry));
-    #[cfg(feature = "content-db")]
     let inner = inner.with_content_db(content_db);
     Ok(Arc::new(inner))
 }

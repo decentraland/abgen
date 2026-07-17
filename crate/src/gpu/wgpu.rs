@@ -1,17 +1,25 @@
+#[cfg(not(target_arch = "wasm32"))]
 use std::future::Future;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::OnceLock;
+#[cfg(not(target_arch = "wasm32"))]
 use std::task::{Context, Poll};
 
 pub(crate) const BLOCKIFY_WGSL: &str = include_str!("shaders/blockify.wgsl");
 
-pub(crate) struct Gpu {
+pub struct Gpu {
+    #[cfg(target_arch = "wasm32")]
+    #[allow(dead_code)]
+    pub(crate) instance: ::wgpu::Instance,
     pub(crate) device: ::wgpu::Device,
     pub(crate) queue: ::wgpu::Queue,
     pub(crate) info: ::wgpu::AdapterInfo,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 static GPU: OnceLock<Result<Gpu, String>> = OnceLock::new();
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn block_on_now<F: Future>(fut: F) -> F::Output {
     let mut fut = std::pin::pin!(fut);
     let waker = std::task::Waker::noop();
@@ -24,6 +32,7 @@ pub(crate) fn block_on_now<F: Future>(fut: F) -> F::Output {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn adapter_score(info: &::wgpu::AdapterInfo) -> i32 {
     let mut s = match info.device_type {
         ::wgpu::DeviceType::DiscreteGpu => 8,
@@ -38,9 +47,28 @@ fn adapter_score(info: &::wgpu::AdapterInfo) -> i32 {
     s
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn hal_backends() -> ::wgpu::Backends {
+    match std::env::var("ABGEN_WGPU_HAL")
+        .ok()
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("dx12") | Some("d3d12") => ::wgpu::Backends::DX12,
+        Some("vulkan") | Some("vk") => ::wgpu::Backends::VULKAN,
+        Some("metal") => ::wgpu::Backends::METAL,
+        Some("gl") => ::wgpu::Backends::GL,
+        _ => ::wgpu::Backends::all(),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn init() -> Result<Gpu, String> {
-    let instance = ::wgpu::Instance::new(::wgpu::InstanceDescriptor::new_without_display_handle());
-    let adapters = block_on_now(instance.enumerate_adapters(::wgpu::Backends::all()));
+    let backends = hal_backends();
+    let mut desc = ::wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backends = backends;
+    let instance = ::wgpu::Instance::new(desc);
+    let adapters = block_on_now(instance.enumerate_adapters(backends));
     let mut best: Option<(i32, ::wgpu::Adapter)> = None;
     for a in adapters {
         let s = adapter_score(&a.get_info());
@@ -65,6 +93,7 @@ fn init() -> Result<Gpu, String> {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn gpu() -> Result<&'static Gpu, String> {
     match GPU.get_or_init(init) {
         Ok(g) => Ok(g),
@@ -72,12 +101,58 @@ pub(crate) fn gpu() -> Result<&'static Gpu, String> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn adapter_summary() -> Result<String, String> {
     let g = gpu()?;
     Ok(format!(
         "{} [{:?} {:?}] driver: {} {}",
         g.info.name, g.info.backend, g.info.device_type, g.info.driver, g.info.driver_info
     ))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn init_gpu() -> std::result::Result<Gpu, String> {
+    let instance = ::wgpu::Instance::new(::wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = instance
+        .request_adapter(&::wgpu::RequestAdapterOptions {
+            power_preference: ::wgpu::PowerPreference::HighPerformance,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| format!("request_adapter failed: {e}"))?;
+    let info = adapter.get_info();
+    let (device, queue) = adapter
+        .request_device(&::wgpu::DeviceDescriptor {
+            label: Some("abgen-gpu-wgpu"),
+            required_limits: adapter.limits(),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| format!("wgpu request_device failed on {}: {e}", info.name))?;
+    Ok(Gpu {
+        instance,
+        device,
+        queue,
+        info,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Gpu {
+    pub fn adapter_summary(&self) -> String {
+        format!(
+            "{} [{:?} {:?}] driver: {} {}",
+            self.info.name,
+            self.info.backend,
+            self.info.device_type,
+            self.info.driver,
+            self.info.driver_info
+        )
+    }
+
+    pub fn backend_debug(&self) -> String {
+        format!("{:?}", self.info.backend)
+    }
 }
 
 #[cfg(test)]

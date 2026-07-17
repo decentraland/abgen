@@ -273,7 +273,6 @@ pub(super) async fn bundle_fallback(
     }
 }
 
-#[cfg(feature = "content-db")]
 async fn resolve_lod_sid_case(state: &AppState, sid: &str) -> String {
     if !lodjit::sid_needs_case_resolution(sid) {
         return sid.to_string();
@@ -301,17 +300,6 @@ async fn resolve_lod_sid_case(state: &AppState, sid: &str) -> String {
             sid.to_string()
         }
     }
-}
-
-#[cfg(not(feature = "content-db"))]
-async fn resolve_lod_sid_case(_state: &AppState, sid: &str) -> String {
-    if lodjit::sid_needs_case_resolution(sid) {
-        tracing::warn!(
-            sid = %sid,
-            "lowercased Qm scene id and no content DB; the case-sensitive content fetch will fail"
-        );
-    }
-    sid.to_string()
 }
 
 pub(super) async fn lod_fallback(
@@ -635,7 +623,6 @@ async fn resolve_hash_owner(
     if let Some(cid) = proxy.entity_for_hash(bare) {
         return Ok(Some(cid));
     }
-    #[cfg(feature = "content-db")]
     if let Some(cdb) = &state.content_db {
         match cdb.entity_for_content_hash(bare).await {
             Ok(Some(cid)) => return Ok(Some(cid)),

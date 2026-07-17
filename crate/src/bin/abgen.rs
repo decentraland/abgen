@@ -1,3 +1,6 @@
+#![cfg_attr(target_arch = "wasm32", no_main)]
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::net::SocketAddr;
 
 use anyhow::Result;
@@ -29,8 +32,9 @@ ENV:
                             (default https://worlds-content-server.decentraland.org; 0/off/empty disables)
   ABGEN_SHADER_JIT          serve-time materialization of the vendored shared shader
                             bundles on shader-path misses (default on; 0/false/no/off disables)
-  ABGEN_GPU                 enable the GPU BC7/BC5 encode path for JIT conversions
-                            (needs a binary built with --features gpu; exits 2 otherwise)
+  ABGEN_GPU                 force the GPU BC7/BC5 encode path: exit non-zero if no GPU
+                            arms. Unset: auto-try GPU, warn and fall back to CPU.
+                            ABGEN_GPU_BACKEND=off skips the attempt entirely (clean CPU)
   ABGEN_HASH_RESOLVE_FAIL_TTL_S  negative-cache TTL for unresolvable flat {hash}_{platform}
                             requests (default 3600)
   AB_REGISTRY_PG_CONNECTION_STRING  optional registry Postgres DB
@@ -68,7 +72,6 @@ fn env_filter() -> tracing_subscriber::EnvFilter {
         .unwrap_or_else(|_| "abgen=info,tower_http=info".into())
 }
 
-#[cfg(feature = "content-db")]
 async fn registry_state(out_root: &str) -> Option<abgen::registry::AppState> {
     let cfg = match abgen::registry::config::Config::from_env() {
         Ok(c) => c,
@@ -113,7 +116,6 @@ async fn main() -> Result<()> {
     let state = build_state(&cfg).await?;
 
     let app = build_app(state);
-    #[cfg(feature = "content-db")]
     let app = match registry_state(&cfg.abgen_out_root).await {
         Some(reg) => app.merge(abgen::registry::signed_router().with_state(reg)),
         None => app,
