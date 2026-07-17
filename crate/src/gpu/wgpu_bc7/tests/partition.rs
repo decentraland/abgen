@@ -238,7 +238,12 @@ fn wgpu_bc7_est_partition_golden() {
             "bc7_test_est_partition",
             total as u32,
             0,
-            &[(1, &pbytes), (4, &words_bytes(&input)), (3, &out)],
+            &[
+                (1, &pbytes),
+                (4, &words_bytes(&input)),
+                (3, &out),
+                (6, &words_bytes(&crate::gpu::corelib::bc7::PRIV_TABLE_WORDS)),
+            ],
             3,
         );
         assert_bytes_eq(
@@ -316,7 +321,12 @@ fn wgpu_bc7_plans_golden() {
             "bc7_test_plans",
             total as u32,
             0,
-            &[(1, &pbytes), (4, &words_bytes(&input)), (3, &out)],
+            &[
+                (1, &pbytes),
+                (4, &words_bytes(&input)),
+                (3, &out),
+                (6, &words_bytes(&crate::gpu::corelib::bc7::PRIV_TABLE_WORDS)),
+            ],
             3,
         );
         assert_bytes_eq(
@@ -666,7 +676,11 @@ fn wgpu_bc7_encode_bits_golden() {
         "bc7_test_encode_bits",
         total as u32,
         0,
-        &[(4, &words_bytes(&input)), (3, &out)],
+        &[
+            (4, &words_bytes(&input)),
+            (3, &out),
+            (6, &words_bytes(&crate::gpu::corelib::bc7::PRIV_TABLE_WORDS)),
+        ],
         3,
     );
     assert_bytes_eq(&got, &want, "bc7_test_encode_bits");
@@ -717,7 +731,12 @@ fn wgpu_bc7_solid_golden() {
         "bc7_test_solid",
         total as u32,
         0,
-        &[(2, &opt_bytes), (4, &words_bytes(&input)), (3, &out)],
+        &[
+            (2, &opt_bytes),
+            (4, &words_bytes(&input)),
+            (3, &out),
+            (6, &words_bytes(&crate::gpu::corelib::bc7::PRIV_TABLE_WORDS)),
+        ],
         3,
     );
     assert_bytes_eq(&got, &want, "bc7_test_solid");

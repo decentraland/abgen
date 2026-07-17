@@ -167,6 +167,47 @@ const fn build_subset_idx(table: &[u8; 64 * 16]) -> [SubsetIdx; 64] {
 pub(super) static SUBSET_IDX2: [SubsetIdx; 64] = build_subset_idx(&G_PARTITION2);
 pub(super) static SUBSET_IDX3: [SubsetIdx; 64] = build_subset_idx(&G_PARTITION3);
 
+/// Flattened copy of the big lookup tables for GPU backends that cannot hold
+/// them in per-thread private memory. Metal enforces a small per-thread stack
+/// and naga lowers WGSL `var<private>` arrays to stack allocations, so ~34 KB
+/// of tables fails compute-pipeline creation on Apple GPUs ("Compute function
+/// exceeds available stack space"); a read-only storage buffer costs nothing.
+/// Word layout consumed by shaders/bc7.wgsl `priv_tables` (binding 6):
+/// part2@0 part3@1024 s2idx@2048 s2tot@5120 s3idx@5312 s3tot@8384.
+/// i32 entries travel as raw bit patterns (`as u32` here, `bitcast` in WGSL).
+pub const PRIV_TABLE_WORDS_LEN: usize = 8576;
+pub static PRIV_TABLE_WORDS: [u32; PRIV_TABLE_WORDS_LEN] = build_priv_table_words();
+
+const fn build_priv_table_words() -> [u32; PRIV_TABLE_WORDS_LEN] {
+    let mut w = [0u32; PRIV_TABLE_WORDS_LEN];
+    let mut i = 0usize;
+    while i < 1024 {
+        w[i] = G_PARTITION2[i] as u32;
+        w[1024 + i] = G_PARTITION3[i] as u32;
+        i += 1;
+    }
+    // Statics are unreadable in const context; rebuild via the same const fn.
+    let s2 = build_subset_idx(&G_PARTITION2);
+    let s3 = build_subset_idx(&G_PARTITION3);
+    let mut p = 0usize;
+    while p < 64 {
+        let mut s = 0usize;
+        while s < 3 {
+            let mut k = 0usize;
+            while k < 16 {
+                w[2048 + (p * 3 + s) * 16 + k] = s2[p].idx[s][k] as u32;
+                w[5312 + (p * 3 + s) * 16 + k] = s3[p].idx[s][k] as u32;
+                k += 1;
+            }
+            w[5120 + p * 3 + s] = s2[p].total[s] as u32;
+            w[8384 + p * 3 + s] = s3[p].total[s] as u32;
+            s += 1;
+        }
+        p += 1;
+    }
+    w
+}
+
 pub(super) fn subset_idx_tables(total_subsets: usize) -> &'static [SubsetIdx; 64] {
     if total_subsets == 3 {
         &SUBSET_IDX3

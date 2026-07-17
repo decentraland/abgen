@@ -1,4 +1,6 @@
-use crate::gpu::corelib::bc7::{build_opt_tables, Bc7Profile, EndpointErr, OptTables, Params};
+use crate::gpu::corelib::bc7::{
+    build_opt_tables, Bc7Profile, EndpointErr, OptTables, Params, PRIV_TABLE_WORDS,
+};
 use crate::gpu::corelib::mips::{box_halve_dims, compute_default_mip_count, level_block_dims};
 use crate::gpu::wgpu::{gpu, Gpu, BLOCKIFY_WGSL};
 use anyhow::{anyhow, ensure, Result};
@@ -77,10 +79,11 @@ struct Engine {
     plan: [::wgpu::ComputePipeline; 3],
     enc: [::wgpu::ComputePipeline; 3],
     opt: ::wgpu::Buffer,
+    big: ::wgpu::Buffer,
     params: [::wgpu::Buffer; 4],
 }
 
-static ENGINE: OnceLock<Engine> = OnceLock::new();
+static ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
 
 fn make_pipeline(
     g: &Gpu,
@@ -136,6 +139,7 @@ fn build_engine(g: &Gpu) -> Engine {
         });
     let t = build_opt_tables();
     let opt = storage_init(g, "bc7-opt-tables", &words_bytes(&opt_tables_words(&t)));
+    let big = storage_init(g, "bc7-priv-tables", &words_bytes(&PRIV_TABLE_WORDS));
     let params = [
         Params::slow(false),
         Params::slow(true),
@@ -155,12 +159,25 @@ fn build_engine(g: &Gpu) -> Engine {
         enc: [0.0f64, 1.0, 2.0]
             .map(|c| make_pipeline(g, &bc7, "bc7_encode_blocks", &[("TRIAL_CLASS", c)])),
         opt,
+        big,
         params,
     }
 }
 
-fn engine(g: &'static Gpu) -> &'static Engine {
-    ENGINE.get_or_init(|| build_engine(g))
+/// Pipeline creation panics on drivers that reject a kernel (wgpu's
+/// uncaptured-error handler): contain it so `--gpu` disqualifies gracefully
+/// instead of crashing the process.
+fn engine(g: &'static Gpu) -> Result<&'static Engine> {
+    let slot = ENGINE.get_or_init(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_engine(g))).map_err(|e| {
+            e.downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "pipeline creation panicked".to_string())
+        })
+    });
+    slot.as_ref()
+        .map_err(|e| anyhow!("wgpu engine init failed: {e}"))
 }
 
 fn push_u64(b: &mut Vec<u8>, x: u64) {
@@ -308,7 +325,7 @@ pub(crate) fn encode_bc7_mip_chain(
     let mips = mip_count.unwrap_or_else(|| compute_default_mip_count(width, height));
     ensure!(mips >= 1, "mip_count {mips} < 1");
     let g = gpu().map_err(|e| anyhow!("wgpu unavailable: {e}"))?;
-    let eng = engine(g);
+    let eng = engine(g)?;
     let bucket = match (profile, perceptual) {
         (Bc7Profile::Slow, false) => 0usize,
         (Bc7Profile::Slow, true) => 1,
@@ -446,7 +463,12 @@ pub(crate) fn encode_bc7_mip_chain(
                     total: l.nb.div_ceil(4),
                     n_items: l.nb as u32,
                     fone: true,
-                    bufs: &[(1, params_buf), (4, &blocks_l), (3, &scratch_l)],
+                    bufs: &[
+                        (1, params_buf),
+                        (4, &blocks_l),
+                        (3, &scratch_l),
+                        (6, &eng.big),
+                    ],
                 },
             );
         }
@@ -466,6 +488,7 @@ pub(crate) fn encode_bc7_mip_chain(
                         (4, &blocks_l),
                         (5, &scratch_l),
                         (3, &out_l),
+                        (6, &eng.big),
                     ],
                 },
             );

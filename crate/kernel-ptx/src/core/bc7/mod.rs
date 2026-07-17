@@ -12,6 +12,7 @@ mod tables;
 
 #[cfg(not(target_arch = "nvptx64"))]
 pub use probe_mod::probe;
+pub use tables::{PRIV_TABLE_WORDS, PRIV_TABLE_WORDS_LEN};
 
 use super::sqrtf;
 use alpha45::*;

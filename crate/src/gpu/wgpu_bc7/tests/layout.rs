@@ -207,8 +207,18 @@ fn wgpu_bc7_tables_golden() {
         &[(2, &opt_bytes), (3, &out)],
         3,
     );
+    let priv_bytes = words_bytes(&crate::gpu::corelib::bc7::PRIV_TABLE_WORDS);
     for entry in ["bc7_test_tables_priv1", "bc7_test_tables_priv2"] {
-        let part = run_kernel(g, BC7_WGSL, "bc7", entry, total, 0, &[(3, &out)], 3);
+        let part = run_kernel(
+            g,
+            BC7_WGSL,
+            "bc7",
+            entry,
+            total,
+            0,
+            &[(3, &out), (6, &priv_bytes)],
+            3,
+        );
         for (a, b) in got.iter_mut().zip(part.iter()) {
             *a |= *b;
         }
