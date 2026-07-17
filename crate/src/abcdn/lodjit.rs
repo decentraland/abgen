@@ -199,13 +199,24 @@ impl LodJit {
                  have a published ISS descriptor; the manifest-builder fallback is unavailable"
             );
         }
+        let workdir = PathBuf::from(cache_base).join("lod-work");
+        if enabled {
+            if let Ok(rd) = std::fs::read_dir(&workdir) {
+                for ent in rd.flatten() {
+                    let name = ent.file_name();
+                    if name.to_string_lossy().starts_with("stage-") {
+                        let _ = std::fs::remove_dir_all(ent.path());
+                    }
+                }
+            }
+        }
         LodJit {
             enabled,
             simplifier,
             gltfpack,
             manifest_builder,
             cache_dir: PathBuf::from(cache_base).join("lod-content"),
-            workdir: PathBuf::from(cache_base).join("lod-work"),
+            workdir,
             timeout: Duration::from_secs(timeout_s.max(1)),
             neg_cache: moka::future::Cache::builder()
                 .max_capacity(10_000)
@@ -239,7 +250,7 @@ impl LodJit {
             return Err(format!("lod-jit-disabled:{}", self.disabled_reason()));
         }
         let sid_lower = sid.to_lowercase();
-        let key = format!("{sid_lower}:{level}");
+        let key = sid_lower.clone();
         if self.neg_cache.get(&key).await.is_some() {
             metrics::counter!("abgen_lod_jit_negcache_hits_total").increment(1);
             return Err("lod-build-failed-cached".to_string());
@@ -301,6 +312,11 @@ impl LodJit {
             Ok(Ok(p)) => p,
             Ok(Err(_)) | Err(_) => return Err("lod-build-inflight".to_string()),
         };
+        if self.on_disk(out_root, path).await {
+            metrics::counter!("abgen_lod_jit_coalesced_total").increment(1);
+            invalidate_paths(resolve_cache, path, sid_lower).await;
+            return Ok(());
+        }
         let stage_root = self.workdir.join(format!(
             "stage-{sid_lower}-{level}-{}-{}",
             std::process::id(),
@@ -334,36 +350,34 @@ impl LodJit {
             key: key.to_string(),
             started: std::time::Instant::now(),
         };
-        let mut handle = tokio::task::spawn_blocking(move || runner(params));
-        match tokio::time::timeout(self.timeout, &mut handle).await {
-            Ok(joined) => {
-                let result = finish.settle(joined).await;
-                drop(permit);
-                drop(guard);
-                result
-            }
+        let inflight = self.inflight.clone();
+        let key_owned = key.to_string();
+        let started = finish.started;
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        tokio::spawn(async move {
+            let joined = tokio::task::spawn_blocking(move || runner(params)).await;
+            let result = finish.settle(joined).await;
+            drop(permit);
+            let lock = tokio::sync::OwnedMutexGuard::mutex(&guard).clone();
+            drop(guard);
+            remove_inflight_entry(&inflight, &key_owned, &lock).await;
+            let _ = tx.send(result);
+        });
+        match tokio::time::timeout(self.timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("lod-build-failed".to_string()),
             Err(_) => {
                 metrics::counter!("abgen_lod_jit_builds_total", "outcome" => "timeout")
                     .increment(1);
                 metrics::histogram!("abgen_lod_jit_build_duration_seconds", "outcome" => "timeout")
-                    .record(finish.started.elapsed().as_secs_f64());
+                    .record(started.elapsed().as_secs_f64());
                 tracing::warn!(
                     sid = %sid_lower,
                     level,
                     timeout_s = self.timeout.as_secs(),
-                    "lod jit build timed out; single-flight lock and build slot stay held until \
-                     the detached worker finishes (NOT negative-cached)"
+                    "lod jit build timed out; the detached worker keeps the single-flight lock \
+                     and build slot until it finishes (NOT negative-cached)"
                 );
-                let inflight = self.inflight.clone();
-                let key_owned = key.to_string();
-                tokio::spawn(async move {
-                    let joined = handle.await;
-                    let _ = finish.settle(joined).await;
-                    drop(permit);
-                    let lock = tokio::sync::OwnedMutexGuard::mutex(&guard).clone();
-                    drop(guard);
-                    remove_inflight_entry(&inflight, &key_owned, &lock).await;
-                });
                 Err("lod-build-timeout".to_string())
             }
         }
@@ -534,7 +548,7 @@ where
     state
         .lod_jit
         .run_build(
-            &state.out_root,
+            &state.jit_root,
             &state.catalyst_url,
             &state.resolve_cache,
             path,
@@ -793,6 +807,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&out_root);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn mixed_level_requests_coalesce_to_one_build() {
+        let out_root = temp_dir("mixedlevel");
+        let sid = "bafkreimixed";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c2 = calls.clone();
+        let runner: LodRunner = Arc::new(move |p: crate::lodgen::GenerateParams| {
+            c2.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(150));
+            for lvl in LOD_LEVELS {
+                let dir = PathBuf::from(&p.out_dir)
+                    .join(&p.scene)
+                    .join("LOD")
+                    .join(lvl.to_string());
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join(format!("{}_{lvl}_windows", p.scene)), b"bundle").unwrap();
+            }
+            Ok(ok_outcome(&p.scene))
+        });
+        let jit = Arc::new(test_jit(runner, true, Duration::from_secs(30), &out_root));
+        let cache = new_cache();
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let level = i % 2;
+            let jit = jit.clone();
+            let cache = cache.clone();
+            let out_root = out_root.clone();
+            let path = format!("LOD/{level}/{sid}_{level}_windows");
+            handles.push(tokio::spawn(async move {
+                jit.run_build(&out_root, "http://127.0.0.1:9", &cache, &path, sid, level)
+                    .await
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap(), Ok(()));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(jit.inflight.lock().await.is_empty());
+        let _ = std::fs::remove_dir_all(&out_root);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failing_runner_negcaches_and_short_circuits() {
         let out_root = temp_dir("negcache");
@@ -815,7 +870,7 @@ mod tests {
             .await;
         assert_eq!(second, Err("lod-build-failed-cached".to_string()));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let stored = jit.neg_cache.get(&format!("{sid}:1")).await.unwrap();
+        let stored = jit.neg_cache.get(sid).await.unwrap();
         assert!(stored.contains("boom"), "{stored}");
         let _ = std::fs::remove_dir_all(&out_root);
     }
@@ -865,7 +920,7 @@ mod tests {
             .await;
         assert_eq!(got, Err("lod-build-timeout".to_string()));
         tokio::time::sleep(Duration::from_millis(600)).await;
-        assert!(jit.neg_cache.get(&format!("{sid}:1")).await.is_none());
+        assert!(jit.neg_cache.get(sid).await.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -968,7 +1023,7 @@ mod tests {
             .run_build(&out_root, "http://127.0.0.1:9", &cache, &path, sid, 1)
             .await;
         assert_eq!(first, Err("lod-build-timeout".to_string()));
-        let key = format!("{sid}:1");
+        let key = sid.to_string();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while jit.neg_cache.get(&key).await.is_none() {
             assert!(
@@ -1022,7 +1077,7 @@ mod tests {
             .map(|rd| rd.flatten().map(|e| e.path()).collect())
             .unwrap_or_default();
         assert!(leftovers.is_empty(), "{leftovers:?}");
-        let stored = jit.neg_cache.get(&format!("{sid}:1")).await.unwrap();
+        let stored = jit.neg_cache.get(sid).await.unwrap();
         assert!(stored.contains("self-gate failed"), "{stored}");
         let _ = std::fs::remove_dir_all(&out_root);
     }

@@ -104,23 +104,19 @@ pub fn convert_entity(
             let h = &c.hash;
             let built = (|| -> Result<(String, Vec<u8>)> {
                 let glb = client.fetch_content(h)?;
-                let ext = naming::file_extension(f);
-                let digest = naming::deps_digest_for_glb(&glb, f, &content_by_file, false)?;
-                let name = naming::canonical_filename(h, &ext, &platform, Some(&digest))?;
+                let name = if platform == "mac" {
+                    format!("{}_{platform}", h.to_lowercase())
+                } else {
+                    format!("{h}_{platform}")
+                };
 
                 let resolve_fn = |uri: &str| -> Option<Vec<u8>> {
-                    let key = naming::resolve_uri_to_content_file(uri, f)
-                        .ok()?
-                        .to_lowercase();
-                    let content_hash = content_by_file.get(&key)?;
+                    let content_hash = naming::uri_content_hash(uri, f, &content_by_file)?;
                     client.fetch_content(content_hash).ok()
                 };
                 let resolve: crate::gltf::Resolve = Some(&resolve_fn);
                 let resolve_hash_fn = |uri: &str| -> Option<String> {
-                    let key = naming::resolve_uri_to_content_file(uri, f)
-                        .ok()?
-                        .to_lowercase();
-                    content_by_file.get(&key).cloned()
+                    naming::uri_content_hash(uri, f, &content_by_file).cloned()
                 };
                 let opts = BuildOpts {
                     keep_forward_plus: keep_fp,

@@ -53,7 +53,7 @@ impl Config {
             live_version: env::var("ABGEN_VERSION")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "v41".to_string()),
+                .unwrap_or_else(|| "v49".to_string()),
             manifest_content_server_url: env::var("ABGEN_MANIFEST_CONTENT_SERVER_URL")
                 .ok()
                 .map(|s| s.trim().to_string())

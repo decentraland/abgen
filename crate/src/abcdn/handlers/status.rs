@@ -119,23 +119,22 @@ pub async fn health(State(state): State<AppState>) -> Response {
     });
     #[cfg(feature = "gpu")]
     {
-        body["gpu"] =
-            match crate::gpu_status() {
-                Some((backend, qualified, reason)) => {
-                    metrics::gauge!("abgen_gpu_qualified", "backend" => backend)
-                        .set(if qualified { 1.0 } else { 0.0 });
-                    serde_json::json!({
-                        "backend": backend,
-                        "qualified": qualified,
-                        "reason": reason,
-                    })
-                }
-                None => serde_json::json!({
-                    "backend": "uninitialized",
-                    "qualified": false,
-                    "reason": null,
-                }),
-            };
+        body["gpu"] = match crate::gpu_status() {
+            Some(s) => {
+                metrics::gauge!("abgen_gpu_qualified", "backend" => s.backend)
+                    .set(if s.qualified { 1.0 } else { 0.0 });
+                serde_json::json!({
+                    "backend": s.backend,
+                    "qualified": s.qualified,
+                    "reason": s.reason,
+                })
+            }
+            None => serde_json::json!({
+                "backend": "uninitialized",
+                "qualified": false,
+                "reason": null,
+            }),
+        };
     }
     (status, Json(body)).into_response()
 }

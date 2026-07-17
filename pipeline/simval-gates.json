@@ -1,0 +1,60 @@
+{
+  "doc": "Per-tier simval gate thresholds (abgencompare/verdict.py). tier prod = abgen vs production asset-bundle-converter output (normalized comparison only; production CAB/GUIDs are nondeterministic by design). tier local = abgen vs the local abc-deterministic-guids converter (raw identity comparison gated). Allowlist entries only count when `why` is filled; every entry needs an evidence pointer (compat-bag discipline).",
+  "tiers": {
+    "prod": {
+      "m1": {"min_set_equal_rate": 0.9, "ours_exit_codes": [0], "upstream_exit_codes": [0, 12], "max_unpaired": null},
+      "m2": {"max_load_fail": 0},
+      "m3": {"gated": false},
+      "m4": {"max_fail_rate": 0.02, "min_ident_rate": 0.5, "allowlist_required": true},
+      "m5": {"min_ok_rate": 0.95, "ok_classes": ["identical", "identical-decode", "imperceptible"], "max_ppm": 200, "max_fail": 0, "max_stub": 0},
+      "m6": {"max_pinned_lines": null, "expected_pin_patterns": ["^class=142 ", "^class=49 pid=※ name=metadata( |$)"]},
+      "m8": {"require_all_detected": true, "max_skipped": 0}
+    },
+    "local": {
+      "m1": {"min_set_equal_rate": 1.0, "ours_exit_codes": [0], "upstream_exit_codes": [0], "max_unpaired": 0},
+      "m2": {"max_load_fail": 0},
+      "m3": {"gated": true, "min_cab_equal_rate": 1.0, "min_pid_ok_rate": 0.9},
+      "m4": {"max_fail_rate": 0.0, "min_ident_rate": 0.95, "allowlist_required": true},
+      "m5": {"min_ok_rate": 1.0, "ok_classes": ["identical", "identical-decode"], "max_fail": 0, "max_stub": 0},
+      "m6": {"max_pinned_lines": 0},
+      "m8": {"require_all_detected": true, "max_skipped": 0}
+    }
+  },
+  "allowlist": [
+    {
+      "signature": "raw file CAB-….resS bytes=#",
+      "why": "The .resS texture stream size differs when ours preserves source texture dims/mips while the vintage production reference (v22-v36 era) applies a downsize cap and/or ships truncated mip chains. Same-vintage divergence reproduced 1:1 against the LIVE production CDN (12/12 label agreement snapshot-vs-live), so this is upstream vintage, not an adapter or abgen artifact.",
+      "evidence": "compat bag §A benign + mac-standalone decomposition ('dims: ours larger, upstream applies a downsize cap', 'upstream-ships-1-mip family')(abgen compat bag, 2026-07-03); runs/20260715-153637-simval-a-win + 20260715-153654-simval-a-mac structure.jsonl (single divergent line class across all 18 structDiff pairs); live cross-check runs/20260715-154105-simval-a-live"
+    },
+    {
+      "signature": "m5:bafkreib25s3kqe3cfj5ejoolgznizyrusetk6lrer3bc57ukbg7fclljmy",
+      "why": "Dims policy: ours 1024x512 (source-preserving) vs upstream v36 512x256 (vintage downsize cap), mips 11 vs 10; decoded pixel compare impossible across dims, 0 delta otherwise.",
+      "evidence": "compat bag 'dims: ours larger, upstream applies a downsize cap ours doesn't' (abgen compat bag, 2026-07-03); texcmp rows in runs/20260715-153637-simval-a-win + 20260715-153654-simval-a-mac"
+    },
+    {
+      "signature": "m5:bafkreid2fuffvxm6w2uimphn4tyxyox3eewt3r67zbrewbdonkjb7bqzx4",
+      "why": "Upstream-ships-1-mip vintage family: mips ours=10 vs upstream=1, base-level texels near-identical (maxChannelDelta 9, meanDelta 0.0023).",
+      "evidence": "compat bag 'upstream-ships-1-mip family ~745' + 'stale GLTFast-era build (runtime image_N textures, mips=1)... B-class (upstream vintage), do not chase'; texcmp rows in runs/20260715-153637-simval-a-win + 20260715-153654-simval-a-mac"
+    },
+    {
+      "signature": "m5:bafkreiettvk4675jx7oi7pofbggn5kbgu6s6gqztiw4bcxhbik4actedge",
+      "why": "BC7 encoder block-choice drift vs different-vintage upstream encoder: 17.8% of pixels differ but maxChannelDelta=4, meanDelta 0.14 — perceptually near-identical, over the 200ppm line only because the line counts pixels not magnitude.",
+      "evidence": "compat bag §A benign 'Honest-path BC7/mip per-pixel encoder drift vs different-vintage upstream (mean color + coverage match; e.g. m09764 stone texture 427K ppm but perceptually near-identical)'; texcmp rows in runs/20260715-153637-simval-a-win + 20260715-153654-simval-a-mac"
+    },
+    {
+      "signature": "m5:bafkreie2zkxkaboe6lo2yuafimiu4rzdlyuw4cvyaaocx4szwyranfpoaa",
+      "why": "BC7 encoder drift vs vintage upstream: 7.9% pixels differ, maxChannelDelta=16, meanDelta 0.047.",
+      "evidence": "compat bag §A benign BC7 encoder-drift class; texcmp rows in runs/20260715-153637-simval-a-win + 20260715-153654-simval-a-mac"
+    },
+    {
+      "signature": "m5:bafkreibjdo4wygl3wt2olzmcpzevmgewbf6v4t3zvu2ojzrum27vt6lkve",
+      "why": "Encoder/resize-semantics drift vs vintage upstream: 2.4% pixels differ, meanDelta 0.10, isolated edge texels to maxChannelDelta=88 (resize filter edge handling).",
+      "evidence": "compat bag 'encoder noise → resize-semantics divergence; worst offenders are content-scale/resize differences'; texcmp rows in runs/20260715-153637-simval-a-win + 20260715-153654-simval-a-mac"
+    },
+    {
+      "signature": "m5:bafkreidvmdpycofi6j6xedlkib6ka4yrt5lrtk3b5g5lesuvmlraf2677m",
+      "why": "Encoder/resize-semantics drift vs vintage upstream: 0.6% pixels differ, meanDelta 0.089, isolated edge texels to maxChannelDelta=78.",
+      "evidence": "compat bag 'encoder noise → resize-semantics divergence'; texcmp rows in runs/20260715-153637-simval-a-win + 20260715-153654-simval-a-mac"
+    }
+  ]
+}

@@ -96,7 +96,11 @@ public static class AbAnimCapture
             rc = 2;
         }
         finally { if (s_log != null) s_log.Flush(); }
-        EditorApplication.Exit(rc);
+        // EditorApplication.Exit runs Unity's managed shutdown, which hangs
+        // forever when a plugin background thread refuses to abort. All
+        // outputs are already flushed to disk — hard-terminate instead
+        // (same pattern as AbVisualCompare; pipeline harvests on any rc).
+        System.Diagnostics.Process.GetCurrentProcess().Kill();
     }
 
     static void RunInner()
@@ -204,12 +208,14 @@ public static class AbAnimCapture
             // clip set: top-level + AnimatorController sub-assets (emote bundles), name-sorted.
             // Sample EVERY clip: emote bundles carry an _Avatar clip (invisible skeleton) plus
             // prop clips — sampling only one can leave the visible meshes at rest pose.
-            var clipSet = new Dictionary<int, AnimationClip>();
-            foreach (AnimationClip c in all.OfType<AnimationClip>()) clipSet[c.GetInstanceID()] = c;
+            // reference-keyed dedup: GetInstanceID() is obsolete-as-error on
+            // Unity 6000.5+, and same instance <=> same id anyway
+            var clipSet = new HashSet<AnimationClip>();
+            foreach (AnimationClip c in all.OfType<AnimationClip>()) clipSet.Add(c);
             foreach (RuntimeAnimatorController rac in all.OfType<RuntimeAnimatorController>())
                 foreach (AnimationClip c in rac.animationClips)
-                    if (c != null) clipSet[c.GetInstanceID()] = c;
-            var clips = clipSet.Values.OrderBy(c => c.name, StringComparer.Ordinal).ToList();
+                    if (c != null) clipSet.Add(c);
+            var clips = clipSet.OrderBy(c => c.name, StringComparer.Ordinal).ToList();
             if (clips.Count == 0) throw new Exception("animated job but bundle has no AnimationClip");
             L(label + " prefabs=" + prefabs.Count + " clips=" + clips.Count +
               " [" + string.Join(",", clips.Select(c => c.name + ":" + F(c.length))) + "]");

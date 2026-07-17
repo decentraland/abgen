@@ -143,10 +143,7 @@ fn scan_one(
     let mut normal_refs: Vec<String> = Vec::new();
     let parse_ext = if fl.ends_with(".gltf") { "gltf" } else { "glb" };
     let resolve_fn = |uri: &str| -> Option<Vec<u8>> {
-        let key = naming::resolve_uri_to_content_file(uri, f)
-            .ok()?
-            .to_lowercase();
-        let hh = content_by_file.get(&key)?;
+        let hh = naming::uri_content_hash(uri, f, content_by_file)?;
         store.fetch(hh).ok()
     };
     let resolve: crate::gltf::Resolve = Some(&resolve_fn);
@@ -156,10 +153,7 @@ fn scan_one(
     if let Ok(Ok(scene)) = parsed {
         let image_hash = |idx: usize| -> Option<String> {
             let uri = scene.image_uri.get(idx).and_then(|o| o.as_ref())?;
-            let key = naming::resolve_uri_to_content_file(uri, f)
-                .ok()?
-                .to_lowercase();
-            content_by_file.get(&key).cloned()
+            naming::uri_content_hash(uri, f, content_by_file).cloned()
         };
         let mut normal_idx: HashSet<usize> = HashSet::new();
         let mut other_idx: HashSet<usize> = HashSet::new();
@@ -222,7 +216,11 @@ impl EntityScan {
                 Some(h) => h,
                 None => continue,
             };
-            let name = format!("{h}_{platform}");
+            let name = if platform == "mac" {
+                format!("{}_{platform}", h.to_lowercase())
+            } else {
+                format!("{h}_{platform}")
+            };
             if seen.insert(name.clone()) {
                 out.push(name);
             }

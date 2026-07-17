@@ -162,6 +162,14 @@ function drift(s){
   const r = triRatio(s);
   return (r != null && (r < 0.6 || r > 1.05)) || (s.fails||0) > 8;
 }
+function renderCol(side, label, sceneId){
+  const im = side && side.render;
+  if (!im) return `<div class="col"><div class="lbl">${label} render</div><div class="none">no render</div></div>`;
+  const cap = `${esc(sceneId)} — ${label} unity render (LOD1)`;
+  return `<div class="col"><div class="lbl">${label} · unity render</div>
+    <img loading="lazy" src="${R('img/'+encodeURIComponent(im))}" data-cap="${esc(cap)}"
+      onclick="zoom(this)"></div>`;
+}
 function imgCol(side, label, sceneId){
   const t = side && side.textures && side.textures[0];
   const im = t && t.imgs && t.imgs.mip0;
@@ -190,6 +198,8 @@ function card(s){
       <span class="ptr">${esc(ptr)}${s.pointers && s.pointers.length>1 ? ' +'+(s.pointers.length-1):''}</span>
       <span class="badge ${bc}">${bt}</span></div>
     <div class="imgs">${imgCol(s.ours,'ours',s.id)}${imgCol(s.prod,'prod',s.id)}</div>
+    ${(s.ours && s.ours.render) || (s.prod && s.prod.render) ?
+      `<div class="imgs">${renderCol(s.ours,'ours',s.id)}${renderCol(s.prod,'prod',s.id)}</div>` : ''}
     <div class="stats">
       <span>tris <b>${s.ours.tris ?? '—'}</b> / ${s.prod ? (s.prod.tris ?? '—') : '—'}
         ${r != null ? '(<b>'+r.toFixed(3)+'</b>)' : ''}</span>

@@ -261,11 +261,17 @@ pub fn resolve_uri_to_content_file(uri: &str, glb_file: &str) -> Result<String> 
     Ok(normalized)
 }
 
-/// Extensions that participate in a glb/gltf deps digest — buffers plus the
-/// texture formats the upstream converter classifies as inputs. Mirrors
-/// `GLB_DEP_EXTENSIONS` in the consumer-server (`asset-reuse.ts`): a resolved
-/// dep outside this set is excluded from the digest even though it still had
-/// to resolve against the entity content map.
+pub fn uri_content_hash<'a>(
+    uri: &str,
+    source_file: &str,
+    content_by_file: &'a HashMap<String, String>,
+) -> Option<&'a String> {
+    let key = resolve_uri_to_content_file(uri, source_file)
+        .ok()?
+        .to_lowercase();
+    content_by_file.get(&key)
+}
+
 pub const GLB_DEP_EXTENSIONS: [&str; 11] = [
     ".bin", ".jpg", ".png", ".jpeg", ".tga", ".gif", ".bmp", ".psd", ".tiff", ".iff", ".ktx",
 ];
@@ -343,14 +349,21 @@ pub fn deps_digest_for_glb(
     Ok(compute_deps_digest(&deps))
 }
 
-/// Split a bundle-name stem (platform suffix already removed) into
-/// `(content_hash, deps_digest)`. Content hashes (Qm…/bafk…) never contain
-/// `_`, so the first `_` separates the hash from the digest of a canonical
-/// glb/gltf name; plain names return `(stem, None)`.
 pub fn split_bundle_stem(stem: &str) -> (&str, Option<&str>) {
     match stem.split_once('_') {
         Some((h, d)) if !h.is_empty() && !d.is_empty() => (h, Some(d)),
         _ => (stem, None),
+    }
+}
+
+pub fn bundle_name_has_digest(name: &str) -> bool {
+    let stem = ["_windows", "_mac", "_linux", "_webgl"]
+        .iter()
+        .find_map(|s| name.strip_suffix(s))
+        .unwrap_or(name);
+    match split_bundle_stem(stem).1 {
+        Some(d) => d.len() == 32 && d.bytes().all(|b| b.is_ascii_hexdigit()),
+        None => false,
     }
 }
 
@@ -407,10 +420,6 @@ mod tests {
 
     #[test]
     fn deps_digest_filters_non_dep_extensions() {
-        // Upstream `computeDepsDigest` filters to GLB_DEP_EXTENSIONS before
-        // hashing, so a resolved ref outside the set must not perturb the
-        // digest — including the empty digest for a glb whose only ref is
-        // filtered out.
         let base = compute_deps_digest(&[("a/b.bin".to_string(), "hashX".to_string())]);
         let with_extra = compute_deps_digest(&[
             ("a/b.bin".to_string(), "hashX".to_string()),
@@ -432,6 +441,21 @@ mod tests {
     }
 
     #[test]
+    fn bundle_name_digest_detection() {
+        assert!(bundle_name_has_digest(
+            "Qmhash_4f53cda18c2baa0c0354bb5f9a3ecbe5_windows"
+        ));
+        assert!(!bundle_name_has_digest("Qmhash_windows"));
+        assert!(!bundle_name_has_digest("Qmhash_mac"));
+        assert!(!bundle_name_has_digest(
+            "staticscene_bafkreihkilunnrpzailg456vx6izcutc6ueixnud6epesb7ydrrxupdegi_windows"
+        ));
+        assert!(bundle_name_has_digest(
+            "bafybeifhash_00112233445566778899aabbccddeeff_mac"
+        ));
+    }
+
+    #[test]
     fn resolve_basic() {
         assert_eq!(
             resolve_uri_to_content_file("tex/a.png", "models/scene.glb").unwrap(),
@@ -440,6 +464,26 @@ mod tests {
         assert!(resolve_uri_to_content_file("../../etc", "scene.glb").is_err());
         assert!(resolve_uri_to_content_file("/abs", "scene.glb").is_err());
         assert!(resolve_uri_to_content_file("http://x/y", "scene.glb").is_err());
+    }
+
+    #[test]
+    fn uri_content_hash_resolves_and_lowercases() {
+        let content: HashMap<String, String> =
+            [("models/tex/a.png".to_string(), "Qm1".to_string())]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            uri_content_hash("Tex/A.png", "models/scene.glb", &content),
+            Some(&"Qm1".to_string())
+        );
+        assert_eq!(
+            uri_content_hash("missing.png", "models/scene.glb", &content),
+            None
+        );
+        assert_eq!(
+            uri_content_hash("/abs.png", "models/scene.glb", &content),
+            None
+        );
     }
 }
 

@@ -365,10 +365,7 @@ pub fn assemble_from(
                     ".glb"
                 };
                 let resolve_fn = |uri: &str| -> Option<Vec<u8>> {
-                    let key = crate::naming::resolve_uri_to_content_file(uri, &src_name)
-                        .ok()?
-                        .to_lowercase();
-                    let h = by_file.get(&key)?;
+                    let h = crate::naming::uri_content_hash(uri, &src_name, by_file)?;
                     fetch(h).ok()
                 };
                 let parsed = crate::gltf::parse(&bytes, ext, Some(&resolve_fn), false, true)

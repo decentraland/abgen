@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess
+from collections import Counter
 
 from .localserver import REPO_ROOT
 
@@ -16,11 +17,19 @@ TOOL_DIR = os.path.join(REPO_ROOT, "target", "release", "examples")
 
 CAB_RE = re.compile(r"cab-[0-9a-f]{32}", re.IGNORECASE)
 PID_RE = re.compile(r"pid ?= ?-?\d+")
+PID_RAW_RE = re.compile(r"pid ?= ?(-?\d+)")
 PINNED_RE = re.compile(r"^class=142 |^class=49 pid=※ name=metadata( |$)")
 
 
 def vol_norm(line):
     return PID_RE.sub("pid=※", CAB_RE.sub("CAB-…", line))
+
+
+def signature_of(norm_line):
+    """Stable truncated key for one normalized diff line: whitespace collapsed
+    and digit runs folded to '#', so one divergence CLASS maps to one
+    allowlist signature instead of one entry per literal line."""
+    return re.sub(r"\d+", "#", " ".join(norm_line.split()))[:96]
 
 
 def tool(name):
@@ -125,33 +134,38 @@ def _dump_lines(text):
     return lines
 
 
-def struct_diff(up_path, ours_path, timeout=90):
-    """objdump both sides, pid/CAB-normalize, line-diff.
-
-    Returns dict: parse failures -> loadFail*; else counts of differing lines
-    split into pinned (manifest/metadata: expected to differ — timestamp,
-    version, CAB names) and real structural drift.
-    """
+def dump_texts(up_path, ours_path, timeout=90):
+    """objdump BOTH sides exactly once so struct_diff and id_diff share the
+    captured raw texts. -> (fail_dict|None, up_txt, ours_txt)."""
     objdump = tool("objdump")
     if not objdump:
-        return {"error": "objdump tool missing (build crate examples)"}
+        return {"error": "objdump tool missing (build crate examples)"}, None, None
     try:
         up_txt, up_rc = run_dump(objdump, up_path, timeout)
     except subprocess.TimeoutExpired:
-        return {"class": "loadFailUpstream", "error": "objdump timeout (upstream)"}
+        return {"class": "loadFailUpstream",
+                "error": "objdump timeout (upstream)"}, None, None
     try:
         ours_txt, ours_rc = run_dump(objdump, ours_path, timeout)
     except subprocess.TimeoutExpired:
-        return {"class": "loadFailOurs", "error": "objdump timeout (ours)"}
+        return {"class": "loadFailOurs",
+                "error": "objdump timeout (ours)"}, None, None
     for side, txt, rc in (("Upstream", up_txt, up_rc), ("Ours", ours_txt, ours_rc)):
         if rc != 0 or "parse error" in txt or "read error" in txt:
             return {
                 "class": f"loadFail{side}",
                 "error": f"objdump failed on {side.lower()} bundle",
-            }
+            }, up_txt, ours_txt
+    return None, up_txt, ours_txt
+
+
+def struct_diff_from_texts(up_txt, ours_txt):
+    """pid/CAB-normalize, line-multiset diff. Counts split into pinned
+    (manifest/metadata: expected to differ — timestamp, version, CAB names)
+    and real structural drift; both get bounded samples."""
     ul = [vol_norm(x) for x in _dump_lines(up_txt)]
     ol = [vol_norm(x) for x in _dump_lines(ours_txt)]
-    pinned_lines, samples = 0, []
+    pinned_lines, samples, pinned_samples = 0, [], []
     up_only = ours_only = 0
     uset, oset = {}, {}
     for x in ul:
@@ -163,6 +177,8 @@ def struct_diff(up_path, ours_path, timeout=90):
         if extra > 0:
             if PINNED_RE.search(x):
                 pinned_lines += extra
+                if len(pinned_samples) < 8:
+                    pinned_samples.append({"up": x[:200], "ours": None})
             else:
                 up_only += extra
                 if len(samples) < 12:
@@ -172,6 +188,8 @@ def struct_diff(up_path, ours_path, timeout=90):
         if extra > 0:
             if PINNED_RE.search(x):
                 pinned_lines += extra
+                if len(pinned_samples) < 8:
+                    pinned_samples.append({"up": None, "ours": x[:200]})
             else:
                 ours_only += extra
                 if len(samples) < 12:
@@ -185,6 +203,47 @@ def struct_diff(up_path, ours_path, timeout=90):
         "pinnedDiffLines": pinned_lines,
         "upOnly": up_only,
         "oursOnly": ours_only,
+        "samples": samples,
+        "pinnedSamples": pinned_samples,
+    }
+
+
+def struct_diff(up_path, ours_path, timeout=90):
+    """objdump both sides, pid/CAB-normalize, line-diff.
+
+    Returns dict: parse failures -> loadFail*; else struct_diff_from_texts.
+    """
+    fail, up_txt, ours_txt = dump_texts(up_path, ours_path, timeout)
+    if fail:
+        return fail
+    return struct_diff_from_texts(up_txt, ours_txt)
+
+
+def id_diff(up_txt, ours_txt):
+    """L3 identity agreement over RAW objdump text — zero normalization, the
+    instrument vol_norm structurally erases: raw pid= i64 multisets (pid
+    equality transitively tests GUID-seed agreement — path_id = prefab-packed
+    SpookyHash of (guid, localId, fileType)) and raw CAB node names."""
+    up_pids = Counter(int(m) for m in PID_RAW_RE.findall(up_txt))
+    ours_pids = Counter(int(m) for m in PID_RAW_RE.findall(ours_txt))
+    inter = sum((up_pids & ours_pids).values())
+    union = sum((up_pids | ours_pids).values())
+    up_only = up_pids - ours_pids
+    ours_only = ours_pids - up_pids
+    cab_up = sorted(set(CAB_RE.findall(up_txt)))
+    cab_ours = sorted(set(CAB_RE.findall(ours_txt)))
+    samples = [{"side": "up", "pid": p} for p in sorted(up_only)[:6]]
+    samples += [{"side": "ours", "pid": p}
+                for p in sorted(ours_only)[:12 - len(samples)]]
+    return {
+        "cabUp": cab_up,
+        "cabOurs": cab_ours,
+        "cabEqual": cab_up == cab_ours,
+        "pidUp": sum(up_pids.values()),
+        "pidOurs": sum(ours_pids.values()),
+        "pidJaccard": round(inter / union, 6) if union else 1.0,
+        "pidUpOnly": sum(up_only.values()),
+        "pidOursOnly": sum(ours_only.values()),
         "samples": samples,
     }
 

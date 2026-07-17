@@ -229,11 +229,15 @@ pub fn gpu_ready() -> Result<(), String> {
     }
 }
 
-pub fn gpu_status() -> Option<(&'static str, bool, Option<String>)> {
+pub fn gpu_status() -> Option<crate::GpuStatus> {
     RESOLVED
         .get()
         .and_then(|r| r.status.as_ref())
-        .map(|s| (s.backend, s.qualified, s.reason.clone()))
+        .map(|s| crate::GpuStatus {
+            backend: s.backend,
+            qualified: s.qualified,
+            reason: s.reason.clone(),
+        })
 }
 
 #[allow(clippy::too_many_arguments)]

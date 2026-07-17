@@ -25,7 +25,7 @@
 
         abgenPkg = pkgs.rustPlatform.buildRustPackage {
           pname = "abgen";
-          version = "0.9.9";
+          version = "0.9.14";
           src = self;
           cargoLock = {
             lockFile = ./Cargo.lock;
@@ -88,7 +88,7 @@
           in
           pkgs.rustPlatform.buildRustPackage {
             pname = "abgen-compare";
-            version = "0.9.9";
+            version = "0.9.14";
             src = self;
             cargoLock = {
               lockFile = ./Cargo.lock;

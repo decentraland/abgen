@@ -31,6 +31,16 @@ fn write_bundle_atomic(out_path: &Path, data: &[u8]) -> std::io::Result<()> {
         })
 }
 
+pub(crate) fn link_or_copy_atomic(src: &Path, dst: &Path) -> bool {
+    let tmp = bundle_tmp_path(dst);
+    let staged = std::fs::hard_link(src, &tmp).is_ok() || std::fs::copy(src, &tmp).is_ok();
+    if staged && std::fs::rename(&tmp, dst).is_ok() {
+        return true;
+    }
+    let _ = std::fs::remove_file(&tmp);
+    false
+}
+
 pub(crate) fn build_one(
     store: &LocalContentStore,
     content_by_file: &HashMap<String, String>,
@@ -54,12 +64,8 @@ fn build_group(
         .source_file
         .clone()
         .unwrap_or_else(|| format!("{}.glb", spec.cid));
-    let sf_for_bytes = effective_source.clone();
     let resolve_fn = |uri: &str| -> Option<Vec<u8>> {
-        let key = naming::resolve_uri_to_content_file(uri, &sf_for_bytes)
-            .ok()?
-            .to_lowercase();
-        let h = content_by_file.get(&key)?;
+        let h = naming::uri_content_hash(uri, &effective_source, content_by_file)?;
         store.fetch(h).ok()
     };
     let resolve: abgen::gltf::Resolve = if !content_by_file.is_empty() {
@@ -67,12 +73,8 @@ fn build_group(
     } else {
         None
     };
-    let sf_for_hash = effective_source.clone();
     let resolve_hash_fn = |uri: &str| -> Option<String> {
-        let key = naming::resolve_uri_to_content_file(uri, &sf_for_hash)
-            .ok()?
-            .to_lowercase();
-        content_by_file.get(&key).cloned()
+        naming::uri_content_hash(uri, &effective_source, content_by_file).cloned()
     };
     let resolve_hash: Option<abgen::builder::ResolveHash> =
         if !content_by_file.is_empty() && spec.source_file.is_some() {
@@ -128,16 +130,16 @@ pub(crate) fn write_cdn_manifest(
         return Ok(missing.len());
     }
 
-    abgen::manifest::write_corpus_manifest(
+    abgen::manifest::write_corpus_manifest(&abgen::manifest::CorpusManifestSpec {
         out_root,
         entity_id,
         platform,
-        &built,
+        built: &built,
         ab_version,
         content_server_url,
-        abgen::manifest::exit_code_for_failures(missing.len()),
+        exit_code: abgen::manifest::exit_code_for_failures(missing.len()),
         date,
-    )?;
+    })?;
     Ok(missing.len())
 }
 
@@ -169,60 +171,19 @@ pub(crate) fn build_bundle_at(
     first_written: Option<&FirstWritten>,
     c: &BuildCounters,
 ) {
-    let out_path = ent_out.join(&spec.bundle_name);
-    let vkey = first_written.and_then(|_| variant_key_for(store, content_by_file, spec, toggles));
-    if skip_existing && !force {
-        if let Ok(m) = std::fs::metadata(&out_path) {
-            if m.is_file() && m.len() > 0 {
-                c.skipped.fetch_add(1, Ordering::Relaxed);
-                if let Some(fw) = first_written {
-                    record_claim(fw, &spec.bundle_name, &out_path, vkey.as_ref(), entity_id);
-                }
-                return;
-            }
-        }
-    }
-    if let Some(fw) = first_written {
-        let prior = fw
-            .lock()
-            .unwrap()
-            .get(&spec.bundle_name)
-            .map(|e| e.path.clone());
-        if let Some(src) = prior {
-            let tmp = bundle_tmp_path(&out_path);
-            let staged =
-                std::fs::hard_link(&src, &tmp).is_ok() || std::fs::copy(&src, &tmp).is_ok();
-            let linked = staged && std::fs::rename(&tmp, &out_path).is_ok();
-            if linked {
-                c.built.fetch_add(1, Ordering::Relaxed);
-                record_claim(fw, &spec.bundle_name, &out_path, vkey.as_ref(), entity_id);
-            } else {
-                let _ = std::fs::remove_file(&tmp);
-                c.errs.fetch_add(1, Ordering::Relaxed);
-                eprintln!("link {}/{}: failed", entity_id, spec.bundle_name);
-            }
-            return;
-        }
-    }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        build_one(store, content_by_file, spec, &out_path, toggles)
-    }));
-    match result {
-        Ok(Ok(_)) => {
-            if let Some(fw) = first_written {
-                record_claim(fw, &spec.bundle_name, &out_path, vkey.as_ref(), entity_id);
-            }
-            c.built.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(Err(e)) => {
-            c.errs.fetch_add(1, Ordering::Relaxed);
-            eprintln!("err {}/{}: {e}", entity_id, spec.bundle_name);
-        }
-        Err(_) => {
-            c.errs.fetch_add(1, Ordering::Relaxed);
-            eprintln!("panic {}/{} (skipped)", entity_id, spec.bundle_name);
-        }
-    }
+    let ent_outs = [ent_out.to_path_buf()];
+    build_bundle_multi_at(
+        store,
+        content_by_file,
+        &[spec],
+        &ent_outs,
+        entity_id,
+        toggles,
+        skip_existing,
+        force,
+        &[first_written],
+        c,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -235,10 +196,14 @@ pub(crate) fn build_bundle_multi_at(
     toggles: EffectiveToggles,
     skip_existing: bool,
     force: bool,
-    first_written: &[FirstWritten],
+    first_written: &[Option<&FirstWritten>],
     c: &BuildCounters,
 ) {
-    let vkey = variant_key_for(store, content_by_file, specs[0], toggles);
+    let vkey = first_written
+        .iter()
+        .any(Option::is_some)
+        .then(|| variant_key_for(store, content_by_file, specs[0], toggles))
+        .flatten();
     let mut pending: Vec<usize> = Vec::new();
     for (i, spec) in specs.iter().enumerate() {
         let out_path = ent_outs[i].join(&spec.bundle_name);
@@ -246,42 +211,29 @@ pub(crate) fn build_bundle_multi_at(
             if let Ok(m) = std::fs::metadata(&out_path) {
                 if m.is_file() && m.len() > 0 {
                     c.skipped.fetch_add(1, Ordering::Relaxed);
-                    record_claim(
-                        &first_written[i],
-                        &spec.bundle_name,
-                        &out_path,
-                        vkey.as_ref(),
-                        entity_id,
-                    );
+                    if let Some(fw) = first_written[i] {
+                        record_claim(fw, &spec.bundle_name, &out_path, vkey.as_ref(), entity_id);
+                    }
                     continue;
                 }
             }
         }
-        let prior = first_written[i]
-            .lock()
-            .unwrap()
-            .get(&spec.bundle_name)
-            .map(|e| e.path.clone());
-        if let Some(src) = prior {
-            let tmp = bundle_tmp_path(&out_path);
-            let staged =
-                std::fs::hard_link(&src, &tmp).is_ok() || std::fs::copy(&src, &tmp).is_ok();
-            let linked = staged && std::fs::rename(&tmp, &out_path).is_ok();
-            if linked {
-                c.built.fetch_add(1, Ordering::Relaxed);
-                record_claim(
-                    &first_written[i],
-                    &spec.bundle_name,
-                    &out_path,
-                    vkey.as_ref(),
-                    entity_id,
-                );
-            } else {
-                let _ = std::fs::remove_file(&tmp);
-                c.errs.fetch_add(1, Ordering::Relaxed);
-                eprintln!("link {}/{}: failed", entity_id, spec.bundle_name);
+        if let Some(fw) = first_written[i] {
+            let prior = fw
+                .lock()
+                .unwrap()
+                .get(&spec.bundle_name)
+                .map(|e| e.path.clone());
+            if let Some(src) = prior {
+                if link_or_copy_atomic(&src, &out_path) {
+                    c.built.fetch_add(1, Ordering::Relaxed);
+                    record_claim(fw, &spec.bundle_name, &out_path, vkey.as_ref(), entity_id);
+                } else {
+                    c.errs.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("link {}/{}: failed", entity_id, spec.bundle_name);
+                }
+                continue;
             }
-            continue;
         }
         pending.push(i);
     }
@@ -306,13 +258,15 @@ pub(crate) fn build_bundle_multi_at(
     match result {
         Ok(Ok(_)) => {
             for (&i, out_path) in pending.iter().zip(out_paths.iter()) {
-                record_claim(
-                    &first_written[i],
-                    &specs[i].bundle_name,
-                    out_path,
-                    vkey.as_ref(),
-                    entity_id,
-                );
+                if let Some(fw) = first_written[i] {
+                    record_claim(
+                        fw,
+                        &specs[i].bundle_name,
+                        out_path,
+                        vkey.as_ref(),
+                        entity_id,
+                    );
+                }
                 c.built.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -333,9 +287,15 @@ pub(crate) fn build_bundle_multi_at(
 fn sibling_spec(spec: &BundleSpec, primary: &str, platform: &str) -> BundleSpec {
     let old_suffix = format!("_{primary}");
     let swap = |s: &str| -> String {
-        s.strip_suffix(old_suffix.as_str())
+        let swapped = s
+            .strip_suffix(old_suffix.as_str())
             .map(|stem| format!("{stem}_{platform}"))
-            .unwrap_or_else(|| s.to_string())
+            .unwrap_or_else(|| s.to_string());
+        if platform == "mac" {
+            swapped.to_lowercase()
+        } else {
+            swapped
+        }
     };
     BundleSpec {
         bundle_name: swap(&spec.bundle_name),
@@ -392,11 +352,14 @@ pub(crate) fn derive_one_entity(
         if !store.exists(&c.hash) {
             continue;
         }
-        let bundle_name = if toggles.asset_reuse && is_glb {
-            // Magenta-tolerant runs drop unresolvable deps from the digest
-            // (the build substitutes placeholders); strict runs skip the glb
-            // entirely, mirroring the upstream converter's skipped-assets
-            // handling for missing deps.
+        let case_hash = if platform == "mac" {
+            c.hash.to_lowercase()
+        } else {
+            c.hash.clone()
+        };
+        let digest_naming =
+            toggles.asset_reuse && is_glb && entity_type.as_deref() == Some("scene");
+        let bundle_name = if digest_naming {
             let digest = store.fetch_mmap(&c.hash).ok().and_then(|bytes| {
                 abgen::naming::deps_digest_for_glb(
                     &bytes,
@@ -408,11 +371,11 @@ pub(crate) fn derive_one_entity(
                 .ok()
             });
             match digest {
-                Some(d) => format!("{}_{d}_{platform}", c.hash),
+                Some(d) => format!("{case_hash}_{d}_{platform}"),
                 None => continue,
             }
         } else {
-            format!("{}_{platform}", c.hash)
+            format!("{case_hash}_{platform}")
         };
         if !local_seen.insert(bundle_name.clone()) {
             continue;
@@ -483,9 +446,7 @@ pub(crate) fn run_fused_entity_ids(
         errs: &errs,
         skipped: &skipped,
     };
-    // Per-bundle heartbeat: the per-entity progress line above only fires
-    // every 5000 entities, so a single big scene (hundreds of bundles) sits
-    // silent for minutes. Prints at most every 2s while bundles complete.
+    let fw_refs: Vec<Option<&FirstWritten>> = first_written.iter().map(Some).collect();
     let last_print_ms = std::sync::atomic::AtomicU64::new(0);
     let heartbeat = || {
         let elapsed_ms = t0.elapsed().as_millis() as u64;
@@ -583,7 +544,7 @@ pub(crate) fn run_fused_entity_ids(
                     toggles,
                     skip_existing,
                     force,
-                    &first_written,
+                    &fw_refs,
                     &counters,
                 );
             }
@@ -635,36 +596,6 @@ pub(crate) fn run_fused_entity_ids(
         manifest_incomplete: manifest_incomplete.into_inner(),
         reconcile,
     }
-}
-
-#[allow(dead_code)]
-fn iso8601_utc_now() -> String {
-    let dur = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let total_secs = dur.as_secs();
-    let millis = dur.subsec_millis();
-    let days = (total_secs / 86_400) as i64;
-    let secs_of_day = (total_secs % 86_400) as i64;
-    let hour = secs_of_day / 3600;
-    let minute = (secs_of_day % 3600) / 60;
-    let second = secs_of_day % 60;
-    let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
-}
-
-const fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
 }
 
 pub(crate) const IMAGE_EXTS: [&str; 3] = [".png", ".jpg", ".jpeg"];
@@ -751,7 +682,6 @@ mod tests {
             ("t.png".to_string(), "Qmtex".to_string()),
         ]);
         assert_eq!(glb_names(&reuse), vec![format!("Qmglb_{digest}_windows")]);
-        // Textures stay hash-keyed: leaves have no inbound dep refs.
         assert!(reuse
             .bundles
             .iter()
@@ -771,8 +701,6 @@ mod tests {
         store.write("Qmtex", b"PNG").unwrap();
         let cache = abgen::glbscan::UriCache::new();
 
-        // Strict: unresolvable "a.bin" skips the glb (upstream skipped-assets
-        // semantics) but leaves the rest of the entity intact.
         let strict = derive_one_entity(
             &store,
             "bafyentity",
@@ -787,7 +715,6 @@ mod tests {
             .iter()
             .any(|b| b.bundle_name == "Qmtex_windows"));
 
-        // Magenta-tolerant: digest over the resolvable subset.
         let tolerant =
             derive_one_entity(&store, "bafyentity", "windows", &cache, toggles(true, true))
                 .unwrap();

@@ -214,7 +214,13 @@ def stage_ab_root(ab_root: str | Path, platform: str,
     """Create the AB_ROOT layout: shader/, out/, and (optionally) the shader
     bundle copy and a jobs file. Returns the AB_ROOT path."""
     root = Path(ab_root)
-    (root / "out").mkdir(parents=True, exist_ok=True)
+    out = root / "out"
+    if out.is_dir():
+        # a reused staging root (e.g. WSL win-staging) accumulates prior
+        # runs' renders; a stale same-label file would classify as fresh
+        # whenever Unity fails, so staging always starts from an empty out/
+        shutil.rmtree(out)
+    out.mkdir(parents=True, exist_ok=True)
     (root / "shader").mkdir(parents=True, exist_ok=True)
     if shader_bundle is not None:
         shutil.copyfile(shader_bundle, root / shader_relpath(platform))

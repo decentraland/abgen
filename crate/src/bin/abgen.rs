@@ -23,7 +23,7 @@ ENV:
   ABGEN_CATALYST_URL        upstream catalyst content URL (default http://127.0.0.1:5141/content)
   ABGEN_CACHE_DIR           in-process JIT cache dir (default ./abgen-serve-cache)
   ABGEN_ROOT                dir containing template/ + shader assets (default: crate dir)
-  ABGEN_VERSION             served bundle version prefix (default v41)
+  ABGEN_VERSION             served bundle version prefix (default v49)
   ABGEN_WORLDS_CONTENT_URL  worlds-content-server fallback for by-hash content misses
                             and the /entities/active?world_name= lane
                             (default https://worlds-content-server.decentraland.org; 0/off/empty disables)
@@ -33,6 +33,10 @@ ENV:
                             (needs a binary built with --features gpu; exits 2 otherwise)
   ABGEN_HASH_RESOLVE_FAIL_TTL_S  negative-cache TTL for unresolvable flat {hash}_{platform}
                             requests (default 3600)
+  AB_REGISTRY_PG_CONNECTION_STRING  optional registry Postgres DB
+                            (denylist + spawn overrides; migrations run on boot)
+  API_ADMIN_TOKEN           optional bearer token guarding the queue/admin routes
+  DENYLIST_MODERATORS       comma-separated addresses allowed to manage the denylist
   ABGEN_LOG_FORMAT          json for JSON logs (default plain text)
   RUST_LOG                  tracing filter (default abgen=info,tower_http=info)
 
@@ -41,6 +45,8 @@ REGISTRY ROUTES:
   serve from the content DB when configured (content-db build +
   CONTENT_PG_CONNECTION_STRING or POSTGRES_*), else proxy ABGEN_CATALYST_URL
   (world manifests additionally need ABGEN_WORLDS_CONTENT_URL enabled);
+  the signed routes (/entities/status, /queues/*, /denylist*, /registry,
+  /flush-cache) mount when CONTENT_PG_CONNECTION_STRING is set (URL form);
   /health reports the live mode in its registry field
 ";
 
@@ -60,6 +66,27 @@ fn handle_argv() {
 fn env_filter() -> tracing_subscriber::EnvFilter {
     tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "abgen=info,tower_http=info".into())
+}
+
+#[cfg(feature = "content-db")]
+async fn registry_state(out_root: &str) -> Option<abgen::registry::AppState> {
+    let cfg = match abgen::registry::config::Config::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::info!(error = %e, "registry surface disabled: config unavailable");
+            return None;
+        }
+    };
+    match abgen::registry::build_state(&cfg, out_root).await {
+        Ok(s) => {
+            tracing::info!("registry surface enabled (signed status, queues, denylist, admin)");
+            Some(s)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "registry surface disabled: state build failed");
+            None
+        }
+    }
 }
 
 #[tokio::main]
@@ -85,7 +112,13 @@ async fn main() -> Result<()> {
     let cfg = Config::from_env()?;
     let state = build_state(&cfg).await?;
 
-    let app = build_app(state).layer(TraceLayer::new_for_http());
+    let app = build_app(state);
+    #[cfg(feature = "content-db")]
+    let app = match registry_state(&cfg.abgen_out_root).await {
+        Some(reg) => app.merge(abgen::registry::signed_router().with_state(reg)),
+        None => app,
+    };
+    let app = app.layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = format!("{}:{}", cfg.http_host, cfg.http_port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr)

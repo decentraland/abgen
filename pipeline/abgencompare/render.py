@@ -166,6 +166,34 @@ def run_harness(run_dir, pairs, platform, unity, project, shader_bundle, log,
                     shutil.copyfile(src,
                                     os.path.join(run_dir, "jobs", name))
 
+    if any(k == "animated" for k in kinds.values()):
+        anim_log = os.path.join(base, "jobs", "unity-anim.log")
+        if wsl_mode:
+            open(anim_log, "ab").close()
+            anim_cmd = hc.unity_cmd(unity, wsl.to_windows(project),
+                                    wsl.to_windows(anim_log),
+                                    method=hc.METHOD_ANIM)
+        else:
+            anim_cmd = hc.unity_cmd(unity, project, anim_log,
+                                    method=hc.METHOD_ANIM)
+        log(f"render: anim frame pass: {' '.join(anim_cmd)}")
+        try:
+            if wsl_mode:
+                arc = wsl.run_windows_unity(anim_cmd, env, anim_log, log,
+                                            timeout=timeout)
+            else:
+                arc = subprocess.run(anim_cmd, env=env,
+                                     timeout=timeout).returncode
+            log(f"render: anim unity exited rc={arc}")
+        finally:
+            if base != run_dir:
+                for src, name in ((anim_log, "unity-anim.log"),
+                                  (os.path.join(ab_root, "harness-anim.log"),
+                                   "harness-anim.log")):
+                    if os.path.exists(src):
+                        shutil.copyfile(src,
+                                        os.path.join(run_dir, "jobs", name))
+
     out_dir = os.path.join(ab_root, "out")
     result = hc.harvest(out_dir, sorted(kinds), kinds=kinds)
     n = 0

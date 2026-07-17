@@ -73,11 +73,28 @@ fn feed_hash_index(state: &AppState, ents: &[ResolvedEntity]) {
     }
 }
 
-async fn resolve_entities(state: &AppState, pointers: Vec<String>) -> Vec<ResolvedEntity> {
+async fn resolve_entities(
+    state: &AppState,
+    pointers: Vec<String>,
+) -> Result<Vec<ResolvedEntity>, Response> {
+    let ents = fetch_entities(state, &pointers).await?;
+    let ents = active_by_pointer(&pointers, ents);
+    feed_hash_index(state, &ents);
+    Ok(ents)
+}
+
+fn resolver_unavailable() -> Response {
+    (StatusCode::BAD_GATEWAY, "entity resolver unavailable").into_response()
+}
+
+async fn fetch_entities(
+    state: &AppState,
+    pointers: &[String],
+) -> Result<Vec<ResolvedEntity>, Response> {
     #[cfg(feature = "content-db")]
     if let Some(cdb) = &state.content_db {
-        let ents = match cdb.resolve_pointers(&pointers).await {
-            Ok(ents) => ents
+        return match cdb.resolve_pointers(pointers).await {
+            Ok(ents) => Ok(ents
                 .into_iter()
                 .map(|e| ResolvedEntity {
                     entity_id: e.entity_id,
@@ -91,35 +108,31 @@ async fn resolve_entities(state: &AppState, pointers: Vec<String>) -> Vec<Resolv
                         .map(|d| d.to_lowercase())
                         .unwrap_or_default(),
                 })
-                .collect(),
+                .collect()),
             Err(e) => {
                 tracing::warn!(error = %e, "folded index: content-db resolve_pointers failed");
-                Vec::new()
+                Err(resolver_unavailable())
             }
         };
-        feed_hash_index(state, &ents);
-        return ents;
     }
 
     if let Some(registry) = &state.contents_registry {
-        let ents: Vec<ResolvedEntity> = match registry.content.resolve_pointers(&pointers).await {
-            Ok(actives) => actives
+        return match registry.content.resolve_pointers(pointers).await {
+            Ok(actives) => Ok(actives
                 .into_iter()
                 .map(ResolvedEntity::from_active)
-                .collect(),
+                .collect()),
             Err(e) => {
                 tracing::warn!(error = %e, "registry proxy resolve_pointers failed");
-                Vec::new()
+                Err(resolver_unavailable())
             }
         };
-        feed_hash_index(state, &ents);
-        return ents;
     }
 
     let st = state.clone();
-    let ents: Vec<ResolvedEntity> = tokio::task::spawn_blocking(move || {
-        pointers
-            .iter()
+    let pts = pointers.to_vec();
+    Ok(tokio::task::spawn_blocking(move || {
+        pts.iter()
             .filter_map(|p| {
                 let s = st.content.resolve_scene(p).ok()?;
                 Some(ResolvedEntity::from_scene(s, 0))
@@ -127,9 +140,43 @@ async fn resolve_entities(state: &AppState, pointers: Vec<String>) -> Vec<Resolv
             .collect()
     })
     .await
-    .unwrap_or_default();
-    feed_hash_index(state, &ents);
-    ents
+    .unwrap_or_default())
+}
+
+fn active_by_pointer(pointers: &[String], ents: Vec<ResolvedEntity>) -> Vec<ResolvedEntity> {
+    use std::collections::{HashMap, HashSet};
+
+    let wanted: Vec<String> = pointers.iter().map(|p| p.trim().to_lowercase()).collect();
+    let lowered: Vec<Vec<String>> = ents
+        .iter()
+        .map(|e| e.pointers.iter().map(|p| p.trim().to_lowercase()).collect())
+        .collect();
+    let ids: Vec<String> = ents.iter().map(|e| e.entity_id.to_lowercase()).collect();
+
+    let mut winner: HashMap<&str, usize> = HashMap::new();
+    for w in &wanted {
+        for i in 0..ents.len() {
+            if !(lowered[i].iter().any(|p| p == w) || ids[i] == *w) {
+                continue;
+            }
+            let better = match winner.get(w.as_str()) {
+                None => true,
+                Some(&j) => {
+                    (ents[i].timestamp, &ents[i].entity_id)
+                        > (ents[j].timestamp, &ents[j].entity_id)
+                }
+            };
+            if better {
+                winner.insert(w.as_str(), i);
+            }
+        }
+    }
+
+    let keep: HashSet<usize> = winner.into_values().collect();
+    ents.into_iter()
+        .enumerate()
+        .filter_map(|(i, e)| keep.contains(&i).then_some(e))
+        .collect()
 }
 
 pub(super) fn valid_world_name(name: &str) -> bool {
@@ -144,7 +191,7 @@ async fn resolve_world_entities(
     state: &AppState,
     name: &str,
     pointers: &[String],
-) -> Vec<ResolvedEntity> {
+) -> Result<Vec<ResolvedEntity>, Response> {
     let Some(url) = state.worlds_content_url.clone() else {
         tracing::warn!(
             world = %name,
@@ -153,7 +200,7 @@ async fn resolve_world_entities(
         return resolve_entities(state, pointers.to_vec()).await;
     };
     if !valid_world_name(name) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let name_q = name.to_string();
     let secs = crate::worlds::SERVE_FETCH_TIMEOUT_SECS;
@@ -179,11 +226,11 @@ async fn resolve_world_entities(
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             tracing::warn!(world = %name, error = %format!("{e:#}"), "world resolution failed");
-            return Vec::new();
+            return Err(resolver_unavailable());
         }
         Err(e) => {
             tracing::error!(error = %e, "world resolution worker panicked");
-            return Vec::new();
+            return Err(resolver_unavailable());
         }
     };
     let wanted: std::collections::HashSet<String> =
@@ -204,7 +251,7 @@ async fn resolve_world_entities(
         out.push(ResolvedEntity::from_scene(scene, timestamp));
     }
     feed_hash_index(state, &out);
-    out
+    Ok(out)
 }
 
 fn entity_buildable(content: &[(String, String)]) -> bool {
@@ -227,35 +274,42 @@ fn eager_build_index(state: &AppState, entities: &[ResolvedEntity]) {
     let Some(proxy) = state.live_proxy.clone() else {
         return;
     };
-    let mut targets: Vec<(String, String)> = Vec::new();
+    let mut candidates: Vec<(String, String)> = Vec::new();
     for e in entities {
         if !entity_buildable(&e.content) {
             continue;
         }
         for platform in &ib.platforms {
-            let manifest = state
-                .out_root
-                .join(&e.entity_id)
-                .join(format!("{platform}.manifest.json"));
-            if !manifest.exists() {
-                targets.push((e.entity_id.clone(), platform.clone()));
-            }
+            candidates.push((e.entity_id.clone(), platform.clone()));
         }
     }
-    if targets.is_empty() {
+    if candidates.is_empty() {
         return;
     }
 
-    let out = state.out_root.clone();
-    let csu = state.manifest_content_server_url.clone();
     let sem = ib.sem.clone();
     let pending = ib.pending.clone();
     let max_queue = ib.max_queue;
     let deadline = ib.deadline;
+    let st = state.clone();
 
     tokio::spawn(async move {
         let mut handles = Vec::new();
-        for (ent, plat) in targets {
+        for (ent, plat) in candidates {
+            let key = format!("{ent}:{plat}");
+            if st.jit_fail_cache.get(&key).await.is_some() {
+                continue;
+            }
+            let rel = format!("{plat}.manifest.json");
+            let warm = st.out_root.join(&ent).join(&rel);
+            let jit = st.jit_root.join(&ent).join(&rel);
+            let (w, j) = (warm, jit.clone());
+            let already = tokio::task::spawn_blocking(move || w.is_file() || j.is_file())
+                .await
+                .unwrap_or(false);
+            if already {
+                continue;
+            }
             if max_queue > 0 && pending.load(std::sync::atomic::Ordering::Relaxed) >= max_queue {
                 metrics::counter!("abgen_index_jit_skipped_total").increment(1);
                 continue;
@@ -264,24 +318,13 @@ fn eager_build_index(state: &AppState, entities: &[ResolvedEntity]) {
             let guard = PendingGuard(pending.clone());
             let sem = sem.clone();
             let px = proxy.clone();
-            let out = out.clone();
-            let csu = csu.clone();
+            let st = st.clone();
             handles.push(tokio::spawn(async move {
                 let _guard = guard;
                 let Ok(_permit) = sem.acquire_owned().await else {
                     return;
                 };
-                let _ = timed_corpus_build(
-                    px,
-                    out,
-                    ent,
-                    plat,
-                    csu,
-                    "abgen_index_jit_builds_total",
-                    "abgen_index_jit_build_duration_seconds",
-                    "index",
-                )
-                .await;
+                let _ = jit_build_entity(&st, &px, &ent, &plat, Some(jit), "index").await;
             }));
         }
         let deadline = tokio::time::Instant::now() + deadline;
@@ -301,7 +344,10 @@ pub async fn post_entities_versions(
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    let ents = resolve_entities(&state, pointers).await;
+    let ents = match resolve_entities(&state, pointers).await {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
     eager_build_index(&state, &ents);
 
     let st = state.clone();
@@ -348,6 +394,10 @@ pub async fn post_entities_active(
         Some(name) => resolve_world_entities(&state, &name, &pointers).await,
         None => resolve_entities(&state, pointers).await,
     };
+    let ents = match ents {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
     eager_build_index(&state, &ents);
     entities_active_records(&state, ents).await
 }
@@ -389,4 +439,54 @@ async fn entities_active_records(state: &AppState, ents: Vec<ResolvedEntity>) ->
     .unwrap_or_default();
 
     Json(out).into_response()
+}
+
+#[cfg(test)]
+mod active_tests {
+    use super::{active_by_pointer, ResolvedEntity};
+
+    fn ent(id: &str, ts: i64, pointers: &[&str]) -> ResolvedEntity {
+        ResolvedEntity {
+            entity_id: id.to_string(),
+            entity_type: "scene".to_string(),
+            timestamp: ts,
+            pointers: pointers.iter().map(|p| p.to_string()).collect(),
+            content: Vec::new(),
+            metadata: serde_json::Value::Null,
+            deployer: String::new(),
+        }
+    }
+
+    #[test]
+    fn collapses_overlapping_deployments_to_newest() {
+        let ents = vec![
+            ent("older", 100, &["-3,-2", "0,0"]),
+            ent("newest", 300, &["-3,-2", "0,0"]),
+            ent("mid", 200, &["-3,-2", "0,0"]),
+        ];
+        let out = active_by_pointer(&["-3,-2".to_string()], ents);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].entity_id, "newest");
+    }
+
+    #[test]
+    fn keeps_one_winner_per_distinct_pointer() {
+        let ents = vec![
+            ent("a", 100, &["-3,-2"]),
+            ent("a2", 200, &["-3,-2"]),
+            ent("b", 100, &["5,5"]),
+        ];
+        let mut out = active_by_pointer(&["-3,-2".to_string(), "5,5".to_string()], ents);
+        out.sort_by(|x, y| x.entity_id.cmp(&y.entity_id));
+        let ids: Vec<_> = out.iter().map(|e| e.entity_id.as_str()).collect();
+        assert_eq!(ids, vec!["a2", "b"]);
+    }
+
+    #[test]
+    fn resolves_entity_id_style_request() {
+        let ents = vec![ent("bafyEntity", 100, &["-3,-2"])];
+        let out = active_by_pointer(&["bafyentity".to_string()], ents);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].entity_id, "bafyEntity");
+    }
 }

@@ -28,7 +28,7 @@ mkdir -p "$WOUT" "$NOUT"
 
 if [ "${PARITY_SKIP_BUILD:-0}" != 1 ]; then
   bash "$POC/build.sh"
-  nix develop "$WS" -c cargo build --release -p abgen --bin abgen --bin abgen-lod
+  nix develop "$WS" -c cargo build --release --manifest-path "$WS/Cargo.toml" -p abgen --bin abgen --bin abgen-lod
 fi
 
 python3 "$POC/test/make-fixtures.py" "$(command -v draco_encoder || true)"
