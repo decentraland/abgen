@@ -1,23 +1,47 @@
 #[path = "../../kernel-ptx/src/core/mod.rs"]
 pub mod corelib;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod cuda;
+#[cfg(not(target_arch = "wasm32"))]
 mod qualify;
-#[cfg(feature = "gpu-wgpu")]
 pub(crate) mod wgpu;
-#[cfg(feature = "gpu-wgpu")]
 pub(crate) mod wgpu_bc7;
 
+#[cfg(not(target_arch = "wasm32"))]
 use anyhow::{anyhow, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::OnceLock;
 
 pub use crate::gpu::corelib::bc7::Bc7Profile;
+#[cfg(not(target_arch = "wasm32"))]
 pub use cuda::{
     cmd_probe, encode_blocks_gpu, tex_geometry, BlockifyStats, BlockifyTex, SlabEngine,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
 use qualify::QualStatus;
 
+#[cfg(target_arch = "wasm32")]
+pub use wgpu::{init_gpu, Gpu};
+#[cfg(target_arch = "wasm32")]
+pub use wgpu_bc7::{build_engine, encode_bc7_mip_chain_on, Engine};
+
+#[cfg(target_arch = "wasm32")]
+pub fn enable_wgpu_wasm() -> std::result::Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn gpu_status() -> Option<crate::GpuStatus> {
+    Some(crate::GpuStatus {
+        backend: "wgpu",
+        qualified: false,
+        reason: Some("wasm: WebGPU qualified per-call at async init".to_string()),
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, PartialEq)]
 enum BackendSel {
     Auto,
@@ -26,20 +50,23 @@ enum BackendSel {
     Off,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Backend {
     Cuda,
-    #[cfg(feature = "gpu-wgpu")]
     Wgpu,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct Resolution {
     active: Result<Backend, String>,
     status: Option<QualStatus>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 static RESOLVED: OnceLock<Resolution> = OnceLock::new();
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_sel(raw: &str) -> Result<BackendSel, String> {
     match raw {
         "" | "auto" => Ok(BackendSel::Auto),
@@ -52,6 +79,7 @@ fn parse_sel(raw: &str) -> Result<BackendSel, String> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_backend_sel() -> Result<BackendSel, String> {
     match std::env::var("ABGEN_GPU_BACKEND") {
         Ok(v) => parse_sel(&v),
@@ -62,8 +90,10 @@ fn parse_backend_sel() -> Result<BackendSel, String> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 type TryBackend<'a> = &'a dyn Fn() -> (Result<Backend, String>, QualStatus);
 
+#[cfg(not(target_arch = "wasm32"))]
 fn try_cuda() -> (Result<Backend, String>, QualStatus) {
     if let Err(e) = cuda::gpu_ready() {
         let reason = format!("init failed: {e}");
@@ -90,7 +120,7 @@ fn try_cuda() -> (Result<Backend, String>, QualStatus) {
     }
 }
 
-#[cfg(feature = "gpu-wgpu")]
+#[cfg(not(target_arch = "wasm32"))]
 fn try_wgpu() -> (Result<Backend, String>, QualStatus) {
     match wgpu::adapter_summary() {
         Err(e) => {
@@ -120,6 +150,7 @@ fn try_wgpu() -> (Result<Backend, String>, QualStatus) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn log_status(st: &QualStatus) {
     eprintln!(
         "abgen-gpu: qualification backend={} qualified={} reason={}",
@@ -129,6 +160,7 @@ fn log_status(st: &QualStatus) {
     );
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn status_resolution(active: Result<Backend, String>, status: QualStatus) -> Resolution {
     Resolution {
         active,
@@ -136,6 +168,7 @@ fn status_resolution(active: Result<Backend, String>, status: QualStatus) -> Res
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn resolve_from(sel: BackendSel, cuda: TryBackend, wgpu_try: Option<TryBackend>) -> Resolution {
     match sel {
         BackendSel::Off => status_resolution(
@@ -193,6 +226,7 @@ fn resolve_from(sel: BackendSel, cuda: TryBackend, wgpu_try: Option<TryBackend>)
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn resolve() -> Resolution {
     let sel = match parse_backend_sel() {
         Ok(s) => s,
@@ -207,10 +241,7 @@ fn resolve() -> Resolution {
             }
         }
     };
-    #[cfg(feature = "gpu-wgpu")]
     let wgpu_try: Option<TryBackend> = Some(&try_wgpu);
-    #[cfg(not(feature = "gpu-wgpu"))]
-    let wgpu_try: Option<TryBackend> = None;
     let res = resolve_from(sel, &try_cuda, wgpu_try);
     if let Some(st) = &res.status {
         log_status(st);
@@ -218,10 +249,12 @@ fn resolve() -> Resolution {
     res
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn resolution() -> &'static Resolution {
     RESOLVED.get_or_init(resolve)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn gpu_ready() -> Result<(), String> {
     match &resolution().active {
         Ok(_) => Ok(()),
@@ -229,6 +262,17 @@ pub fn gpu_ready() -> Result<(), String> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn backend_is_off() -> bool {
+    matches!(parse_backend_sel(), Ok(BackendSel::Off))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn auto_defaults_to_cpu() -> bool {
+    cfg!(target_os = "macos") && matches!(parse_backend_sel(), Ok(BackendSel::Auto))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn gpu_status() -> Option<crate::GpuStatus> {
     RESOLVED
         .get()
@@ -240,6 +284,7 @@ pub fn gpu_status() -> Option<crate::GpuStatus> {
         })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 pub fn encode_bc7_mip_chain_gpu(
     rgba: &[u8],
@@ -255,7 +300,6 @@ pub fn encode_bc7_mip_chain_gpu(
         Ok(Backend::Cuda) => cuda::encode_bc7_mip_chain_gpu(
             rgba, width, height, mip_count, flip, srgb, perceptual, profile,
         ),
-        #[cfg(feature = "gpu-wgpu")]
         Ok(Backend::Wgpu) => wgpu_bc7::encode_bc7_mip_chain(
             rgba, width, height, mip_count, flip, srgb, perceptual, profile,
         ),
@@ -314,22 +358,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_wgpu_without_feature_fails_closed_as_not_built() {
-        let r = resolve_from(BackendSel::Wgpu, &cuda_ok, None);
-        assert_eq!(
-            r.active.unwrap_err(),
-            "wgpu backend not built (feature gpu-wgpu)"
-        );
-        let st = r.status.unwrap();
-        assert_eq!(st.backend, "wgpu");
-        assert!(!st.qualified);
-        assert_eq!(
-            st.reason.as_deref(),
-            Some("wgpu backend not built (feature gpu-wgpu)")
-        );
-    }
-
-    #[test]
     fn resolve_auto_without_feature_is_cuda_only() {
         let r = resolve_from(BackendSel::Auto, &cuda_fail, None);
         let e = r.active.unwrap_err();
@@ -354,7 +382,6 @@ mod tests {
         assert_eq!(r.active.unwrap(), Backend::Cuda);
     }
 
-    #[cfg(feature = "gpu-wgpu")]
     mod wgpu_arms {
         use super::*;
 

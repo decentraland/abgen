@@ -59,25 +59,19 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
 }
 
 fn content_db_status(state: &AppState) -> &'static str {
-    #[cfg(feature = "content-db")]
-    {
-        if state.content_db.is_some() {
-            return "connected";
-        }
+    if state.content_db.is_some() {
+        "connected"
+    } else {
+        "fallback"
     }
-    let _ = state;
-    "fallback"
 }
 
 fn registry_mode(state: &AppState) -> &'static str {
-    #[cfg(feature = "content-db")]
-    {
-        if state.content_db.is_some() {
-            return "content-db";
-        }
+    if state.content_db.is_some() {
+        "content-db"
+    } else {
+        "catalyst-proxy"
     }
-    let _ = state;
-    "catalyst-proxy"
 }
 
 pub async fn health(State(state): State<AppState>) -> Response {
@@ -89,7 +83,6 @@ pub async fn health(State(state): State<AppState>) -> Response {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    #[allow(unused_mut)]
     let mut body = serde_json::json!({
         "status": if ready { "ready" } else { "degraded" },
         "mode": if jit { "in-process" } else { "static" },
@@ -117,7 +110,6 @@ pub async fn health(State(state): State<AppState>) -> Response {
             "timeout_s": state.lod_jit.timeout.as_secs(),
         },
     });
-    #[cfg(feature = "gpu")]
     {
         body["gpu"] = match crate::gpu_status() {
             Some(s) => {

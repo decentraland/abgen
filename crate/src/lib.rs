@@ -11,11 +11,10 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[macro_use]
 pub mod value;
-#[cfg(feature = "gpu")]
 pub mod gpu;
-#[cfg(feature = "gpu")]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod gpu_dispatch;
-#[cfg(feature = "gpu")]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod gpuhost;
 pub mod scene;
 
@@ -88,19 +87,19 @@ pub mod wearables;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod abcdn;
 
-#[cfg(all(feature = "content-db", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod registry;
 
 pub use anyhow::{anyhow, bail, Context, Result};
 
-#[cfg(feature = "gpu")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn enable_gpu() -> std::result::Result<(), String> {
     gpu_dispatch::enable()
 }
 
-#[cfg(not(feature = "gpu"))]
+#[cfg(target_arch = "wasm32")]
 pub fn enable_gpu() -> std::result::Result<(), String> {
-    Err("this binary was built without the gpu feature (rebuild with --features gpu)".to_string())
+    gpu::enable_wgpu_wasm()
 }
 
 pub struct GpuStatus {
@@ -109,22 +108,60 @@ pub struct GpuStatus {
     pub reason: Option<String>,
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn gpu_status() -> Option<GpuStatus> {
     gpu::gpu_status()
 }
 
-#[cfg(not(feature = "gpu"))]
+#[cfg(target_arch = "wasm32")]
 pub fn gpu_status() -> Option<GpuStatus> {
-    None
+    gpu::gpu_status()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn maybe_enable_gpu_from_env() {
-    if clihelp::env_bool("ABGEN_GPU", false) {
-        if let Err(e) = enable_gpu() {
-            eprintln!("error: ABGEN_GPU: {e}");
+    if gpu::backend_is_off() {
+        return;
+    }
+    let explicit = clihelp::env_bool("ABGEN_GPU", false);
+    if !explicit && gpu::auto_defaults_to_cpu() {
+        eprintln!(
+            "abgen-gpu: macOS default is CPU (integrated Metal is slower than the CPU for BC7); set ABGEN_GPU=1 or ABGEN_GPU_BACKEND=wgpu to force the GPU"
+        );
+        return;
+    }
+    if let Err(e) = enable_gpu() {
+        if explicit {
+            eprintln!("error: ABGEN_GPU set but no GPU available: {e}");
             std::process::exit(2);
         }
+        eprintln!("warning: no GPU available ({e}); continuing on CPU");
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn arm_gpu_explicit() {
+    if gpu::backend_is_off() {
+        return;
+    }
+    if let Err(e) = enable_gpu() {
+        eprintln!("error: --gpu: {e}");
+        std::process::exit(2);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn arm_gpu_default() {
+    if gpu::backend_is_off() {
+        return;
+    }
+    if gpu::auto_defaults_to_cpu() {
+        eprintln!(
+            "abgen-gpu: macOS default is CPU (integrated Metal is slower than the CPU for BC7); pass --gpu or set ABGEN_GPU_BACKEND=wgpu to force the GPU"
+        );
+        return;
+    }
+    if let Err(e) = enable_gpu() {
+        eprintln!("warning: no GPU available ({e}); continuing on CPU");
     }
 }

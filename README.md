@@ -93,12 +93,16 @@ falls over.
 with backfill of pre-existing conversions and a crash-safe resume cursor. Every flag has an env twin
 for service deployment; `./pipeline/abgen-compare watch --help` documents them.
 ## Features
-| Feature | Default | Adds |
+There are no compile-time feature flags. Every capability below builds into every native binary;
+`wasm32` builds target-gate the server, content-DB, and GPU code off automatically. Each capability
+is activated at runtime, not at build time.
+
+| Capability | Built | Enable at runtime |
 |---|---|---|
-| `server` | yes | tokio/axum HTTP server (`abcdn` module + `abgen` bin) |
-| `content-db` | no | catalyst content-DB index (sqlx/postgres, via the in-tree `dcl-contents` crate) for real timestamps + deployer on `/entities/*` and the unsigned registry routes (`/profiles*`, `/entities/status/{id}`, `/worlds/{name}/manifest`); without it the built-in content-client fallback serves the index routes with `timestamp: 0`, empty deployer, and the registry routes proxy the upstream catalyst |
-| `gpu` | no | CUDA GPU BC7/BC5 encode path (`libcuda` dlopen'd at runtime, no toolkit needed to build; PTX kernels vendored in `crate/src/gpu/kernel.ptx`, regen from `crate/kernel-ptx/`); opt in per run with `--gpu` / `ABGEN_GPU=1`, backend pick via `ABGEN_GPU_BACKEND=auto\|cuda\|wgpu\|off` |
-| `gpu-wgpu` (`gpu-all`) | no | adds the portable `wgpu` compute backend (Vulkan/Metal/DX12) behind the same dispatch + qualification gate |
+| tokio/axum HTTP JIT server (`abcdn` module + `abgen` bin) | always (native targets) | run the `abgen` bin |
+| catalyst content-DB index (sqlx/postgres, via the in-tree `dcl-contents` crate) for real timestamps + deployer on `/entities/*` and the unsigned registry routes (`/profiles*`, `/entities/status/{id}`, `/worlds/{name}/manifest`) | always | set a content-DB connection (`CONTENT_PG_CONNECTION_STRING` or `POSTGRES_CONTENT_*`); without one the built-in content-client fallback serves the index routes with `timestamp: 0`, empty deployer, and the registry routes proxy the upstream catalyst |
+| CUDA GPU BC7/BC5 encode path (`libcuda` dlopen'd at runtime, no toolkit needed to build; PTX kernels vendored in `crate/src/gpu/kernel.ptx`, regen from `crate/kernel-ptx/`) | always | opt in per run with `--gpu` / `ABGEN_GPU=1`, backend pick via `ABGEN_GPU_BACKEND=auto\|cuda\|wgpu\|off` |
+| portable `wgpu` compute backend (Vulkan/Metal/DX12), same dispatch + qualification gate | always | `ABGEN_GPU_BACKEND=wgpu` (or `auto`, which tries CUDA first) |
 
 GPU backends self-qualify per device at enable time: the selected backend (`auto` tries CUDA, then
 wgpu) must reproduce the CPU BC7 encoder bit-for-bit on a probe matrix (sizes x srgb x perceptual x
@@ -106,7 +110,8 @@ profile, full mip chains) or it is disqualified and `--gpu`/`ABGEN_GPU=1` exits 
 degrading - a qualified GPU run produces byte-identical output to the CPU path. `ABGEN_GPU_QUALIFY=0`
 skips the probe.
 
-`cargo build --no-default-features` builds the pure converter lib + CLIs with no async stack.
+The slim, async-free converter lib + CLIs are the `wasm32-unknown-unknown` target build (the server,
+content-DB, and GPU stacks are `cfg(not(target_arch = "wasm32"))`).
 ## Toolchain
 - rustc/cargo (edition 2021; the vendored `draco_decoder` is edition 2024)
 - cc + a C++ toolchain (vendored crunch, libjpeg9c)

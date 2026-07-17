@@ -24,7 +24,7 @@ embedded in the host lives at `../src/gpu/kernel.ptx` (`include_bytes!`);
 
 ```
 nix develop .#gpu -c \
-cargo run --release -p abgen --features gpu --bin abgen-verify -- gpu diff --gpu
+cargo run --release -p abgen --bin abgen-verify -- gpu diff --gpu
 ```
 
 The `gpu` devShell pins the 64-bit vulkan-loader by derivation and sets the

@@ -32,7 +32,6 @@
           };
           nativeBuildInputs = with pkgs; [ cmake pkg-config git ];
           cargoBuildFlags = [ "--bin" "abgen" ];
-          buildFeatures = [ "content-db" ];
           doCheck = false;
         };
       in

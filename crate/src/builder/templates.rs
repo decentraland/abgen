@@ -133,16 +133,16 @@ fn template_mmap() -> Result<&'static memmap2::Mmap> {
 fn embedded_template(file: &str) -> Option<&'static [u8]> {
     match file {
         "all-types.windows.bundle" => {
-            Some(include_bytes!("../../template/all-types.windows.bundle"))
+            Some(include_bytes!("../../../template/all-types.windows.bundle"))
         }
         "animated-types.windows.bundle" => Some(include_bytes!(
-            "../../template/animated-types.windows.bundle"
+            "../../../template/animated-types.windows.bundle"
         )),
-        "emote-types.windows.bundle" => {
-            Some(include_bytes!("../../template/emote-types.windows.bundle"))
-        }
+        "emote-types.windows.bundle" => Some(include_bytes!(
+            "../../../template/emote-types.windows.bundle"
+        )),
         "skinned-types.windows.bundle" => Some(include_bytes!(
-            "../../template/skinned-types.windows.bundle"
+            "../../../template/skinned-types.windows.bundle"
         )),
         _ => None,
     }

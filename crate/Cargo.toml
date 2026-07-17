@@ -17,7 +17,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "abgen"
 path = "src/bin/abgen.rs"
-required-features = ["server"]
 
 [[bin]]
 name = "abgen-build"
@@ -83,21 +82,6 @@ path = "examples/ressdump.rs"
 name = "atlasprobe"
 path = "examples/atlasprobe.rs"
 
-[features]
-default = ["server"]
-gpu = []
-gpu-wgpu = ["gpu", "dep:wgpu"]
-gpu-all = ["gpu-wgpu"]
-server = []
-content-db = [
-    "server",
-    "dep:sqlx",
-    "dcl-contents/pg",
-    "dep:ethers-core",
-    "dep:hex",
-    "dep:thiserror",
-]
-
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip", "raw_value"] }
@@ -116,7 +100,6 @@ texpresso = "2"
 crunch_ffi = { path = "third_party/crunch" }
 libjpeg9c = { path = "third_party/libjpeg9c" }
 texture2ddecoder = "0.1"
-wgpu = { version = "=30.0.0", optional = true, default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12"] }
 chrono = "0.4"
 tracing = "0.1"
 
@@ -133,15 +116,21 @@ tower-http = { version = "0.7", features = ["trace"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 moka = { version = "0.12", features = ["future"] }
-sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "json"], optional = true }
-dcl-contents = { path = "dcl-contents", default-features = false }
-ethers-core = { version = "2.0.14", optional = true }
-hex = { version = "0.4", optional = true }
-thiserror = { version = "2", optional = true }
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "json"] }
+dcl-contents = { path = "dcl-contents" }
+ethers-core = "2.0.14"
+hex = "0.4"
+thiserror = "2"
+wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif", "tga"] }
 meshopt = "=0.6.2"
+wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "webgpu"] }
+wasm-bindgen = "=0.2.121"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
 
 [target.'cfg(all(not(target_os = "windows"), not(target_arch = "wasm32")))'.dependencies]
 mimalloc = { version = "0.1.52", default-features = false }

@@ -266,7 +266,7 @@ pub fn encode_bc7_mip_chain_with_profile(
     perceptual: bool,
     profile: Bc7Profile,
 ) -> (Vec<u8>, i32) {
-    #[cfg(feature = "gpu")]
+    #[cfg(not(target_arch = "wasm32"))]
     if crate::gpu_dispatch::enabled() {
         if let Some(r) = crate::gpu_dispatch::encode_bc7_mip_chain(
             rgba, width, height, mip_count, flip, srgb, perceptual, profile,
