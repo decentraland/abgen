@@ -74,9 +74,9 @@ impl crate::live::Proxy {
             if blobs.contains_key(hash) {
                 continue;
             }
-            self.ensure_content(hash)
+            let raw = self
+                .content_bytes_allow_empty(hash)
                 .with_context(|| format!("content {hash} ({file})"))?;
-            let raw = self.content_store().fetch(hash)?;
             let kind = kind_for(file);
             let resolve_fn = |uri: &str| -> Option<Vec<u8>> {
                 let h = crate::naming::uri_content_hash(uri, file, content_by_file)?;
@@ -259,6 +259,52 @@ mod tests {
             .is_file());
         let _ = std::fs::remove_dir_all(&cache);
         bytes
+    }
+
+    #[test]
+    fn empty_content_files_pack_as_zero_length_entries() {
+        let entity = "bafkemptyent";
+        let js = b"console.log('hi')".to_vec();
+        let ent = serde_json::to_vec(&json!({
+            "id": entity,
+            "type": "scene",
+            "pointers": ["9,9"],
+            "content": [
+                {"file": "models/put_models_here.txt", "hash": "bafkempty"},
+                {"file": "empty.png", "hash": "bafkemptypng"},
+                {"file": "game.js", "hash": "bafkjs"}
+            ],
+            "metadata": {}
+        }))
+        .unwrap();
+        let routes = vec![
+            (format!("/contents/{entity}"), 200, ent),
+            ("/contents/bafkempty".to_string(), 200, Vec::new()),
+            ("/contents/bafkemptypng".to_string(), 200, Vec::new()),
+            ("/contents/bafkjs".to_string(), 200, js.clone()),
+        ];
+        let first = build_once("e1", routes.clone(), entity);
+        let second = build_once("e2", routes, entity);
+        assert_eq!(first, second);
+        let parsed = pack::parse_pack(&first).unwrap();
+        let by_path: std::collections::HashMap<&str, &pack::PackEntry> = parsed
+            .index
+            .files
+            .iter()
+            .map(|e| (e.path.as_str(), e))
+            .collect();
+        let txt = by_path["models/put_models_here.txt"];
+        assert_eq!((txt.len, txt.kind.as_str()), (0, "raw"));
+        assert_eq!(
+            txt.sha256,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let png = by_path["empty.png"];
+        assert_eq!((png.len, png.kind.as_str()), (0, "raw"));
+        assert_eq!(
+            pack::entry_slice(&first, &parsed, by_path["game.js"]),
+            &js[..]
+        );
     }
 
     #[test]

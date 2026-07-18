@@ -201,6 +201,19 @@ impl Proxy {
         Ok(())
     }
 
+    pub(crate) fn content_bytes_allow_empty(&self, hash: &str) -> Result<Vec<u8>> {
+        match self.ensure_content(hash) {
+            Ok(()) => self.content_store().fetch(hash),
+            Err(e) => {
+                let bytes = self.catalyst.fetch_content(hash)?;
+                if bytes.is_empty() {
+                    return Ok(bytes);
+                }
+                Err(e)
+            }
+        }
+    }
+
     pub(crate) fn entity_ctx(&self, cid: &str) -> Result<Arc<EntityCtx>> {
         if let Some(c) = self.entities.lock().unwrap().get(cid) {
             return Ok(c.clone());
