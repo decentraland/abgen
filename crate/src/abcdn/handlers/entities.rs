@@ -299,7 +299,11 @@ fn eager_build_index(state: &AppState, entities: &[ResolvedEntity]) {
             if st.jit_fail_cache.get(&key).await.is_some() {
                 continue;
             }
-            let rel = format!("{plat}.manifest.json");
+            let rel = if plat == crate::bvwebgpu::BVW_PLATFORM {
+                format!("{plat}/{}", crate::bvwebgpu::pack_file_name(&ent))
+            } else {
+                format!("{plat}.manifest.json")
+            };
             let warm = st.out_root.join(&ent).join(&rel);
             let jit = st.jit_root.join(&ent).join(&rel);
             let (w, j) = (warm, jit.clone());

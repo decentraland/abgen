@@ -66,10 +66,10 @@ impl KeyedLocks {
     }
 }
 
-struct EntityCtx {
-    scene: Scene,
-    content_by_file: HashMap<String, String>,
-    scan: EntityScan,
+pub(crate) struct EntityCtx {
+    pub(crate) scene: Scene,
+    pub(crate) content_by_file: HashMap<String, String>,
+    pub(crate) scan: EntityScan,
 
     deps_digests: HashMap<String, String>,
 }
@@ -169,7 +169,11 @@ impl Proxy {
         }
     }
 
-    fn ensure_content(&self, hash: &str) -> Result<()> {
+    pub(crate) fn content_store(&self) -> &LocalContentStore {
+        &self.content
+    }
+
+    pub(crate) fn ensure_content(&self, hash: &str) -> Result<()> {
         if self.content.exists(hash) {
             if let Some(c) = self.jit() {
                 c.touch(&format!("c:{hash}"));
@@ -197,7 +201,7 @@ impl Proxy {
         Ok(())
     }
 
-    fn entity_ctx(&self, cid: &str) -> Result<Arc<EntityCtx>> {
+    pub(crate) fn entity_ctx(&self, cid: &str) -> Result<Arc<EntityCtx>> {
         if let Some(c) = self.entities.lock().unwrap().get(cid) {
             return Ok(c.clone());
         }
@@ -659,6 +663,10 @@ impl Proxy {
         platform: &str,
         content_server_url: &str,
     ) -> Result<Vec<String>> {
+        if platform == crate::bvwebgpu::BVW_PLATFORM {
+            self.build_bvwebgpu_pack(out_root, cid)?;
+            return Ok(vec![crate::bvwebgpu::pack_file_name(cid)]);
+        }
         let ctx = self.entity_ctx(cid)?;
         let pdir = out_root
             .join(&*naming::fs_safe_component(cid))

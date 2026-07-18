@@ -288,7 +288,7 @@ fn world_name_validation() {
     assert!(!super::valid_world_name(""));
 }
 
-fn lane_temp_dir(tag: &str) -> std::path::PathBuf {
+pub(super) fn lane_temp_dir(tag: &str) -> std::path::PathBuf {
     let dir =
         std::env::temp_dir().join(format!("abgen-handlers-lane-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -296,7 +296,7 @@ fn lane_temp_dir(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-fn mk_lane_state(
+pub(super) fn mk_lane_state(
     dir: &std::path::Path,
     proxy: Option<std::sync::Arc<crate::live::Proxy>>,
 ) -> super::super::state::AppState {
@@ -409,7 +409,7 @@ fn mk_stub_proxy(host: &str, read_only: bool, tag: &str) -> std::sync::Arc<crate
     mk_stub_proxy_catalyst(host, "http://127.0.0.1:9", read_only, tag)
 }
 
-fn mk_stub_proxy_catalyst(
+pub(super) fn mk_stub_proxy_catalyst(
     host: &str,
     catalyst_url: &str,
     read_only: bool,
@@ -434,14 +434,14 @@ async fn lane_get(state: &super::super::state::AppState, path: &str) -> axum::re
     .await
 }
 
-async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
+pub(super) async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
     axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap()
         .to_vec()
 }
 
-fn reason_of(resp: &axum::response::Response) -> Option<String> {
+pub(super) fn reason_of(resp: &axum::response::Response) -> Option<String> {
     resp.headers()
         .get(super::lodjit::REASON_HEADER)
         .and_then(|v| v.to_str().ok())

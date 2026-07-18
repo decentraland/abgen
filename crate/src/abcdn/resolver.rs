@@ -126,6 +126,22 @@ pub fn iss_manifest_path(root: &Path, filename: &str) -> Option<PathBuf> {
     Some(root.join(sid).join(filename))
 }
 
+pub fn bvpack_path(root: &Path, entity: &str, filename: &str) -> Option<PathBuf> {
+    if !is_safe_component(entity) || !is_safe_component(filename) {
+        return None;
+    }
+    let raw = filename.strip_suffix(".br").unwrap_or(filename);
+    if raw != format!("{entity}.pack") {
+        return None;
+    }
+    let br = if filename.ends_with(".br") { ".br" } else { "" };
+    Some(
+        root.join(entity)
+            .join(crate::bvwebgpu::BVW_PLATFORM)
+            .join(format!("{}{br}", crate::bvwebgpu::pack_file_name(entity))),
+    )
+}
+
 pub const SHADER_PLATFORMS: [&str; 3] = ["windows", "mac", "linux"];
 
 pub struct ShaderTarget {
@@ -333,6 +349,22 @@ mod tests {
         // Production-length names pass through verbatim.
         let short = binary_path(root, "bafkScene", "Qmhash_windows").unwrap();
         assert_eq!(short, Path::new("/out/bafkScene/windows/Qmhash_windows"));
+    }
+
+    #[test]
+    fn bvpack_mapping() {
+        let root = Path::new("/out");
+        assert_eq!(
+            bvpack_path(root, "bafkEnt", "bafkEnt.pack").unwrap(),
+            Path::new("/out/bafkEnt/bvwebgpu/bafkEnt_bv1.pack")
+        );
+        assert_eq!(
+            bvpack_path(root, "bafkEnt", "bafkEnt.pack.br").unwrap(),
+            Path::new("/out/bafkEnt/bvwebgpu/bafkEnt_bv1.pack.br")
+        );
+        assert!(bvpack_path(root, "bafkEnt", "other.pack").is_none());
+        assert!(bvpack_path(root, "bafkEnt", "bafkEnt.zip").is_none());
+        assert!(bvpack_path(root, "..", "...pack").is_none());
     }
 
     #[test]

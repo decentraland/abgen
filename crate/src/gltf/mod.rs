@@ -4,6 +4,8 @@ mod scene_build;
 mod transform;
 
 pub use load::load_gltf_inputs;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use load::decode_data_uri;
 
 use crate::mesh_layout;
 use crate::scene::{Primitive, Scene};
