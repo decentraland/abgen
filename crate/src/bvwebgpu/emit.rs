@@ -132,8 +132,7 @@ fn split_container(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         let mut json: Option<Vec<u8>> = None;
         let mut bin: Vec<u8> = Vec::new();
         while pos + 8 <= bytes.len() {
-            let clen =
-                u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+            let clen = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
             let ctype = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
             let start = pos + 8;
             let end = start + clen;
@@ -526,8 +525,8 @@ pub(crate) fn transform_glb(bytes: &[u8], ext: &str, resolve: ResolveUri) -> Res
         match extract_image_bytes(image, &root.buffer_views, &merged) {
             None => plans.push(None),
             Some(src) => {
-                let img = image::load_from_memory(&src)
-                    .map_err(|e| anyhow!("decode image[{i}]: {e}"))?;
+                let img =
+                    image::load_from_memory(&src).map_err(|e| anyhow!("decode image[{i}]: {e}"))?;
                 if img.width() <= 2 || img.height() <= 2 {
                     plans.push(None);
                 } else {
@@ -570,8 +569,8 @@ pub(crate) fn transform_glb(bytes: &[u8], ext: &str, resolve: ResolveUri) -> Res
         let Some((rgba, srgb, is_normal)) = plan else {
             continue;
         };
-        let dds = encode_dds_bc7(&rgba, srgb, is_normal)
-            .with_context(|| format!("encode image[{i}]"))?;
+        let dds =
+            encode_dds_bc7(&rgba, srgb, is_normal).with_context(|| format!("encode image[{i}]"))?;
         while !new_bin.len().is_multiple_of(4) {
             new_bin.push(0);
         }
@@ -646,11 +645,8 @@ pub(crate) mod tests {
     pub(crate) fn png_bytes(w: u32, h: u32, px: [u8; 4]) -> Vec<u8> {
         let img = image::RgbaImage::from_pixel(w, h, image::Rgba(px));
         let mut out = Vec::new();
-        img.write_to(
-            &mut std::io::Cursor::new(&mut out),
-            image::ImageFormat::Png,
-        )
-        .unwrap();
+        img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
         out
     }
 
@@ -758,7 +754,10 @@ pub(crate) mod tests {
         let out = transform_glb(&mk_glb(gltf, &png), ".glb", None).unwrap();
         let (root, bin) = out_root_and_bin(&out);
         let img = &root.images[0];
-        assert_eq!(img.mime_type.as_ref().map(|m| m.0.as_str()), Some("image/png"));
+        assert_eq!(
+            img.mime_type.as_ref().map(|m| m.0.as_str()),
+            Some("image/png")
+        );
         let view = &root.buffer_views[img.buffer_view.unwrap().value()];
         let start = view.byte_offset.unwrap().0 as usize;
         assert_eq!(&bin[start..start + png.len()], &png[..]);
@@ -913,10 +912,9 @@ pub(crate) mod tests {
         let out = transform_glb(&mk_glb(gltf, &bin), ".glb", None).unwrap();
         let (root, obin) = out_root_and_bin(&out);
         let prim = &root.meshes[0].primitives[0];
-        assert!(prim
+        assert!(!prim
             .attributes
-            .get(&Checked::Valid(mesh::Semantic::Tangents))
-            .is_none());
+            .contains_key(&Checked::Valid(mesh::Semantic::Tangents)));
         let ext = prim.extensions.as_ref().unwrap();
         assert_eq!(
             ext.others.get("KHR_draco_mesh_compression"),
@@ -942,7 +940,8 @@ pub(crate) mod tests {
             "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 42}]
         });
         let bytes = serde_json::to_vec(&gltf).unwrap();
-        let resolve = |uri: &str| -> Option<Vec<u8>> { (uri == "geo.bin").then(|| ext_bin.clone()) };
+        let resolve =
+            |uri: &str| -> Option<Vec<u8>> { (uri == "geo.bin").then(|| ext_bin.clone()) };
         let out = transform_glb(&bytes, ".gltf", Some(&resolve)).unwrap();
         let (root, obin) = out_root_and_bin(&out);
         assert_eq!(root.images[0].uri.as_deref(), Some("textures/wall.png"));

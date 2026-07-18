@@ -120,8 +120,7 @@ impl crate::live::Proxy {
                 }
             })
             .collect();
-        let (pack_bytes, index_json) =
-            pack::build_pack(cid, &entries, &blobs, BVW_MAX_PACK_BYTES)?;
+        let (pack_bytes, index_json) = pack::build_pack(cid, &entries, &blobs, BVW_MAX_PACK_BYTES)?;
 
         let dir = out_root.join(cid).join(BVW_PLATFORM);
         std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
@@ -253,7 +252,11 @@ mod tests {
             .join(BVW_PLATFORM)
             .join(format!("{}.br", pack_file_name(entity)))
             .is_file());
-        assert!(out.join(entity).join(BVW_PLATFORM).join("pack.json").is_file());
+        assert!(out
+            .join(entity)
+            .join(BVW_PLATFORM)
+            .join("pack.json")
+            .is_file());
         let _ = std::fs::remove_dir_all(&cache);
         bytes
     }
@@ -269,12 +272,7 @@ mod tests {
         let parsed = pack::parse_pack(&first).unwrap();
         assert_eq!(parsed.index.entity, entity);
         assert_eq!(parsed.index.profile, BVW_PROFILE);
-        let paths: Vec<&str> = parsed
-            .index
-            .files
-            .iter()
-            .map(|e| e.path.as_str())
-            .collect();
+        let paths: Vec<&str> = parsed.index.files.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(
             paths,
             vec![

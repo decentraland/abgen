@@ -120,7 +120,10 @@ pub fn parse_pack(bytes: &[u8]) -> Result<ParsedPack> {
     }
     let index_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as u64;
     if 16 + index_len > bytes.len() as u64 {
-        bail!("index length {index_len} overruns pack of {} bytes", bytes.len());
+        bail!(
+            "index length {index_len} overruns pack of {} bytes",
+            bytes.len()
+        );
     }
     let index: PackIndex = serde_json::from_slice(&bytes[16..16 + index_len as usize])?;
     let payload_base = align_up(16 + index_len, ALIGN);
@@ -206,9 +209,9 @@ mod tests {
             spec("main.crdt", "cid3", "raw"),
         ];
         let b = blobs(&[
-            (&"cid1", b"GLBBYTESGLBBYTESGLB"),
-            (&"cid2", b"DDS"),
-            (&"cid3", b"c"),
+            ("cid1", b"GLBBYTESGLBBYTESGLB"),
+            ("cid2", b"DDS"),
+            ("cid3", b"c"),
         ]);
         let (pack, index_json) = build_pack("bafkent", &entries, &b, u64::MAX).unwrap();
         let parsed = parse_pack(&pack).unwrap();
@@ -216,7 +219,10 @@ mod tests {
         assert_eq!(parsed.index.profile, "bv1");
         assert_eq!(parsed.index.entity, "bafkent");
         let paths: Vec<&str> = parsed.index.files.iter().map(|e| e.path.as_str()).collect();
-        assert_eq!(paths, vec!["a.png", "copy/z.glb", "main.crdt", "models/z.glb"]);
+        assert_eq!(
+            paths,
+            vec!["a.png", "copy/z.glb", "main.crdt", "models/z.glb"]
+        );
         let by_path: HashMap<&str, &PackEntry> = parsed
             .index
             .files
@@ -241,7 +247,7 @@ mod tests {
     #[test]
     fn cap_is_enforced() {
         let entries = vec![spec("a.bin", "cid1", "raw")];
-        let b = blobs(&[(&"cid1", &[0u8; 4096][..])]);
+        let b = blobs(&[("cid1", &[0u8; 4096][..])]);
         let err = build_pack("bafkent", &entries, &b, 128).unwrap_err();
         assert!(err.to_string().contains("over the 128"), "{err}");
         assert!(build_pack("bafkent", &entries, &b, 1 << 20).is_ok());
@@ -250,7 +256,7 @@ mod tests {
     #[test]
     fn parse_rejects_corruption() {
         let entries = vec![spec("a.bin", "cid1", "raw"), spec("b.bin", "cid2", "raw")];
-        let b = blobs(&[(&"cid1", b"AAAA"), (&"cid2", b"BB")]);
+        let b = blobs(&[("cid1", b"AAAA"), ("cid2", b"BB")]);
         let (pack, _) = build_pack("bafkent", &entries, &b, u64::MAX).unwrap();
 
         assert!(parse_pack(&pack[..12]).is_err());

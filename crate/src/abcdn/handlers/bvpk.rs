@@ -42,8 +42,15 @@ fn accepts_brotli(headers: &HeaderMap) -> bool {
         .get("accept-encoding")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| {
-            v.split(',')
-                .any(|t| t.trim().split(';').next().map(str::trim) == Some("br"))
+            v.split(',').any(|t| {
+                let mut parts = t.trim().split(';');
+                parts.next().map(str::trim) == Some("br")
+                    && !parts.any(|p| {
+                        p.trim()
+                            .strip_prefix("q=")
+                            .is_some_and(|q| q.trim().parse::<f32>() == Ok(0.0))
+                    })
+            })
         })
 }
 
@@ -86,7 +93,8 @@ pub(super) async fn bvpk_serve_local(
             }
         }
     }
-    let Some((exact, from_jit)) = state.serve_lookup(|r| resolver::bvpack_path(r, entity, filename))
+    let Some((exact, from_jit)) =
+        state.serve_lookup(|r| resolver::bvpack_path(r, entity, filename))
     else {
         return serve::not_found();
     };

@@ -88,7 +88,10 @@ async fn warm_pack_serves_with_etag_ranges_and_cors() {
     assert_eq!(body_bytes(resp).await, pack);
 
     let mut inm = HeaderMap::new();
-    inm.insert("if-none-match", format!("\"{entity}.pack\"").parse().unwrap());
+    inm.insert(
+        "if-none-match",
+        format!("\"{entity}.pack\"").parse().unwrap(),
+    );
     let cached = request(&state, Method::GET, &path, inm).await;
     assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
 
@@ -149,6 +152,13 @@ async fn brotli_negotiation_serves_sidecar_on_the_plain_url() {
     assert_eq!(plain.status(), StatusCode::OK);
     assert!(plain.headers().get("Content-Encoding").is_none());
     assert_eq!(body_bytes(plain).await, pack);
+
+    let mut refuse = HeaderMap::new();
+    refuse.insert("accept-encoding", "br;q=0, gzip".parse().unwrap());
+    let refused = request(&state, Method::GET, &path, refuse).await;
+    assert_eq!(refused.status(), StatusCode::OK);
+    assert!(refused.headers().get("Content-Encoding").is_none());
+    assert_eq!(body_bytes(refused).await, pack);
 
     let explicit = get(&state, &format!("{path}.br")).await;
     assert_eq!(explicit.status(), StatusCode::OK);
@@ -224,10 +234,7 @@ async fn cold_jit_builds_detached_and_wait_coalesces() {
     let entity = "bafkbvjit";
     let ent_json = entity_json(
         entity,
-        &[
-            ("Assets/Readme.TXT", "bafkraw1"),
-            ("movie.mp4", "bafkvid1"),
-        ],
+        &[("Assets/Readme.TXT", "bafkraw1"), ("movie.mp4", "bafkvid1")],
     );
     let (cat_host, cat_seen) = crate::live::stub::serve(vec![
         (format!("/contents/{entity}"), 200, ent_json),
@@ -266,12 +273,7 @@ async fn cold_jit_builds_detached_and_wait_coalesces() {
     let bytes = body_bytes(get(&state, &path).await).await;
     let parsed = crate::bvwebgpu::pack::parse_pack(&bytes).unwrap();
     assert_eq!(parsed.index.entity, entity);
-    let paths: Vec<&str> = parsed
-        .index
-        .files
-        .iter()
-        .map(|e| e.path.as_str())
-        .collect();
+    let paths: Vec<&str> = parsed.index.files.iter().map(|e| e.path.as_str()).collect();
     assert_eq!(paths, vec!["assets/readme.txt"]);
     assert_eq!(
         crate::bvwebgpu::pack::entry_slice(&bytes, &parsed, &parsed.index.files[0]),
@@ -284,7 +286,10 @@ async fn cold_jit_builds_detached_and_wait_coalesces() {
         .filter(|l| *l == &format!("GET /contents/{entity}"))
         .count();
     assert_eq!(ent_fetches, 1, "{log:?}");
-    assert!(!log.contains(&"GET /contents/bafkvid1".to_string()), "{log:?}");
+    assert!(
+        !log.contains(&"GET /contents/bafkvid1".to_string()),
+        "{log:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
