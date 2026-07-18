@@ -34,29 +34,35 @@ fn align_up(v: u64, a: u64) -> u64 {
     v.div_ceil(a) * a
 }
 
-pub fn build_pack(
+pub struct PackPlan {
+    pub index_json: Vec<u8>,
+    pub payload_base: u64,
+    pub blob_order: Vec<(String, u64, u64)>,
+    pub total: u64,
+}
+
+pub fn plan_pack(
     entity: &str,
     entries: &[EntrySpec],
-    blobs_by_cid: &HashMap<String, Vec<u8>>,
+    meta_by_cid: &HashMap<String, (u64, String)>,
     max_bytes: u64,
-) -> Result<(Vec<u8>, Vec<u8>)> {
+) -> Result<PackPlan> {
     let mut sorted: Vec<&EntrySpec> = entries.iter().collect();
     sorted.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
 
-    let mut layout: HashMap<&str, (u64, u64, String)> = HashMap::new();
-    let mut blob_order: Vec<&str> = Vec::new();
+    let mut layout: HashMap<&str, (u64, u64, &str)> = HashMap::new();
+    let mut blob_order: Vec<(String, u64, u64)> = Vec::new();
     let mut cursor: u64 = 0;
     for e in &sorted {
         if layout.contains_key(e.cid.as_str()) {
             continue;
         }
-        let blob = blobs_by_cid
+        let (len, sha) = meta_by_cid
             .get(&e.cid)
             .ok_or_else(|| anyhow!("no blob for cid {}", e.cid))?;
         let off = align_up(cursor, ALIGN);
-        let len = blob.len() as u64;
-        layout.insert(&e.cid, (off, len, crate::hashes::sha256_hex(blob)));
-        blob_order.push(&e.cid);
+        layout.insert(&e.cid, (off, *len, sha.as_str()));
+        blob_order.push((e.cid.clone(), off, *len));
         cursor = off + len;
     }
     let payload = cursor;
@@ -71,7 +77,7 @@ pub fn build_pack(
                 off: *off,
                 len: *len,
                 kind: e.kind.to_string(),
-                sha256: sha.clone(),
+                sha256: sha.to_string(),
             }
         })
         .collect();
@@ -89,20 +95,66 @@ pub fn build_pack(
     if total > max_bytes {
         bail!("bvwebgpu pack for {entity} is {total} bytes, over the {max_bytes} cap");
     }
+    Ok(PackPlan {
+        index_json,
+        payload_base,
+        blob_order,
+        total,
+    })
+}
 
-    let mut out = Vec::with_capacity(total as usize);
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&VERSION.to_le_bytes());
-    out.extend_from_slice(&(index_json.len() as u32).to_le_bytes());
-    out.extend_from_slice(&index_json);
-    out.resize(payload_base as usize, 0);
-    for cid in blob_order {
-        let (off, _, _) = layout[cid];
-        out.resize((payload_base + off) as usize, 0);
-        out.extend_from_slice(&blobs_by_cid[cid]);
+fn pad_to<W: std::io::Write>(out: &mut W, cursor: &mut u64, target: u64) -> Result<()> {
+    let zeros = [0u8; ALIGN as usize];
+    while *cursor < target {
+        let n = (target - *cursor).min(ALIGN) as usize;
+        out.write_all(&zeros[..n])?;
+        *cursor += n as u64;
     }
-    debug_assert_eq!(out.len() as u64, total);
-    Ok((out, index_json))
+    Ok(())
+}
+
+pub fn write_pack<W: std::io::Write, R: std::io::Read>(
+    plan: &PackPlan,
+    mut open: impl FnMut(&str) -> Result<R>,
+    out: &mut W,
+) -> Result<()> {
+    out.write_all(MAGIC)?;
+    out.write_all(&VERSION.to_le_bytes())?;
+    out.write_all(&(plan.index_json.len() as u32).to_le_bytes())?;
+    out.write_all(&plan.index_json)?;
+    let mut cursor = 8 + 4 + 4 + plan.index_json.len() as u64;
+    pad_to(out, &mut cursor, plan.payload_base)?;
+    for (cid, off, len) in &plan.blob_order {
+        pad_to(out, &mut cursor, plan.payload_base + off)?;
+        let mut r = open(cid)?;
+        let copied = std::io::copy(&mut r, out)?;
+        if copied != *len {
+            bail!("blob {cid} yielded {copied} bytes, planned {len}");
+        }
+        cursor += copied;
+    }
+    debug_assert_eq!(cursor, plan.total);
+    Ok(())
+}
+
+pub fn build_pack(
+    entity: &str,
+    entries: &[EntrySpec],
+    blobs_by_cid: &HashMap<String, Vec<u8>>,
+    max_bytes: u64,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let meta: HashMap<String, (u64, String)> = blobs_by_cid
+        .iter()
+        .map(|(c, b)| (c.clone(), (b.len() as u64, crate::hashes::sha256_hex(b))))
+        .collect();
+    let plan = plan_pack(entity, entries, &meta, max_bytes)?;
+    let mut out = Vec::with_capacity(plan.total as usize);
+    write_pack(
+        &plan,
+        |cid| Ok(std::io::Cursor::new(blobs_by_cid[cid].as_slice())),
+        &mut out,
+    )?;
+    Ok((out, plan.index_json))
 }
 
 pub struct ParsedPack {
