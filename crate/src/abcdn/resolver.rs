@@ -356,11 +356,11 @@ mod tests {
         let root = Path::new("/out");
         assert_eq!(
             bvpack_path(root, "bafkEnt", "bafkEnt.pack").unwrap(),
-            Path::new("/out/bafkEnt/bvwebgpu/bafkEnt_bv1.pack")
+            Path::new("/out/bafkEnt/bvwebgpu/bafkEnt_bv2.pack")
         );
         assert_eq!(
             bvpack_path(root, "bafkEnt", "bafkEnt.pack.br").unwrap(),
-            Path::new("/out/bafkEnt/bvwebgpu/bafkEnt_bv1.pack.br")
+            Path::new("/out/bafkEnt/bvwebgpu/bafkEnt_bv2.pack.br")
         );
         assert!(bvpack_path(root, "bafkEnt", "other.pack").is_none());
         assert!(bvpack_path(root, "bafkEnt", "bafkEnt.zip").is_none());

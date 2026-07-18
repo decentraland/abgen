@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const BVW_PLATFORM: &str = "bvwebgpu";
-pub const BVW_PROFILE: &str = "bv1";
+pub const BVW_PROFILE: &str = "bv2";
 pub const BVW_MAX_PACK_BYTES: u64 = 256 * 1024 * 1024;
 pub const BVW_TEXTURE_MAX: u32 = 1024;
 
@@ -210,11 +210,11 @@ mod tests {
     use serde_json::json;
 
     const GOLDEN_PACK_SHA256: &str =
-        "d5b1eeb8f0956d8a7d190a5de030c71875784f5037a7b96db7707e32f1ae70cd";
+        "3034ca9e27476f4faef436980454f707ed24ca7cc50b38df68b4c907c75195cd";
 
     fn fixture_routes(entity: &str) -> (crate::live::stub::Routes, Vec<u8>, Vec<u8>, Vec<u8>) {
-        let png = emit::tests::png_bytes(8, 8, [180, 40, 220, 255]);
-        let normal_png = emit::tests::png_bytes(4, 4, [128, 128, 255, 255]);
+        let png = emit::tests::noise_png_bytes(16, 16);
+        let normal_png = emit::tests::noise_png_bytes(16, 16);
         let glb = {
             let mut bin: Vec<u8> = Vec::new();
             bin.extend_from_slice(&normal_png);
@@ -239,6 +239,7 @@ mod tests {
             )
         };
         let tiny = emit::tests::png_bytes(2, 2, [1, 2, 3, 4]);
+        let flat = emit::tests::png_bytes(64, 64, [90, 120, 30, 255]);
         let bad = b"corrupt png bytes".to_vec();
         let js = b"console.log('hi')".to_vec();
         let ent = serde_json::to_vec(&json!({
@@ -249,6 +250,7 @@ mod tests {
                 {"file": "Models/Scene.GLB", "hash": "bafkglb"},
                 {"file": "tex\\Color.PNG", "hash": "bafkpng"},
                 {"file": "tiny.png", "hash": "bafktiny"},
+                {"file": "flat.png", "hash": "bafkflat"},
                 {"file": "bad.png", "hash": "bafkbad"},
                 {"file": "movie.webm", "hash": "bafkvid"},
                 {"file": "game.js", "hash": "bafkjs"},
@@ -262,10 +264,11 @@ mod tests {
             ("/contents/bafkglb".to_string(), 200, glb),
             ("/contents/bafkpng".to_string(), 200, png.clone()),
             ("/contents/bafktiny".to_string(), 200, tiny.clone()),
+            ("/contents/bafkflat".to_string(), 200, flat.clone()),
             ("/contents/bafkbad".to_string(), 200, bad.clone()),
             ("/contents/bafkjs".to_string(), 200, js),
         ];
-        (routes, tiny, bad, png)
+        (routes, tiny, bad, flat)
     }
 
     fn build_once(tag: &str, routes: crate::live::stub::Routes, entity: &str) -> Vec<u8> {
@@ -354,7 +357,7 @@ mod tests {
     #[test]
     fn pack_build_is_deterministic_and_matches_membership_rules() {
         let entity = "bafkgoldenent";
-        let (routes, tiny, bad, _png) = fixture_routes(entity);
+        let (routes, tiny, bad, flat) = fixture_routes(entity);
         let first = build_once("a", routes.clone(), entity);
         let second = build_once("b", routes, entity);
         assert_eq!(first, second, "same inputs must give byte-identical packs");
@@ -368,6 +371,7 @@ mod tests {
             vec![
                 "bad.png",
                 "dup/game.js",
+                "flat.png",
                 "game.js",
                 "models/scene.glb",
                 "tex/color.png",
@@ -390,6 +394,11 @@ mod tests {
             pack::entry_slice(&first, &parsed, by_path["tiny.png"]),
             &tiny[..]
         );
+        assert_eq!(by_path["flat.png"].kind, "img");
+        assert_eq!(
+            pack::entry_slice(&first, &parsed, by_path["flat.png"]),
+            &flat[..]
+        );
         assert_eq!(by_path["models/scene.glb"].kind, "glb");
         assert_eq!(by_path["tex/color.png"].kind, "img");
         let d1 = by_path["dup/game.js"];
@@ -398,8 +407,8 @@ mod tests {
 
         let dds = pack::entry_slice(&first, &parsed, by_path["tex/color.png"]);
         let dds = ddsfile::Dds::read(std::io::Cursor::new(dds)).unwrap();
-        assert_eq!((dds.get_width(), dds.get_height()), (8, 8));
-        assert_eq!(dds.get_num_mipmap_levels(), 4);
+        assert_eq!((dds.get_width(), dds.get_height()), (16, 16));
+        assert_eq!(dds.get_num_mipmap_levels(), 5);
 
         let glb = pack::entry_slice(&first, &parsed, by_path["models/scene.glb"]);
         assert_eq!(&glb[..4], b"glTF");

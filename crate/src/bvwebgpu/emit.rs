@@ -10,10 +10,24 @@ pub(crate) type ResolveUri<'a> = crate::gltf::Resolve<'a>;
 
 pub(crate) fn transform_img(bytes: &[u8]) -> Result<Vec<u8>> {
     let img = image::load_from_memory(bytes).context("decode image")?;
-    if img.width() <= 2 || img.height() <= 2 {
+    if keep_raw(img.width(), img.height(), bytes.len()) {
         return Ok(bytes.to_vec());
     }
     encode_dds_bc7(&img.to_rgba8(), true, false)
+}
+
+const DDS_HEADER_LEN: usize = 148;
+
+// BC7 is fixed-rate, so the encoded size (header + full mip chain) is exact
+// from the target dimensions alone; images the encode cannot shrink skip it.
+fn encoded_dds_len(w: u32, h: u32) -> usize {
+    let (tw, th) = crate::texprofile::bc7_target_size(w, h, super::BVW_TEXTURE_MAX);
+    let mips = crate::bc7_pure::compute_default_mip_count(tw, th);
+    DDS_HEADER_LEN + crate::bc7_pure::compute_mip_chain_size(tw, th, mips)
+}
+
+fn keep_raw(w: u32, h: u32, raw_len: usize) -> bool {
+    w <= 2 || h <= 2 || encoded_dds_len(w, h) >= raw_len
 }
 
 fn encode_dds_bc7(rgba: &RgbaImage, srgb: bool, is_normal: bool) -> Result<Vec<u8>> {
@@ -527,7 +541,7 @@ pub(crate) fn transform_glb(bytes: &[u8], ext: &str, resolve: ResolveUri) -> Res
             Some(src) => {
                 let img =
                     image::load_from_memory(&src).map_err(|e| anyhow!("decode image[{i}]: {e}"))?;
-                if img.width() <= 2 || img.height() <= 2 {
+                if keep_raw(img.width(), img.height(), src.len()) {
                     plans.push(None);
                 } else {
                     let class = classes.get(i).copied().unwrap_or(Tc::Srgb);
@@ -571,6 +585,7 @@ pub(crate) fn transform_glb(bytes: &[u8], ext: &str, resolve: ResolveUri) -> Res
         };
         let dds =
             encode_dds_bc7(&rgba, srgb, is_normal).with_context(|| format!("encode image[{i}]"))?;
+        debug_assert_eq!(dds.len(), encoded_dds_len(rgba.width(), rgba.height()));
         while !new_bin.len().is_multiple_of(4) {
             new_bin.push(0);
         }
@@ -650,6 +665,20 @@ pub(crate) mod tests {
         out
     }
 
+    pub(crate) fn noise_png_bytes(w: u32, h: u32) -> Vec<u8> {
+        let mut s = 0x2545_f491u32;
+        let mut img = image::RgbaImage::new(w, h);
+        for p in img.pixels_mut() {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let b = s.to_le_bytes();
+            *p = image::Rgba([b[0], b[1], b[2], 255]);
+        }
+        let mut out = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    }
+
     pub(crate) fn mk_glb(mut gltf: serde_json::Value, bin: &[u8]) -> Vec<u8> {
         gltf["asset"] = json!({"version": "2.0"});
         if !bin.is_empty() {
@@ -707,7 +736,7 @@ pub(crate) mod tests {
 
     #[test]
     fn embedded_png_becomes_dds_bc7_with_full_mips() {
-        let png = png_bytes(8, 8, [200, 60, 10, 255]);
+        let png = noise_png_bytes(16, 16);
         let gltf = json!({
             "images": [{"bufferView": 0, "mimeType": "image/png"}],
             "textures": [{"source": 0}],
@@ -718,12 +747,12 @@ pub(crate) mod tests {
         let out = transform_glb(&glb, ".glb", None).unwrap();
         let (root, bin) = out_root_and_bin(&out);
         let dds = dds_of(&root, &bin, 0);
-        assert_eq!((dds.get_width(), dds.get_height()), (8, 8));
-        assert_eq!(dds.get_num_mipmap_levels(), 4);
+        assert_eq!((dds.get_width(), dds.get_height()), (16, 16));
+        assert_eq!(dds.get_num_mipmap_levels(), 5);
         assert_eq!(dds.get_dxgi_format(), Some(ddsfile::DxgiFormat::BC7_UNorm));
         assert_eq!(
             dds.data.len(),
-            crate::bc7_pure::compute_mip_chain_size(8, 8, 4)
+            crate::bc7_pure::compute_mip_chain_size(16, 16, 5)
         );
         let zombie = &root.buffer_views[0];
         assert_eq!(zombie.byte_length.0, 0);
@@ -731,8 +760,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn compressible_image_stays_raw_when_encode_is_larger() {
+        let flat = png_bytes(64, 64, [90, 120, 30, 255]);
+        assert_eq!(transform_img(&flat).unwrap(), flat);
+        let noisy = noise_png_bytes(16, 16);
+        let mut bin = flat.clone();
+        while !bin.len().is_multiple_of(4) {
+            bin.push(0);
+        }
+        let noisy_off = bin.len();
+        bin.extend_from_slice(&noisy);
+        let gltf = json!({
+            "images": [
+                {"bufferView": 0, "mimeType": "image/png"},
+                {"bufferView": 1, "mimeType": "image/png"}
+            ],
+            "textures": [{"source": 0}, {"source": 1}],
+            "materials": [
+                {"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}},
+                {"pbrMetallicRoughness": {"baseColorTexture": {"index": 1}}}
+            ],
+            "bufferViews": [
+                {"buffer": 0, "byteOffset": 0, "byteLength": flat.len()},
+                {"buffer": 0, "byteOffset": noisy_off, "byteLength": noisy.len()}
+            ]
+        });
+        let out = transform_glb(&mk_glb(gltf, &bin), ".glb", None).unwrap();
+        let (root, obin) = out_root_and_bin(&out);
+        assert_eq!(
+            root.images[0].mime_type.as_ref().map(|m| m.0.as_str()),
+            Some("image/png")
+        );
+        let view = &root.buffer_views[root.images[0].buffer_view.unwrap().value()];
+        let start = view.byte_offset.unwrap().0 as usize;
+        assert_eq!(&obin[start..start + flat.len()], &flat[..]);
+        let dds = dds_of(&root, &obin, 1);
+        assert_eq!((dds.get_width(), dds.get_height()), (16, 16));
+    }
+
+    #[test]
+    fn encoded_dds_len_matches_encoder_output() {
+        for (w, h) in [(8u32, 8u32), (16, 8)] {
+            let img = image::load_from_memory(&noise_png_bytes(w, h)).unwrap();
+            let dds = encode_dds_bc7(&img.to_rgba8(), true, false).unwrap();
+            assert_eq!(dds.len(), encoded_dds_len(w, h));
+        }
+        assert_eq!(
+            encoded_dds_len(1500, 500),
+            DDS_HEADER_LEN + crate::bc7_pure::compute_mip_chain_size(1024, 256, 11)
+        );
+    }
+
+    #[test]
     fn oversize_png_is_capped_to_1024_with_npot_snap() {
-        let png = png_bytes(1500, 500, [10, 10, 10, 255]);
+        let png = noise_png_bytes(1500, 500);
         let gltf = json!({
             "images": [{"bufferView": 0, "mimeType": "image/png"}],
             "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": png.len()}]
@@ -839,7 +920,7 @@ pub(crate) mod tests {
 
     #[test]
     fn tangents_and_weight_renorm_on_normal_mapped_skinned_quad() {
-        let png = png_bytes(4, 4, [128, 128, 255, 255]);
+        let png = noise_png_bytes(16, 16);
         let (bin, views, accessors) = quad_bin_and_views(&png);
         let gltf = json!({
             "scene": 0,
@@ -892,7 +973,7 @@ pub(crate) mod tests {
 
     #[test]
     fn draco_primitive_keeps_extension_and_gets_no_mesh_passes() {
-        let png = png_bytes(4, 4, [50, 50, 50, 255]);
+        let png = noise_png_bytes(16, 16);
         let (bin, views, accessors) = quad_bin_and_views(&png);
         let gltf = json!({
             "extensionsUsed": ["KHR_draco_mesh_compression"],
@@ -958,7 +1039,8 @@ pub(crate) mod tests {
         let tiny = png_bytes(2, 2, [9, 9, 9, 9]);
         assert_eq!(transform_img(&tiny).unwrap(), tiny);
         assert!(transform_img(b"garbage").is_err());
-        let big = png_bytes(16, 8, [90, 120, 30, 255]);
+        let big = noise_png_bytes(16, 8);
+        assert!(encoded_dds_len(16, 8) < big.len());
         let dds_bytes = transform_img(&big).unwrap();
         let dds = ddsfile::Dds::read(std::io::Cursor::new(&dds_bytes[..])).unwrap();
         assert_eq!((dds.get_width(), dds.get_height()), (16, 8));
