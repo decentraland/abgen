@@ -34,7 +34,7 @@ fn write_warm_pack(dir: &std::path::Path, entity: &str) -> Vec<u8> {
     let (pack, _) = crate::bvwebgpu::pack::build_pack(entity, &entries, &blobs, u64::MAX).unwrap();
     let pdir = dir.join(entity).join("bvwebgpu");
     std::fs::create_dir_all(&pdir).unwrap();
-    std::fs::write(pdir.join(format!("{entity}_bv2.pack")), &pack).unwrap();
+    std::fs::write(pdir.join(format!("{entity}_bv3.pack")), &pack).unwrap();
     pack
 }
 
@@ -60,7 +60,7 @@ async fn warm_pack_serves_with_etag_ranges_and_cors() {
     let pack = write_warm_pack(&dir, entity);
     let state = mk_lane_state(&dir, None);
 
-    let path = format!("bvwebgpu/bv2/{entity}.pack");
+    let path = format!("bvwebgpu/bv3/{entity}.pack");
     let resp = get(&state, &path).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
@@ -121,12 +121,12 @@ async fn brotli_negotiation_serves_sidecar_on_the_plain_url() {
     std::fs::write(
         dir.join(entity)
             .join("bvwebgpu")
-            .join(format!("{entity}_bv2.pack.br")),
+            .join(format!("{entity}_bv3.pack.br")),
         &br,
     )
     .unwrap();
     let state = mk_lane_state(&dir, None);
-    let path = format!("bvwebgpu/bv2/{entity}.pack");
+    let path = format!("bvwebgpu/bv3/{entity}.pack");
 
     let mut ae = HeaderMap::new();
     ae.insert("accept-encoding", "gzip, br".parse().unwrap());
@@ -183,7 +183,7 @@ async fn preflight_and_error_reasons() {
     let pre = request(
         &state,
         Method::OPTIONS,
-        "bvwebgpu/bv2/whatever.pack",
+        "bvwebgpu/bv3/whatever.pack",
         HeaderMap::new(),
     )
     .await;
@@ -208,20 +208,20 @@ async fn preflight_and_error_reasons() {
         Some("bvwebgpu-unknown-profile")
     );
 
-    let traversal = get(&state, "bvwebgpu/bv2/...pack").await;
+    let traversal = get(&state, "bvwebgpu/bv3/...pack").await;
     assert_eq!(traversal.status(), StatusCode::NOT_FOUND);
     assert_eq!(reason_of(&traversal), None);
 
-    let not_pack = get(&state, "bvwebgpu/bv2/bafkx.zip").await;
+    let not_pack = get(&state, "bvwebgpu/bv3/bafkx.zip").await;
     assert_eq!(not_pack.status(), StatusCode::NOT_FOUND);
     assert_eq!(reason_of(&not_pack), None);
 
-    let br_cold = get(&state, "bvwebgpu/bv2/bafkx.pack.br").await;
+    let br_cold = get(&state, "bvwebgpu/bv3/bafkx.pack.br").await;
     assert_eq!(br_cold.status(), StatusCode::NOT_FOUND);
     assert_eq!(reason_of(&br_cold).as_deref(), Some("br-not-built"));
 
     std::env::set_var("ABGEN_BVWEBGPU", "0");
-    let disabled = get(&state, "bvwebgpu/bv2/bafkx.pack").await;
+    let disabled = get(&state, "bvwebgpu/bv3/bafkx.pack").await;
     std::env::remove_var("ABGEN_BVWEBGPU");
     assert_eq!(disabled.status(), StatusCode::NOT_FOUND);
     assert_eq!(reason_of(&disabled).as_deref(), Some("bvwebgpu-disabled"));
@@ -249,7 +249,7 @@ async fn cold_jit_builds_detached_and_wait_coalesces() {
         "bvpk-jit",
     );
     let state = mk_lane_state(&dir, Some(proxy));
-    let path = format!("bvwebgpu/bv2/{entity}.pack");
+    let path = format!("bvwebgpu/bv3/{entity}.pack");
 
     let cold = get(&state, &path).await;
     assert_eq!(cold.status(), StatusCode::NOT_FOUND);
@@ -258,7 +258,7 @@ async fn cold_jit_builds_detached_and_wait_coalesces() {
     let probe = dir
         .join(entity)
         .join("bvwebgpu")
-        .join(format!("{entity}_bv2.pack"));
+        .join(format!("{entity}_bv3.pack"));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while !probe.is_file() && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -306,7 +306,7 @@ async fn unbuildable_entity_is_negative_cached() {
         "bvpk-fail",
     );
     let state = mk_lane_state(&dir, Some(proxy));
-    let path = format!("bvwebgpu/bv2/{entity}.pack?wait=1");
+    let path = format!("bvwebgpu/bv3/{entity}.pack?wait=1");
 
     let first = get(&state, &path).await;
     assert_eq!(first.status(), StatusCode::NOT_FOUND);
@@ -325,13 +325,13 @@ async fn space_read_through_materializes_the_pack() {
     let staging = lane_temp_dir("bvpk-space-staging");
     let pack = write_warm_pack(&staging, entity);
     let (space_host, sseen) = crate::live::stub::serve(vec![(
-        format!("/bvwebgpu/bv2/{entity}.pack"),
+        format!("/bvwebgpu/bv3/{entity}.pack"),
         200,
         pack.clone(),
     )]);
     let proxy = mk_stub_proxy_catalyst(&space_host, "http://127.0.0.1:9", false, "bvpk-space");
     let state = mk_lane_state(&dir, Some(proxy));
-    let path = format!("bvwebgpu/bv2/{entity}.pack");
+    let path = format!("bvwebgpu/bv3/{entity}.pack");
 
     let resp = get(&state, &path).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -339,12 +339,12 @@ async fn space_read_through_materializes_the_pack() {
     assert!(dir
         .join(entity)
         .join("bvwebgpu")
-        .join(format!("{entity}_bv2.pack"))
+        .join(format!("{entity}_bv3.pack"))
         .is_file());
     assert!(sseen
         .lock()
         .unwrap()
-        .contains(&format!("GET /bvwebgpu/bv2/{entity}.pack")));
+        .contains(&format!("GET /bvwebgpu/bv3/{entity}.pack")));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&staging);
 }

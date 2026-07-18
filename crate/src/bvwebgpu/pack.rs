@@ -268,7 +268,7 @@ mod tests {
         let (pack, index_json) = build_pack("bafkent", &entries, &b, u64::MAX).unwrap();
         let parsed = parse_pack(&pack).unwrap();
         assert_eq!(parsed.index.v, 1);
-        assert_eq!(parsed.index.profile, "bv2");
+        assert_eq!(parsed.index.profile, "bv3");
         assert_eq!(parsed.index.entity, "bafkent");
         let paths: Vec<&str> = parsed.index.files.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(
@@ -291,7 +291,7 @@ mod tests {
             assert_eq!(got, b[&e.cid].as_slice());
             assert_eq!(e.sha256, crate::hashes::sha256_hex(got));
         }
-        assert!(index_json.starts_with(b"{\"v\":1,\"profile\":\"bv2\",\"entity\":\"bafkent\","));
+        assert!(index_json.starts_with(b"{\"v\":1,\"profile\":\"bv3\",\"entity\":\"bafkent\","));
         let again = build_pack("bafkent", &entries, &b, u64::MAX).unwrap().0;
         assert_eq!(pack, again);
     }

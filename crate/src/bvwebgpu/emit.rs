@@ -168,7 +168,7 @@ fn split_container(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     }
 }
 
-fn is_draco(prim: &mesh::Primitive) -> bool {
+pub(super) fn is_draco(prim: &mesh::Primitive) -> bool {
     prim.extensions
         .as_ref()
         .is_some_and(|e| e.others.contains_key("KHR_draco_mesh_compression"))
@@ -196,7 +196,7 @@ fn acc_layout(root: &Root, ai: usize, elem: usize) -> Option<AccLayout> {
     })
 }
 
-fn acc_kind(root: &Root, ai: usize) -> Option<(ComponentType, Type, bool)> {
+pub(super) fn acc_kind(root: &Root, ai: usize) -> Option<(ComponentType, Type, bool)> {
     let a = root.accessors.get(ai)?;
     let Checked::Valid(GenericComponentType(ct)) = a.component_type else {
         return None;
@@ -207,7 +207,11 @@ fn acc_kind(root: &Root, ai: usize) -> Option<(ComponentType, Type, bool)> {
     Some((ct, ty, a.normalized))
 }
 
-fn read_f32_rows<const N: usize>(root: &Root, bin: &[u8], ai: usize) -> Option<Vec<[f32; N]>> {
+pub(super) fn read_f32_rows<const N: usize>(
+    root: &Root,
+    bin: &[u8],
+    ai: usize,
+) -> Option<Vec<[f32; N]>> {
     let (ct, ty, normalized) = acc_kind(root, ai)?;
     let ncomp = match ty {
         Type::Vec2 => 2,
@@ -253,7 +257,7 @@ fn read_f32_rows<const N: usize>(root: &Root, bin: &[u8], ai: usize) -> Option<V
     Some(out)
 }
 
-fn read_indices(root: &Root, bin: &[u8], ai: usize) -> Option<Vec<u32>> {
+pub(super) fn read_indices(root: &Root, bin: &[u8], ai: usize) -> Option<Vec<u32>> {
     let (ct, ty, _) = acc_kind(root, ai)?;
     if ty != Type::Scalar {
         return None;
@@ -279,6 +283,35 @@ fn read_indices(root: &Root, bin: &[u8], ai: usize) -> Option<Vec<u32>> {
         });
     }
     Some(out)
+}
+
+pub(super) fn read_tight(root: &Root, bin: &[u8], ai: usize) -> Option<(Vec<u8>, usize)> {
+    let (ct, ty, _) = acc_kind(root, ai)?;
+    let comp = match ct {
+        ComponentType::I8 | ComponentType::U8 => 1,
+        ComponentType::I16 | ComponentType::U16 => 2,
+        ComponentType::U32 | ComponentType::F32 => 4,
+    };
+    let ncomp = match ty {
+        Type::Scalar => 1,
+        Type::Vec2 => 2,
+        Type::Vec3 => 3,
+        Type::Vec4 => 4,
+        Type::Mat2 => 4,
+        Type::Mat3 => 9,
+        Type::Mat4 => 16,
+    };
+    let elem = comp * ncomp;
+    let l = acc_layout(root, ai, elem)?;
+    if l.count == 0 || l.start + l.stride * (l.count - 1) + elem > bin.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(l.count * elem);
+    for i in 0..l.count {
+        let s = l.start + i * l.stride;
+        out.extend_from_slice(&bin[s..s + elem]);
+    }
+    Some((out, elem))
 }
 
 fn renorm_weights_f32(root: &Root, bin: &mut [u8], ai: usize) {
@@ -454,7 +487,12 @@ fn write_glb(root: &Root, binary_payload: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-pub(crate) fn transform_glb(bytes: &[u8], ext: &str, resolve: ResolveUri) -> Result<Vec<u8>> {
+pub(crate) fn transform_glb(
+    bytes: &[u8],
+    ext: &str,
+    resolve: ResolveUri,
+    mesh_compress: bool,
+) -> Result<Vec<u8>> {
     let (json_bytes, glb_bin) = split_container(bytes)?;
     let mut root: Root =
         gltf_json::deserialize::from_slice(&json_bytes).context("gltf json parse")?;
@@ -558,6 +596,17 @@ pub(crate) fn transform_glb(bytes: &[u8], ext: &str, resolve: ResolveUri) -> Res
         }
     }
 
+    let mesh_plan = if mesh_compress {
+        super::meshcomp::plan(&root, &merged)
+    } else {
+        None
+    };
+    if let Some(p) = &mesh_plan {
+        for &vi in &p.zombies {
+            zombie[vi] = true;
+        }
+    }
+
     let mut new_bin: Vec<u8> = Vec::new();
     for (i, view) in root.buffer_views.iter_mut().enumerate() {
         if zombie[i] {
@@ -607,42 +656,79 @@ pub(crate) fn transform_glb(bytes: &[u8], ext: &str, resolve: ResolveUri) -> Res
         root.images[i].mime_type = Some(gltf_json::image::MimeType("image/vnd-ms.dds".into()));
     }
 
+    if let Some(p) = &mesh_plan {
+        super::meshcomp::apply(&mut root, &mut new_bin, &p.streams);
+    }
+
     for (mi, pi, tangents) in tangent_jobs {
-        while !new_bin.len().is_multiple_of(4) {
-            new_bin.push(0);
-        }
-        let offset = new_bin.len() as u64;
-        for t in &tangents {
-            for c in t {
-                new_bin.extend_from_slice(&c.to_le_bytes());
-            }
-        }
-        let vidx = root.buffer_views.len() as u32;
-        root.buffer_views.push(buffer::View {
-            buffer: Index::new(0),
-            byte_length: USize64(tangents.len() as u64 * 16),
-            byte_offset: Some(USize64(offset)),
-            byte_stride: None,
-            name: None,
-            target: None,
-            extensions: None,
-            extras: Default::default(),
-        });
+        let comp = mesh_plan
+            .as_ref()
+            .filter(|p| p.eligible.contains(&(mi, pi)))
+            .and_then(|_| super::meshcomp::tangent_stream(&tangents));
         let aidx = root.accessors.len() as u32;
-        root.accessors.push(gltf_json::Accessor {
-            buffer_view: Some(Index::new(vidx)),
-            byte_offset: Some(USize64(0)),
-            count: USize64(tangents.len() as u64),
-            component_type: Checked::Valid(GenericComponentType(ComponentType::F32)),
-            extensions: None,
-            extras: Default::default(),
-            type_: Checked::Valid(Type::Vec4),
-            min: None,
-            max: None,
-            name: None,
-            normalized: false,
-            sparse: None,
-        });
+        if let Some((cbytes, count)) = comp {
+            let s = super::meshcomp::Stream {
+                accessor: 0,
+                bytes: cbytes,
+                mode: "ATTRIBUTES",
+                filter: Some("OCTAHEDRAL"),
+                stride: 4,
+                count,
+                component_type: ComponentType::I8,
+                type_: Type::Vec4,
+                normalized: true,
+            };
+            let vidx = super::meshcomp::append_stream_view(&mut root, &mut new_bin, &s);
+            root.accessors.push(gltf_json::Accessor {
+                buffer_view: Some(Index::new(vidx)),
+                byte_offset: Some(USize64(0)),
+                count: USize64(count as u64),
+                component_type: Checked::Valid(GenericComponentType(ComponentType::I8)),
+                extensions: None,
+                extras: Default::default(),
+                type_: Checked::Valid(Type::Vec4),
+                min: None,
+                max: None,
+                name: None,
+                normalized: true,
+                sparse: None,
+            });
+        } else {
+            while !new_bin.len().is_multiple_of(4) {
+                new_bin.push(0);
+            }
+            let offset = new_bin.len() as u64;
+            for t in &tangents {
+                for c in t {
+                    new_bin.extend_from_slice(&c.to_le_bytes());
+                }
+            }
+            let vidx = root.buffer_views.len() as u32;
+            root.buffer_views.push(buffer::View {
+                buffer: Index::new(0),
+                byte_length: USize64(tangents.len() as u64 * 16),
+                byte_offset: Some(USize64(offset)),
+                byte_stride: None,
+                name: None,
+                target: None,
+                extensions: None,
+                extras: Default::default(),
+            });
+            root.accessors.push(gltf_json::Accessor {
+                buffer_view: Some(Index::new(vidx)),
+                byte_offset: Some(USize64(0)),
+                count: USize64(tangents.len() as u64),
+                component_type: Checked::Valid(GenericComponentType(ComponentType::F32)),
+                extensions: None,
+                extras: Default::default(),
+                type_: Checked::Valid(Type::Vec4),
+                min: None,
+                max: None,
+                name: None,
+                normalized: false,
+                sparse: None,
+            });
+        }
         root.meshes[mi].primitives[pi]
             .attributes
             .insert(Checked::Valid(mesh::Semantic::Tangents), Index::new(aidx));
@@ -706,7 +792,7 @@ pub(crate) mod tests {
         glb
     }
 
-    fn out_root_and_bin(out: &[u8]) -> (Root, Vec<u8>) {
+    pub(crate) fn out_root_and_bin(out: &[u8]) -> (Root, Vec<u8>) {
         assert_eq!(&out[..4], b"glTF");
         assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 2);
         assert_eq!(
@@ -744,7 +830,7 @@ pub(crate) mod tests {
             "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": png.len()}]
         });
         let glb = mk_glb(gltf, &png);
-        let out = transform_glb(&glb, ".glb", None).unwrap();
+        let out = transform_glb(&glb, ".glb", None, true).unwrap();
         let (root, bin) = out_root_and_bin(&out);
         let dds = dds_of(&root, &bin, 0);
         assert_eq!((dds.get_width(), dds.get_height()), (16, 16));
@@ -785,7 +871,7 @@ pub(crate) mod tests {
                 {"buffer": 0, "byteOffset": noisy_off, "byteLength": noisy.len()}
             ]
         });
-        let out = transform_glb(&mk_glb(gltf, &bin), ".glb", None).unwrap();
+        let out = transform_glb(&mk_glb(gltf, &bin), ".glb", None, true).unwrap();
         let (root, obin) = out_root_and_bin(&out);
         assert_eq!(
             root.images[0].mime_type.as_ref().map(|m| m.0.as_str()),
@@ -818,7 +904,7 @@ pub(crate) mod tests {
             "images": [{"bufferView": 0, "mimeType": "image/png"}],
             "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": png.len()}]
         });
-        let out = transform_glb(&mk_glb(gltf, &png), ".glb", None).unwrap();
+        let out = transform_glb(&mk_glb(gltf, &png), ".glb", None, true).unwrap();
         let (root, bin) = out_root_and_bin(&out);
         let dds = dds_of(&root, &bin, 0);
         assert_eq!((dds.get_width(), dds.get_height()), (1024, 256));
@@ -832,7 +918,7 @@ pub(crate) mod tests {
             "images": [{"bufferView": 0, "mimeType": "image/png"}],
             "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": png.len()}]
         });
-        let out = transform_glb(&mk_glb(gltf, &png), ".glb", None).unwrap();
+        let out = transform_glb(&mk_glb(gltf, &png), ".glb", None, true).unwrap();
         let (root, bin) = out_root_and_bin(&out);
         let img = &root.images[0];
         assert_eq!(
@@ -851,10 +937,12 @@ pub(crate) mod tests {
             "images": [{"bufferView": 0, "mimeType": "image/png"}],
             "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": bad.len()}]
         });
-        assert!(transform_glb(&mk_glb(gltf, &bad), ".glb", None).is_err());
+        assert!(transform_glb(&mk_glb(gltf, &bad), ".glb", None, true).is_err());
     }
 
-    fn quad_bin_and_views(png: &[u8]) -> (Vec<u8>, serde_json::Value, serde_json::Value) {
+    pub(crate) fn quad_bin_and_views(
+        png: &[u8],
+    ) -> (Vec<u8>, serde_json::Value, serde_json::Value) {
         let mut bin: Vec<u8> = Vec::new();
         let positions: [[f32; 3]; 4] = [
             [0.0, 0.0, 0.0],
@@ -937,7 +1025,7 @@ pub(crate) mod tests {
             "bufferViews": views,
             "accessors": accessors
         });
-        let out = transform_glb(&mk_glb(gltf, &bin), ".glb", None).unwrap();
+        let out = transform_glb(&mk_glb(gltf, &bin), ".glb", None, false).unwrap();
         let (root, obin) = out_root_and_bin(&out);
         let prim = &root.meshes[0].primitives[0];
         let tai = prim
@@ -990,7 +1078,7 @@ pub(crate) mod tests {
             "bufferViews": views,
             "accessors": accessors
         });
-        let out = transform_glb(&mk_glb(gltf, &bin), ".glb", None).unwrap();
+        let out = transform_glb(&mk_glb(gltf, &bin), ".glb", None, true).unwrap();
         let (root, obin) = out_root_and_bin(&out);
         let prim = &root.meshes[0].primitives[0];
         assert!(!prim
@@ -1023,7 +1111,7 @@ pub(crate) mod tests {
         let bytes = serde_json::to_vec(&gltf).unwrap();
         let resolve =
             |uri: &str| -> Option<Vec<u8>> { (uri == "geo.bin").then(|| ext_bin.clone()) };
-        let out = transform_glb(&bytes, ".gltf", Some(&resolve)).unwrap();
+        let out = transform_glb(&bytes, ".gltf", Some(&resolve), true).unwrap();
         let (root, obin) = out_root_and_bin(&out);
         assert_eq!(root.images[0].uri.as_deref(), Some("textures/wall.png"));
         assert!(root.images[0].buffer_view.is_none());

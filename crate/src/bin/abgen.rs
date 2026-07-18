@@ -32,6 +32,9 @@ ENV:
                             (default https://worlds-content-server.decentraland.org; 0/off/empty disables)
   ABGEN_SHADER_JIT          serve-time materialization of the vendored shared shader
                             bundles on shader-path misses (default on; 0/false/no/off disables)
+  ABGEN_BVWEBGPU            bevy scene-pack lane /bvwebgpu/ (default on; 0 disables)
+  ABGEN_BVWEBGPU_MESHOPT    EXT_meshopt_compression mesh encode inside bevy packs
+                            (default on; 0/false/off disables)
   ABGEN_GPU                 force the GPU BC7/BC5 encode path: exit non-zero if no GPU
                             arms. Unset: auto-try GPU, warn and fall back to CPU.
                             ABGEN_GPU_BACKEND=off skips the attempt entirely (clean CPU)

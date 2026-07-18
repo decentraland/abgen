@@ -1,4 +1,5 @@
 pub mod emit;
+mod meshcomp;
 pub mod pack;
 
 use anyhow::{bail, Context, Result};
@@ -7,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const BVW_PLATFORM: &str = "bvwebgpu";
-pub const BVW_PROFILE: &str = "bv2";
+pub const BVW_PROFILE: &str = "bv3";
 pub const BVW_MAX_PACK_BYTES: u64 = 256 * 1024 * 1024;
 pub const BVW_TEXTURE_MAX: u32 = 1024;
 
@@ -17,6 +18,13 @@ const VIDEO_EXTS: [&str; 8] = [
 
 pub fn pack_file_name(entity: &str) -> String {
     format!("{entity}_{BVW_PROFILE}.pack")
+}
+
+pub fn meshopt_enabled() -> bool {
+    !matches!(
+        std::env::var("ABGEN_BVWEBGPU_MESHOPT").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    )
 }
 
 pub fn is_video(file: &str) -> bool {
@@ -80,6 +88,7 @@ impl crate::live::Proxy {
         std::fs::create_dir_all(&spool.0)
             .with_context(|| format!("mkdir {}", spool.0.display()))?;
 
+        let mesh_compress = meshopt_enabled();
         let content_by_file = &ctx.content_by_file;
         let mut meta: HashMap<String, (u64, String)> = HashMap::new();
         let mut spooled: HashMap<String, PathBuf> = HashMap::new();
@@ -102,7 +111,9 @@ impl crate::live::Proxy {
                 self.content_store().fetch(h).ok()
             };
             let transformed = match kind {
-                "glb" => emit::transform_glb(&raw, file_ext(file), Some(&resolve_fn)),
+                "glb" => {
+                    emit::transform_glb(&raw, file_ext(file), Some(&resolve_fn), mesh_compress)
+                }
                 "img" => emit::transform_img(&raw),
                 _ => Ok(raw.clone()),
             };
@@ -210,30 +221,28 @@ mod tests {
     use serde_json::json;
 
     const GOLDEN_PACK_SHA256: &str =
-        "3034ca9e27476f4faef436980454f707ed24ca7cc50b38df68b4c907c75195cd";
+        "df4e71838138bcc376c4c5e9198d7f5999a2beec534ed6d602fa61ecf4679430";
 
     fn fixture_routes(entity: &str) -> (crate::live::stub::Routes, Vec<u8>, Vec<u8>, Vec<u8>) {
         let png = emit::tests::noise_png_bytes(16, 16);
         let normal_png = emit::tests::noise_png_bytes(16, 16);
         let glb = {
-            let mut bin: Vec<u8> = Vec::new();
-            bin.extend_from_slice(&normal_png);
+            let (bin, views, accessors) = emit::tests::quad_bin_and_views(&normal_png);
             emit::tests::mk_glb(
                 json!({
+                    "scene": 0,
+                    "scenes": [{"nodes": [0]}],
+                    "nodes": [{"mesh": 0}],
                     "meshes": [{"primitives": [{
-                        "attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2},
-                        "indices": 3, "material": 0
+                        "attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2,
+                                       "WEIGHTS_0": 3, "JOINTS_0": 4},
+                        "indices": 5, "material": 0
                     }]}],
                     "materials": [{"normalTexture": {"index": 0}}],
                     "textures": [{"source": 0}],
-                    "images": [{"bufferView": 0, "mimeType": "image/png"}],
-                    "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": normal_png.len()}],
-                    "accessors": [
-                        {"componentType": 5126, "count": 0, "type": "VEC3"},
-                        {"componentType": 5126, "count": 0, "type": "VEC3"},
-                        {"componentType": 5126, "count": 0, "type": "VEC2"},
-                        {"componentType": 5123, "count": 0, "type": "SCALAR"}
-                    ]
+                    "images": [{"bufferView": 6, "mimeType": "image/png"}],
+                    "bufferViews": views,
+                    "accessors": accessors
                 }),
                 &bin,
             )
@@ -412,6 +421,9 @@ mod tests {
 
         let glb = pack::entry_slice(&first, &parsed, by_path["models/scene.glb"]);
         assert_eq!(&glb[..4], b"glTF");
+        let glb_json = String::from_utf8_lossy(glb);
+        assert!(glb_json.contains("EXT_meshopt_compression"));
+        assert!(glb_json.contains("KHR_mesh_quantization"));
 
         assert_eq!(
             crate::hashes::sha256_hex(&first),
