@@ -888,3 +888,92 @@ fn lod_opaque_and_cutout_materials_keep_their_state() {
     let tags = t.get("stringTagMap").and_then(|v| v.as_array()).unwrap();
     assert_eq!(tags.len(), 1);
 }
+
+#[test]
+fn lod0_rollup_material_binds_slots_and_keeps_verbatim_alpha() {
+    let m = crate::scene::Material {
+        alpha_mode: "BLEND".into(),
+        base_color: [0.25, 0.5, 0.75, 0.6],
+        emissive: [1.0, 0.5, 0.25],
+        ..Default::default()
+    };
+    let lod = LodBuildParams {
+        level: 0,
+        plane_clipping: [1.0, 2.0, 3.0, 4.0],
+        vertical_clipping: [-2147483648.0, 2147483648.0, 0.0, 0.0],
+        main_asset: String::new(),
+        timestamp: None,
+    };
+    let mut tex = HashMap::new();
+    tex.insert("_BaseMap".to_string(), (0i64, 11i64));
+    tex.insert("_BumpMap".to_string(), (0i64, 22i64));
+    tex.insert("_EmissionMap".to_string(), (0i64, 33i64));
+    let t = build_lod_material_tree(&Value::map(), &m, "mat", &Value::map(), &tex, &lod);
+
+    let envs = t
+        .get("m_SavedProperties")
+        .and_then(|p| p.get("m_TexEnvs"))
+        .and_then(|v| v.as_array())
+        .unwrap();
+    let slot_pid = |slot: &str| {
+        envs.iter()
+            .find(|e| e.as_array().unwrap()[0].as_str() == Some(slot))
+            .map(|e| {
+                e.as_array().unwrap()[1]
+                    .get("m_Texture")
+                    .and_then(|p| p.get("m_PathID"))
+                    .and_then(|x| x.as_i64())
+                    .unwrap()
+            })
+    };
+    assert_eq!(envs.len(), 8, "no _BaseMapArr channel at level 0");
+    assert_eq!(slot_pid("_BaseMapArr"), None);
+    assert_eq!(slot_pid("_BaseMap"), Some(11));
+    assert_eq!(slot_pid("_BumpMap"), Some(22));
+    assert_eq!(slot_pid("_EmissionMap"), Some(33));
+
+    let ints = t
+        .get("m_SavedProperties")
+        .and_then(|p| p.get("m_Ints"))
+        .and_then(|v| v.as_array())
+        .unwrap();
+    assert!(ints.is_empty(), "no _BaseMapArr_ID at level 0");
+    let floats: Vec<&str> = t
+        .get("m_SavedProperties")
+        .and_then(|p| p.get("m_Floats"))
+        .and_then(|v| v.as_array())
+        .unwrap()
+        .iter()
+        .filter_map(|f| f.as_array().unwrap()[0].as_str())
+        .collect();
+    assert!(!floats.contains(&"_AddPrecomputedVelocity"));
+    assert!(!floats.contains(&"_XRMotionVectorsPass"));
+    let passes = t
+        .get("disabledShaderPasses")
+        .and_then(|v| v.as_array())
+        .unwrap();
+    assert!(passes.is_empty());
+
+    let color = |name: &str| {
+        t.get("m_SavedProperties")
+            .and_then(|p| p.get("m_Colors"))
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .find(|c| c.as_array().unwrap()[0].as_str() == Some(name))
+            .map(|c| {
+                let v = &c.as_array().unwrap()[1];
+                let f = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap();
+                [f("r"), f("g"), f("b"), f("a")]
+            })
+            .unwrap()
+    };
+    assert_eq!(color("_BaseColor")[3], 0.6, "verbatim alpha, no 0.8 force");
+    assert_eq!(color("_EmissionColor"), [1.0, 0.5, 0.25, 1.0]);
+    assert_eq!(
+        color("_VerticalClipping"),
+        [-2147483648.0, 2147483648.0, 0.0, 0.0]
+    );
+    assert_eq!(lod_saved_float(&t, "_ZWrite"), 1.0);
+    assert_eq!(lod_saved_float(&t, "_DstBlend"), 10.0);
+}

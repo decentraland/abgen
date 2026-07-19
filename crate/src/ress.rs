@@ -112,3 +112,62 @@ pub fn build_ress(
         node_flags: RESS_NODE_FLAGS,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ress_framing_byte_identical_on_synthetic_fixture() {
+        let blobs = vec![
+            TextureBlob::new(7, vec![0xBB; 20], ""),
+            TextureBlob::new(3, vec![0xAA; 40], ""),
+        ];
+        let built = build_ress(&blobs, "cab-fixture", None);
+
+        let mut want = vec![0xAA; 40];
+        want.extend_from_slice(&[0u8; 8]);
+        want.extend_from_slice(&[0xBB; 20]);
+        want.extend_from_slice(&[0u8; 12]);
+        assert_eq!(built.payload, want);
+        assert_eq!(built.node_name, "cab-fixture.resS");
+        assert_eq!(built.node_flags, RESS_NODE_FLAGS);
+
+        let path = "archive:/cab-fixture/cab-fixture.resS".to_string();
+        assert_eq!(
+            built.stream_data,
+            vec![
+                (
+                    3,
+                    StreamData {
+                        offset: 0,
+                        size: 40,
+                        path: path.clone()
+                    }
+                ),
+                (
+                    7,
+                    StreamData {
+                        offset: 48,
+                        size: 20,
+                        path
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn ress_inline_predicate_keeps_blob_out_of_payload() {
+        let blobs = vec![
+            TextureBlob::new(1, vec![0x11; 16], ""),
+            TextureBlob::new(2, vec![0x22; 16], ""),
+        ];
+        let inline = |t: &TextureBlob| t.path_id == 1;
+        let built = build_ress(&blobs, "cab-x", Some(&inline));
+        assert_eq!(built.payload, vec![0x22; 16]);
+        assert_eq!(built.stream_data[0], (1, StreamData::empty()));
+        assert_eq!(built.stream_data[1].1.offset, 0);
+        assert_eq!(built.stream_data[1].1.size, 16);
+    }
+}

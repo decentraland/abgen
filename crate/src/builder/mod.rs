@@ -342,7 +342,7 @@ impl<'a> Builder<'a> {
     }
 
     fn assign_lod_mesh_names(&mut self, scene: &Scene) {
-        if self.lod.is_none() {
+        if !self.lod_atlas() {
             return;
         }
         let mut k = 0usize;
@@ -373,8 +373,20 @@ impl<'a> Builder<'a> {
         }
     }
 
+    fn lod_level(&self) -> Option<u32> {
+        self.lod.as_ref().map(|l| l.level)
+    }
+
+    fn lod_atlas(&self) -> bool {
+        matches!(self.lod_level(), Some(l) if l >= 1)
+    }
+
+    fn lod_rollup(&self) -> bool {
+        self.lod_level() == Some(0)
+    }
+
     fn active_shader_pptr(&self) -> Value {
-        if self.lod.is_some() {
+        if self.lod_atlas() {
             crate::value::pptr(SHADER_FILE_ID, crate::shader::TEXARRAY_SHADER_PATH_ID)
         } else {
             shader_pptr()
@@ -382,7 +394,7 @@ impl<'a> Builder<'a> {
     }
 
     fn shader_cab_name(&self) -> String {
-        if self.lod.is_some() {
+        if self.lod_atlas() {
             cabname::cab_name(&crate::shader::texarray_bundle_name(self.target))
         } else {
             cabname::shader_bundle_cab(self.target).to_string()
@@ -390,7 +402,7 @@ impl<'a> Builder<'a> {
     }
 
     fn shader_dep_path_id(&self) -> i64 {
-        if self.lod.is_some() {
+        if self.lod_atlas() {
             crate::shader::TEXARRAY_SHADER_PATH_ID
         } else {
             SHADER_PATH_ID

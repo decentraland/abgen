@@ -26,11 +26,13 @@ impl<'a> Builder<'a> {
                 .insert(tr.sampler);
         }
 
-        for tr in &scene.texture_refs {
-            let img = tr.image;
-            let is_external = img < scene.image_uri.len() && scene.image_uri[img].is_some();
-            if !is_external {
-                self.texture(scene, Some(*tr));
+        if !self.lod_rollup() {
+            for tr in &scene.texture_refs {
+                let img = tr.image;
+                let is_external = img < scene.image_uri.len() && scene.image_uri[img].is_some();
+                if !is_external {
+                    self.texture(scene, Some(*tr));
+                }
             }
         }
 
@@ -788,7 +790,7 @@ impl<'a> Builder<'a> {
         self.scene_object_pids.push(mesh_pid);
 
         if suppress_emission {
-            if prim.material_index.is_some() {
+            if prim.material_index.is_some() && !self.lod_rollup() {
                 let _ = self.material_orphan(scene, prim.material_index);
             }
             self.component_pids = Vec::new();
@@ -797,7 +799,7 @@ impl<'a> Builder<'a> {
         }
 
         if becomes_collider {
-            if prim.material_index.is_some() {
+            if prim.material_index.is_some() && !self.lod_rollup() {
                 let _ = self.material_orphan(scene, prim.material_index);
             }
             let mf = self.add(

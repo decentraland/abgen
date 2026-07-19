@@ -12,6 +12,7 @@ struct Facts {
     meshes: Vec<MeshFacts>,
     metadata: Option<serde_json::Value>,
     container: Vec<String>,
+    nodes: Vec<String>,
 }
 
 struct MatFacts {
@@ -37,6 +38,10 @@ struct MeshFacts {
     vertex_count: i64,
     index_format: i64,
     total_tris: i64,
+    channels: Vec<(i64, i64, i64, i64)>,
+    payload: i64,
+    inline_vertex_bytes: i64,
+    archive_streamed: bool,
 }
 
 fn vec3(v: Option<&Value>) -> [f64; 3] {
@@ -79,6 +84,13 @@ fn extract_facts(path: &str) -> Result<Facts> {
     let data = std::fs::read(path).with_context(|| format!("read {path}"))?;
     let bundle = Bundle::load_bytes(&data).with_context(|| format!("parse bundle {path}"))?;
     let mut f = Facts::default();
+    for file in &bundle.files {
+        f.nodes.push(match &file.content {
+            FileContent::Serialized(_) => "CAB".to_string(),
+            FileContent::Raw(_) if file.name.ends_with(".resS") => "CAB.resS".to_string(),
+            FileContent::Raw(_) => file.name.clone(),
+        });
+    }
     let mut transforms: Vec<(i64, i64, [f64; 3])> = Vec::new();
     let mut go_names: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
     for file in &bundle.files {
@@ -148,9 +160,9 @@ fn extract_facts(path: &str) -> Result<Facts> {
                     });
                 }
                 43 => {
-                    let vc = v
-                        .get("m_VertexData")
-                        .and_then(|vd| vd.get("m_VertexCount"))
+                    let vd = v.get("m_VertexData");
+                    let vc = vd
+                        .and_then(|d| d.get("m_VertexCount"))
                         .and_then(|x| x.as_i64())
                         .unwrap_or(-1);
                     let idxfmt = v
@@ -166,11 +178,50 @@ fn extract_facts(path: &str) -> Result<Facts> {
                                 .sum()
                         })
                         .unwrap_or(0);
+                    let channels: Vec<(i64, i64, i64, i64)> = vd
+                        .and_then(|d| d.get("m_Channels"))
+                        .and_then(|c| c.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .map(|c| {
+                                    let g =
+                                        |k: &str| c.get(k).and_then(|x| x.as_i64()).unwrap_or(-1);
+                                    (g("stream"), g("offset"), g("format"), g("dimension"))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let inline = vd
+                        .and_then(|d| d.get("m_DataSize"))
+                        .and_then(|x| x.as_bytes())
+                        .map(|b| b.len() as i64)
+                        .unwrap_or(0);
+                    let streamed = v
+                        .get("m_StreamData")
+                        .and_then(|s| s.get("size"))
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or(0);
+                    let stream_path = v
+                        .get("m_StreamData")
+                        .and_then(|s| s.get("path"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
+                    let index_bytes = v
+                        .get("m_IndexBuffer")
+                        .and_then(|x| x.as_bytes())
+                        .map(|b| b.len() as i64)
+                        .unwrap_or(0);
                     f.meshes.push(MeshFacts {
                         name,
                         vertex_count: vc,
                         index_format: idxfmt,
                         total_tris: total_idx / 3,
+                        channels,
+                        payload: inline.max(streamed) + index_bytes,
+                        inline_vertex_bytes: inline,
+                        archive_streamed: streamed > 0
+                            && stream_path.starts_with("archive:/")
+                            && stream_path.ends_with(".resS"),
                     });
                 }
                 49 if name == "metadata" => {
@@ -409,6 +460,30 @@ pub(crate) fn cmd_compare(argv: &[String]) -> Result<i32> {
                     b.total_tris
                 ),
             );
+            c.check(
+                &format!("vertex-decl[{}]", a.name),
+                a.channels == b.channels,
+                format!("ours={:?} prod={:?}", a.channels, b.channels),
+            );
+            let within = (a.payload - b.payload).abs() as f64 <= 0.05 * b.payload.max(1) as f64;
+            c.check(
+                &format!("mesh-payload[{}]", a.name),
+                within,
+                format!("ours={} prod={} bytes", a.payload, b.payload),
+            );
+            let streamed_like_prod = (a.archive_streamed, a.inline_vertex_bytes == 0)
+                == (b.archive_streamed, b.inline_vertex_bytes == 0);
+            c.check(
+                &format!("mesh-streamed[{}]", a.name),
+                streamed_like_prod,
+                format!(
+                    "ours archive={} inline={} | prod archive={} inline={}",
+                    a.archive_streamed,
+                    a.inline_vertex_bytes,
+                    b.archive_streamed,
+                    b.inline_vertex_bytes
+                ),
+            );
         }
     }
 
@@ -426,10 +501,8 @@ pub(crate) fn cmd_compare(argv: &[String]) -> Result<i32> {
             if ts_ours == 0 {
                 println!("INFO metadata.timestamp: ours=0 (not injected; exempt) prod={ts_prod}");
             } else {
-                c.check(
-                    "metadata.timestamp",
-                    ts_ours == ts_prod,
-                    format!("ours={ts_ours} prod={ts_prod}"),
+                println!(
+                    "INFO metadata.timestamp: ours={ts_ours} prod={ts_prod} (envelope: prod bakes wall-clock ticks)"
                 );
             }
         }
@@ -446,6 +519,12 @@ pub(crate) fn cmd_compare(argv: &[String]) -> Result<i32> {
         "container-keys",
         ours.container == prod.container,
         format!("ours={:?} prod={:?}", ours.container, prod.container),
+    );
+
+    c.check(
+        "archive-nodes",
+        ours.nodes == prod.nodes,
+        format!("ours={:?} prod={:?}", ours.nodes, prod.nodes),
     );
 
     if c.failures == 0 {

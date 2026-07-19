@@ -8,6 +8,11 @@ use super::model::LodModel;
 
 pub const CLASS_SURVIVAL_MIN_TRIS: usize = 200;
 pub const CLASS_RESCUE_ERROR_LIMIT: f64 = 0.001;
+// gltfpack's default -se 0.01 stalls far above deep caps, while -sa welds the
+// mesh to ~0.5 verts/tri and destroys UVs (prod ships 1.5-2.4 verts/tri at the
+// cap); 0.25 keeps the seam-preserving simplifier and sits under the measured
+// -se ~0.5 cliff where meshes collapse far past the ratio target
+pub const DEEP_ERROR_LIMIT: f64 = 0.25;
 
 pub const GLTFPACK_NIX_RECIPE: &str =
     "nix-shell -p meshoptimizer --run 'gltfpack -i <in.glb> -o <out.glb> -si 0.1 -noq'";
@@ -437,19 +442,34 @@ pub fn simplify(
     };
     let mut current = ratio.clamp(1e-3, 1.0);
     let mut tris_after = tris_before;
-    for attempt in 0..4 {
-        let aggressive = attempt == 3;
-        run_gltfpack(gltfpack, input, output, current, aggressive, None)?;
+    let mut mode = (false, None);
+    for attempt in 0..5 {
+        let (aggressive, error_limit) = match attempt {
+            0 | 1 => (false, None),
+            2 | 3 => (false, Some(DEEP_ERROR_LIMIT)),
+            _ => (true, None),
+        };
+        run_gltfpack(gltfpack, input, output, current, aggressive, error_limit)?;
         report.ratios_run.push(current);
         report.aggressive_final = aggressive;
         tris_after = glb_tris(output)?;
-        if under_cap(tris_after) || aggressive {
+        if under_cap(tris_after) {
+            mode = (aggressive, error_limit);
             break;
         }
-        current = if attempt == 2 {
-            rescale_ratio(1.0, tris_before as u64, tri_cap.unwrap_or(1))
-        } else {
+        if aggressive {
+            bail!(
+                "tri cap {} not reached after {} gltfpack attempts (final {} tris, ratios {:?})",
+                tri_cap.unwrap_or(0),
+                report.ratios_run.len(),
+                tris_after,
+                report.ratios_run
+            );
+        }
+        current = if attempt == 0 || attempt == 2 {
             rescale_ratio(current, tris_after as u64, tri_cap.unwrap_or(1))
+        } else {
+            rescale_ratio(1.0, tris_before as u64, tri_cap.unwrap_or(1))
         };
     }
     let mut error_relaxed = false;
@@ -511,7 +531,7 @@ pub fn simplify(
                 if (cand - lo_ratio).abs() < 1e-6 {
                     break;
                 }
-                run_gltfpack(gltfpack, input, output, cand, true, None)?;
+                run_gltfpack(gltfpack, input, output, cand, mode.0, mode.1)?;
                 let t = glb_tris(output)?;
                 if t as u64 > cap {
                     hi_ratio = Some(cand);

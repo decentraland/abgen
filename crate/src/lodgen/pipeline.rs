@@ -7,7 +7,7 @@ use crate::lods;
 
 use super::gate::{push_check, self_gate_bundle_with, tri_cap_check, GateCheck};
 use super::model::LodModel;
-use super::{assemble, atlas, crop, emit, placements, simplify, simplify_meshopt};
+use super::{assemble, atlas, crop, emit, placements, rollup, simplify, simplify_meshopt};
 
 pub fn parse_parcel(s: &str) -> Result<(i32, i32)> {
     let parts: Vec<&str> = s.trim().split(',').collect();
@@ -230,7 +230,6 @@ pub const TRIS_PER_PARCEL: u64 = 500;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SimplifyLane {
     Passthrough,
-    Uncapped { ratio: f64 },
     Capped { ratio: f64, cap: u64 },
 }
 
@@ -261,11 +260,11 @@ pub fn choose_lane(
     if level == 0 {
         return SimplifyLane::Passthrough;
     }
-    match effective_tri_cap(level, tri_cap, tri_cap_auto, threshold) {
-        Some(cap) if source_tris as u64 <= cap => SimplifyLane::Passthrough,
-        Some(cap) => SimplifyLane::Capped { ratio, cap },
-        None if source_tris as u64 <= threshold => SimplifyLane::Passthrough,
-        None => SimplifyLane::Uncapped { ratio },
+    let cap = effective_tri_cap(level, tri_cap, tri_cap_auto, threshold).unwrap_or(threshold);
+    if source_tris as u64 <= cap {
+        SimplifyLane::Passthrough
+    } else {
+        SimplifyLane::Capped { ratio, cap }
     }
 }
 
@@ -361,21 +360,6 @@ fn run_simplify(
             }
             simplify::passthrough(pre, out)
         }
-        SimplifyLane::Uncapped { ratio } => {
-            log.push(format!(
-                "simplify-lane[{level}]: ratio {ratio} uncapped ({source_tris} tris > {threshold} = {TRIS_PER_PARCEL} x {parcel_count} parcels, {})",
-                params.simplifier.name()
-            ));
-            match params.simplifier {
-                simplify::SimplifierBackend::Gltfpack => {
-                    run_gltfpack_lane(pre, out, params, ratio, None)
-                }
-                simplify::SimplifierBackend::Meshopt => {
-                    let target = (source_tris as f64 * ratio.clamp(1e-3, 1.0)).round() as u64;
-                    run_meshopt_lane(model, pre, out, params, target, false)
-                }
-            }
-        }
         SimplifyLane::Capped { ratio, cap } => {
             log.push(format!(
                 "simplify-lane[{level}]: capped (tri cap {cap}, {})",
@@ -454,57 +438,101 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     let mut source_tris = 0usize;
     let mut staged: Vec<(u32, PathBuf, simplify::SimplifyReport)> = Vec::new();
     if expect_content {
-        let t = std::time::Instant::now();
-        let mut model = assemble::assemble(
-            &client,
-            &ent,
-            &placements,
-            levels[0],
-            params.cache.as_deref(),
-        )?;
-        assemble_ms = t.elapsed().as_millis();
-        if params.crop {
-            let rects = crop::crop_rects_rh(base, &parcels);
-            let report = crop::crop(&mut model, &rects);
-            eprintln!("crop: {}", report.summary());
-            if !model.primitives.is_empty() {
-                crop_stats = Some(crop::union_stats(&model, &rects, 1e-3));
+        let atlas_levels: Vec<u32> = levels.iter().copied().filter(|&l| l >= 1).collect();
+        // level 0 rolls the regular converter lane up: full hierarchy, colliders,
+        // per-object materials, original textures; no crop, no atlas, no simplify
+        if levels.contains(&0) {
+            if params.tri_cap.is_some() || params.tri_cap_auto {
+                eprintln!(
+                    "WARNING: --tri-cap is ignored at level 0; level 0 is always the \
+                     un-decimated rollup of the real scene"
+                );
             }
-        }
-        let t = std::time::Instant::now();
-        let mode = if params.atlas_fixed {
-            atlas::AtlasMode::FullBleed
-        } else if params.atlas_adaptive {
-            atlas::AtlasMode::Adaptive
-        } else {
-            atlas::AtlasMode::Native
-        };
-        let model = atlas::atlas_with(&model, params.atlas_max, params.atlas_padding, mode)?;
-        atlas_ms = t.elapsed().as_millis();
-        log.extend(model.log.iter().cloned());
-        source_tris = model.total_tris();
-
-        let t = std::time::Instant::now();
-        let glb = emit::emit_glb(&model)?;
-        std::fs::write(&pre, &glb).with_context(|| format!("write {}", pre.display()))?;
-        emit_ms = t.elapsed().as_millis();
-
-        for &level in &levels {
-            let out = staging.join(staged_glb_name(&sid, level));
             let t = std::time::Instant::now();
-            let sim = run_simplify(
-                &model,
-                &pre,
-                &out,
-                params,
-                level,
-                source_tris,
-                parcel_count,
-                &mut log,
+            let rolled = rollup::rollup(&client, &ent, &placements, 0, params.cache.as_deref())?;
+            assemble_ms += t.elapsed().as_millis();
+            for l in &rolled.log {
+                eprintln!("{l}");
+            }
+            log.extend(rolled.log.iter().cloned());
+            let out = staging.join(staged_glb_name(&sid, 0));
+            let t = std::time::Instant::now();
+            std::fs::write(&out, &rolled.glb)
+                .with_context(|| format!("write {}", out.display()))?;
+            let parsed = crate::gltf::parse(&rolled.glb, ".glb", None, false, true)
+                .context("re-parse rollup GLB")?;
+            let rollup_tris: usize = parsed
+                .nodes
+                .iter()
+                .flat_map(|n| n.primitives.iter())
+                .map(|p| p.indices.len() / 3)
+                .sum();
+            emit_ms += t.elapsed().as_millis();
+            log.push(format!(
+                "simplify-lane: level-0 rollup ({rollup_tris} tris, no atlas, no simplify)"
+            ));
+            staged.push((
+                0,
+                out,
+                simplify::SimplifyReport {
+                    passthrough: true,
+                    ..Default::default()
+                },
+            ));
+        }
+        if !atlas_levels.is_empty() {
+            let t = std::time::Instant::now();
+            let mut model = assemble::assemble(
+                &client,
+                &ent,
+                &placements,
+                atlas_levels[0],
+                params.cache.as_deref(),
             )?;
-            simplify_ms += t.elapsed().as_millis();
-            log.push(format!("simplify[{level}]: {}", sim.summary()));
-            staged.push((level, out, sim));
+            assemble_ms += t.elapsed().as_millis();
+            if params.crop {
+                let rects = crop::crop_rects_rh(base, &parcels);
+                let report = crop::crop(&mut model, &rects);
+                eprintln!("crop: {}", report.summary());
+                if !model.primitives.is_empty() {
+                    crop_stats = Some(crop::union_stats(&model, &rects, 1e-3));
+                }
+            }
+            let t = std::time::Instant::now();
+            let mode = if params.atlas_fixed {
+                atlas::AtlasMode::FullBleed
+            } else if params.atlas_adaptive {
+                atlas::AtlasMode::Adaptive
+            } else {
+                atlas::AtlasMode::Native
+            };
+            let model = atlas::atlas_with(&model, params.atlas_max, params.atlas_padding, mode)?;
+            atlas_ms = t.elapsed().as_millis();
+            log.extend(model.log.iter().cloned());
+            source_tris = model.total_tris();
+
+            let t = std::time::Instant::now();
+            let glb = emit::emit_glb(&model)?;
+            std::fs::write(&pre, &glb).with_context(|| format!("write {}", pre.display()))?;
+            emit_ms += t.elapsed().as_millis();
+
+            for &level in &atlas_levels {
+                let out = staging.join(staged_glb_name(&sid, level));
+                let t = std::time::Instant::now();
+                let sim = run_simplify(
+                    &model,
+                    &pre,
+                    &out,
+                    params,
+                    level,
+                    source_tris,
+                    parcel_count,
+                    &mut log,
+                )?;
+                simplify_ms += t.elapsed().as_millis();
+                log.push(format!("simplify[{level}]: {}", sim.summary()));
+                staged.push((level, out, sim));
+            }
         }
     } else {
         log.push("empty scene: no placements; emitting content-free LOD bundles".to_string());
@@ -530,7 +558,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         lod: Some(lods::LodGenMeta {
             parcels,
             base,
-            timestamp: None,
+            timestamp: ent.timestamp.map(lods::entity_ticks),
             vertical_override: None,
         }),
         ..Default::default()
@@ -632,8 +660,9 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         }
         let mut primary_path = PathBuf::new();
         let mut primary_bytes = 0usize;
-        let gate_budget = (expect_content && !params.atlas_fixed && !params.atlas_adaptive)
-            .then(|| atlas::budget_pot(params.atlas_max));
+        let gate_budget =
+            (expect_content && level >= 1 && !params.atlas_fixed && !params.atlas_adaptive)
+                .then(|| atlas::budget_pot(params.atlas_max));
         for plat in &platforms {
             let rel = expected_rel_path(&sid, level, plat);
             let path = PathBuf::from(&params.out_dir)

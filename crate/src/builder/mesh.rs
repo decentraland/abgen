@@ -10,7 +10,11 @@ impl<'a> Builder<'a> {
         let mut t = self.base_clone("Mesh");
         let n = prim.positions.len();
 
-        let use_u16 = prim.from_draco && n <= u16::MAX as usize + 1;
+        let use_u16 = if self.lod.is_some() {
+            prim.indices.iter().max().is_none_or(|&m| m < 65536)
+        } else {
+            prim.from_draco && n <= u16::MAX as usize + 1
+        };
         let mut idx_bytes: Vec<u8> =
             Vec::with_capacity(prim.indices.len() * if use_u16 { 2 } else { 4 });
         if use_u16 {
@@ -22,7 +26,11 @@ impl<'a> Builder<'a> {
                 idx_bytes.extend_from_slice(&i.to_le_bytes());
             }
         }
-        let (data, channels) = gltf::vertex_buffer(prim);
+        let (data, channels) = if self.lod.is_some() {
+            gltf::vertex_buffer_lod(prim, bind_poses.is_some())
+        } else {
+            gltf::vertex_buffer(prim)
+        };
         let (center, extent) = gltf::aabb(
             &prim.positions,
             prim.position_min_decl,
@@ -105,7 +113,7 @@ impl<'a> Builder<'a> {
     }
 
     fn register_lod_mesh(&mut self, pid: i64, prim: &Primitive) {
-        if self.lod.is_none() {
+        if !self.lod_atlas() {
             return;
         }
         let name = if !prim.name.is_empty() {
@@ -171,12 +179,24 @@ impl<'a> Builder<'a> {
         let p0 = prims[0];
         let mut t = self.base_clone("Mesh");
         let n = p0.positions.len();
-        let (data, channels) = gltf::vertex_buffer(p0);
+        let (data, channels) = if self.lod.is_some() {
+            gltf::vertex_buffer_lod(p0, bind_poses.is_some())
+        } else {
+            gltf::vertex_buffer(p0)
+        };
         let (center, extent) =
             gltf::aabb(&p0.positions, p0.position_min_decl, p0.position_max_decl);
 
         let merged_from_draco = prims.iter().all(|p| p.from_draco);
-        let use_u16 = merged_from_draco && n <= u16::MAX as usize + 1;
+        let use_u16 = if self.lod.is_some() {
+            prims
+                .iter()
+                .flat_map(|p| p.indices.iter())
+                .max()
+                .is_none_or(|&m| m < 65536)
+        } else {
+            merged_from_draco && n <= u16::MAX as usize + 1
+        };
         let idx_width: i64 = if use_u16 { 2 } else { 4 };
         let mut idx_bytes: Vec<u8> = Vec::new();
         let mut submeshes: Vec<Value> = Vec::with_capacity(prims.len());
@@ -273,6 +293,14 @@ impl<'a> Builder<'a> {
     }
 
     fn add_mesh_merged(&mut self, prims: &[Primitive], mesh_base: &str, usage: i64) -> i64 {
+        if self.lod_rollup() {
+            if let Some(mi) = prims[0].gltf_mesh_index {
+                let key = (mi, prims[0].gltf_prim_index, usage, prims[0].skin_index);
+                if let Some(&pid) = self.mesh_pid_by_gltf.get(&key) {
+                    return pid;
+                }
+            }
+        }
         let recycle = self.unique_recycle("meshes", mesh_base);
         let refs: Vec<&Primitive> = prims.iter().collect();
         let tree = self.mesh_tree_merged(&refs, usage, None);
@@ -346,9 +374,11 @@ impl<'a> Builder<'a> {
             let mesh_pid = self.add_mesh_merged(prims, mesh_base, usage);
             self.scene_object_pids.push(mesh_pid);
 
-            for p in prims {
-                if p.material_index.is_some() {
-                    let _ = self.material_orphan(scene, p.material_index);
+            if !self.lod_rollup() {
+                for p in prims {
+                    if p.material_index.is_some() {
+                        let _ = self.material_orphan(scene, p.material_index);
+                    }
                 }
             }
             let mf = self.add(

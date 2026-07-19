@@ -75,9 +75,25 @@ pub fn self_gate_bundle_with(
     let mut root_positions: Vec<[f64; 3]> = Vec::new();
     let mut materials: Vec<(String, i64, i64, i64)> = Vec::new();
     let mut renderer_mat_pids: HashSet<i64> = HashSet::new();
+    let mut renderer_gos: HashSet<i64> = HashSet::new();
+    let mut filter_mesh_by_go: HashMap<i64, i64> = HashMap::new();
+    let mut colliders: Vec<(i64, i64)> = Vec::new();
     let mut textures: Vec<(String, i64, i64, i64, i64)> = Vec::new();
     let mut mesh_extent = [0.0f64; 3];
     let mut mesh_count = 0usize;
+    struct MeshEnc {
+        name: String,
+        channels: Vec<(i64, i64, i64, i64)>,
+        idxfmt: i64,
+        vcount: i64,
+        inline_len: i64,
+        stream_size: i64,
+        stream_path: String,
+        has_bindposes: bool,
+    }
+    let mut mesh_encodings: Vec<MeshEnc> = Vec::new();
+    let node_names: Vec<String> = bundle.files.iter().map(|f| f.name.clone()).collect();
+    let mut cab_node: Option<String> = None;
     let mut deps: Vec<String> = Vec::new();
     let mut metadata: Option<serde_json::Value> = None;
     let mut target_platform: Option<i32> = None;
@@ -87,6 +103,9 @@ pub fn self_gate_bundle_with(
         };
         if target_platform.is_none() {
             target_platform = Some(sf.target_platform);
+        }
+        if cab_node.is_none() {
+            cab_node = Some(file.name.clone());
         }
         for obj in &sf.objects {
             let v = sf
@@ -144,6 +163,39 @@ pub fn self_gate_bundle_with(
                             }
                         }
                     }
+                    if let Some(go) = v
+                        .get("m_GameObject")
+                        .and_then(|p| p.get("m_PathID"))
+                        .and_then(|x| x.as_i64())
+                    {
+                        renderer_gos.insert(go);
+                    }
+                }
+                33 => {
+                    let go = v
+                        .get("m_GameObject")
+                        .and_then(|p| p.get("m_PathID"))
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or(0);
+                    let mesh = v
+                        .get("m_Mesh")
+                        .and_then(|p| p.get("m_PathID"))
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or(0);
+                    filter_mesh_by_go.insert(go, mesh);
+                }
+                64 => {
+                    let go = v
+                        .get("m_GameObject")
+                        .and_then(|p| p.get("m_PathID"))
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or(0);
+                    let mesh = v
+                        .get("m_Mesh")
+                        .and_then(|p| p.get("m_PathID"))
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or(0);
+                    colliders.push((go, mesh));
                 }
                 43 => {
                     mesh_count += 1;
@@ -153,6 +205,57 @@ pub fn self_gate_bundle_with(
                             mesh_extent[i] = mesh_extent[i].max(e.abs());
                         }
                     }
+                    let vd = v.get("m_VertexData");
+                    let channels: Vec<(i64, i64, i64, i64)> = vd
+                        .and_then(|d| d.get("m_Channels"))
+                        .and_then(|c| c.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .map(|c| {
+                                    let f =
+                                        |k: &str| c.get(k).and_then(|x| x.as_i64()).unwrap_or(-1);
+                                    (f("stream"), f("offset"), f("format"), f("dimension"))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let vcount = vd
+                        .and_then(|d| d.get("m_VertexCount"))
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or(-1);
+                    let inline_len = match vd.and_then(|d| d.get("m_DataSize")) {
+                        Some(crate::value::Value::Bytes(b)) => b.len() as i64,
+                        Some(crate::value::Value::Array(a)) => a.len() as i64,
+                        _ => -1,
+                    };
+                    let idxfmt = v
+                        .get("m_IndexFormat")
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or(-1);
+                    let sd = v.get("m_StreamData");
+                    let stream_size = sd
+                        .and_then(|s| s.get("size"))
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or(0);
+                    let stream_path = sd
+                        .and_then(|s| s.get("path"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let has_bindposes = v
+                        .get("m_BindPose")
+                        .and_then(|b| b.as_array())
+                        .is_some_and(|a| !a.is_empty());
+                    mesh_encodings.push(MeshEnc {
+                        name,
+                        channels,
+                        idxfmt,
+                        vcount,
+                        inline_len,
+                        stream_size,
+                        stream_path,
+                        has_bindposes,
+                    });
                 }
                 28 => {
                     let get = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(-1);
@@ -233,12 +336,17 @@ pub fn self_gate_bundle_with(
             materials.len()
         ),
     );
+    let want_shader_pid = if level == 0 {
+        crate::shader::SHADER_PATH_ID
+    } else {
+        crate::shader::TEXARRAY_SHADER_PATH_ID
+    };
     for (name, fid, pid, _) in &materials {
         push_check(
             &mut checks,
             format!("shader-pptr[{name}]"),
-            (*fid, *pid) == (1, crate::shader::TEXARRAY_SHADER_PATH_ID),
-            format!("({fid}, {pid})"),
+            (*fid, *pid) == (1, want_shader_pid),
+            format!("({fid}, {pid}) want (1, {want_shader_pid})"),
         );
     }
     // an unreferenced material drags its texture into the preload table:
@@ -257,12 +365,14 @@ pub fn self_gate_bundle_with(
             orphan_mats.len()
         ),
     );
-    let want_deps: Vec<String> = if expect_content {
+    let want_deps: Vec<String> = if !expect_content {
+        Vec::new()
+    } else if level == 0 {
+        vec![crate::cabname::shader_bundle_cab(platform).to_lowercase()]
+    } else {
         vec![
             crate::cabname::cab_name(&crate::shader::texarray_bundle_name(platform)).to_lowercase(),
         ]
-    } else {
-        Vec::new()
     };
     push_check(
         &mut checks,
@@ -277,16 +387,78 @@ pub fn self_gate_bundle_with(
         (mesh_count > 0 && extent_span > 0.0) == expect_content,
         format!("{mesh_count} mesh(es), max extent {extent_span}, expect_content={expect_content}"),
     );
+    let want_channels = crate::mesh_layout::lod_channel_table();
+    let cab = cab_node.unwrap_or_default();
+    let want_stream_path = format!("archive:/{cab}/{cab}.resS");
+    for m in &mesh_encodings {
+        let name = &m.name;
+        let idx_ok = (m.idxfmt == 0) == (m.vcount <= 65536);
+        let detail = format!(
+            "channels={:?} idxfmt={} verts={} streamed={} inline={} path={:?}",
+            m.channels, m.idxfmt, m.vcount, m.stream_size, m.inline_len, m.stream_path
+        );
+        if m.has_bindposes {
+            let pos_ok = m.channels.first() == Some(&(0, 0, 0, 3));
+            let blend_ok = matches!(
+                (m.channels.get(12), m.channels.get(13)),
+                (Some(&(ws, 0, 0, 4)), Some(&(js, 16, 10, 4))) if ws == js && ws >= 1
+            );
+            let inline = m.stream_size == 0 && m.stream_path.is_empty() && m.inline_len > 0;
+            push_check(
+                &mut checks,
+                format!("mesh-encoding[{name}]"),
+                pos_ok && blend_ok && idx_ok && inline,
+                detail,
+            );
+            continue;
+        }
+        let interleaved = m.channels == want_channels
+            && m.stream_size == m.vcount * crate::mesh_layout::LOD_INTERLEAVED_STRIDE as i64;
+        let streamed = m.inline_len == 0 && m.stream_path == want_stream_path;
+        push_check(
+            &mut checks,
+            format!("mesh-encoding[{name}]"),
+            interleaved && idx_ok && streamed,
+            detail,
+        );
+    }
+    let want_nodes: Vec<String> = if mesh_encodings.iter().any(|m| m.stream_size > 0) {
+        vec![cab.clone(), format!("{cab}.resS")]
+    } else {
+        vec![cab.clone()]
+    };
+    push_check(
+        &mut checks,
+        "archive-nodes",
+        node_names == want_nodes,
+        format!("got {node_names:?} want {want_nodes:?}"),
+    );
+    let tex_count_ok = if level == 0 {
+        expect_content || textures.is_empty()
+    } else {
+        textures.is_empty() != expect_content
+    };
     push_check(
         &mut checks,
         "texture-count",
-        textures.is_empty() != expect_content,
+        tex_count_ok,
         format!(
             "{} texture(s), expect_content={expect_content}",
             textures.len()
         ),
     );
     for (name, fmt, w, h, mips) in &textures {
+        if level == 0 {
+            let fmt_ok = matches!(*fmt, 10 | 12 | 25);
+            let dims_ok = *w > 0 && *h > 0 && *w <= 2048 && *h <= 2048;
+            push_check(
+                &mut checks,
+                format!("texture[{name}]"),
+                fmt_ok && dims_ok && *mips >= 1,
+                format!("fmt={fmt} {w}x{h} mips={mips}"),
+            );
+            continue;
+        }
         let square_pot = *w > 0 && w == h && (*w as u64).is_power_of_two() && *w <= 512;
         let full_mips = square_pot && *mips == (*w as u64).trailing_zeros() as i64 + 1;
         let on_budget = atlas_budget.is_none_or(|b| *w == b as i64);
@@ -298,14 +470,35 @@ pub fn self_gate_bundle_with(
         );
     }
     // production ships one uniform atlas size per bundle (shared texture-array slots)
-    let tex_sizes: std::collections::BTreeSet<(i64, i64)> =
-        textures.iter().map(|(_, _, w, h, _)| (*w, *h)).collect();
-    push_check(
-        &mut checks,
-        "texture-uniform-size",
-        tex_sizes.len() <= 1,
-        format!("{} distinct size(s): {tex_sizes:?}", tex_sizes.len()),
-    );
+    if level >= 1 {
+        let tex_sizes: std::collections::BTreeSet<(i64, i64)> =
+            textures.iter().map(|(_, _, w, h, _)| (*w, *h)).collect();
+        push_check(
+            &mut checks,
+            "texture-uniform-size",
+            tex_sizes.len() <= 1,
+            format!("{} distinct size(s): {tex_sizes:?}", tex_sizes.len()),
+        );
+    }
+    if !colliders.is_empty() {
+        let bad_ref = colliders
+            .iter()
+            .filter(|(go, mesh)| *mesh == 0 || filter_mesh_by_go.get(go) != Some(mesh))
+            .count();
+        let rendered = colliders
+            .iter()
+            .filter(|(go, _)| renderer_gos.contains(go))
+            .count();
+        push_check(
+            &mut checks,
+            "collider-mesh-refs",
+            bad_ref == 0 && rendered == 0,
+            format!(
+                "{} collider(s), {bad_ref} without matching MeshFilter mesh, {rendered} with a renderer",
+                colliders.len()
+            ),
+        );
+    }
     match &metadata {
         Some(m) => {
             push_check(
@@ -321,10 +514,12 @@ pub fn self_gate_bundle_with(
                 m.get("mainAsset").and_then(|v| v.as_str()) == Some(want_main.as_str()),
                 format!("got {:?} want {want_main:?}", m.get("mainAsset")),
             );
-            let want_deps = if expect_content {
-                serde_json::json!([crate::shader::texarray_bundle_name(platform)])
-            } else {
+            let want_deps = if !expect_content {
                 serde_json::json!([])
+            } else if level == 0 {
+                serde_json::json!([format!("dcl/scene_ignore_{platform}")])
+            } else {
+                serde_json::json!([crate::shader::texarray_bundle_name(platform)])
             };
             push_check(
                 &mut checks,

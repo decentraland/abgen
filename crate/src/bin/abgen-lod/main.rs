@@ -94,13 +94,12 @@ simplify: decimates a GLB. --simplifier picks the backend (default from
   topology-preserving pass with a loose error bound so the count target
   dominates, a sloppy (topology-ignoring) retry when that stops early
   above target, then orphan-vertex compaction; a capped result still over
-  budget is a hard error. gltfpack shells out (-si <ratio> -sp -noq;
+  budget is a hard error. gltfpack shells out (-si <ratio> -noq;
   binary resolved --gltfpack > ABGEN_GLTFPACK > PATH): --tri-cap N re-runs
-  up to 3 times with the ratio rescaled by target/actual*0.9 (-sa on the
-  final attempt); if the cap is still unreached at gltfpack's default -se
-  error bound it binary-searches a relaxed -se (aggressive) for the
-  largest result under the cap, else it fills back toward [0.8*cap, cap]
-  when the input was above the cap. In both backends inputs already
+  up to 5 times with the ratio rescaled by target/actual*0.9 (a raised -se
+  seam-preserving pass on the third and fourth attempts, -sa only as the
+  last resort), then fills back toward [0.8*cap, cap] in the mode that
+  reached the cap when the input was above the cap. In both backends inputs already
   satisfying ratio>=1 + cap pass through untouched.
   --allow-unsimplified copies the input through verbatim (loud warning)
   when the simplifier is unavailable or fails.
@@ -110,10 +109,11 @@ generate: the full sync chain: resolve scene -> placements (iss|embedded
   scene runtime) -> assemble -> crop -> atlas -> simplify -> bundle via the LOD build mode
   into {out}/{sceneId}/LOD/{level}/{sceneId}_{level}_{platform} (+.br,
   LOD.manifest.json). --level takes a comma-separated list (default 0,1;
-  level 2 is refused; production stopped emitting it): every level shares
-  ONE assemble/crop/atlas bake and gets its own simplify pass, staged
+  level 2 is refused; production stopped emitting it): level 1 shares
+  ONE assemble/crop/atlas bake and gets its own simplify pass while level 0
+  is the merged-scene rollup, each staged
   {sceneId}_{level}.glb, bundles and self-gate table (labels L{level}: /
-  L{level}:{platform}:). Level 0 = that bake un-decimated (ratio 1.0):
+  L{level}:{platform}:). Level 0 = the rollup un-decimated (ratio 1.0):
   always the pass-through lane, gltfpack is neither run nor resolved, and a
   numeric --tri-cap is ignored with a warning. This DIVERGES from legacy
   production LOD0 (a real-scene bundle with per-source meshes/materials on
@@ -124,9 +124,9 @@ generate: the full sync chain: resolve scene -> placements (iss|embedded
   mesh is min(source, 500 x parcels) tris. Scenes at or under the cap pass
   through bit-identically (without resolving gltfpack); larger scenes are
   decimated into [0.8*cap, cap] (hard error if the cap is unreachable).
-  --tri-cap N overrides the cap; --tri-cap off restores the legacy
-  ratio-only lane (pass-through at or under 500 x parcels, else an
-  uncapped ratio decimation). --simplifier picks the decimation backend
+  --tri-cap N overrides the cap; --tri-cap auto restates the default (there
+  is no uncapped level-1 lane: every non-empty reference LOD1 lands exactly
+  the budget). --simplifier picks the decimation backend
   exactly as in `simplify` above (default from ABGEN_SIMPLIFIER, else
   meshopt). Every capped run adds a tri-cap self-gate
   check (tris_after <= cap); an --allow-unsimplified verbatim copy passes

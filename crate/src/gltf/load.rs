@@ -24,7 +24,7 @@ pub(super) fn decode_image_rgba8_unity(bytes: &[u8]) -> Option<image::RgbaImage>
     image::RgbaImage::from_raw(w, h, out)
 }
 
-pub(super) fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
     if !uri.starts_with("data:") {
         return None;
     }

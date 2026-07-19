@@ -495,8 +495,10 @@ impl<'a> Builder<'a> {
 
         let is_bc5_normal = self.bc5_normal_images.contains(&idx);
 
-        let max_size = if self.lod.is_some() {
+        let max_size = if self.lod_atlas() {
             texprofile::max_texture_size_for(self.target).min(512)
+        } else if self.lod_rollup() {
+            texprofile::TEXTURE_IMPORTER_DEFAULT_MAX
         } else {
             texprofile::max_texture_size_for(self.target)
         };
@@ -508,11 +510,22 @@ impl<'a> Builder<'a> {
             texprofile::texture_profile(&src, colorspace, is_normal, mag, mn, max_size)
         };
 
-        if self.lod.is_some() && bc7_p.compressed {
+        if self.lod_atlas() && bc7_p.compressed {
             let side = bc7_p.target_w.max(bc7_p.target_h);
             bc7_p.target_w = side;
             bc7_p.target_h = side;
             bc7_p.mip_count = texprofile::default_mip_count(side, side);
+        }
+        if self.lod_rollup()
+            && bc7_p.compressed
+            && bc7_p.texture_format == texprofile::TF_BC7
+            && bc7_p.lightmap_format != 3
+        {
+            bc7_p.texture_format = if src.has_real_alpha {
+                texprofile::TF_DXT5
+            } else {
+                texprofile::TF_DXT1
+            };
         }
 
         if self.spec_color_only_images.contains(&idx) {

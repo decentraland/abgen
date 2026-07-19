@@ -265,6 +265,7 @@ module.exports.onUpdate = async function () {
                 hash: "hscene".into(),
             }],
             metadata: serde_json::json!({"runtimeVersion": "6"}),
+            timestamp: None,
         };
         let got = run_scene_placements(&client, &ent);
         std::env::remove_var(SDK6_ADAPTION_URL_ENV);

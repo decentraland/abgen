@@ -125,6 +125,16 @@ pub(super) fn commit_objects(
                         tree.insert("image data", Value::Bytes(Vec::new()));
                     }
                     overrides.insert(*pid, tree);
+                } else if tn == "Mesh" && !sd.path.is_empty() {
+                    let mut tree = tree.clone();
+                    tree.insert(
+                        "m_StreamData",
+                        map! {"offset" => sd.offset as i64, "size" => sd.size as i64, "path" => sd.path.clone()},
+                    );
+                    let mut vd = tree.get("m_VertexData").cloned().unwrap_or_else(Value::map);
+                    vd.insert("m_DataSize", Value::Bytes(Vec::new()));
+                    tree.insert("m_VertexData", vd);
+                    overrides.insert(*pid, tree);
                 }
             }
         }
@@ -395,8 +405,10 @@ impl<'a> Builder<'a> {
         let mut deps: Vec<String> = if self.lod.is_some() {
             if self.material_entries.is_empty() {
                 Vec::new()
-            } else {
+            } else if self.lod_atlas() {
                 vec![crate::shader::texarray_bundle_name(self.target)]
+            } else {
+                vec![format!("dcl/scene_ignore_{}", self.target)]
             }
         } else {
             self.metadata_dependencies.to_vec()
@@ -698,6 +710,22 @@ impl<'a> Builder<'a> {
     pub(super) fn commit(&self, bundle: &mut Bundle) -> Result<()> {
         let mut blobs: Vec<ress::TextureBlob> = Vec::new();
         for (&pid, (tn, tree)) in self.objects.iter() {
+            if tn == "Mesh" && self.lod.is_some() {
+                let skinned = tree
+                    .get("m_BindPose")
+                    .and_then(|b| b.as_array())
+                    .is_some_and(|a| !a.is_empty());
+                if !skinned {
+                    if let Some(Value::Bytes(b)) =
+                        tree.get("m_VertexData").and_then(|vd| vd.get("m_DataSize"))
+                    {
+                        if !b.is_empty() {
+                            blobs.push(ress::TextureBlob::new(pid, b.clone(), ""));
+                        }
+                    }
+                }
+                continue;
+            }
             if tn != "Texture2D" {
                 continue;
             }

@@ -45,11 +45,17 @@ fn choose_lane_level_1_matrix() {
     );
     assert_eq!(
         choose_lane(1, None, false, 0.1, 501, 500),
-        SimplifyLane::Uncapped { ratio: 0.1 }
+        SimplifyLane::Capped {
+            ratio: 0.1,
+            cap: 500
+        }
     );
     assert_eq!(
         choose_lane(1, None, false, 0.25, 5_000_000, 1500),
-        SimplifyLane::Uncapped { ratio: 0.25 }
+        SimplifyLane::Capped {
+            ratio: 0.25,
+            cap: 1500
+        }
     );
     assert_eq!(
         choose_lane(1, Some(250), false, 0.25, 400, 500),
@@ -776,5 +782,772 @@ fn orphan_material_is_dropped_from_lod_bundle() {
             .any(|c| c.label == "shader-pptr[TextureBakeResult-mat]"),
         "referenced material missing"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn metadata_script(data: &[u8]) -> String {
+    let bundle = Bundle::load_bytes(data).unwrap();
+    for file in &bundle.files {
+        let FileContent::Serialized(sf) = &file.content else {
+            continue;
+        };
+        for obj in &sf.objects {
+            if obj.class_id != 49 {
+                continue;
+            }
+            let v = sf.read_typetree(obj).unwrap();
+            if v.get("m_Name").and_then(|x| x.as_str()) == Some("metadata") {
+                let s = v.get("m_Script").unwrap();
+                return s.as_str().map(String::from).unwrap_or_else(|| {
+                    String::from_utf8_lossy(s.as_bytes().unwrap()).into_owned()
+                });
+            }
+        }
+    }
+    panic!("no metadata TextAsset in bundle");
+}
+
+#[test]
+fn metadata_ticks_stable_across_rebuilds_and_schema_modulo_ticks() {
+    std::env::set_var(
+        "ABGEN_ROOT",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap(),
+    );
+    let dir = std::env::temp_dir().join(format!("abgen-lod-ticks-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sid = "bafkreitickssynthetic";
+    let src = dir.join(format!("{sid}_1.glb"));
+    std::fs::write(&src, synthetic_glb()).unwrap();
+
+    let client = CatalystClient::new("http://127.0.0.1:9");
+    let ticks = lods::entity_ticks(1_694_177_669_000);
+    assert_eq!(ticks, 638_297_744_690_000_000);
+    let opts = lods::LodOptions {
+        platform: "windows".to_string(),
+        lod: Some(lods::LodGenMeta {
+            parcels: vec![(8, -83)],
+            base: (8, -83),
+            timestamp: Some(ticks),
+            vertical_override: None,
+        }),
+        ..Default::default()
+    };
+    let mut bundles: Vec<Vec<u8>> = Vec::new();
+    for run in ["a", "b"] {
+        let out = dir.join(run);
+        let conv = lods::convert_lods(
+            &client,
+            &[src.to_string_lossy().into_owned()],
+            out.to_str().unwrap(),
+            &opts,
+        )
+        .unwrap();
+        bundles.push(std::fs::read(out.join(sid).join(&conv.results[0].rel_path)).unwrap());
+    }
+    assert_eq!(bundles[0], bundles[1], "rebuild not byte-stable");
+
+    let want = format!(
+        "{{\"timestamp\":{ticks},\"version\":\"1.0\",\"dependencies\":[{}],\"mainAsset\":\"{sid}_1.prefab\"}}",
+        serde_json::to_string(&crate::shader::texarray_bundle_name("windows")).unwrap()
+    );
+    assert_eq!(metadata_script(&bundles[0]), want);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn build_lod_bundle_from(glb: Vec<u8>, sid: &str, tag: &str) -> Vec<u8> {
+    std::env::set_var(
+        "ABGEN_ROOT",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap(),
+    );
+    let dir = std::env::temp_dir().join(format!("abgen-lod-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join(format!("{sid}_1.glb"));
+    std::fs::write(&src, glb).unwrap();
+    let client = CatalystClient::new("http://127.0.0.1:9");
+    let opts = lods::LodOptions {
+        platform: "windows".to_string(),
+        lod: Some(lods::LodGenMeta {
+            parcels: vec![(0, 0)],
+            base: (0, 0),
+            timestamp: None,
+            vertical_override: None,
+        }),
+        ..Default::default()
+    };
+    let out = dir.join("out");
+    let conv = lods::convert_lods(
+        &client,
+        &[src.to_string_lossy().into_owned()],
+        out.to_str().unwrap(),
+        &opts,
+    )
+    .unwrap();
+    let data = std::fs::read(out.join(sid).join(&conv.results[0].rel_path)).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    data
+}
+
+fn mesh_encoding_facts(data: &[u8]) -> Vec<(Vec<(i64, i64, i64, i64)>, i64, i64, Vec<u8>)> {
+    let bundle = Bundle::load_bytes(data).unwrap();
+    let mut ress: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    for file in &bundle.files {
+        if let FileContent::Raw(raw) = &file.content {
+            ress.insert(file.name.clone(), raw.clone());
+        }
+    }
+    let mut out = Vec::new();
+    for file in &bundle.files {
+        let FileContent::Serialized(sf) = &file.content else {
+            continue;
+        };
+        for obj in &sf.objects {
+            if obj.class_id != 43 {
+                continue;
+            }
+            let v = sf.read_typetree(obj).unwrap();
+            let vd = v.get("m_VertexData").unwrap();
+            let channels = vd
+                .get("m_Channels")
+                .and_then(|c| c.as_array())
+                .unwrap()
+                .iter()
+                .map(|c| {
+                    let g = |k: &str| c.get(k).and_then(|x| x.as_i64()).unwrap();
+                    (g("stream"), g("offset"), g("format"), g("dimension"))
+                })
+                .collect();
+            let idxfmt = v.get("m_IndexFormat").and_then(|x| x.as_i64()).unwrap();
+            let vcount = vd.get("m_VertexCount").and_then(|x| x.as_i64()).unwrap();
+            let inline = vd.get("m_DataSize").and_then(|x| x.as_bytes()).unwrap();
+            let bytes = if inline.is_empty() {
+                let sd = v.get("m_StreamData").unwrap();
+                let g = |k: &str| sd.get(k).and_then(|x| x.as_i64()).unwrap() as usize;
+                let path = sd.get("path").and_then(|x| x.as_str()).unwrap();
+                let node = path.rsplit('/').next().unwrap();
+                ress[node][g("offset")..g("offset") + g("size")].to_vec()
+            } else {
+                inline.to_vec()
+            };
+            out.push((channels, idxfmt, vcount, bytes));
+        }
+    }
+    out
+}
+
+#[test]
+fn lod_vertex_declaration_matches_prod_and_payload_is_interleaved() {
+    let sid = "bafkreimeshencoding";
+    let data = build_lod_bundle_from(synthetic_glb(), sid, "meshenc");
+    let facts = mesh_encoding_facts(&data);
+    assert_eq!(facts.len(), 1);
+    let (channels, idxfmt, vcount, bytes) = &facts[0];
+    assert_eq!(*channels, crate::mesh_layout::lod_channel_table());
+    assert_eq!(*idxfmt, 0, "u16 indices when max index < 65536");
+    assert_eq!(
+        bytes.len() as i64,
+        vcount * crate::mesh_layout::LOD_INTERLEAVED_STRIDE as i64
+    );
+    assert!(
+        facts[0]
+            .3
+            .chunks(32)
+            .any(|row| row[20..28].iter().any(|&b| b != 0)),
+        "tangent bytes all zero"
+    );
+    let checks = self_gate_bundle(&data, sid, 1, "windows").unwrap();
+    assert!(
+        checks.iter().any(|c| c.label.starts_with("mesh-encoding[")),
+        "mesh-encoding gate missing"
+    );
+    for c in &checks {
+        assert!(c.ok, "unexpected FAIL {}: {}", c.label, c.detail);
+    }
+}
+
+#[test]
+fn lod_bundle_splits_vertex_payload_into_cab_ress() {
+    let sid = "bafkreiresssplit";
+    let data = build_lod_bundle_from(synthetic_glb(), sid, "resssplit");
+    let bundle = Bundle::load_bytes(&data).unwrap();
+    let names: Vec<&str> = bundle.files.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names.len(), 2, "container census: {names:?}");
+    assert_eq!(names[1], format!("{}.resS", names[0]), "census: {names:?}");
+    let cab = names[0].to_string();
+    let ress = &bundle.files[1];
+    assert_eq!(ress.flags, crate::ress::RESS_NODE_FLAGS);
+    let FileContent::Raw(ress_bytes) = &ress.content else {
+        panic!(".resS node must be raw");
+    };
+    let FileContent::Serialized(sf) = &bundle.files[0].content else {
+        panic!("CAB node must be serialized");
+    };
+    let mut meshes = 0;
+    for obj in &sf.objects {
+        if obj.class_id != 43 {
+            continue;
+        }
+        meshes += 1;
+        let v = sf.read_typetree(obj).unwrap();
+        let vd = v.get("m_VertexData").unwrap();
+        let inline = vd.get("m_DataSize").and_then(|x| x.as_bytes()).unwrap();
+        assert!(inline.is_empty(), "vertexData must be inline=0");
+        let vcount = vd.get("m_VertexCount").and_then(|x| x.as_i64()).unwrap();
+        let sd = v.get("m_StreamData").unwrap();
+        let g = |k: &str| sd.get(k).and_then(|x| x.as_i64()).unwrap();
+        assert_eq!(
+            sd.get("path").and_then(|x| x.as_str()).unwrap(),
+            format!("archive:/{cab}/{cab}.resS"),
+            "archive streamData ref"
+        );
+        assert_eq!(
+            g("size"),
+            vcount * crate::mesh_layout::LOD_INTERLEAVED_STRIDE as i64
+        );
+        let end = (g("offset") + g("size")) as usize;
+        assert!(end <= ress_bytes.len(), "stream span exceeds .resS node");
+    }
+    assert!(meshes > 0, "fixture bundle has no meshes");
+    assert!(
+        ress_bytes.len().is_multiple_of(16),
+        ".resS length {} not 16-aligned",
+        ress_bytes.len()
+    );
+    let mut texs = 0;
+    for obj in &sf.objects {
+        if obj.class_id != 28 {
+            continue;
+        }
+        texs += 1;
+        let v = sf.read_typetree(obj).unwrap();
+        let img = v.get("image data").and_then(|x| x.as_bytes()).unwrap();
+        assert!(!img.is_empty(), "texture streamed out of CAB");
+        let size = v
+            .get("m_StreamData")
+            .and_then(|s| s.get("size"))
+            .and_then(|x| x.as_i64())
+            .unwrap();
+        assert_eq!(size, 0);
+    }
+    assert!(texs > 0, "fixture bundle has no textures");
+    let checks = self_gate_bundle(&data, sid, 1, "windows").unwrap();
+    assert!(
+        checks.iter().any(|c| c.label == "archive-nodes" && c.ok),
+        "archive-nodes gate missing"
+    );
+    for c in &checks {
+        assert!(c.ok, "unexpected FAIL {}: {}", c.label, c.detail);
+    }
+}
+
+#[test]
+fn lod_index_width_follows_max_index_boundary() {
+    let n = 65537usize;
+    let glb = emit_glb(&LodModel {
+        root_name: "wide".to_string(),
+        primitives: vec![LodPrimitive {
+            positions: (0..n)
+                .map(|i| [(i % 256) as f32 * 0.01, (i / 256) as f32 * 0.01, 0.0])
+                .collect(),
+            normals: vec![[0.0, 0.0, 1.0]; n],
+            uvs: vec![[0.0, 0.0]; n],
+            indices: vec![0, 1, n as u32 - 1],
+            material: 0,
+            ..Default::default()
+        }],
+        materials: vec![LodMaterial {
+            name: "TextureBakeResult-m".to_string(),
+            class: AlphaClass::Opaque,
+            base_color: [1.0, 1.0, 1.0, 1.0],
+            cutoff: 0.5,
+            image: None,
+            double_sided: false,
+        }],
+        images: Vec::new(),
+        log: Vec::new(),
+    })
+    .unwrap();
+    let data = build_lod_bundle_from(glb, "bafkreiwideindex", "wideidx");
+    let facts = mesh_encoding_facts(&data);
+    assert_eq!(facts.len(), 1);
+    let (_, idxfmt, vcount, _) = &facts[0];
+    assert_eq!(*vcount, 65537);
+    assert_eq!(*idxfmt, 1, "u32 indices once max index >= 65536");
+}
+
+fn rollup_fixture_glb() -> Vec<u8> {
+    let glb = synthetic_glb();
+    let jlen = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+    let mut json: serde_json::Value = serde_json::from_slice(&glb[20..20 + jlen]).unwrap();
+    let bstart = 20 + jlen;
+    let blen = u32::from_le_bytes(glb[bstart..bstart + 4].try_into().unwrap()) as usize;
+    let bin = glb[bstart + 8..bstart + 8 + blen].to_vec();
+    json["nodes"] = serde_json::json!([
+        {"children": [1, 2], "name": "prop"},
+        {"mesh": 0, "name": "box"},
+        {"mesh": 0, "name": "box_collider"}
+    ]);
+    json["scenes"] = serde_json::json!([{"nodes": [0]}]);
+    let mut jb = serde_json::to_vec(&json).unwrap();
+    while !jb.len().is_multiple_of(4) {
+        jb.push(b' ');
+    }
+    let mut bb = bin;
+    while !bb.len().is_multiple_of(4) {
+        bb.push(0);
+    }
+    let total = 12 + 8 + jb.len() + 8 + bb.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(b"glTF");
+    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&(total as u32).to_le_bytes());
+    out.extend_from_slice(&(jb.len() as u32).to_le_bytes());
+    out.extend_from_slice(b"JSON");
+    out.extend_from_slice(&jb);
+    out.extend_from_slice(&(bb.len() as u32).to_le_bytes());
+    out.extend_from_slice(&[0x42, 0x49, 0x4E, 0x00]);
+    out.extend_from_slice(&bb);
+    out
+}
+
+#[test]
+fn lod0_rollup_single_root_collider_parity_and_original_textures() {
+    std::env::set_var(
+        "ABGEN_ROOT",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap(),
+    );
+    let dir = std::env::temp_dir().join(format!("abgen-lod0-rollup-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cache = dir.join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("hbox"), rollup_fixture_glb()).unwrap();
+    let sid = "bafkreirollupzero";
+    let ent = crate::catalyst::Scene {
+        entity_id: sid.to_string(),
+        entity_type: "scene".to_string(),
+        pointers: Vec::new(),
+        content: vec![crate::catalyst::ContentEntry {
+            file: "box.glb".to_string(),
+            hash: "hbox".to_string(),
+        }],
+        metadata: serde_json::json!({}),
+        timestamp: None,
+    };
+    let client = CatalystClient::new("http://127.0.0.1:9");
+    let mk = |pos: [f64; 3]| placements::Placement {
+        glb_hash: Some("hbox".to_string()),
+        position: pos,
+        ..Default::default()
+    };
+    let out = rollup::rollup(
+        &client,
+        &ent,
+        &[mk([3.0, 4.0, 5.0]), mk([-8.0, 0.0, 2.0])],
+        0,
+        Some(&cache),
+    )
+    .unwrap();
+    let src = dir.join(format!("{sid}_0.glb"));
+    std::fs::write(&src, &out.glb).unwrap();
+
+    let opts = lods::LodOptions {
+        platform: "windows".to_string(),
+        lod: Some(lods::LodGenMeta {
+            parcels: vec![(1, 2)],
+            base: (1, 2),
+            timestamp: Some(1_694_177_669_000),
+            vertical_override: None,
+        }),
+        ..Default::default()
+    };
+    let outdir = dir.join("out");
+    let conv = lods::convert_lods(
+        &client,
+        &[src.to_string_lossy().into_owned()],
+        outdir.to_str().unwrap(),
+        &opts,
+    )
+    .unwrap();
+    let data = std::fs::read(outdir.join(sid).join(&conv.results[0].rel_path)).unwrap();
+
+    let bundle = Bundle::load_bytes(&data).unwrap();
+    let mut go_names: HashMap<i64, String> = HashMap::new();
+    let mut roots: Vec<(i64, [f64; 3])> = Vec::new();
+    let mut positions: Vec<[f64; 3]> = Vec::new();
+    let mut filters: HashMap<i64, i64> = HashMap::new();
+    let mut colliders: Vec<(i64, i64)> = Vec::new();
+    let mut renderer_gos: Vec<i64> = Vec::new();
+    let mut materials: Vec<(String, i64, Vec<(String, [f64; 4])>)> = Vec::new();
+    let mut textures: Vec<(String, i64, i64, i64)> = Vec::new();
+    let mut mesh_count = 0;
+    for file in &bundle.files {
+        let FileContent::Serialized(sf) = &file.content else {
+            continue;
+        };
+        for obj in &sf.objects {
+            let v = sf.read_typetree(obj).unwrap();
+            let go = |v: &crate::value::Value| {
+                v.get("m_GameObject")
+                    .and_then(|p| p.get("m_PathID"))
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or(0)
+            };
+            match obj.class_id {
+                1 => {
+                    go_names.insert(
+                        obj.path_id,
+                        v.get("m_Name")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .into(),
+                    );
+                }
+                4 => {
+                    let pos = v.get("m_LocalPosition");
+                    let axis =
+                        |k: &str| pos.and_then(|p| p.get(k)).and_then(|x| x.as_f64()).unwrap();
+                    let p = [axis("x"), axis("y"), axis("z")];
+                    positions.push(p);
+                    let father = v
+                        .get("m_Father")
+                        .and_then(|f| f.get("m_PathID"))
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or(0);
+                    if father == 0 {
+                        roots.push((go(&v), p));
+                    }
+                }
+                21 => {
+                    let name = v
+                        .get("m_Name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let pid = v
+                        .get("m_Shader")
+                        .and_then(|p| p.get("m_PathID"))
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or(0);
+                    let mut colors = Vec::new();
+                    if let Some(arr) = v
+                        .get("m_SavedProperties")
+                        .and_then(|sp| sp.get("m_Colors"))
+                        .and_then(|c| c.as_array())
+                    {
+                        for pair in arr {
+                            let Some(items) = pair.as_array() else {
+                                continue;
+                            };
+                            let key = items[0].as_str().unwrap_or("").to_string();
+                            let col = items.get(1);
+                            let f = |k: &str| {
+                                col.and_then(|c| c.get(k))
+                                    .and_then(|x| x.as_f64())
+                                    .unwrap_or(f64::NAN)
+                            };
+                            colors.push((key, [f("r"), f("g"), f("b"), f("a")]));
+                        }
+                    }
+                    materials.push((name, pid, colors));
+                }
+                23 => renderer_gos.push(go(&v)),
+                33 => {
+                    let mesh = v
+                        .get("m_Mesh")
+                        .and_then(|p| p.get("m_PathID"))
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or(0);
+                    filters.insert(go(&v), mesh);
+                }
+                43 => mesh_count += 1,
+                64 => {
+                    let mesh = v
+                        .get("m_Mesh")
+                        .and_then(|p| p.get("m_PathID"))
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or(0);
+                    colliders.push((go(&v), mesh));
+                }
+                28 => {
+                    let g = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(-1);
+                    textures.push((
+                        v.get("m_Name")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .into(),
+                        g("m_TextureFormat"),
+                        g("m_Width"),
+                        g("m_Height"),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert_eq!(roots.len(), 1, "exactly one root GameObject");
+    assert_eq!(go_names[&roots[0].0], format!("{sid}_0"));
+    assert_eq!(roots[0].1, [0.0, 0.0, 0.0], "root at origin");
+    for want in [[3.0, 4.0, 5.0], [-8.0, 0.0, 2.0]] {
+        assert!(
+            positions
+                .iter()
+                .any(|p| p.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5)),
+            "no transform at {want:?}: {positions:?}"
+        );
+    }
+    assert_eq!(colliders.len(), 2, "one MeshCollider per instance");
+    for (go, mesh) in &colliders {
+        assert_eq!(go_names[go], "box_collider");
+        assert_eq!(filters[go], *mesh, "collider mesh == filter mesh");
+        assert!(*mesh != 0);
+        assert!(!renderer_gos.contains(go), "collider GO has a renderer");
+    }
+    assert_eq!(renderer_gos.len(), 2, "one MeshRenderer per instance");
+    assert_eq!(mesh_count, 1, "instances share the mesh");
+    assert_eq!(materials.len(), 1);
+    let (_, shader_pid, colors) = &materials[0];
+    assert_eq!(*shader_pid, crate::shader::SHADER_PATH_ID);
+    let color = |k: &str| colors.iter().find(|(n, _)| n == k).unwrap().1;
+    assert_eq!(
+        color("_VerticalClipping"),
+        [-2147483648.0, 2147483648.0, 0.0, 0.0]
+    );
+    for (got, want) in color("_PlaneClipping")
+        .iter()
+        .zip([15.95, 32.05, 31.95, 48.05])
+    {
+        assert!((got - want).abs() < 1e-4, "plane clipping {got} vs {want}");
+    }
+    assert_eq!(textures.len(), 1);
+    let (_, fmt, w, h) = &textures[0];
+    assert_eq!((*w, *h), (4, 4), "original texture dims, no atlas canvas");
+    assert!(*fmt == 10 || *fmt == 12, "DXT pair, got {fmt}");
+
+    let checks = self_gate_bundle_with(&data, sid, 0, "windows", true, None).unwrap();
+    assert!(
+        checks
+            .iter()
+            .any(|c| c.label == "collider-mesh-refs" && c.ok),
+        "collider-mesh-refs gate missing"
+    );
+    for c in &checks {
+        assert!(c.ok, "unexpected FAIL {}: {}", c.label, c.detail);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn skinned_fixture_glb() -> Vec<u8> {
+    // skinned node + static node sharing mesh 0, two joint nodes
+    let glb = synthetic_glb();
+    let jlen = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+    let mut json: serde_json::Value = serde_json::from_slice(&glb[20..20 + jlen]).unwrap();
+    let bstart = 20 + jlen;
+    let blen = u32::from_le_bytes(glb[bstart..bstart + 4].try_into().unwrap()) as usize;
+    let mut bin = glb[bstart + 8..bstart + 8 + blen].to_vec();
+    while !bin.len().is_multiple_of(4) {
+        bin.push(0);
+    }
+    let w_off = bin.len();
+    for w in [[0.7f32, 0.3, 0.0, 0.0]; 3] {
+        for c in w {
+            bin.extend_from_slice(&c.to_le_bytes());
+        }
+    }
+    let j_off = bin.len();
+    bin.extend_from_slice(&[1u8, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]);
+    let views = json["bufferViews"].as_array().unwrap().len();
+    json["bufferViews"].as_array_mut().unwrap().extend([
+        serde_json::json!({"buffer": 0, "byteOffset": w_off, "byteLength": 48}),
+        serde_json::json!({"buffer": 0, "byteOffset": j_off, "byteLength": 12}),
+    ]);
+    let accs = json["accessors"].as_array().unwrap().len();
+    json["accessors"].as_array_mut().unwrap().extend([
+        serde_json::json!({"bufferView": views, "componentType": 5126, "count": 3, "type": "VEC4"}),
+        serde_json::json!({"bufferView": views + 1, "componentType": 5121, "count": 3, "type": "VEC4"}),
+    ]);
+    json["buffers"][0]["byteLength"] = serde_json::json!(bin.len());
+    json["meshes"][0]["primitives"][0]["attributes"]["WEIGHTS_0"] = serde_json::json!(accs);
+    json["meshes"][0]["primitives"][0]["attributes"]["JOINTS_0"] = serde_json::json!(accs + 1);
+    json["skins"] = serde_json::json!([{"joints": [3, 4]}]);
+    json["nodes"] = serde_json::json!([
+        {"children": [1, 2, 3, 4], "name": "prop"},
+        {"mesh": 0, "skin": 0, "name": "skinbox"},
+        {"mesh": 0, "name": "staticbox"},
+        {"name": "jointA"},
+        {"name": "jointB"}
+    ]);
+    json["scenes"] = serde_json::json!([{"nodes": [0]}]);
+    let mut jb = serde_json::to_vec(&json).unwrap();
+    while !jb.len().is_multiple_of(4) {
+        jb.push(b' ');
+    }
+    let total = 12 + 8 + jb.len() + 8 + bin.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(b"glTF");
+    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&(total as u32).to_le_bytes());
+    out.extend_from_slice(&(jb.len() as u32).to_le_bytes());
+    out.extend_from_slice(b"JSON");
+    out.extend_from_slice(&jb);
+    out.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+    out.extend_from_slice(&[0x42, 0x49, 0x4E, 0x00]);
+    out.extend_from_slice(&bin);
+    out
+}
+
+#[test]
+fn lod0_skinned_mesh_keeps_blend_channels_and_stays_inline() {
+    std::env::set_var(
+        "ABGEN_ROOT",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap(),
+    );
+    let dir = std::env::temp_dir().join(format!("abgen-lod0-skinned-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cache = dir.join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("hskin"), skinned_fixture_glb()).unwrap();
+    let sid = "bafkreiskinzero";
+    let ent = crate::catalyst::Scene {
+        entity_id: sid.to_string(),
+        entity_type: "scene".to_string(),
+        pointers: Vec::new(),
+        content: vec![crate::catalyst::ContentEntry {
+            file: "skin.glb".to_string(),
+            hash: "hskin".to_string(),
+        }],
+        metadata: serde_json::json!({}),
+        timestamp: None,
+    };
+    let client = CatalystClient::new("http://127.0.0.1:9");
+    let out = rollup::rollup(
+        &client,
+        &ent,
+        &[placements::Placement {
+            glb_hash: Some("hskin".to_string()),
+            position: [3.0, 0.0, 5.0],
+            ..Default::default()
+        }],
+        0,
+        Some(&cache),
+    )
+    .unwrap();
+    let src = dir.join(format!("{sid}_0.glb"));
+    std::fs::write(&src, &out.glb).unwrap();
+
+    let opts = lods::LodOptions {
+        platform: "windows".to_string(),
+        lod: Some(lods::LodGenMeta {
+            parcels: vec![(1, 2)],
+            base: (1, 2),
+            timestamp: Some(1_694_177_669_000),
+            vertical_override: None,
+        }),
+        ..Default::default()
+    };
+    let outdir = dir.join("out");
+    let conv = lods::convert_lods(
+        &client,
+        &[src.to_string_lossy().into_owned()],
+        outdir.to_str().unwrap(),
+        &opts,
+    )
+    .unwrap();
+    let data = std::fs::read(outdir.join(sid).join(&conv.results[0].rel_path)).unwrap();
+
+    let bundle = Bundle::load_bytes(&data).unwrap();
+    let mut smr_mesh_pids: Vec<i64> = Vec::new();
+    struct MeshFacts {
+        bindposes: usize,
+        channels: Vec<(usize, i64, i64, i64, i64)>,
+        inline: usize,
+        stream: i64,
+    }
+    let mut meshes: HashMap<i64, MeshFacts> = HashMap::new();
+    for file in &bundle.files {
+        let FileContent::Serialized(sf) = &file.content else {
+            continue;
+        };
+        for obj in &sf.objects {
+            let v = sf.read_typetree(obj).unwrap();
+            if obj.class_id == 137 {
+                smr_mesh_pids.push(
+                    v.get("m_Mesh")
+                        .and_then(|p| p.get("m_PathID"))
+                        .and_then(|x| x.as_i64())
+                        .unwrap(),
+                );
+            } else if obj.class_id == 43 {
+                let vd = v.get("m_VertexData").unwrap();
+                let channels = vd
+                    .get("m_Channels")
+                    .and_then(|c| c.as_array())
+                    .unwrap()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, c)| {
+                        let f = |k: &str| c.get(k).and_then(|x| x.as_i64()).unwrap();
+                        (f("dimension") != 0)
+                            .then(|| (i, f("stream"), f("offset"), f("format"), f("dimension")))
+                    })
+                    .collect();
+                meshes.insert(
+                    obj.path_id,
+                    MeshFacts {
+                        bindposes: v
+                            .get("m_BindPose")
+                            .and_then(|b| b.as_array())
+                            .map_or(0, |a| a.len()),
+                        channels,
+                        inline: vd
+                            .get("m_DataSize")
+                            .and_then(|x| x.as_bytes())
+                            .map_or(0, |b| b.len()),
+                        stream: v
+                            .get("m_StreamData")
+                            .and_then(|s| s.get("size"))
+                            .and_then(|x| x.as_i64())
+                            .unwrap_or(0),
+                    },
+                );
+            }
+        }
+    }
+    assert_eq!(smr_mesh_pids.len(), 1, "one SkinnedMeshRenderer");
+    let skinned = &meshes[&smr_mesh_pids[0]];
+    assert_eq!(skinned.bindposes, 2);
+    assert!(
+        skinned.channels.contains(&(12, 2, 0, 0, 4))
+            && skinned.channels.contains(&(13, 2, 16, 10, 4)),
+        "blend channels: {:?}",
+        skinned.channels
+    );
+    assert!(
+        skinned.inline > 0 && skinned.stream == 0,
+        "skinned stays inline"
+    );
+    let statics: Vec<&MeshFacts> = meshes.values().filter(|m| m.bindposes == 0).collect();
+    assert!(!statics.is_empty(), "static mesh present");
+    for m in statics {
+        assert!(
+            m.inline == 0 && m.stream > 0,
+            "static meshes stream to .resS"
+        );
+    }
+
+    let checks = self_gate_bundle_with(&data, sid, 0, "windows", true, None).unwrap();
+    for c in &checks {
+        assert!(c.ok, "unexpected FAIL {}: {}", c.label, c.detail);
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -12,6 +12,12 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_LODS_BUCKET: &str = "https://lods-bucket-ed4300a.s3.amazonaws.com";
 
+pub const DOTNET_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
+
+pub fn entity_ticks(entity_timestamp_ms: i64) -> i64 {
+    entity_timestamp_ms * 10_000 + DOTNET_EPOCH_TICKS
+}
+
 #[derive(Clone, Debug)]
 pub struct LodGenMeta {
     pub parcels: Vec<(i32, i32)>,
@@ -215,9 +221,11 @@ fn build_lod_bundle(
     let lod_params: Option<LodBuildParams> = opts.lod.as_ref().map(|m| LodBuildParams {
         level,
         plane_clipping: plane_clipping(&m.parcels),
-        vertical_clipping: match m.vertical_override {
-            Some(h) => [0.0, h, 0.0, 0.0],
-            None => vertical_clipping(m.parcels.len()),
+        // level 0 never height-clips: production pins the full i32 range
+        vertical_clipping: match (level, m.vertical_override) {
+            (0, _) => [i32::MIN as f64, -(i32::MIN as f64), 0.0, 0.0],
+            (_, Some(h)) => [0.0, h, 0.0, 0.0],
+            _ => vertical_clipping(m.parcels.len()),
         },
         main_asset: lod_main_asset(sid, level),
         timestamp: m.timestamp,
@@ -367,29 +375,62 @@ pub(crate) fn write_brotli_sidecar(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn manifest_key(rel: &str) -> Option<(u32, String)> {
+    let mut segs = rel.split('/');
+    if segs.next()? != "LOD" {
+        return None;
+    }
+    let level: u32 = segs.next()?.parse().ok()?;
+    let name = segs.next()?;
+    if segs.next().is_some() {
+        return None;
+    }
+    let platform = name.rsplit('_').next()?;
+    validate_lod_platform(platform).ok()?;
+    Some((level, platform.to_string()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn write_lod_manifest(entity_dir: &Path, conv: &LodConversion, ab_version: &str) -> Result<()> {
     std::fs::create_dir_all(entity_dir)?;
-    let mut files: Vec<serde_json::Value> = conv
-        .results
-        .iter()
-        .map(|r| serde_json::Value::String(r.rel_path.clone()))
-        .collect();
-    files.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+    let mpath = entity_dir.join("LOD.manifest.json");
+    let mut merged: Vec<String> = conv.results.iter().map(|r| r.rel_path.clone()).collect();
+    // merge-on-write: a level-N run must not clobber the other levels' records
+    let new_keys: std::collections::HashSet<Option<(u32, String)>> =
+        merged.iter().map(|r| manifest_key(r)).collect();
+    if let Ok(prev) = std::fs::read(&mpath) {
+        if let Ok(prev) = serde_json::from_slice::<serde_json::Value>(&prev) {
+            for f in prev["files"].as_array().into_iter().flatten() {
+                let Some(rel) = f.as_str() else { continue };
+                if new_keys.contains(&manifest_key(rel)) {
+                    continue;
+                }
+                if entity_dir.join(rel).is_file() {
+                    merged.push(rel.to_string());
+                }
+            }
+        }
+    }
+    merged.sort();
+    merged.dedup();
     let levels: Vec<serde_json::Value> = {
-        let mut v: Vec<u32> = conv.results.iter().map(|r| r.level).collect();
+        let mut v: Vec<u32> = merged
+            .iter()
+            .filter_map(|r| Some(manifest_key(r)?.0))
+            .collect();
         v.sort_unstable();
         v.dedup();
         v.into_iter().map(serde_json::Value::from).collect()
     };
+    let files: Vec<serde_json::Value> = merged.into_iter().map(serde_json::Value::String).collect();
     let manifest = serde_json::json!({
         "version": ab_version,
         "sceneId": conv.scene_id,
         "levels": levels,
         "files": files,
-        "exitCode": if conv.results.is_empty() { 1 } else { 0 },
+        "exitCode": if files.is_empty() { 1 } else { 0 },
     });
     let text = serde_json::to_string_pretty(&manifest)?;
-    let mpath = entity_dir.join("LOD.manifest.json");
     write_atomic(&mpath, text.as_bytes())?;
     write_brotli_sidecar(&mpath, text.as_bytes())?;
     Ok(())
@@ -398,6 +439,108 @@ fn write_lod_manifest(entity_dir: &Path, conv: &LodConversion, ab_version: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_ticks_derive_from_entity_timestamp() {
+        assert_eq!(entity_ticks(0), DOTNET_EPOCH_TICKS);
+        assert_eq!(entity_ticks(1_694_177_669_000), 638_297_744_690_000_000);
+    }
+
+    #[test]
+    fn metadata_ticks_distinct_unless_same_deploy_instant() {
+        assert_eq!(
+            entity_ticks(1_694_177_669_000),
+            entity_ticks(1_694_177_669_000)
+        );
+        assert_ne!(
+            entity_ticks(1_694_177_669_000),
+            entity_ticks(1_694_177_669_001)
+        );
+    }
+
+    fn manifest_fixture(dir: &Path, sid: &str, level: u32, platform: &str) -> LodConversion {
+        let bundle_name = lod_bundle_name(sid, level, platform);
+        let rel = lod_rel_path(level, &bundle_name);
+        let path = dir.join(&rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"bundle").unwrap();
+        LodConversion {
+            scene_id: sid.to_string(),
+            results: vec![LodResult {
+                scene_id: sid.to_string(),
+                level,
+                bundle_name,
+                bytes: 6,
+                rel_path: rel,
+            }],
+            skipped: vec![],
+        }
+    }
+
+    fn manifest_files(dir: &Path) -> (Vec<String>, serde_json::Value) {
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("LOD.manifest.json")).unwrap()).unwrap();
+        let files = v["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.as_str().unwrap().to_string())
+            .collect();
+        (files, v)
+    }
+
+    #[test]
+    fn interleaved_level0_level1_runs_leave_both_records() {
+        let dir = std::env::temp_dir().join(format!(
+            "abgen-lod-manifest-merge-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sid = "bafkreimanifestmerge";
+        let conv0 = manifest_fixture(&dir, sid, 0, "windows");
+        write_lod_manifest(&dir, &conv0, "v1").unwrap();
+        let conv1 = manifest_fixture(&dir, sid, 1, "windows");
+        write_lod_manifest(&dir, &conv1, "v1").unwrap();
+        let (files, v) = manifest_files(&dir);
+        assert_eq!(
+            files,
+            vec![
+                format!("LOD/0/{sid}_0_windows"),
+                format!("LOD/1/{sid}_1_windows"),
+            ]
+        );
+        assert_eq!(v["levels"], serde_json::json!([0, 1]));
+        assert_eq!(v["exitCode"], serde_json::json!(0));
+
+        write_lod_manifest(&dir, &conv0, "v1").unwrap();
+        let (files, v) = manifest_files(&dir);
+        assert_eq!(files.len(), 2, "re-run must replace by key, not duplicate");
+        assert_eq!(v["levels"], serde_json::json!([0, 1]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manifest_merge_keeps_platforms_and_prunes_gone_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "abgen-lod-manifest-prune-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sid = "bafkreimanifestprune";
+        let conv_mac = manifest_fixture(&dir, sid, 1, "mac");
+        write_lod_manifest(&dir, &conv_mac, "v1").unwrap();
+        let conv0 = manifest_fixture(&dir, sid, 0, "windows");
+        write_lod_manifest(&dir, &conv0, "v1").unwrap();
+        let (files, _) = manifest_files(&dir);
+        assert_eq!(files.len(), 2);
+
+        std::fs::remove_file(dir.join(format!("LOD/1/{sid}_1_mac"))).unwrap();
+        write_lod_manifest(&dir, &conv0, "v1").unwrap();
+        let (files, v) = manifest_files(&dir);
+        assert_eq!(files, vec![format!("LOD/0/{sid}_0_windows")]);
+        assert_eq!(v["levels"], serde_json::json!([0]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_lod_filenames() {

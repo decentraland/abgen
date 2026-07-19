@@ -3,6 +3,7 @@ mod load;
 mod scene_build;
 mod transform;
 
+pub(crate) use load::decode_data_uri;
 pub use load::load_gltf_inputs;
 
 use crate::mesh_layout;
@@ -75,6 +76,57 @@ pub fn vertex_buffer(prim: &Primitive) -> (Vec<u8>, Vec<Value>) {
         color_unorm16: prim.from_draco && prim.colors.is_some(),
     };
     mesh_layout::vertex_buffer(&attrs)
+}
+
+pub fn vertex_buffer_lod(prim: &Primitive, skinned: bool) -> (Vec<u8>, Vec<Value>) {
+    let single: Vec<Vec<[f64; 2]>>;
+    let uv_sets: &[Vec<[f64; 2]>] = if !prim.uv_sets.is_empty() {
+        &prim.uv_sets
+    } else if let Some(uvs) = &prim.uvs {
+        single = vec![uvs.clone()];
+        &single
+    } else {
+        &[]
+    };
+    let computed;
+    let tangents: &[[f64; 4]] = match prim.tangents.as_deref() {
+        Some(t) => t,
+        None => {
+            let empty_uvs: Vec<[f64; 2]> = Vec::new();
+            let uvs = uv_sets.first().map(|s| s.as_slice()).unwrap_or(&empty_uvs);
+            computed = crate::tangents::calculate_tangents(
+                &prim.positions,
+                &prim.normals,
+                uvs,
+                &prim.indices,
+            );
+            &computed
+        }
+    };
+    if skinned && prim.weights.is_some() && prim.joints.is_some() {
+        let attrs = mesh_layout::MeshAttributes {
+            positions: &prim.positions,
+            normals: Some(&prim.normals),
+            tangents: Some(tangents),
+            colors: prim.colors.as_deref(),
+            uv_sets,
+            weights: prim.weights.as_deref(),
+            joints: prim.joints.as_deref(),
+            color_unorm16: prim.from_draco && prim.colors.is_some(),
+        };
+        return mesh_layout::vertex_buffer(&attrs);
+    }
+    let attrs = mesh_layout::MeshAttributes {
+        positions: &prim.positions,
+        normals: Some(&prim.normals),
+        tangents: Some(tangents),
+        colors: None,
+        uv_sets,
+        weights: None,
+        joints: None,
+        color_unorm16: false,
+    };
+    mesh_layout::vertex_buffer_encoded(&attrs, mesh_layout::MeshEncoding::LodInterleaved)
 }
 
 pub fn aabb(
@@ -417,5 +469,50 @@ mod tests {
             load_gltf_inputs(EXT_BUF_GLTF.as_bytes(), ".gltf", Some(&ok)).expect("resolves");
         assert_eq!(buffers.len(), 1);
         assert_eq!(buffers[0], vec![7u8; 42]);
+    }
+
+    #[test]
+    fn lod_vertex_buffer_keeps_blend_channels_on_skinned_meshes() {
+        let prim = Primitive {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            uvs: Some(vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]),
+            indices: vec![0, 1, 2],
+            weights: Some(vec![[0.7, 0.3, 0.0, 0.0]; 3]),
+            joints: Some(vec![[1, 0, 0, 0]; 3]),
+            skin_index: Some(0),
+            ..Default::default()
+        };
+        let active = |ch: &[Value]| -> Vec<(usize, i64, i64, i64, i64)> {
+            ch.iter()
+                .enumerate()
+                .filter_map(|(i, c)| {
+                    let f = |k: &str| c.get(k).and_then(|v| v.as_i64()).unwrap();
+                    (f("dimension") != 0)
+                        .then(|| (i, f("stream"), f("offset"), f("format"), f("dimension")))
+                })
+                .collect()
+        };
+
+        let (buf, ch) = vertex_buffer_lod(&prim, true);
+        let a = active(&ch);
+        assert!(a.contains(&(12, 2, 0, 0, 4)), "BLENDWEIGHT: {a:?}");
+        assert!(a.contains(&(13, 2, 16, 10, 4)), "BLENDINDICES: {a:?}");
+        assert_eq!(buf.len(), 256);
+        let w0 = f32::from_le_bytes(buf[160..164].try_into().unwrap());
+        assert!((w0 - 0.7).abs() < 1e-6, "first blend weight, got {w0}");
+        let j0 = u32::from_le_bytes(buf[176..180].try_into().unwrap());
+        assert_eq!(j0, 1, "first blend index");
+
+        let (buf, ch) = vertex_buffer_lod(&prim, false);
+        let table: Vec<(i64, i64, i64, i64)> = ch
+            .iter()
+            .map(|c| {
+                let f = |k: &str| c.get(k).and_then(|v| v.as_i64()).unwrap();
+                (f("stream"), f("offset"), f("format"), f("dimension"))
+            })
+            .collect();
+        assert_eq!(table, crate::mesh_layout::lod_channel_table());
+        assert_eq!(buf.len(), 3 * crate::mesh_layout::LOD_INTERLEAVED_STRIDE);
     }
 }

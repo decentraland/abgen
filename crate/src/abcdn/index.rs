@@ -197,6 +197,7 @@ mod tests {
                 })
                 .collect(),
             metadata: serde_json::Value::Null,
+            timestamp: None,
         }
     }
 

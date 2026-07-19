@@ -20,6 +20,7 @@ pub struct Scene {
     pub pointers: Vec<String>,
     pub content: Vec<ContentEntry>,
     pub metadata: serde_json::Value,
+    pub timestamp: Option<i64>,
 }
 
 impl Scene {
@@ -271,12 +272,14 @@ impl CatalystClient {
             .get("metadata")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
+        let timestamp = ent.get("timestamp").and_then(|v| v.as_i64());
         Ok(Scene {
             entity_id,
             entity_type,
             pointers,
             content,
             metadata,
+            timestamp,
         })
     }
 
@@ -380,6 +383,18 @@ mod tests {
     }
 
     #[test]
+    fn entity_timestamp_parsed() {
+        let ent = serde_json::json!({"id": "bafx", "timestamp": 1_694_177_669_000i64});
+        let s = CatalystClient::parse_entity(&ent).unwrap();
+        assert_eq!(s.timestamp, Some(1_694_177_669_000));
+        let no_ts = serde_json::json!({"id": "bafy"});
+        assert_eq!(
+            CatalystClient::parse_entity(&no_ts).unwrap().timestamp,
+            None
+        );
+    }
+
+    #[test]
     fn content_helpers() {
         let s = Scene {
             entity_id: "e".into(),
@@ -396,6 +411,7 @@ mod tests {
                 },
             ],
             metadata: serde_json::json!({}),
+            timestamp: None,
         };
         let map = s.content_by_file();
         assert_eq!(map.get("models/a.glb").map(String::as_str), Some("h1"));

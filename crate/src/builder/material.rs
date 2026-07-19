@@ -32,6 +32,7 @@ pub(super) fn build_lod_material_tree(
     tex_pid: &HashMap<String, (i64, i64)>,
     lod: &LodBuildParams,
 ) -> Value {
+    let rollup = lod.level == 0;
     let mut t = base_template.clone();
     t.insert("m_Name", name);
     t.insert("m_Shader", shader.clone());
@@ -75,24 +76,49 @@ pub(super) fn build_lod_material_tree(
     } else {
         t.insert("stringTagMap", Value::Array(Vec::new()));
     }
-    t.insert("disabledShaderPasses", arr!["MOTIONVECTORS"]);
+    if rollup {
+        t.insert("disabledShaderPasses", Value::Array(Vec::new()));
+    } else {
+        t.insert("disabledShaderPasses", arr!["MOTIONVECTORS"]);
+    }
 
+    let slot_env = |slot: &str| {
+        let pid = tex_pid.get(slot).copied().unwrap_or((0, 0));
+        let (scale, offset) = match m.tex_transforms.get(slot) {
+            Some(x) if pid != (0, 0) => ((x.scale[0], x.scale[1]), (x.offset[0], x.offset[1])),
+            _ => ((1.0, 1.0), (0.0, 0.0)),
+        };
+        lod_tex_env(slot, pid, scale, offset)
+    };
     let base_pid = tex_pid.get("_BaseMap").copied().unwrap_or((0, 0));
     let (base_scale, base_offset) = match m.tex_transforms.get("_BaseMap") {
         Some(x) => ((x.scale[0], x.scale[1]), (x.offset[0], x.offset[1])),
         None => ((1.0, 1.0), (0.0, 0.0)),
     };
-    let tex_envs: Vec<Value> = vec![
-        lod_tex_env("_BaseMap", base_pid, base_scale, base_offset),
-        lod_tex_env("_BaseMapArr", (0, 0), (1.0, 1.0), (0.0, 0.0)),
-        lod_tex_env("_BumpMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
-        lod_tex_env("_EmissionMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
-        lod_tex_env("_MainTex", (0, 0), (1.0, 1.0), (0.0, 0.0)),
-        lod_tex_env("_MetallicGlossMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
-        lod_tex_env("_OcclusionMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
-        lod_tex_env("_ParallaxMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
-        lod_tex_env("_SpecGlossMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
-    ];
+    let tex_envs: Vec<Value> = if rollup {
+        vec![
+            lod_tex_env("_BaseMap", base_pid, base_scale, base_offset),
+            slot_env("_BumpMap"),
+            slot_env("_EmissionMap"),
+            lod_tex_env("_MainTex", (0, 0), (1.0, 1.0), (0.0, 0.0)),
+            slot_env("_MetallicGlossMap"),
+            slot_env("_OcclusionMap"),
+            lod_tex_env("_ParallaxMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
+            slot_env("_SpecGlossMap"),
+        ]
+    } else {
+        vec![
+            lod_tex_env("_BaseMap", base_pid, base_scale, base_offset),
+            lod_tex_env("_BaseMapArr", (0, 0), (1.0, 1.0), (0.0, 0.0)),
+            lod_tex_env("_BumpMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
+            lod_tex_env("_EmissionMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
+            lod_tex_env("_MainTex", (0, 0), (1.0, 1.0), (0.0, 0.0)),
+            lod_tex_env("_MetallicGlossMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
+            lod_tex_env("_OcclusionMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
+            lod_tex_env("_ParallaxMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
+            lod_tex_env("_SpecGlossMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
+        ]
+    };
 
     // Transparent-class state is pinned to production's FORCED_TRANSPARENT bake,
     // byte-verified on every reference LOD1: depth-writing transparency
@@ -102,7 +128,7 @@ pub(super) fn build_lod_material_tree(
     let cutoff = if masked { m.alpha_cutoff } else { 0.5 };
     let dst_blend = if transparent { 10.0 } else { 0.0 };
     let surface = if masked || transparent { 1.0 } else { 0.0 };
-    let floats: Vec<(&str, f64)> = vec![
+    let mut floats: Vec<(&str, f64)> = vec![
         ("_AddPrecomputedVelocity", 0.0),
         ("_AlphaClip", alpha_clip),
         ("_AlphaToMask", alpha_to_mask),
@@ -138,16 +164,24 @@ pub(super) fn build_lod_material_tree(
         ("_XRMotionVectorsPass", 1.0),
         ("_ZWrite", 1.0),
     ];
+    if rollup {
+        floats.retain(|(n, _)| *n != "_AddPrecomputedVelocity" && *n != "_XRMotionVectorsPass");
+    }
     let floats_v: Vec<Value> = floats.into_iter().map(|(n, v)| arr![n, v]).collect();
 
     let mut base_color = materials::base_color_verbatim(m.base_color);
-    if transparent {
+    if transparent && !rollup {
         base_color[3] = 0.8_f32 as f64;
     }
+    let emission = if rollup {
+        [m.emissive[0], m.emissive[1], m.emissive[2], 1.0]
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    };
     let colors: Vec<Value> = vec![
         lod_color("_BaseColor", base_color),
         lod_color("_Color", [1.0, 1.0, 1.0, 1.0]),
-        lod_color("_EmissionColor", [0.0, 0.0, 0.0, 1.0]),
+        lod_color("_EmissionColor", emission),
         lod_color("_PlaneClipping", lod.plane_clipping),
         lod_color(
             "_SpecColor",
@@ -156,11 +190,16 @@ pub(super) fn build_lod_material_tree(
         lod_color("_VerticalClipping", lod.vertical_clipping),
     ];
 
+    let ints: Vec<Value> = if rollup {
+        Vec::new()
+    } else {
+        vec![arr!["_BaseMapArr_ID", -1]]
+    };
     t.insert(
         "m_SavedProperties",
         map! {
             "m_TexEnvs" => Value::Array(tex_envs),
-            "m_Ints" => Value::Array(vec![arr!["_BaseMapArr_ID", -1]]),
+            "m_Ints" => Value::Array(ints),
             "m_Floats" => Value::Array(floats_v),
             "m_Colors" => Value::Array(colors),
         },

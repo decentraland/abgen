@@ -1,15 +1,22 @@
 use crate::value::Value;
 
 const FMT_FLOAT32: i64 = 0;
+const FMT_FLOAT16: i64 = 1;
 const FMT_UNORM16: i64 = 4;
 const FMT_UINT32: i64 = 10;
 
 #[inline]
 fn fmt_bytes(fmt: i64) -> i64 {
     match fmt {
-        FMT_UNORM16 => 2,
+        FMT_FLOAT16 | FMT_UNORM16 => 2,
         _ => 4,
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MeshEncoding {
+    Split,
+    LodInterleaved,
 }
 
 const CH_POSITION: usize = 0;
@@ -101,6 +108,103 @@ fn build_channels(attrs: &MeshAttributes) -> Vec<Value> {
     }
 
     channels
+}
+
+// production LOD bakes set the 0x30 dimension-flag bits on the normal channel;
+// consumers mask dimension & 0xF
+const LOD_NORMAL_DIM_FLAGS: i64 = 0x30;
+
+pub const LOD_INTERLEAVED_STRIDE: usize = 32;
+
+fn build_channels_lod() -> Vec<Value> {
+    let mut channels: Vec<Value> = (0..NUM_CHANNELS).map(|_| ch(0, 0, 0, 0)).collect();
+    channels[CH_POSITION] = ch(0, 0, FMT_FLOAT32, 3);
+    channels[CH_NORMAL] = ch(0, 12, FMT_FLOAT16, 4 | LOD_NORMAL_DIM_FLAGS);
+    channels[CH_TANGENT] = ch(0, 20, FMT_FLOAT16, 4);
+    channels[CH_TEXCOORD0] = ch(0, 28, FMT_FLOAT16, 2);
+    channels
+}
+
+pub fn lod_channel_table() -> Vec<(i64, i64, i64, i64)> {
+    build_channels_lod()
+        .iter()
+        .map(|c| {
+            (
+                ch_field(c, "stream"),
+                ch_field(c, "offset"),
+                ch_field(c, "format"),
+                ch_field(c, "dimension"),
+            )
+        })
+        .collect()
+}
+
+pub fn vertex_buffer_encoded(
+    attrs: &MeshAttributes,
+    encoding: MeshEncoding,
+) -> (Vec<u8>, Vec<Value>) {
+    match encoding {
+        MeshEncoding::Split => vertex_buffer(attrs),
+        MeshEncoding::LodInterleaved => vertex_buffer_lod_interleaved(attrs),
+    }
+}
+
+fn vertex_buffer_lod_interleaved(attrs: &MeshAttributes) -> (Vec<u8>, Vec<Value>) {
+    let channels = build_channels_lod();
+    let n = attrs.positions.len();
+    let mut out: Vec<u8> = Vec::with_capacity(n * LOD_INTERLEAVED_STRIDE);
+    for v in 0..n {
+        let mut row = [0u8; LOD_INTERLEAVED_STRIDE];
+        let p = attrs.positions[v];
+        pack_f32(&mut row, 0, &[p[0], p[1], p[2]]);
+        let nrm = attrs
+            .normals
+            .and_then(|ns| ns.get(v).copied())
+            .unwrap_or([0.0, 0.0, 0.0]);
+        pack_f16(&mut row, 12, &[nrm[0], nrm[1], nrm[2], 0.0]);
+        let t = attrs
+            .tangents
+            .and_then(|ts| ts.get(v).copied())
+            .unwrap_or([0.0, 0.0, 0.0, 0.0]);
+        pack_f16(&mut row, 20, &t);
+        let uv = attrs
+            .uv_sets
+            .first()
+            .and_then(|s| s.get(v).copied())
+            .unwrap_or([0.0, 0.0]);
+        pack_f16(&mut row, 28, &[uv[0], uv[1]]);
+        out.extend_from_slice(&row);
+    }
+    (out, channels)
+}
+
+pub fn f32_to_f16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x007f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | (((mant != 0) as u16) << 9);
+    }
+    let e = exp - 112;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = (mant | 0x0080_0000) >> (1 - e);
+        let rounded = (m + 0x0fff + ((m >> 13) & 1)) >> 13;
+        return sign | rounded as u16;
+    }
+    let m = mant + 0x0fff + ((mant >> 13) & 1);
+    let out = ((e as u32) << 10) + (m >> 13);
+    if out >= 0x7c00 {
+        sign | 0x7c00
+    } else {
+        sign | out as u16
+    }
 }
 
 pub fn normalize_color(raw: &[f64], component_type: i32, dim: usize) -> [f64; 4] {
@@ -266,6 +370,14 @@ fn pack_f32(row: &mut [u8], off: usize, vals: &[f64]) {
     for (i, v) in vals.iter().enumerate() {
         let b = (*v as f32).to_le_bytes();
         row[off + i * 4..off + i * 4 + 4].copy_from_slice(&b);
+    }
+}
+
+#[inline]
+fn pack_f16(row: &mut [u8], off: usize, vals: &[f64]) {
+    for (i, v) in vals.iter().enumerate() {
+        let b = f32_to_f16_bits(*v as f32).to_le_bytes();
+        row[off + i * 2..off + i * 2 + 2].copy_from_slice(&b);
     }
 }
 
@@ -604,6 +716,69 @@ mod tests {
         assert_eq!(c[&5], (1, 24, 0, 2));
         assert_eq!(c[&12], (2, 0, 0, 4));
         assert_eq!(c[&13], (2, 16, 10, 4));
+    }
+
+    #[test]
+    fn lod_vertex_declaration_channel_table_matches_prod() {
+        // observed on every reference LOD1 mesh: pos f32x3, normal f16x4 (dim
+        // flags 0x30), tangent f16x4, uv0 f16x2, one 32 B stream
+        let mut want = vec![(0i64, 0i64, 0i64, 0i64); 14];
+        want[0] = (0, 0, 0, 3);
+        want[1] = (0, 12, 1, 52);
+        want[2] = (0, 20, 1, 4);
+        want[4] = (0, 28, 1, 2);
+        assert_eq!(lod_channel_table(), want);
+    }
+
+    #[test]
+    fn lod_interleaved_buffer_is_32b_stride_with_f16_attributes() {
+        let positions = vec![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
+        let normals = vec![[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]];
+        let tangents = vec![[1.0, 0.0, 0.0, -1.0], [0.0, 1.0, 0.0, 1.0]];
+        let uv_sets = vec![vec![[0.25, 0.75], [0.5, 1.0]]];
+        let attrs = MeshAttributes {
+            positions: &positions,
+            normals: Some(&normals),
+            tangents: Some(&tangents),
+            colors: None,
+            uv_sets: &uv_sets,
+            weights: None,
+            joints: None,
+            color_unorm16: false,
+        };
+        let (buf, ch) = vertex_buffer_encoded(&attrs, MeshEncoding::LodInterleaved);
+        assert_eq!(buf.len(), 2 * LOD_INTERLEAVED_STRIDE);
+        assert_eq!(ch.len(), 14);
+        assert_eq!(&buf[0..4], &le_f32(1.0));
+        assert_eq!(&buf[8..12], &le_f32(3.0));
+        let h = |v: f32| f32_to_f16_bits(v).to_le_bytes();
+        assert_eq!(&buf[12..14], &h(0.0));
+        assert_eq!(&buf[16..18], &h(1.0));
+        assert_eq!(&buf[18..20], &h(0.0), "normal w pads to 0");
+        assert_eq!(&buf[20..22], &h(1.0));
+        assert_eq!(&buf[26..28], &h(-1.0));
+        assert_eq!(&buf[28..30], &h(0.25));
+        assert_eq!(&buf[30..32], &h(0.75));
+        assert_eq!(&buf[32..36], &le_f32(4.0));
+        assert_eq!(&buf[60..62], &h(0.5));
+        assert_eq!(&buf[62..64], &h(1.0));
+    }
+
+    #[test]
+    fn f16_bits_round_to_nearest_even() {
+        assert_eq!(f32_to_f16_bits(0.0), 0x0000);
+        assert_eq!(f32_to_f16_bits(-0.0), 0x8000);
+        assert_eq!(f32_to_f16_bits(1.0), 0x3c00);
+        assert_eq!(f32_to_f16_bits(-2.0), 0xc000);
+        assert_eq!(f32_to_f16_bits(0.5), 0x3800);
+        assert_eq!(f32_to_f16_bits(65504.0), 0x7bff);
+        assert_eq!(f32_to_f16_bits(1.0e6), 0x7c00);
+        assert_eq!(f32_to_f16_bits(f32::NEG_INFINITY), 0xfc00);
+        assert_eq!(f32_to_f16_bits(f32::NAN) & 0x7e00, 0x7e00);
+        assert_eq!(f32_to_f16_bits(5.960_464_5e-8), 0x0001);
+        assert_eq!(f32_to_f16_bits(1.0e-10), 0x0000);
+        assert_eq!(f32_to_f16_bits(1.0 + 1.0 / 2048.0), 0x3c00, "tie to even");
+        assert_eq!(f32_to_f16_bits(1.0 + 3.0 / 2048.0), 0x3c02, "tie to even");
     }
 
     #[test]
