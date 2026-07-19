@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const BVW_PLATFORM: &str = "bvwebgpu";
-pub const BVW_PROFILE: &str = "bv3";
+pub const BVW_PROFILE: &str = "bv4";
 pub const BVW_MAX_PACK_BYTES: u64 = 256 * 1024 * 1024;
 pub const BVW_TEXTURE_MAX: u32 = 1024;
 
@@ -40,6 +40,23 @@ pub fn kind_for(file: &str) -> &'static str {
         "img"
     } else {
         "raw"
+    }
+}
+
+const CLASS0_EXTS: [&str; 4] = [".js", ".json", ".crdt", ".wasm"];
+const CLASS1_EXTS: [&str; 3] = [".glb", ".gltf", ".bin"];
+const CLASS3_EXTS: [&str; 6] = [".mp3", ".wav", ".flac", ".aac", ".oga", ".opus"];
+
+pub fn class_for(file: &str) -> u8 {
+    let f = file.to_lowercase();
+    if CLASS0_EXTS.iter().any(|e| f.ends_with(e)) {
+        0
+    } else if CLASS1_EXTS.iter().any(|e| f.ends_with(e)) {
+        1
+    } else if CLASS3_EXTS.iter().any(|e| f.ends_with(e)) {
+        3
+    } else {
+        2
     }
 }
 
@@ -154,6 +171,7 @@ impl crate::live::Proxy {
                     path: p.clone(),
                     cid: hash.clone(),
                     kind: kinds[hash],
+                    class: class_for(p),
                 }
             })
             .collect();
@@ -221,7 +239,9 @@ mod tests {
     use serde_json::json;
 
     const GOLDEN_PACK_SHA256: &str =
-        "df4e71838138bcc376c4c5e9198d7f5999a2beec534ed6d602fa61ecf4679430";
+        "a342152efd2ccbf79855cac8a08f3d8d01474939d43a0acc473ceb5d8b27a574";
+    const AUDIO_BYTES: &[u8] = b"ID3fakeaudiopayloadfakeaudiopayload";
+    const SHARED_BYTES: &[u8] = b"sfx";
 
     fn fixture_routes(entity: &str) -> (crate::live::stub::Routes, Vec<u8>, Vec<u8>, Vec<u8>) {
         let png = emit::tests::noise_png_bytes(16, 16);
@@ -263,7 +283,10 @@ mod tests {
                 {"file": "bad.png", "hash": "bafkbad"},
                 {"file": "movie.webm", "hash": "bafkvid"},
                 {"file": "game.js", "hash": "bafkjs"},
-                {"file": "dup/game.js", "hash": "bafkjs"}
+                {"file": "dup/game.js", "hash": "bafkjs"},
+                {"file": "Audio/Boom.MP3", "hash": "bafkmp3"},
+                {"file": "shared.js", "hash": "bafkshared"},
+                {"file": "loop.wav", "hash": "bafkshared"}
             ],
             "metadata": {}
         }))
@@ -276,6 +299,12 @@ mod tests {
             ("/contents/bafkflat".to_string(), 200, flat.clone()),
             ("/contents/bafkbad".to_string(), 200, bad.clone()),
             ("/contents/bafkjs".to_string(), 200, js),
+            ("/contents/bafkmp3".to_string(), 200, AUDIO_BYTES.to_vec()),
+            (
+                "/contents/bafkshared".to_string(),
+                200,
+                SHARED_BYTES.to_vec(),
+            ),
         ];
         (routes, tiny, bad, flat)
     }
@@ -375,24 +404,78 @@ mod tests {
         assert_eq!(parsed.index.entity, entity);
         assert_eq!(parsed.index.profile, BVW_PROFILE);
         let paths: Vec<&str> = parsed.index.files.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths.len(), 10);
         assert_eq!(
-            paths,
-            vec![
-                "bad.png",
+            &paths[..5],
+            [
+                "loop.wav",
+                "shared.js",
                 "dup/game.js",
-                "flat.png",
                 "game.js",
-                "models/scene.glb",
-                "tex/color.png",
-                "tiny.png"
+                "models/scene.glb"
             ]
         );
+        let mut class2: Vec<&str> = paths[5..9].to_vec();
+        class2.sort_unstable();
+        assert_eq!(
+            class2,
+            vec!["bad.png", "flat.png", "tex/color.png", "tiny.png"]
+        );
+        assert_eq!(paths[9], "audio/boom.mp3");
+        for e in &parsed.index.files {
+            let expected = match e.path.as_str() {
+                "loop.wav" | "shared.js" | "dup/game.js" | "game.js" => 0,
+                "models/scene.glb" => 1,
+                "audio/boom.mp3" => 3,
+                _ => 2,
+            };
+            assert_eq!(e.c, expected, "{}", e.path);
+        }
+        let mut min_path: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for e in &parsed.index.files {
+            let mp = min_path.entry(e.cid.as_str()).or_insert(e.path.as_str());
+            if e.path.as_str() < *mp {
+                *mp = e.path.as_str();
+            }
+        }
+        let keys: Vec<_> = parsed
+            .index
+            .files
+            .iter()
+            .map(|e| (e.c, e.len, min_path[e.cid.as_str()], e.path.as_str()))
+            .collect();
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort_unstable();
+        assert_eq!(keys, sorted_keys, "index must be in demand order");
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = 0u64;
+        for e in &parsed.index.files {
+            if seen.insert(e.cid.as_str()) {
+                assert_eq!(e.off, cursor.div_ceil(16) * 16, "{}", e.path);
+                cursor = e.off + e.len;
+            }
+        }
+        assert_eq!(parsed.index.payload, cursor);
+        let index_len = u32::from_le_bytes(first[12..16].try_into().unwrap()) as usize;
+        let ij = std::str::from_utf8(&first[16..16 + index_len]).unwrap();
+        assert!(ij.starts_with("{\"v\":1,\"profile\":\"bv4\",\"entity\":\"bafkgoldenent\","));
+        assert!(ij.contains("\"kind\":\"glb\",\"c\":1,\"sha256\":\""));
         let by_path: std::collections::HashMap<&str, &pack::PackEntry> = parsed
             .index
             .files
             .iter()
             .map(|e| (e.path.as_str(), e))
             .collect();
+        let s1 = by_path["loop.wav"];
+        let s2 = by_path["shared.js"];
+        assert_eq!((s1.off, s1.len, s1.c), (s2.off, s2.len, s2.c));
+        assert_eq!(pack::entry_slice(&first, &parsed, s1), SHARED_BYTES);
+        assert!(s1.off < by_path["models/scene.glb"].off);
+        assert_eq!(by_path["audio/boom.mp3"].kind, "raw");
+        assert_eq!(
+            pack::entry_slice(&first, &parsed, by_path["audio/boom.mp3"]),
+            AUDIO_BYTES
+        );
         assert_eq!(by_path["bad.png"].kind, "raw");
         assert_eq!(
             pack::entry_slice(&first, &parsed, by_path["bad.png"]),

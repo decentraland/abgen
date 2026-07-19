@@ -21,6 +21,7 @@ pub struct PackEntry {
     pub off: u64,
     pub len: u64,
     pub kind: String,
+    pub c: u8,
     pub sha256: String,
 }
 
@@ -28,6 +29,7 @@ pub struct EntrySpec {
     pub path: String,
     pub cid: String,
     pub kind: &'static str,
+    pub class: u8,
 }
 
 fn align_up(v: u64, a: u64) -> u64 {
@@ -41,43 +43,74 @@ pub struct PackPlan {
     pub total: u64,
 }
 
+struct BlobInfo<'a> {
+    class: u8,
+    len: u64,
+    min_path: &'a str,
+    sha: &'a str,
+}
+
+impl BlobInfo<'_> {
+    fn key(&self) -> (u8, u64, &[u8]) {
+        (self.class, self.len, self.min_path.as_bytes())
+    }
+}
+
 pub fn plan_pack(
     entity: &str,
     entries: &[EntrySpec],
     meta_by_cid: &HashMap<String, (u64, String)>,
     max_bytes: u64,
 ) -> Result<PackPlan> {
-    let mut sorted: Vec<&EntrySpec> = entries.iter().collect();
-    sorted.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
-
-    let mut layout: HashMap<&str, (u64, u64, &str)> = HashMap::new();
-    let mut blob_order: Vec<(String, u64, u64)> = Vec::new();
-    let mut cursor: u64 = 0;
-    for e in &sorted {
-        if layout.contains_key(e.cid.as_str()) {
-            continue;
-        }
+    let mut blobs: HashMap<&str, BlobInfo> = HashMap::new();
+    for e in entries {
         let (len, sha) = meta_by_cid
             .get(&e.cid)
             .ok_or_else(|| anyhow!("no blob for cid {}", e.cid))?;
+        let b = blobs.entry(e.cid.as_str()).or_insert(BlobInfo {
+            class: e.class,
+            len: *len,
+            min_path: &e.path,
+            sha,
+        });
+        b.class = b.class.min(e.class);
+        if e.path.as_bytes() < b.min_path.as_bytes() {
+            b.min_path = &e.path;
+        }
+    }
+
+    let mut blob_seq: Vec<&str> = blobs.keys().copied().collect();
+    blob_seq.sort_by(|a, b| blobs[a].key().cmp(&blobs[b].key()));
+    let mut layout: HashMap<&str, (u64, u64)> = HashMap::new();
+    let mut blob_order: Vec<(String, u64, u64)> = Vec::new();
+    let mut cursor: u64 = 0;
+    for cid in &blob_seq {
+        let len = blobs[cid].len;
         let off = align_up(cursor, ALIGN);
-        layout.insert(&e.cid, (off, *len, sha.as_str()));
-        blob_order.push((e.cid.clone(), off, *len));
+        layout.insert(cid, (off, len));
+        blob_order.push((cid.to_string(), off, len));
         cursor = off + len;
     }
     let payload = cursor;
 
+    let mut sorted: Vec<&EntrySpec> = entries.iter().collect();
+    sorted.sort_by(|a, b| {
+        let (ka, kb) = (blobs[a.cid.as_str()].key(), blobs[b.cid.as_str()].key());
+        ka.cmp(&kb).then(a.path.as_bytes().cmp(b.path.as_bytes()))
+    });
     let files: Vec<PackEntry> = sorted
         .iter()
         .map(|e| {
-            let (off, len, sha) = &layout[e.cid.as_str()];
+            let b = &blobs[e.cid.as_str()];
+            let (off, len) = layout[e.cid.as_str()];
             PackEntry {
                 path: e.path.clone(),
                 cid: e.cid.clone(),
-                off: *off,
-                len: *len,
+                off,
+                len,
                 kind: e.kind.to_string(),
-                sha256: sha.to_string(),
+                c: b.class,
+                sha256: b.sha.to_string(),
             }
         })
         .collect();
@@ -187,8 +220,12 @@ pub fn parse_pack(bytes: &[u8]) -> Result<ParsedPack> {
         );
     }
     let mut spans: Vec<(u64, u64)> = Vec::new();
-    let mut by_cid: HashMap<&str, (u64, u64)> = HashMap::new();
+    let mut by_cid: HashMap<&str, (u64, u64, u8)> = HashMap::new();
+    let mut prev_key: Option<(u8, u64)> = None;
     for e in &index.files {
+        if e.c > 3 {
+            bail!("entry {} class {} out of range", e.path, e.c);
+        }
         if e.off % ALIGN != 0 {
             bail!("entry {} offset {} not {ALIGN}-aligned", e.path, e.off);
         }
@@ -196,14 +233,20 @@ pub fn parse_pack(bytes: &[u8]) -> Result<ParsedPack> {
             bail!("entry {} overruns payload", e.path);
         }
         match by_cid.get(e.cid.as_str()) {
-            Some(&(off, len)) => {
-                if (off, len) != (e.off, e.len) {
+            Some(&(off, len, c)) => {
+                if (off, len, c) != (e.off, e.len, e.c) {
                     bail!("cid {} has divergent spans", e.cid);
                 }
             }
             None => {
-                by_cid.insert(&e.cid, (e.off, e.len));
+                by_cid.insert(&e.cid, (e.off, e.len, e.c));
                 spans.push((e.off, e.len));
+                if let Some(k) = prev_key {
+                    if k > (e.c, e.len) {
+                        bail!("index not in demand order at {}", e.path);
+                    }
+                }
+                prev_key = Some((e.c, e.len));
             }
         }
     }
@@ -212,15 +255,6 @@ pub fn parse_pack(bytes: &[u8]) -> Result<ParsedPack> {
         if w[0].0 + w[0].1 > w[1].0 {
             bail!("overlapping blob spans");
         }
-    }
-    let mut prev: Option<&str> = None;
-    for e in &index.files {
-        if let Some(p) = prev {
-            if p.as_bytes() > e.path.as_bytes() {
-                bail!("index paths not sorted");
-            }
-        }
-        prev = Some(&e.path);
     }
     Ok(ParsedPack {
         index,
@@ -242,6 +276,7 @@ mod tests {
             path: path.to_string(),
             cid: cid.to_string(),
             kind,
+            class: crate::bvwebgpu::class_for(path),
         }
     }
 
@@ -268,12 +303,12 @@ mod tests {
         let (pack, index_json) = build_pack("bafkent", &entries, &b, u64::MAX).unwrap();
         let parsed = parse_pack(&pack).unwrap();
         assert_eq!(parsed.index.v, 1);
-        assert_eq!(parsed.index.profile, "bv3");
+        assert_eq!(parsed.index.profile, "bv4");
         assert_eq!(parsed.index.entity, "bafkent");
         let paths: Vec<&str> = parsed.index.files.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(
             paths,
-            vec!["a.png", "copy/z.glb", "main.crdt", "models/z.glb"]
+            vec!["main.crdt", "copy/z.glb", "models/z.glb", "a.png"]
         );
         let by_path: HashMap<&str, &PackEntry> = parsed
             .index
@@ -283,15 +318,18 @@ mod tests {
             .collect();
         let e1 = by_path["copy/z.glb"];
         let e2 = by_path["models/z.glb"];
-        assert_eq!((e1.off, e1.len), (e2.off, e2.len));
+        assert_eq!((e1.off, e1.len, e1.c), (e2.off, e2.len, e2.c));
         assert_eq!(e1.sha256, e2.sha256);
+        assert_eq!(by_path["main.crdt"].c, 0);
+        assert_eq!(by_path["models/z.glb"].c, 1);
+        assert_eq!(by_path["a.png"].c, 2);
         for e in &parsed.index.files {
             assert_eq!(e.off % 16, 0);
             let got = entry_slice(&pack, &parsed, e);
             assert_eq!(got, b[&e.cid].as_slice());
             assert_eq!(e.sha256, crate::hashes::sha256_hex(got));
         }
-        assert!(index_json.starts_with(b"{\"v\":1,\"profile\":\"bv3\",\"entity\":\"bafkent\","));
+        assert!(index_json.starts_with(b"{\"v\":1,\"profile\":\"bv4\",\"entity\":\"bafkent\","));
         let again = build_pack("bafkent", &entries, &b, u64::MAX).unwrap().0;
         assert_eq!(pack, again);
     }
@@ -351,6 +389,54 @@ mod tests {
             i.files[1].len = 1;
         })
         .is_err());
+        assert!(mangle(&|i| i.files[0].c = 9).is_err());
+        assert!(mangle(&|i| {
+            i.files[1] = i.files[0].clone();
+            i.files[1].c = 2;
+        })
+        .is_err());
         assert!(mangle(&|_| {}).is_ok());
+    }
+
+    #[test]
+    fn bv3_style_index_is_rejected() {
+        let entries = vec![spec("b.png", "cid1", "img"), spec("a.crdt", "cid2", "raw")];
+        let b = blobs(&[("cid1", b"PNGBYTES"), ("cid2", b"CC")]);
+        let (pack, _) = build_pack("bafkent", &entries, &b, u64::MAX).unwrap();
+        let parsed = parse_pack(&pack).unwrap();
+        let mut idx = serde_json::to_value(&parsed.index).unwrap();
+        let files = idx["files"].as_array_mut().unwrap();
+        files.sort_by_key(|f| f["path"].as_str().unwrap().to_string());
+        for f in files.iter_mut() {
+            f.as_object_mut().unwrap().remove("c");
+        }
+        let ij = serde_json::to_vec(&idx).unwrap();
+        let base = (16 + ij.len() as u64).div_ceil(16) * 16;
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&(ij.len() as u32).to_le_bytes());
+        out.extend_from_slice(&ij);
+        out.resize(base as usize, 0);
+        out.extend_from_slice(&pack[parsed.payload_base as usize..]);
+        let err = match parse_pack(&out) {
+            Err(e) => e,
+            Ok(_) => panic!("bv3-style index must be rejected"),
+        };
+        assert!(err.to_string().contains("missing field `c`"), "{err}");
+    }
+
+    #[test]
+    fn index_field_order_is_pinned() {
+        let entries = vec![spec("main.crdt", "cid1", "raw")];
+        let b = blobs(&[("cid1", b"X")]);
+        let (_, index_json) = build_pack("bafkent", &entries, &b, u64::MAX).unwrap();
+        let s = String::from_utf8(index_json).unwrap();
+        assert!(
+            s.contains(
+                "{\"path\":\"main.crdt\",\"cid\":\"cid1\",\"off\":0,\"len\":1,\"kind\":\"raw\",\"c\":0,\"sha256\":\""
+            ),
+            "{s}"
+        );
     }
 }
