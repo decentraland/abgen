@@ -203,7 +203,7 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
         }
         tracing::info!(
             gltfpack = %lod_jit.gltfpack.as_deref().unwrap_or(Path::new("?")).display(),
-            manifest_builder = lod_jit.manifest_builder.is_some(),
+            embedded_scene_runtime = cfg!(not(target_arch = "wasm32")),
             cache = %lod_jit.cache_dir.display(),
             workdir = %lod_jit.workdir.display(),
             timeout_s = lod_jit.timeout.as_secs(),

@@ -3,7 +3,6 @@
 
 use abgen::catalyst::CatalystClient;
 use abgen::lodgen::assemble;
-use abgen::lodgen::placements;
 use abgen::lodgen::simplify;
 use abgen::lods;
 use anyhow::{anyhow, bail, Context, Result};
@@ -28,11 +27,12 @@ USAGE:
             [--base X,Y --parcels 'x,y;x,y;...'] [--timestamp N] [--vertical-clip H]
   abgen-lod compare <ours> <prod>
   abgen-lod placements (--coords X,Y | --scene <entityId>) [--iss FILE|auto|off]
-            [--catalyst URL] [--manifest-builder DIR] [--workdir DIR]
+            [--catalyst URL]
+  abgen-lod parse-manifest <manifest.json> --scene <pointer|entityId>
+            [--catalyst URL]
   abgen-lod assemble (--scene <entityId|X,Y> | --entity-json FILE) -o out.glb
-            [--catalyst URL] [--iss FILE|auto|off] [--manifest-builder DIR]
-            [--workdir DIR] [--cache DIR] [--level 1] [--no-crop] [--no-atlas]
-            [--max-size 512] [--padding 0] [--atlas-fixed]
+            [--catalyst URL] [--iss FILE|auto|off] [--cache DIR] [--level 1]
+            [--no-crop] [--no-atlas] [--max-size 512] [--padding 0] [--atlas-fixed]
   abgen-lod atlas -i in.glb -o out.glb [--max-size 512] [--padding 0]
             [--atlas-fixed] [--crop-base X,Y --crop-parcels 'x,y;x,y;...']
   abgen-lod simplify -i in.glb -o out.glb [--ratio 0.1] [--tri-cap N]
@@ -42,8 +42,8 @@ USAGE:
             [--platform windows|mac|linux[,windows|mac|linux...]]
             [--level 0,1] [--ratio 0.1] [--tri-cap N|auto|off] [--atlas-max 512]
             [--atlas-fixed] [--no-crop] [--catalyst URL] [--iss FILE|auto|off]
-            [--manifest-builder DIR] [--workdir DIR] [--cache DIR]
-            [--simplifier meshopt|gltfpack] [--gltfpack PATH]
+            [--workdir DIR] [--cache DIR] [--simplifier meshopt|gltfpack]
+            [--gltfpack PATH]
             [--allow-unsimplified] [--keep-glb] [--gpu]
 
 bundle: stages <src.glb> as {entityIdLower}_{level}.glb and builds
@@ -53,10 +53,12 @@ compare: parses both bundles and prints PASS/FAIL per structural check; exits 1 
 placements: resolves the scene, then prints its GLB placement list as JSON.
   --iss auto (default) tries the production InitialSceneState descriptor first
   (404 falls through); --iss FILE reads a local descriptor; --iss off skips ISS.
-  Without ISS the scene-lod-entities-manifest-builder runs as a black box
-  (tool dir: --manifest-builder > ABGEN_LOD_MANIFEST_BUILDER, required — a
-  checkout of decentraland/scene-lod-entities-manifest-builder;
-  copied into --workdir, default ~/.cache/abgen-lod/manifest-builder).
+  Without ISS the scene runs in the embedded scene runtime (node is not
+  required); --manifest-builder is deprecated and ignored.
+parse-manifest: reads a <sceneId>-lod-manifest.json written by the npm
+  scene-lod-entities-manifest-builder, resolves the scene for its file->hash
+  map, and prints the same pretty placement JSON as `placements` — the
+  bridge scripts/lod-parity-oracle.sh diffs against the embedded runtime.
 assemble: resolves placements like `placements`, fetches every referenced GLB
   (--cache DIR caches content by hash; --entity-json FILE reads a catalyst
   entity document from disk instead of resolving --scene, for offline runs
@@ -94,8 +96,10 @@ simplify: decimates a GLB. --simplifier picks the backend (default from
   satisfying ratio>=1 + cap pass through untouched.
   --allow-unsimplified copies the input through verbatim (loud warning)
   when the simplifier is unavailable or fails.
-generate: the full sync chain: resolve scene -> placements (iss|manifest
-  builder) -> assemble -> crop -> atlas -> simplify -> bundle via the LOD build mode
+generate/placements/assemble run without node: scenes lacking an ISS
+  descriptor are executed by the embedded scene runtime.
+generate: the full sync chain: resolve scene -> placements (iss|embedded
+  scene runtime) -> assemble -> crop -> atlas -> simplify -> bundle via the LOD build mode
   into {out}/{sceneId}/LOD/{level}/{sceneId}_{level}_{platform} (+.br,
   LOD.manifest.json). --level takes a comma-separated list (default 0,1;
   level 2 is refused; production stopped emitting it): every level shares
@@ -119,8 +123,8 @@ generate: the full sync chain: resolve scene -> placements (iss|manifest
   meshopt). Every capped run adds a tri-cap self-gate
   check (tris_after <= cap); an --allow-unsimplified verbatim copy passes
   it with a recorded waiver. A scene whose
-  placements resolve to nothing (e.g. the manifest builder runs clean but
-  emits no manifest) builds a content-free bundle: no meshes, materials or
+  placements resolve to nothing (e.g. the scene runtime captures no
+  renderer state) builds a content-free bundle: no meshes, materials or
   textures, metadata dependencies []. The crop stage (default on, matching
   production; --no-crop disables) clips merged geometry to the plane-clipping
   rect and adds a crop-bounds self-gate check. --platform takes a
@@ -134,8 +138,8 @@ generate: the full sync chain: resolve scene -> placements (iss|manifest
   next to LOD.manifest.json — the production InitialSceneState shape
   ({version, sceneId, assets:[{hash, position, rotation, scale}]}) with the
   acquired placements serialized verbatim in the pinned base-relative
-  frame, in BOTH lanes (ISS pass-through and manifest-builder; empty
-  scene => assets []); the abcdn server serves it at
+  frame, in BOTH lanes (ISS pass-through and embedded scene runtime;
+  empty scene => assets []); the abcdn server serves it at
   /lods-unity/manifests/{sceneId}_InitialSceneState.json and an
   iss-descriptor self-gate check re-parses it. Every run ends with a
   structural self-gate; any FAIL exits nonzero. --keep-glb keeps the
@@ -151,6 +155,7 @@ fn main() {
         "bundle" => cmd_bundle(&argv[1..]),
         "compare" => cmd_compare(&argv[1..]),
         "placements" => cmd_placements(&argv[1..]),
+        "parse-manifest" => cmd_parse_manifest(&argv[1..]),
         "assemble" => cmd_assemble(&argv[1..]),
         "atlas" => cmd_atlas(&argv[1..]),
         "simplify" => cmd_simplify(&argv[1..]),
@@ -335,13 +340,15 @@ fn cmd_bundle(argv: &[String]) -> Result<i32> {
     Ok(if conv.skipped.is_empty() { 0 } else { 1 })
 }
 
+fn warn_manifest_builder_ignored() {
+    eprintln!("deprecated: --manifest-builder is ignored; the scene runtime is embedded");
+}
+
 fn cmd_placements(argv: &[String]) -> Result<i32> {
     let mut coords: Option<String> = None;
     let mut scene: Option<String> = None;
     let mut iss = "auto".to_string();
     let mut catalyst = "https://peer.decentraland.org/content".to_string();
-    let mut manifest_builder: Option<String> = None;
-    let mut workdir: Option<String> = None;
 
     let mut i = 0usize;
     while i < argv.len() {
@@ -367,11 +374,8 @@ fn cmd_placements(argv: &[String]) -> Result<i32> {
                 i += 1;
             }
             "--manifest-builder" => {
-                manifest_builder = Some(need(i)?.clone());
-                i += 1;
-            }
-            "--workdir" => {
-                workdir = Some(need(i)?.clone());
+                need(i)?;
+                warn_manifest_builder_ignored();
                 i += 1;
             }
             "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
@@ -394,34 +398,61 @@ fn cmd_placements(argv: &[String]) -> Result<i32> {
         .with_context(|| format!("resolve scene {target:?}"))?;
     eprintln!("scene entity: {}", ent.entity_id);
 
-    let list = acquire_placements(
-        &ent,
-        coords.as_deref(),
-        &iss,
-        manifest_builder,
-        workdir,
-        &catalyst,
-    )?;
+    let list = abgen::lodgen::acquire_placements(&client, &ent, &iss)?;
     println!("{}", serde_json::to_string_pretty(&list)?);
     Ok(0)
 }
 
-fn acquire_placements(
-    ent: &abgen::catalyst::Scene,
-    coords: Option<&str>,
-    iss: &str,
-    manifest_builder: Option<String>,
-    workdir: Option<String>,
-    catalyst: &str,
-) -> Result<Vec<placements::Placement>> {
-    abgen::lodgen::acquire_placements(
-        ent,
-        coords,
-        iss,
-        manifest_builder.as_deref(),
-        workdir.map(PathBuf::from).as_deref(),
-        catalyst,
-    )
+fn cmd_parse_manifest(argv: &[String]) -> Result<i32> {
+    let mut manifest: Option<String> = None;
+    let mut scene: Option<String> = None;
+    let mut catalyst = "https://peer.decentraland.org/content".to_string();
+
+    let mut i = 0usize;
+    while i < argv.len() {
+        let need = |i: usize| -> Result<&String> {
+            argv.get(i + 1)
+                .ok_or_else(|| anyhow!("{} needs a value", argv[i]))
+        };
+        match argv[i].as_str() {
+            "--scene" => {
+                scene = Some(need(i)?.clone());
+                i += 1;
+            }
+            "--catalyst" => {
+                catalyst = need(i)?.clone();
+                i += 1;
+            }
+            "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
+            other if other.starts_with("--") => bail!("unknown parse-manifest flag {other:?}"),
+            other => {
+                if manifest.is_some() {
+                    bail!("unexpected positional {other:?}");
+                }
+                manifest = Some(other.to_string());
+            }
+        }
+        i += 1;
+    }
+    let manifest =
+        manifest.ok_or_else(|| anyhow!("parse-manifest needs a <manifest.json> positional"))?;
+    let target = scene.ok_or_else(|| anyhow!("parse-manifest needs --scene <pointer|entityId>"))?;
+
+    let bytes = std::fs::read(&manifest).with_context(|| format!("read {manifest}"))?;
+    let client = CatalystClient::from_args(&catalyst, None);
+    let ent = client
+        .resolve_scene(&target)
+        .with_context(|| format!("resolve scene {target:?}"))?;
+    eprintln!("scene entity: {}", ent.entity_id);
+    let full = abgen::lodgen::placements::parse_lod_manifest_full(&bytes, &ent.content_by_file())?;
+    eprintln!(
+        "source: manifest ({} placements, {} mesh-renderer-only skipped, {} unresolved src)",
+        full.placements.len(),
+        full.skipped_mesh_renderer,
+        full.unresolved_src
+    );
+    println!("{}", serde_json::to_string_pretty(&full.placements)?);
+    Ok(0)
 }
 
 fn cmd_assemble(argv: &[String]) -> Result<i32> {
@@ -430,8 +461,6 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
     let mut out: Option<String> = None;
     let mut iss = "auto".to_string();
     let mut catalyst = "https://peer.decentraland.org/content".to_string();
-    let mut manifest_builder: Option<String> = None;
-    let mut workdir: Option<String> = None;
     let mut cache: Option<String> = None;
     let mut level: u32 = 1;
     let mut no_crop = false;
@@ -468,11 +497,8 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
                 i += 1;
             }
             "--manifest-builder" => {
-                manifest_builder = Some(need(i)?.clone());
-                i += 1;
-            }
-            "--workdir" => {
-                workdir = Some(need(i)?.clone());
+                need(i)?;
+                warn_manifest_builder_ignored();
                 i += 1;
             }
             "--cache" => {
@@ -506,36 +532,27 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
         i += 1;
     }
     let out = out.ok_or_else(|| anyhow!("assemble needs -o <out.glb>"))?;
+
     let client = CatalystClient::from_args(&catalyst, None);
-    let (ent, coords_hint) = match &entity_json {
+    let ent = match &entity_json {
         Some(path) => {
             let bytes = std::fs::read(path).with_context(|| format!("read entity json {path}"))?;
             let v: serde_json::Value = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse entity json {path}"))?;
-            let hint = scene.as_ref().filter(|s| parse_parcel(s).is_ok()).cloned();
-            (CatalystClient::parse_entity(&v)?, hint)
+            CatalystClient::parse_entity(&v)?
         }
         None => {
             let target = scene.ok_or_else(|| {
                 anyhow!("assemble needs --scene <entityId|X,Y> or --entity-json FILE")
             })?;
-            let hint = parse_parcel(&target).ok().map(|_| target.clone());
-            let ent = client
+            client
                 .resolve_scene(&target)
-                .with_context(|| format!("resolve scene {target:?}"))?;
-            (ent, hint)
+                .with_context(|| format!("resolve scene {target:?}"))?
         }
     };
     eprintln!("scene entity: {}", ent.entity_id);
 
-    let list = acquire_placements(
-        &ent,
-        coords_hint.as_deref(),
-        &iss,
-        manifest_builder,
-        workdir,
-        &catalyst,
-    )?;
+    let list = abgen::lodgen::acquire_placements(&client, &ent, &iss)?;
     eprintln!("placements: {}", list.len());
 
     let cache_dir = cache.as_deref().map(std::path::Path::new);
@@ -917,7 +934,8 @@ fn cmd_generate(argv: &[String]) -> Result<i32> {
                 i += 1;
             }
             "--manifest-builder" => {
-                params.manifest_builder = Some(need(i)?.clone());
+                need(i)?;
+                warn_manifest_builder_ignored();
                 i += 1;
             }
             "--workdir" => {

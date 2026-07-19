@@ -1,0 +1,22 @@
+[
+  {
+    "glb_hash": "QmQgQtuAg9qsdrmLwnFiLRAYZ6Du4Dp7Yh7bw7ELn7AqkD",
+    "glb_file": "models/SCENE.glb",
+    "position": [
+      8.0,
+      0.03999999910593033,
+      8.0
+    ],
+    "rotation": [
+      1.0,
+      0.0,
+      0.0,
+      6.123234262925839e-17
+    ],
+    "scale": [
+      0.9789999723434448,
+      0.9789999723434448,
+      0.9789999723434448
+    ]
+  }
+]

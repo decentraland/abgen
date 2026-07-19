@@ -82,6 +82,9 @@ path = "examples/ressdump.rs"
 name = "atlasprobe"
 path = "examples/atlasprobe.rs"
 
+[features]
+engine-v8 = ["dep:v8"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip", "raw_value"] }
@@ -122,6 +125,7 @@ ethers-core = "2.0.14"
 hex = "0.4"
 thiserror = "2"
 wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12"] }
+rquickjs = { version = "0.12", default-features = false, features = ["std", "array-buffer"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif", "tga"] }
@@ -134,3 +138,6 @@ web-sys = { version = "0.3", features = ["console"] }
 
 [target.'cfg(all(not(target_os = "windows"), not(target_arch = "wasm32")))'.dependencies]
 mimalloc = { version = "0.1.52", default-features = false }
+
+[target.'cfg(not(any(target_arch = "wasm32", all(target_os = "windows", target_env = "gnu"))))'.dependencies]
+v8 = { version = "=149.4.0", optional = true }

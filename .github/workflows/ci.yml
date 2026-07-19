@@ -38,6 +38,12 @@ jobs:
           toolchain: "1.97.0"
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # the toolchain is node-free: the crate must never spawn npm or node
+      - name: forbid node spawns
+        run: |
+          ! grep -rn 'Command::new("npm\|Command::new("node' crate/src
       # --test-threads=1: the lib tests share the ABGEN_ROOT env (lodgen vs emote-template race).
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: ABGEN_ROOT="$GITHUB_WORKSPACE" cargo test --workspace --lib -- --test-threads=1
+      # --locked matches the Dockerfile build: a Cargo.toml edit without a
+      # regenerated Cargo.lock must fail at PR time, not at image-build time.
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: ABGEN_ROOT="$GITHUB_WORKSPACE" cargo test --locked --workspace --lib -- --test-threads=1

@@ -1,0 +1,35 @@
+[
+  {
+    "entityId": 513,
+    "componentId": 1,
+    "componentName": "core::Transform",
+    "data": {
+      "position": {
+        "x": 8,
+        "y": 0.03999999910593033,
+        "z": 8
+      },
+      "rotation": {
+        "x": 1,
+        "y": 0,
+        "z": 0,
+        "w": 6.123234262925839e-17
+      },
+      "scale": {
+        "x": 0.9789999723434448,
+        "y": 0.9789999723434448,
+        "z": 0.9789999723434448
+      },
+      "parent": 0
+    }
+  },
+  {
+    "entityId": 513,
+    "componentId": 1041,
+    "componentName": "core::GltfContainer",
+    "data": {
+      "src": "models/SCENE.glb",
+      "invisibleMeshesCollisionMask": 2
+    }
+  }
+]
