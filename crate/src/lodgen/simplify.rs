@@ -1,7 +1,13 @@
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+
+use super::model::LodModel;
+
+pub const CLASS_SURVIVAL_MIN_TRIS: usize = 200;
+pub const CLASS_RESCUE_ERROR_LIMIT: f64 = 0.001;
 
 pub const GLTFPACK_NIX_RECIPE: &str =
     "nix-shell -p meshoptimizer --run 'gltfpack -i <in.glb> -o <out.glb> -si 0.1 -noq'";
@@ -191,6 +197,22 @@ pub fn resolve_gltfpack(flag: Option<&Path>) -> Result<PathBuf> {
     resolve_from(flag, env.as_deref(), path_var.as_deref())
 }
 
+// no -sp: permissive simplification prunes whole small components, deleting
+// salient geometry (tree canopies, alpha-class foliage) the production
+// reference preserves at the same triangle budget
+fn simplify_args(ratio: f64, aggressive: bool, error_limit: Option<f64>) -> Vec<String> {
+    let mut args = vec!["-si".to_string(), format!("{ratio}")];
+    if let Some(e) = error_limit {
+        args.push("-se".to_string());
+        args.push(format!("{e}"));
+    }
+    if aggressive {
+        args.push("-sa".to_string());
+    }
+    args.push("-noq".to_string());
+    args
+}
+
 fn run_gltfpack(
     gltfpack: &Path,
     input: &Path,
@@ -201,15 +223,7 @@ fn run_gltfpack(
 ) -> Result<()> {
     let mut cmd = Command::new(gltfpack);
     cmd.arg("-i").arg(input).arg("-o").arg(output);
-    cmd.arg("-si").arg(format!("{ratio}"));
-    cmd.arg("-sp");
-    if aggressive {
-        cmd.arg("-sa");
-    }
-    if let Some(se) = error_limit {
-        cmd.arg("-se").arg(format!("{se}"));
-    }
-    cmd.arg("-noq");
+    cmd.args(simplify_args(ratio, aggressive, error_limit));
     let out = run_with_deadline(
         cmd,
         subproc_deadline(),
@@ -234,10 +248,138 @@ fn run_gltfpack(
 }
 
 fn glb_tris(path: &Path) -> Result<usize> {
+    Ok(glb_model(path)?.total_tris())
+}
+
+fn glb_model(path: &Path) -> Result<LodModel> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let model = super::model::from_glb_bytes(&bytes, "simplify-check")
-        .with_context(|| format!("reparse {}", path.display()))?;
-    Ok(model.total_tris())
+    super::model::from_glb_bytes(&bytes, "simplify-check")
+        .with_context(|| format!("reparse {}", path.display()))
+}
+
+fn tris_by_material(model: &LodModel) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for prim in &model.primitives {
+        if let Some(mat) = model.materials.get(prim.material) {
+            *counts.entry(mat.name.clone()).or_insert(0) += prim.indices.len() / 3;
+        }
+    }
+    counts
+}
+
+fn class_submodel(model: &LodModel, mat_idx: usize) -> LodModel {
+    let mat = &model.materials[mat_idx];
+    let mut sub = LodModel {
+        root_name: format!("{}-rescue", model.root_name),
+        materials: vec![super::model::LodMaterial {
+            image: None,
+            ..mat.clone()
+        }],
+        ..Default::default()
+    };
+    if let Some(img) = mat.image {
+        sub.images.push(model.images[img].clone());
+        sub.materials[0].image = Some(0);
+    }
+    for prim in &model.primitives {
+        if prim.material == mat_idx {
+            let mut p = prim.clone();
+            p.material = 0;
+            sub.primitives.push(p);
+        }
+    }
+    sub
+}
+
+fn merge_class(out_model: &mut LodModel, source: &LodModel, mat_idx: usize, geometry: &LodModel) {
+    let mat = &source.materials[mat_idx];
+    let merged_mat = match out_model.materials.iter().position(|m| m.name == mat.name) {
+        Some(i) => i,
+        None => {
+            let mut m = super::model::LodMaterial {
+                image: None,
+                ..mat.clone()
+            };
+            if let Some(img) = mat.image {
+                out_model.images.push(source.images[img].clone());
+                m.image = Some(out_model.images.len() - 1);
+            }
+            out_model.materials.push(m);
+            out_model.materials.len() - 1
+        }
+    };
+    for prim in &geometry.primitives {
+        let mut p = prim.clone();
+        p.material = merged_mat;
+        out_model.primitives.push(p);
+    }
+}
+
+// gltfpack's per-mesh ratio target can delete an entire material class made of
+// small scattered pieces (foliage cards); production always keeps every class,
+// so re-run vanished classes alone with a tightened error limit and merge back
+fn rescue_lost_classes(
+    input: &Path,
+    output: &Path,
+    ratio: f64,
+    gltfpack: &Path,
+    report: &mut SimplifyReport,
+) -> Result<()> {
+    let in_model = glb_model(input)?;
+    let in_tris = tris_by_material(&in_model);
+    let mut out_model = glb_model(output)?;
+    let out_tris = tris_by_material(&out_model);
+    let mut changed = false;
+    for mat_idx in 0..in_model.materials.len() {
+        let name = in_model.materials[mat_idx].name.clone();
+        let before = in_tris.get(&name).copied().unwrap_or(0);
+        if before < CLASS_SURVIVAL_MIN_TRIS || out_tris.get(&name).copied().unwrap_or(0) > 0 {
+            continue;
+        }
+        let sub = class_submodel(&in_model, mat_idx);
+        let sub_in = output.with_extension("rescue-in.glb");
+        let sub_out = output.with_extension("rescue-out.glb");
+        std::fs::write(&sub_in, super::emit::emit_glb(&sub)?)
+            .with_context(|| format!("write {}", sub_in.display()))?;
+        run_gltfpack(
+            gltfpack,
+            &sub_in,
+            &sub_out,
+            ratio,
+            false,
+            Some(CLASS_RESCUE_ERROR_LIMIT),
+        )?;
+        let rescued = glb_model(&sub_out)?;
+        let _ = std::fs::remove_file(&sub_in);
+        let _ = std::fs::remove_file(&sub_out);
+        if rescued.total_tris() > 0 {
+            eprintln!(
+                "simplify: class {name:?} vanished at ratio {ratio} ({before} source tris); \
+                 rescued alone with -se {CLASS_RESCUE_ERROR_LIMIT} ({} tris)",
+                rescued.total_tris()
+            );
+            merge_class(&mut out_model, &in_model, mat_idx, &rescued);
+        } else {
+            eprintln!(
+                "simplify: class {name:?} vanished at ratio {ratio} ({before} source tris) and \
+                 the -se {CLASS_RESCUE_ERROR_LIMIT} retry also emptied it; merging it verbatim"
+            );
+            merge_class(
+                &mut out_model,
+                &in_model,
+                mat_idx,
+                &class_submodel(&in_model, mat_idx),
+            );
+        }
+        report.rescued_classes.push(name);
+        changed = true;
+    }
+    if changed {
+        std::fs::write(output, super::emit::emit_glb(&out_model)?)
+            .with_context(|| format!("write {}", output.display()))?;
+        report.tris_after = out_model.total_tris();
+    }
+    Ok(())
 }
 
 fn copy_through(input: &Path, output: &Path) -> Result<()> {
@@ -254,10 +396,8 @@ pub fn passthrough(input: &Path, output: &Path) -> Result<SimplifyReport> {
     Ok(SimplifyReport {
         tris_before: tris,
         tris_after: tris,
-        ratios_run: Vec::new(),
-        aggressive_final: false,
         passthrough: true,
-        unsimplified: false,
+        ..Default::default()
     })
 }
 
@@ -287,10 +427,8 @@ pub fn simplify(
         return Ok(SimplifyReport {
             tris_before,
             tris_after: tris_before,
-            ratios_run: Vec::new(),
-            aggressive_final: false,
             passthrough: true,
-            unsimplified: false,
+            ..Default::default()
         });
     }
     let mut report = SimplifyReport {
@@ -390,6 +528,8 @@ pub fn simplify(
         }
     }
     report.tris_after = tris_after;
+    let ratio_run = report.ratios_run.last().copied().unwrap_or(current);
+    rescue_lost_classes(input, output, ratio_run, gltfpack, &mut report)?;
     Ok(report)
 }
 
@@ -412,7 +552,7 @@ mod tests {
         dir
     }
 
-    fn grid_glb(n: u32) -> Vec<u8> {
+    fn grid_primitive(n: u32) -> LodPrimitive {
         let mut positions = Vec::new();
         let mut normals = Vec::new();
         let mut uvs = Vec::new();
@@ -438,28 +578,97 @@ mod tests {
                 indices.extend_from_slice(&[a, c, b, b, c, d]);
             }
         }
+        LodPrimitive {
+            positions,
+            normals,
+            uvs,
+            indices,
+            material: 0,
+            ..Default::default()
+        }
+    }
+
+    fn material(name: &str, class: AlphaClass) -> LodMaterial {
+        LodMaterial {
+            name: name.to_string(),
+            class,
+            base_color: [1.0, 1.0, 1.0, 1.0],
+            cutoff: 0.5,
+            image: None,
+            double_sided: false,
+        }
+    }
+
+    fn grid_glb(n: u32) -> Vec<u8> {
         emit_glb(&LodModel {
             root_name: "grid".to_string(),
-            primitives: vec![LodPrimitive {
-                positions,
-                normals,
-                uvs,
-                indices,
-                material: 0,
-                ..Default::default()
-            }],
-            materials: vec![LodMaterial {
-                name: "m".to_string(),
-                class: AlphaClass::Opaque,
-                base_color: [1.0, 1.0, 1.0, 1.0],
-                cutoff: 0.5,
-                image: None,
-                double_sided: false,
-            }],
+            primitives: vec![grid_primitive(n)],
+            materials: vec![material("m", AlphaClass::Opaque)],
             images: Vec::new(),
             log: Vec::new(),
         })
         .unwrap()
+    }
+
+    // a thin tall landmark with per-segment uv islands, the shape class the
+    // pre-fix flags flattened; pins that a 10x ratio never costs the skyline
+    fn append_spire(prim: &mut LodPrimitive, cx: f32, cz: f32, top: f32, segments: u32) {
+        let w = 0.1f32;
+        for (dx, dz) in [(w, 0.0), (0.0, w)] {
+            for k in 0..segments {
+                let y0 = top * k as f32 / segments as f32;
+                let y1 = top * (k + 1) as f32 / segments as f32;
+                let base = prim.positions.len() as u32;
+                for y in [y0, y1] {
+                    prim.positions.push([cx - dx, y, cz - dz]);
+                    prim.positions.push([cx + dx, y, cz + dz]);
+                    prim.normals.push([dz / w, 0.0, dx / w]);
+                    prim.normals.push([dz / w, 0.0, dx / w]);
+                }
+                let u = (k % 7) as f32 / 8.0;
+                let v = (k % 5) as f32 / 6.0;
+                prim.uvs.extend_from_slice(&[
+                    [u, v],
+                    [u + 0.1, v],
+                    [u, v + 0.1],
+                    [u + 0.1, v + 0.1],
+                ]);
+                prim.indices.extend_from_slice(&[
+                    base,
+                    base + 2,
+                    base + 1,
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                ]);
+            }
+        }
+    }
+
+    fn scattered_quads(material: usize, count: u32, size: f32) -> LodPrimitive {
+        let mut prim = LodPrimitive {
+            material,
+            ..Default::default()
+        };
+        for k in 0..count {
+            let x = (k % 12) as f32 * 0.8;
+            let z = (k / 12) as f32 * 0.8;
+            let base = prim.positions.len() as u32;
+            for (dx, dy) in [(0.0, 0.0), (size, 0.0), (0.0, size), (size, size)] {
+                prim.positions.push([x + dx, 1.0 + dy, z]);
+                prim.normals.push([0.0, 0.0, 1.0]);
+                prim.uvs.push([dx / size, dy / size]);
+            }
+            prim.indices.extend_from_slice(&[
+                base,
+                base + 2,
+                base + 1,
+                base + 1,
+                base + 2,
+                base + 3,
+            ]);
+        }
+        prim
     }
 
     #[cfg(unix)]
@@ -609,6 +818,101 @@ mod tests {
         assert!(capped.tris_after <= 100, "{}", capped.tris_after);
         assert!(capped.tris_after > 0);
         assert!(capped.ratios_run.len() >= 2, "{:?}", capped.ratios_run);
+    }
+
+    #[test]
+    fn simplify_args_are_feature_preserving() {
+        assert_eq!(simplify_args(0.1, false, None), vec!["-si", "0.1", "-noq"]);
+        assert_eq!(
+            simplify_args(0.25, true, None),
+            vec!["-si", "0.25", "-sa", "-noq"]
+        );
+        assert_eq!(
+            simplify_args(0.1, false, Some(CLASS_RESCUE_ERROR_LIMIT)),
+            vec!["-si", "0.1", "-se", "0.001", "-noq"]
+        );
+        for lever in ["-sp", "-sa"] {
+            assert!(
+                !simplify_args(0.1, false, None).iter().any(|a| a == lever),
+                "{lever} must not be in the default invocation"
+            );
+        }
+    }
+
+    #[test]
+    fn tall_thin_feature_survives_ratio_simplify() {
+        let Ok(bin) = resolve_gltfpack(None) else {
+            eprintln!("SKIP: gltfpack not resolvable ({GLTFPACK_NIX_RECIPE})");
+            return;
+        };
+        let dir = temp_dir("spire");
+        let mut prim = grid_primitive(32);
+        append_spire(&mut prim, 5.0, 5.0, 17.0, 40);
+        let glb = emit_glb(&LodModel {
+            root_name: "spire".to_string(),
+            primitives: vec![prim],
+            materials: vec![material("m", AlphaClass::Opaque)],
+            images: Vec::new(),
+            log: Vec::new(),
+        })
+        .unwrap();
+        let input = dir.join("in.glb");
+        let output = dir.join("out.glb");
+        std::fs::write(&input, &glb).unwrap();
+
+        let report = simplify(&input, &output, 0.1, None, &bin).unwrap();
+        assert!(report.tris_after < report.tris_before);
+        assert!(report.rescued_classes.is_empty(), "{report:?}");
+        let out = glb_model(&output).unwrap();
+        let (_, mx) = out.bounds();
+        assert!(
+            mx[1] >= 16.0,
+            "spire pruned: max y {} after {:?}",
+            mx[1],
+            report
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vanished_material_class_is_rescued() {
+        let Ok(bin) = resolve_gltfpack(None) else {
+            eprintln!("SKIP: gltfpack not resolvable ({GLTFPACK_NIX_RECIPE})");
+            return;
+        };
+        let dir = temp_dir("rescue");
+        let materials = vec![
+            material("op", AlphaClass::Opaque),
+            material("bl", AlphaClass::Blend),
+        ];
+        let full = LodModel {
+            root_name: "rescue".to_string(),
+            primitives: vec![grid_primitive(32), scattered_quads(1, 150, 0.5)],
+            materials: materials.clone(),
+            images: Vec::new(),
+            log: Vec::new(),
+        };
+        let lost = LodModel {
+            root_name: "rescue".to_string(),
+            primitives: vec![grid_primitive(8)],
+            materials,
+            images: Vec::new(),
+            log: Vec::new(),
+        };
+        let input = dir.join("in.glb");
+        let output = dir.join("out.glb");
+        std::fs::write(&input, emit_glb(&full).unwrap()).unwrap();
+        std::fs::write(&output, emit_glb(&lost).unwrap()).unwrap();
+
+        let mut report = SimplifyReport::default();
+        rescue_lost_classes(&input, &output, 0.1, &bin, &mut report).unwrap();
+        assert_eq!(report.rescued_classes, vec!["bl".to_string()]);
+        let out = glb_model(&output).unwrap();
+        let by_mat = tris_by_material(&out);
+        assert_eq!(by_mat.get("op").copied().unwrap_or(0), 128);
+        assert!(by_mat.get("bl").copied().unwrap_or(0) > 0, "{by_mat:?}");
+        assert_eq!(report.tris_after, out.total_tris());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

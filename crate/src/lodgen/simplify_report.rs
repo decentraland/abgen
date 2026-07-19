@@ -6,12 +6,13 @@ pub struct SimplifyReport {
     pub aggressive_final: bool,
     pub passthrough: bool,
     pub unsimplified: bool,
+    pub rescued_classes: Vec<String>,
 }
 
 impl SimplifyReport {
     pub fn summary(&self) -> String {
         format!(
-            "tris {} -> {} (ratios {:?}{}{}{})",
+            "tris {} -> {} (ratios {:?}{}{}{}{})",
             self.tris_before,
             self.tris_after,
             self.ratios_run,
@@ -25,6 +26,11 @@ impl SimplifyReport {
                 ", UNSIMPLIFIED"
             } else {
                 ""
+            },
+            if self.rescued_classes.is_empty() {
+                String::new()
+            } else {
+                format!(", rescued {:?}", self.rescued_classes)
             },
         )
     }

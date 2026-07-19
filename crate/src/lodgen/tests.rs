@@ -337,11 +337,16 @@ fn empty_scene_bundle_passes_empty_gate_and_fails_content_gate() {
     let bundle_path = out.join(sid).join(&conv.results[0].rel_path);
     let data = std::fs::read(&bundle_path).unwrap();
 
-    let checks = self_gate_bundle_with(&data, sid, 1, "windows", false).unwrap();
+    let checks = self_gate_bundle_with(&data, sid, 1, "windows", false, None).unwrap();
     for c in &checks {
         assert!(c.ok, "unexpected FAIL {}: {}", c.label, c.detail);
     }
-    let as_content = self_gate_bundle_with(&data, sid, 1, "windows", true).unwrap();
+    // Nonzero base (55,-76): the bundled root must still sit at the origin.
+    assert!(
+        checks.iter().any(|c| c.label == "root-position" && c.ok),
+        "root-position gate missing"
+    );
+    let as_content = self_gate_bundle_with(&data, sid, 1, "windows", true, None).unwrap();
     let failed: Vec<&str> = as_content
         .iter()
         .filter(|c| !c.ok)
@@ -665,5 +670,111 @@ fn self_gate_passes_on_synthetic_lod_bundle_and_catches_mismatches() {
     let wrong_level = self_gate_bundle(&data, sid, 0, "windows").unwrap();
     assert!(gate_failures(&wrong_level) > 0);
 
+    let on_budget = self_gate_bundle_with(&data, sid, 1, "windows", true, Some(4)).unwrap();
+    assert_eq!(gate_failures(&on_budget), 0);
+    assert!(on_budget
+        .iter()
+        .any(|c| c.label == "texture-uniform-size" && c.ok));
+
+    let off_budget = self_gate_bundle_with(&data, sid, 1, "windows", true, Some(256)).unwrap();
+    let failed: Vec<&str> = off_budget
+        .iter()
+        .filter(|c| !c.ok)
+        .map(|c| c.label.as_str())
+        .collect();
+    assert!(!failed.is_empty());
+    assert!(
+        failed.iter().all(|l| l.starts_with("texture[")),
+        "{failed:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn orphan_material_is_dropped_from_lod_bundle() {
+    std::env::set_var(
+        "ABGEN_ROOT",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap(),
+    );
+    let dir = std::env::temp_dir().join(format!("abgen-lod-orphanmat-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sid = "bafkreiorphanmat";
+    let src = dir.join(format!("{sid}_1.glb"));
+    let glb = emit_glb(&LodModel {
+        root_name: "orphan".to_string(),
+        primitives: vec![LodPrimitive {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            indices: vec![0, 1, 2],
+            material: 0,
+            ..Default::default()
+        }],
+        materials: vec![
+            LodMaterial {
+                name: "TextureBakeResult-mat".to_string(),
+                class: AlphaClass::Opaque,
+                base_color: [1.0, 1.0, 1.0, 1.0],
+                cutoff: 0.5,
+                image: Some(0),
+                double_sided: false,
+            },
+            LodMaterial {
+                name: "TextureBakeResult-mat-transparent".to_string(),
+                class: AlphaClass::Blend,
+                base_color: [1.0, 1.0, 1.0, 1.0],
+                cutoff: 0.5,
+                image: Some(0),
+                double_sided: false,
+            },
+        ],
+        images: vec![LodImage {
+            bytes: tiny_png(),
+            mime: "image/png".to_string(),
+        }],
+        log: Vec::new(),
+    })
+    .unwrap();
+    std::fs::write(&src, glb).unwrap();
+
+    let client = CatalystClient::new("http://127.0.0.1:9");
+    let opts = lods::LodOptions {
+        platform: "windows".to_string(),
+        lod: Some(lods::LodGenMeta {
+            parcels: vec![(1, 2)],
+            base: (1, 2),
+            timestamp: None,
+            vertical_override: None,
+        }),
+        ..Default::default()
+    };
+    let out = dir.join("out");
+    let conv = lods::convert_lods(
+        &client,
+        &[src.to_string_lossy().into_owned()],
+        out.to_str().unwrap(),
+        &opts,
+    )
+    .unwrap();
+    let data = std::fs::read(out.join(sid).join(&conv.results[0].rel_path)).unwrap();
+    let checks = self_gate_bundle(&data, sid, 1, "windows").unwrap();
+    for c in &checks {
+        assert!(c.ok, "unexpected FAIL {}: {}", c.label, c.detail);
+    }
+    let shader_checks = checks
+        .iter()
+        .filter(|c| c.label.starts_with("shader-pptr["))
+        .count();
+    assert_eq!(shader_checks, 1, "orphan material shipped");
+    assert!(
+        checks
+            .iter()
+            .any(|c| c.label == "shader-pptr[TextureBakeResult-mat]"),
+        "referenced material missing"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

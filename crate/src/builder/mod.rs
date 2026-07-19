@@ -524,7 +524,6 @@ pub struct LodBuildParams {
     pub level: u32,
     pub plane_clipping: [f64; 4],
     pub vertical_clipping: [f64; 4],
-    pub root_position: [f64; 3],
     pub main_asset: String,
     pub timestamp: Option<i64>,
 }

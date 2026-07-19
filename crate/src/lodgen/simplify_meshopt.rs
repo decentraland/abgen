@@ -161,6 +161,7 @@ pub fn simplify_model(
             aggressive_final: sloppy,
             passthrough: false,
             unsimplified: false,
+            rescued_classes: Vec::new(),
         },
     ))
 }

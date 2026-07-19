@@ -32,16 +32,18 @@ USAGE:
             [--catalyst URL]
   abgen-lod assemble (--scene <entityId|X,Y> | --entity-json FILE) -o out.glb
             [--catalyst URL] [--iss FILE|auto|off] [--cache DIR] [--level 1]
-            [--no-crop] [--no-atlas] [--max-size 512] [--padding 0] [--atlas-fixed]
-  abgen-lod atlas -i in.glb -o out.glb [--max-size 512] [--padding 0]
-            [--atlas-fixed] [--crop-base X,Y --crop-parcels 'x,y;x,y;...']
+            [--no-crop] [--no-atlas] [--max-size 256] [--padding 0] [--atlas-fixed]
+            [--atlas-adaptive]
+  abgen-lod atlas -i in.glb -o out.glb [--max-size 256] [--padding 0]
+            [--atlas-fixed] [--atlas-adaptive] [--crop-base X,Y --crop-parcels 'x,y;x,y;...']
   abgen-lod simplify -i in.glb -o out.glb [--ratio 0.1] [--tri-cap N]
             [--simplifier meshopt|gltfpack] [--gltfpack PATH]
             [--allow-unsimplified]
   abgen-lod generate --scene <pointer|entityId> --out DIR
             [--platform windows|mac|linux[,windows|mac|linux...]]
-            [--level 0,1] [--ratio 0.1] [--tri-cap N|auto|off] [--atlas-max 512]
-            [--atlas-fixed] [--no-crop] [--catalyst URL] [--iss FILE|auto|off]
+            [--level 0,1] [--ratio 0.1] [--tri-cap N|auto|off] [--atlas-max 256]
+            [--atlas-fixed] [--atlas-adaptive] [--no-crop] [--catalyst URL]
+            [--iss FILE|auto|off]
             [--workdir DIR] [--cache DIR] [--simplifier meshopt|gltfpack]
             [--gltfpack PATH]
             [--allow-unsimplified] [--keep-glb] [--gpu]
@@ -64,19 +66,25 @@ assemble: resolves placements like `placements`, fetches every referenced GLB
   entity document from disk instead of resolving --scene, for offline runs
   against a prestaged cache), bakes all instances into one flat
   merged GLB in glTF right-handed space (the bundler applies the RH->LH flip),
-  crops it on x/z to the scene's plane-clipping rect (parcel bounds +-0.05 —
-  production ISS-lane merged GLBs are cropped the same way: geometry
-  overhanging neighbouring parcels is clipped, not dropped; disable with
-  --no-crop), atlases it into per-alpha-class TextureBakeResult materials
+  crops it on x/z to the exact parcel rect (production crops the same way:
+  geometry overhanging neighbouring parcels is clipped at the parcel line,
+  not dropped; the +-0.05 margin exists only in the _PlaneClipping shader
+  vector; disable with --no-crop), atlases it into per-alpha-class
+  TextureBakeResult materials
   (disable with --no-atlas) and writes it to -o.
 atlas: re-runs only the atlas stage on an existing merged GLB: dedupe +
   skyline-pack tiles into one square power-of-two atlas per alpha class
   (opaque JPEG, mask/transparent PNG after alpha bleed), merge each class
-  into a single primitive (welding duplicate verts), remap uvs. Default is
-  the current-lane native bake (tiles cropped to their used UV window at
-  native texels, flat tiles 8x8, canvas shrunk to the packed extent, never
-  upscaled); --atlas-fixed selects the retired-lane full-bleed bake (canvas
-  pinned to --max-size, tiles scaled to fill). --crop-base/--crop-parcels
+  into a single primitive (welding duplicate verts), remap uvs. Default
+  matches production's fixed per-level budget: every canvas is pinned to
+  --max-size (256, production's current LOD budget; 512 for the pre-2025
+  vintage), tiles composited at native texels, solid tiles fill the whole
+  canvas, remainder alpha-bled. The client copies each atlas into a
+  fixed-size shared texture-array slot, so undersized or mixed sizes get
+  skipped and render untextured. --atlas-adaptive selects the old
+  shrink-to-content bake (canvas shrunk to the packed extent, flat tiles
+  8x8) for non-Unity consumers; --atlas-fixed selects the retired-lane
+  full-bleed bake (tiles scaled to fill). --crop-base/--crop-parcels
   clip the model to the parcel-union rects before atlasing (the generate
   stage order), for staged crop runs without a catalyst entity.
 simplify: decimates a GLB. --simplifier picks the backend (default from
@@ -126,7 +134,7 @@ generate: the full sync chain: resolve scene -> placements (iss|embedded
   placements resolve to nothing (e.g. the scene runtime captures no
   renderer state) builds a content-free bundle: no meshes, materials or
   textures, metadata dependencies []. The crop stage (default on, matching
-  production; --no-crop disables) clips merged geometry to the plane-clipping
+  production; --no-crop disables) clips merged geometry to the exact parcel
   rect and adds a crop-bounds self-gate check. --platform takes a
   comma-separated list (windows|mac|linux; webgl is refused — upstream webgl
   LOD bundles use an empty suffix and are unsupported here): every platform
@@ -149,6 +157,16 @@ generate: the full sync chain: resolve scene -> placements (iss|embedded
 }
 
 fn main() {
+    // scene-runtime failures are tracing::warn!; without a subscriber a
+    // failed scene eval ships a half-booted capture in silence
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "abgen=warn".into()),
+        )
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = argv.first() else { usage() };
     let rc = match cmd.as_str() {
@@ -293,7 +311,7 @@ fn cmd_bundle(argv: &[String]) -> Result<i32> {
         None => lods::vertical_clipping(parcel_list.len()),
     };
     println!(
-        "planeClipping=({},{},{},{}) verticalClipping=({},{},{},{}) rootPosition=({},{},{})",
+        "planeClipping=({},{},{},{}) verticalClipping=({},{},{},{}) clientPlacement=({},{},{})",
         plane[0],
         plane[1],
         plane[2],
@@ -302,9 +320,9 @@ fn cmd_bundle(argv: &[String]) -> Result<i32> {
         vertical[1],
         vertical[2],
         vertical[3],
-        lods::root_position(base_parcel)[0],
-        lods::root_position(base_parcel)[1],
-        lods::root_position(base_parcel)[2]
+        lods::client_placement(base_parcel)[0],
+        lods::client_placement(base_parcel)[1],
+        lods::client_placement(base_parcel)[2]
     );
 
     let work = PathBuf::from(&out).join(".work");
@@ -465,9 +483,10 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
     let mut level: u32 = 1;
     let mut no_crop = false;
     let mut no_atlas = false;
-    let mut max_size: u32 = 512;
+    let mut max_size: u32 = 256;
     let mut padding: u32 = 0;
     let mut atlas_fixed = false;
+    let mut atlas_adaptive = false;
 
     let mut i = 0usize;
     while i < argv.len() {
@@ -526,6 +545,9 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
             "--atlas-fixed" => {
                 atlas_fixed = true;
             }
+            "--atlas-adaptive" => {
+                atlas_adaptive = true;
+            }
             "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
             other => bail!("unknown assemble arg {other:?}"),
         }
@@ -571,6 +593,8 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
     } else {
         let mode = if atlas_fixed {
             abgen::lodgen::atlas::AtlasMode::FullBleed
+        } else if atlas_adaptive {
+            abgen::lodgen::atlas::AtlasMode::Adaptive
         } else {
             abgen::lodgen::atlas::AtlasMode::Native
         };
@@ -642,9 +666,10 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
 fn cmd_atlas(argv: &[String]) -> Result<i32> {
     let mut input: Option<String> = None;
     let mut out: Option<String> = None;
-    let mut max_size: u32 = 512;
+    let mut max_size: u32 = 256;
     let mut padding: u32 = 0;
     let mut atlas_fixed = false;
+    let mut atlas_adaptive = false;
     let mut crop_base: Option<String> = None;
     let mut crop_parcels: Option<String> = None;
 
@@ -673,6 +698,9 @@ fn cmd_atlas(argv: &[String]) -> Result<i32> {
             }
             "--atlas-fixed" => {
                 atlas_fixed = true;
+            }
+            "--atlas-adaptive" => {
+                atlas_adaptive = true;
             }
             "--crop-base" => {
                 crop_base = Some(need(i)?.clone());
@@ -711,6 +739,8 @@ fn cmd_atlas(argv: &[String]) -> Result<i32> {
     }
     let mode = if atlas_fixed {
         abgen::lodgen::atlas::AtlasMode::FullBleed
+    } else if atlas_adaptive {
+        abgen::lodgen::atlas::AtlasMode::Adaptive
     } else {
         abgen::lodgen::atlas::AtlasMode::Native
     };
@@ -921,6 +951,9 @@ fn cmd_generate(argv: &[String]) -> Result<i32> {
             }
             "--atlas-fixed" => {
                 params.atlas_fixed = true;
+            }
+            "--atlas-adaptive" => {
+                params.atlas_adaptive = true;
             }
             "--no-crop" => {
                 params.crop = false;

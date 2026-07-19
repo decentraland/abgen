@@ -386,6 +386,54 @@ module.exports.onUpdate = async function (_dt) {{
         assert!(outcome.stream.is_empty());
     }
 
+    // UMD libs sniff CommonJS via `typeof module`; a module/exports global
+    // makes them skip define() and silently half-boot SDK6 scenes
+    #[test]
+    fn scene_scope_hides_commonjs_globals() {
+        let code = format!(
+            "{SCENE_HELPERS}
+const engineApi = require('~system/EngineApi');
+const failures = [];
+if (typeof module !== 'object' || module.exports !== exports) failures.push('wrapper');
+const leaked = new Function(
+  'return [typeof module, typeof exports, typeof process, typeof __filename, typeof __dirname].join()'
+)();
+if (leaked !== 'undefined,undefined,undefined,undefined,undefined') failures.push('globals=' + leaked);
+const sandbox = {{ record: [], define: Object.assign(function () {{}}, {{ amd: true }}) }};
+new Function('code', 'with (this) {{ eval(code) }}').call(sandbox,
+  \"(function (global, factory) {{ typeof exports === 'object' && typeof module !== 'undefined' ? (record.push('cjs'), factory({{}})) : typeof define === 'function' && define.amd ? (record.push('amd'), define(['exports'], factory)) : (record.push('root'), factory({{}})); }})(this, function (_exports) {{}});\");
+if (sandbox.record.join() !== 'amd') failures.push('umd=' + sandbox.record.join());
+let sent = false;
+module.exports = {{
+  onUpdate: async function () {{
+    if (sent) return;
+    sent = true;
+    const src = failures.length ? 'failed:' + failures.join('|') : 'models/clean.glb';
+    await engineApi.crdtSendToRenderer({{ data: putMessage(600, 1041, 1, gltfData(src)) }});
+  }}
+}};
+"
+        );
+        let engines: Vec<Box<dyn SceneEngine>> = vec![
+            Box::new(QuickJsEngine),
+            #[cfg(all(
+                feature = "engine-v8",
+                not(all(target_os = "windows", target_env = "gnu"))
+            ))]
+            Box::new(crate::lodgen::scenerun::V8Engine),
+        ];
+        for engine in engines {
+            let outcome = engine.run_capture(job(code.clone(), None)).unwrap();
+            assert!(outcome.sent);
+            let got = crdt::placements_from_crdt(&outcome.stream, &HashMap::new());
+            assert_eq!(got.placements.len(), 1);
+            assert_eq!(
+                got.placements[0].glb_file.as_deref(),
+                Some("models/clean.glb")
+            );
+        }
+    }
+
     #[test]
     fn eval_throw_still_completes() {
         let outcome = QuickJsEngine

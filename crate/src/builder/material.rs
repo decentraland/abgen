@@ -24,7 +24,7 @@ fn lod_color(name: &str, rgba: [f64; 4]) -> Value {
     ]
 }
 
-fn build_lod_material_tree(
+pub(super) fn build_lod_material_tree(
     base_template: &Value,
     m: &crate::scene::Material,
     name: &str,
@@ -72,8 +72,6 @@ fn build_lod_material_tree(
             "stringTagMap",
             arr![arr!["RenderType", "TransparentCutout"]],
         );
-    } else if transparent {
-        t.insert("stringTagMap", arr![arr!["RenderType", "Transparent"]]);
     } else {
         t.insert("stringTagMap", Value::Array(Vec::new()));
     }
@@ -96,12 +94,14 @@ fn build_lod_material_tree(
         lod_tex_env("_SpecGlossMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
     ];
 
+    // Transparent-class state is pinned to production's FORCED_TRANSPARENT bake,
+    // byte-verified on every reference LOD1: depth-writing transparency
+    // (_ZWrite 1), _DstBlendAlpha 0, base alpha forced to 0.8, no RenderType tag.
     let alpha_clip = if masked { 1.0 } else { 0.0 };
     let alpha_to_mask = if masked { 1.0 } else { 0.0 };
     let cutoff = if masked { m.alpha_cutoff } else { 0.5 };
     let dst_blend = if transparent { 10.0 } else { 0.0 };
     let surface = if masked || transparent { 1.0 } else { 0.0 };
-    let zwrite = if transparent { 0.0 } else { 1.0 };
     let floats: Vec<(&str, f64)> = vec![
         ("_AddPrecomputedVelocity", 0.0),
         ("_AlphaClip", alpha_clip),
@@ -116,7 +116,7 @@ fn build_lod_material_tree(
         ("_DetailAlbedoMapScale", 1.0),
         ("_DetailNormalMapScale", 1.0),
         ("_DstBlend", dst_blend),
-        ("_DstBlendAlpha", dst_blend),
+        ("_DstBlendAlpha", 0.0),
         ("_EnvironmentReflections", 1.0),
         ("_GlossMapScale", 1.0),
         ("_Glossiness", 0.0),
@@ -136,12 +136,16 @@ fn build_lod_material_tree(
         ("_UVSec", 0.0),
         ("_WorkflowMode", 1.0),
         ("_XRMotionVectorsPass", 1.0),
-        ("_ZWrite", zwrite),
+        ("_ZWrite", 1.0),
     ];
     let floats_v: Vec<Value> = floats.into_iter().map(|(n, v)| arr![n, v]).collect();
 
+    let mut base_color = materials::base_color_verbatim(m.base_color);
+    if transparent {
+        base_color[3] = 0.8_f32 as f64;
+    }
     let colors: Vec<Value> = vec![
-        lod_color("_BaseColor", materials::base_color_verbatim(m.base_color)),
+        lod_color("_BaseColor", base_color),
         lod_color("_Color", [1.0, 1.0, 1.0, 1.0]),
         lod_color("_EmissionColor", [0.0, 0.0, 0.0, 1.0]),
         lod_color("_PlaneClipping", lod.plane_clipping),

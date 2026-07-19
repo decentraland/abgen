@@ -7,10 +7,11 @@ pub(super) const FRAME_DT_SECS: f64 = 100.0 / 3000.0;
 pub(super) const FRAME_DT_MS: f64 = 100.0 / 3.0;
 
 // single-line CJS wrapper: preserves bundle line numbers and keeps scene
-// top-level vars from clobbering the globals the prelude installed
+// top-level vars from clobbering the globals the prelude installed; module
+// and exports arrive only as these parameters, never as globals
 pub(super) fn cjs_wrap(code: &str) -> String {
     format!(
-        ";(function (module, exports) {{ {code}\n}}).call(module.exports, module, module.exports);"
+        ";(function (module, exports) {{ {code}\n}}).call(__abgen_module.exports, __abgen_module, __abgen_module.exports);"
     )
 }
 

@@ -323,26 +323,31 @@ pub fn assemble_from(
         bail!("assemble: no placements");
     }
 
-    let mut resolved: Vec<String> = Vec::with_capacity(placements.len());
-    let mut resolve_errs: Vec<String> = Vec::new();
+    // A src missing from the content map is unloadable at runtime too, so
+    // production bakes the rest of the scene and the LOD drops that one prop.
+    let mut placed: Vec<(usize, &Placement, String)> = Vec::with_capacity(placements.len());
+    let mut unresolved: Vec<String> = Vec::new();
     for (i, p) in placements.iter().enumerate() {
         match resolve_placement_hash(p, by_file) {
-            Ok(h) => resolved.push(h),
-            Err(e) => resolve_errs.push(format!("placement {i}: {e}")),
+            Ok(h) => placed.push((i, p, h)),
+            Err(e) => unresolved.push(format!("placement {i}: {e}")),
         }
     }
-    if !resolve_errs.is_empty() {
+    if placed.is_empty() {
         bail!(
-            "assemble: {} unresolvable placement(s):\n{}",
-            resolve_errs.len(),
-            resolve_errs.join("\n")
+            "assemble: all {} placement(s) unresolvable:\n{}",
+            unresolved.len(),
+            unresolved.join("\n")
         );
+    }
+    for u in &unresolved {
+        eprintln!("assemble: skipping unresolvable {u}");
     }
 
     let mut uniq: Vec<String> = Vec::new();
     {
         let mut seen: HashMap<&str, ()> = HashMap::new();
-        for h in &resolved {
+        for (_, _, h) in &placed {
             if seen.insert(h.as_str(), ()).is_none() {
                 uniq.push(h.clone());
             }
@@ -466,7 +471,7 @@ pub fn assemble_from(
     }
 
     let mut counters = Counters::default();
-    for (pi, (p, hash)) in placements.iter().zip(resolved.iter()).enumerate() {
+    for &(pi, p, ref hash) in &placed {
         let prep = &prepared[hash.as_str()];
         let parent = model::mat4_from_trs(p.position, p.rotation, p.scale);
         let prims_before = model.primitives.len();
@@ -481,9 +486,12 @@ pub fn assemble_from(
             model.total_tris() - tris_before
         ));
     }
+    for u in &unresolved {
+        model.log.push(format!("skipped unresolvable {u}"));
+    }
     model.log.push(format!(
         "summary: instances={} unique_glbs={} prims_kept={} prims_collider_dropped={} prims_skinned_skipped={}",
-        placements.len(),
+        placed.len(),
         uniq.len(),
         counters.kept,
         counters.dropped_collider,
@@ -1000,6 +1008,48 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("missing.glb"), "{msg}");
         assert!(msg.contains("unresolvable"), "{msg}");
+    }
+
+    #[test]
+    fn unresolvable_placement_skipped_rest_assembled() {
+        let glb = tri_glb();
+        let cache = temp_cache("skipunres");
+        stage(&cache, "htri", &glb);
+        let ent = entity(&[
+            ("models/ok.glb", "htri"),
+            (
+                "models/wearables/second_floor/A/spy_suit_lower_body.glb",
+                "hspy",
+            ),
+        ]);
+        let model = assemble(
+            &dummy_client(),
+            &ent,
+            &[
+                Placement {
+                    glb_file: Some(
+                        "models/wearables/second_floor/A/spy_suit_lower_body".to_string(),
+                    ),
+                    ..Default::default()
+                },
+                Placement {
+                    glb_file: Some("models/OK.glb".to_string()),
+                    ..Default::default()
+                },
+            ],
+            1,
+            Some(&cache),
+        )
+        .unwrap();
+        assert_eq!(model.total_tris(), 1);
+        assert_eq!(model.primitives.len(), 1);
+        let s = summary_line(&model);
+        assert!(s.contains("instances=1"), "{s}");
+        let skipped = model
+            .log
+            .iter()
+            .any(|l| l.starts_with("skipped unresolvable") && l.contains("spy_suit_lower_body"));
+        assert!(skipped, "{:?}", model.log);
     }
 
     #[test]
