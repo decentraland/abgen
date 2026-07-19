@@ -37,6 +37,15 @@ const CLASS_ORDER: [AlphaClass; 3] = [AlphaClass::Opaque, AlphaClass::Mask, Alph
 pub enum AtlasMode {
     FullBleed,
     Native,
+    Adaptive,
+}
+
+pub fn budget_pot(max_size: u32) -> u32 {
+    let mut pot = 1u32;
+    while pot * 2 <= max_size {
+        pot *= 2;
+    }
+    pot
 }
 
 pub fn class_material_name(class: AlphaClass) -> &'static str {
@@ -76,10 +85,7 @@ pub fn atlas_with(
     if model.primitives.is_empty() {
         bail!("atlas: model has no primitives");
     }
-    let mut max_pot = 1u32;
-    while max_pot * 2 <= max_size {
-        max_pot *= 2;
-    }
+    let max_pot = budget_pot(max_size);
     if max_pot <= 2 * padding + MIN_TILE_DIM {
         bail!("atlas: max size {max_size} too small for padding {padding}");
     }
@@ -201,7 +207,7 @@ pub fn atlas_with(
             }
             Some((|| {
                 let mut crops = match mode {
-                    AtlasMode::Native => native_crops(bucket, model),
+                    AtlasMode::Native | AtlasMode::Adaptive => native_crops(bucket, model),
                     AtlasMode::FullBleed => vec![None; bucket.tiles.len()],
                 };
                 let packed = pack_bucket(&mut bucket.tiles, &mut crops, mode, max_pot, padding)?;

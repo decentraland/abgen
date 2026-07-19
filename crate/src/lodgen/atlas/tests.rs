@@ -1,3 +1,4 @@
+use super::pack::canvas_size;
 use super::*;
 
 fn png_bytes(img: &RgbaImage) -> Vec<u8> {
@@ -581,13 +582,13 @@ fn overflow_scales_to_fit() {
 }
 
 #[test]
-fn native_single_solid_tile_is_8x8() {
+fn adaptive_single_solid_tile_is_8x8() {
     let m = model_of(
         vec![mat("a", AlphaClass::Blend, [0.2, 0.4, 0.6, 1.0], None)],
         vec![prim(0, tri_uvs())],
         vec![],
     );
-    let out = atlas_with(&m, 512, 0, AtlasMode::Native).unwrap();
+    let out = atlas_with(&m, 512, 0, AtlasMode::Adaptive).unwrap();
     let canvas = decode(&out.images[0]);
     assert_eq!(canvas.width(), 8);
     assert_eq!(canvas.height(), 8);
@@ -597,7 +598,102 @@ fn native_single_solid_tile_is_8x8() {
 }
 
 #[test]
-fn native_crops_single_image_tile_to_uv_window() {
+fn canvas_size_policy() {
+    for extent in [1u32, 8, 40, 256, 600] {
+        assert_eq!(canvas_size(AtlasMode::Native, 256, extent), 256);
+        assert_eq!(canvas_size(AtlasMode::FullBleed, 512, extent), 512);
+    }
+    assert_eq!(canvas_size(AtlasMode::Adaptive, 512, 1), 8);
+    assert_eq!(canvas_size(AtlasMode::Adaptive, 512, 40), 64);
+    assert_eq!(canvas_size(AtlasMode::Adaptive, 512, 256), 256);
+    assert_eq!(canvas_size(AtlasMode::Adaptive, 512, 600), 512);
+    assert_eq!(budget_pot(256), 256);
+    assert_eq!(budget_pot(300), 256);
+    assert_eq!(budget_pot(512), 512);
+    assert_eq!(budget_pot(1), 1);
+}
+
+#[test]
+fn native_single_solid_fills_budget() {
+    let m = model_of(
+        vec![mat("a", AlphaClass::Blend, [0.2, 0.4, 0.6, 1.0], None)],
+        vec![prim(0, tri_uvs())],
+        vec![],
+    );
+    let out = atlas_with(&m, 256, 0, AtlasMode::Native).unwrap();
+    let canvas = decode(&out.images[0]);
+    assert_eq!(canvas.width(), 256);
+    assert_eq!(canvas.height(), 256);
+    for &(x, y) in &[(0u32, 0u32), (255, 0), (0, 255), (255, 255), (128, 128)] {
+        assert_eq!(&canvas.get_pixel(x, y).0[0..3], &[51, 102, 153]);
+    }
+}
+
+#[test]
+fn native_small_image_pads_canvas_to_budget() {
+    let png = flat_image(16, 16, [10, 200, 30, 255]);
+    let m = model_of(
+        vec![mat("a", AlphaClass::Mask, [1.0; 4], Some(0))],
+        vec![prim(0, vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])],
+        vec![png],
+    );
+    let out = atlas_with(&m, 256, 0, AtlasMode::Native).unwrap();
+    let canvas = decode(&out.images[0]);
+    assert_eq!(canvas.width(), 256);
+    assert_eq!(canvas.height(), 256);
+    assert_eq!(canvas.get_pixel(0, 0).0, [10, 200, 30, 255]);
+    let uvs = &out.primitives[0].uvs;
+    assert!(uvs.iter().all(|uv| uv[0] <= 16.0 / 256.0 + 1e-6));
+    assert!(uvs.iter().all(|uv| uv[1] <= 16.0 / 256.0 + 1e-6));
+}
+
+#[test]
+fn native_all_classes_share_budget_size() {
+    let png = flat_image(16, 16, [9, 9, 9, 255]);
+    let m = model_of(
+        vec![
+            mat("o", AlphaClass::Opaque, [1.0; 4], Some(0)),
+            mat("c", AlphaClass::Mask, [1.0; 4], Some(0)),
+            mat("t", AlphaClass::Blend, [1.0; 4], None),
+        ],
+        vec![prim(0, tri_uvs()), prim(1, tri_uvs()), prim(2, tri_uvs())],
+        vec![png],
+    );
+    let out = atlas_with(&m, 256, 0, AtlasMode::Native).unwrap();
+    assert_eq!(out.images.len(), 3);
+    for img in &out.images {
+        let d = decode(img);
+        assert_eq!((d.width(), d.height()), (256, 256));
+    }
+    let adaptive = atlas_with(&m, 256, 0, AtlasMode::Adaptive).unwrap();
+    let dims: Vec<u32> = adaptive.images.iter().map(|i| decode(i).width()).collect();
+    assert!(dims.iter().any(|&w| w < 256), "{dims:?}");
+}
+
+#[test]
+fn native_multi_tile_canvas_stays_budget() {
+    let mut mats = Vec::new();
+    let mut prims = Vec::new();
+    let mut images = Vec::new();
+    for i in 0..3u32 {
+        images.push(flat_image(16, 16, [i as u8 * 60 + 10, 20, 200, 255]));
+        mats.push(mat(
+            &format!("m{i}"),
+            AlphaClass::Mask,
+            [1.0; 4],
+            Some(i as usize),
+        ));
+        prims.push(prim(i as usize, vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]));
+    }
+    let m = model_of(mats, prims, images);
+    let out = atlas_with(&m, 256, 0, AtlasMode::Native).unwrap();
+    let canvas = decode(&out.images[0]);
+    assert_eq!(canvas.width(), 256);
+    assert_eq!(canvas.height(), 256);
+}
+
+#[test]
+fn adaptive_crops_single_image_tile_to_uv_window() {
     let mut img = RgbaImage::new(64, 64);
     for (x, y, p) in img.enumerate_pixels_mut() {
         *p = image::Rgba([(x * 4) as u8, (y * 4) as u8, 7, 255]);
@@ -608,7 +704,7 @@ fn native_crops_single_image_tile_to_uv_window() {
         vec![prim(0, vec![[0.25, 0.25], [0.3, 0.25], [0.25, 0.3]])],
         vec![png],
     );
-    let out = atlas_with(&m, 512, 0, AtlasMode::Native).unwrap();
+    let out = atlas_with(&m, 512, 0, AtlasMode::Adaptive).unwrap();
     let canvas = decode(&out.images[0]);
     assert_eq!(canvas.width(), 8);
     assert_eq!(canvas.height(), 8);
@@ -624,21 +720,21 @@ fn native_crops_single_image_tile_to_uv_window() {
 }
 
 #[test]
-fn native_full_span_single_image_keeps_native_size() {
+fn adaptive_full_span_single_image_keeps_native_size() {
     let png = flat_image(32, 32, [10, 200, 30, 255]);
     let m = model_of(
         vec![mat("a", AlphaClass::Mask, [1.0; 4], Some(0))],
         vec![prim(0, vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])],
         vec![png],
     );
-    let out = atlas_with(&m, 512, 0, AtlasMode::Native).unwrap();
+    let out = atlas_with(&m, 512, 0, AtlasMode::Adaptive).unwrap();
     let canvas = decode(&out.images[0]);
     assert_eq!(canvas.width(), 32);
     assert_eq!(canvas.get_pixel(0, 0).0, [10, 200, 30, 255]);
 }
 
 #[test]
-fn native_canvas_shrinks_to_packed_extent() {
+fn adaptive_canvas_shrinks_to_packed_extent() {
     let mut mats = Vec::new();
     let mut prims = Vec::new();
     let mut images = Vec::new();
@@ -653,7 +749,7 @@ fn native_canvas_shrinks_to_packed_extent() {
         prims.push(prim(i as usize, vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]));
     }
     let m = model_of(mats, prims, images);
-    let out = atlas_with(&m, 512, 0, AtlasMode::Native).unwrap();
+    let out = atlas_with(&m, 512, 0, AtlasMode::Adaptive).unwrap();
     let canvas = decode(&out.images[0]);
     assert!(
         canvas.width() <= 64,

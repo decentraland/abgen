@@ -1,3 +1,4 @@
+use super::material::build_lod_material_tree;
 use super::templates::template_path;
 use super::texture::apply_png_gamma;
 use super::texture::encode_dxt5_mip_chain_real;
@@ -800,4 +801,90 @@ fn build_bundle_multi_pair_standalone_texture_matches_singles() {
             "{name}: standalone encode-once serialize must match a fresh build"
         );
     }
+}
+
+fn lod_material(alpha_mode: &str) -> Value {
+    let m = crate::scene::Material {
+        alpha_mode: alpha_mode.into(),
+        base_color: [0.25, 0.5, 0.75, 1.0],
+        ..Default::default()
+    };
+    let lod = LodBuildParams {
+        level: 1,
+        plane_clipping: [0.0; 4],
+        vertical_clipping: [0.0; 4],
+        main_asset: String::new(),
+        timestamp: None,
+    };
+    build_lod_material_tree(
+        &Value::map(),
+        &m,
+        "mat",
+        &Value::map(),
+        &std::collections::HashMap::new(),
+        &lod,
+    )
+}
+
+fn lod_saved_float(t: &Value, name: &str) -> f64 {
+    t.get("m_SavedProperties")
+        .and_then(|p| p.get("m_Floats"))
+        .and_then(|f| f.as_array())
+        .and_then(|entries| {
+            entries.iter().find_map(|e| {
+                let pair = e.as_array()?;
+                (pair.first()?.as_str()? == name).then(|| pair.get(1)?.as_f64())?
+            })
+        })
+        .unwrap_or(f64::NAN)
+}
+
+#[test]
+fn lod_transparent_material_pins_forced_transparent_state() {
+    let t = lod_material("BLEND");
+    assert_eq!(lod_saved_float(&t, "_ZWrite"), 1.0);
+    assert_eq!(lod_saved_float(&t, "_DstBlendAlpha"), 0.0);
+    assert_eq!(lod_saved_float(&t, "_DstBlend"), 10.0);
+    assert_eq!(lod_saved_float(&t, "_SrcBlend"), 1.0);
+    let base = t
+        .get("m_SavedProperties")
+        .and_then(|p| p.get("m_Colors"))
+        .and_then(|c| c.as_array())
+        .and_then(|entries| {
+            entries.iter().find_map(|e| {
+                let pair = e.as_array()?;
+                (pair.first()?.as_str()? == "_BaseColor").then(|| pair.get(1).cloned())?
+            })
+        })
+        .expect("_BaseColor present");
+    let ch = |k: &str| base.get(k).and_then(|v| v.as_f64()).unwrap();
+    assert_eq!(
+        [ch("r"), ch("g"), ch("b"), ch("a")],
+        [0.25, 0.5, 0.75, 0.8_f32 as f64]
+    );
+    let tags = t.get("stringTagMap").and_then(|v| v.as_array()).unwrap();
+    assert!(
+        tags.is_empty(),
+        "prod ships no RenderType tag on FORCED_TRANSPARENT"
+    );
+}
+
+#[test]
+fn lod_opaque_and_cutout_materials_keep_their_state() {
+    let t = lod_material("OPAQUE");
+    assert_eq!(lod_saved_float(&t, "_ZWrite"), 1.0);
+    assert_eq!(lod_saved_float(&t, "_DstBlend"), 0.0);
+    assert_eq!(lod_saved_float(&t, "_DstBlendAlpha"), 0.0);
+    assert!(t
+        .get("stringTagMap")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let t = lod_material("MASK");
+    assert_eq!(lod_saved_float(&t, "_ZWrite"), 1.0);
+    assert_eq!(lod_saved_float(&t, "_AlphaClip"), 1.0);
+    let tags = t.get("stringTagMap").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(tags.len(), 1);
 }

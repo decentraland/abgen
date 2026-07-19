@@ -27,16 +27,16 @@ impl CropReport {
     }
 }
 
+// Exact parcel rect, no slack: production crops geometry to the parcel line;
+// the +/-0.05 m margin belongs only to the _PlaneClipping shader vector.
 pub fn crop_rect_rh(base: (i32, i32), parcels: &[(i32, i32)]) -> [f64; 4] {
-    let plane = crate::lods::plane_clipping(parcels);
+    let min_x = parcels.iter().map(|p| p.0).min().unwrap_or(0) as f64 * 16.0;
+    let max_x = parcels.iter().map(|p| p.0 + 1).max().unwrap_or(1) as f64 * 16.0;
+    let min_z = parcels.iter().map(|p| p.1).min().unwrap_or(0) as f64 * 16.0;
+    let max_z = parcels.iter().map(|p| p.1 + 1).max().unwrap_or(1) as f64 * 16.0;
     let bx = base.0 as f64 * 16.0;
     let bz = base.1 as f64 * 16.0;
-    [
-        -(plane[1] - bx),
-        -(plane[0] - bx),
-        plane[2] - bz,
-        plane[3] - bz,
-    ]
+    [bx - max_x, bx - min_x, min_z - bz, max_z - bz]
 }
 
 fn cell_rects(parcels: &[(i32, i32)]) -> Vec<(i32, i32, i32, i32)> {
@@ -75,10 +75,10 @@ pub fn crop_rects_rh(base: (i32, i32), parcels: &[(i32, i32)]) -> Vec<[f64; 4]> 
     cell_rects(parcels)
         .into_iter()
         .map(|(x0, x1, y0, y1)| {
-            let wx0 = x0 as f64 * 16.0 - 0.05;
-            let wx1 = (x1 + 1) as f64 * 16.0 + 0.05;
-            let wz0 = y0 as f64 * 16.0 - 0.05;
-            let wz1 = (y1 + 1) as f64 * 16.0 + 0.05;
+            let wx0 = x0 as f64 * 16.0;
+            let wx1 = (x1 + 1) as f64 * 16.0;
+            let wz0 = y0 as f64 * 16.0;
+            let wz1 = (y1 + 1) as f64 * 16.0;
             [-(wx1 - bx), -(wx0 - bx), wz0 - bz, wz1 - bz]
         })
         .collect()
@@ -446,13 +446,34 @@ mod tests {
             .collect();
         assert_eq!(parcels.len(), 98);
         let rect = crop_rect_rh((-3, -2), &parcels);
-        let want = [-112.05, 0.05, -32.05, 192.05];
+        assert_eq!(rect, [-112.0, 0.0, -32.0, 192.0]);
+    }
+
+    #[test]
+    fn single_parcel_rect_exact() {
+        let rect = crop_rect_rh((-57, -105), &[(-57, -105)]);
+        assert_eq!(rect, [-16.0, 0.0, 0.0, 16.0]);
+    }
+
+    #[test]
+    fn crop_rect_has_no_clip_margin() {
+        let parcels = [(-57, -105), (-56, -105), (-57, -104)];
+        let base = (-57, -105);
+        let rect = crop_rect_rh(base, &parcels);
+        assert_eq!(rect, [-32.0, 0.0, 0.0, 32.0]);
+        let plane = crate::lods::plane_clipping(&parcels);
+        let bx = base.0 as f64 * 16.0;
+        let bz = base.1 as f64 * 16.0;
+        let with_margin = [
+            -(plane[1] - bx),
+            -(plane[0] - bx),
+            plane[2] - bz,
+            plane[3] - bz,
+        ];
         for i in 0..4 {
             assert!(
-                (rect[i] - want[i]).abs() < 1e-9,
-                "rect[{i}] = {} want {}",
-                rect[i],
-                want[i]
+                (rect[i] - with_margin[i]).abs() > 0.049,
+                "rect[{i}] kept margin"
             );
         }
     }
@@ -500,8 +521,8 @@ mod tests {
         assert_eq!(cell_rects(&[(5, 3), (5, 5), (5, 4)]), vec![(5, 5, 3, 5)]);
         let l = crop_rects_rh((0, 0), &[(0, 0), (1, 0), (0, 1)]);
         assert_eq!(l.len(), 2);
-        assert_eq!(l[0], [-32.05, 0.05, -0.05, 16.05]);
-        assert_eq!(l[1], [-16.05, 0.05, 15.95, 32.05]);
+        assert_eq!(l[0], [-32.0, 0.0, 0.0, 16.0]);
+        assert_eq!(l[1], [-16.0, 0.0, 16.0, 32.0]);
     }
 
     #[test]

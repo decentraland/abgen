@@ -60,7 +60,7 @@ pub fn vertical_clipping(n_parcels: usize) -> [f64; 4] {
     [0.0, height as f64, 0.0, 0.0]
 }
 
-pub fn root_position(base: (i32, i32)) -> [f64; 3] {
+pub fn client_placement(base: (i32, i32)) -> [f64; 3] {
     [base.0 as f64 * 16.0, 0.0, base.1 as f64 * 16.0]
 }
 
@@ -219,7 +219,6 @@ fn build_lod_bundle(
             Some(h) => [0.0, h, 0.0, 0.0],
             None => vertical_clipping(m.parcels.len()),
         },
-        root_position: root_position(m.base),
         main_asset: lod_main_asset(sid, level),
         timestamp: m.timestamp,
     });
@@ -480,9 +479,9 @@ mod tests {
     }
 
     #[test]
-    fn root_position_is_base_parcel_world_origin() {
-        assert_eq!(root_position((8, -83)), [128.0, 0.0, -1328.0]);
-        assert_eq!(root_position((-3, -2)), [-48.0, 0.0, -32.0]);
+    fn client_placement_is_base_parcel_world_position() {
+        assert_eq!(client_placement((8, -83)), [128.0, 0.0, -1328.0]);
+        assert_eq!(client_placement((-3, -2)), [-48.0, 0.0, -32.0]);
     }
 
     #[test]

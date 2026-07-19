@@ -146,6 +146,7 @@ pub struct GenerateParams {
     pub atlas_max: u32,
     pub atlas_padding: u32,
     pub atlas_fixed: bool,
+    pub atlas_adaptive: bool,
     pub crop: bool,
     pub catalyst: String,
     pub iss: String,
@@ -168,9 +169,10 @@ impl Default for GenerateParams {
             ratio: 0.1,
             tri_cap: None,
             tri_cap_auto: true,
-            atlas_max: 512,
+            atlas_max: 256,
             atlas_padding: 0,
             atlas_fixed: false,
+            atlas_adaptive: false,
             crop: true,
             catalyst: "https://peer.decentraland.org/content".to_string(),
             iss: "auto".to_string(),
@@ -423,6 +425,15 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     let placements = acquire_placements(&client, &ent, &params.iss)?;
     let placements_ms = t.elapsed().as_millis();
     log.push(format!("placements: {}", placements.len()));
+    // every-scale-zero means a half-booted scene, not a real layout; refuse
+    // rather than ship a bundle whose vertices all collapse to the origin
+    if !placements.is_empty() && placements.iter().all(|p| p.scale.iter().all(|s| *s == 0.0)) {
+        bail!(
+            "scene {} produced {} placements, all scaled to zero; refusing to emit an invisible bundle",
+            ent.entity_id,
+            placements.len()
+        );
+    }
 
     if let Some(dir) = params.cache.as_deref() {
         std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
@@ -463,6 +474,8 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         let t = std::time::Instant::now();
         let mode = if params.atlas_fixed {
             atlas::AtlasMode::FullBleed
+        } else if params.atlas_adaptive {
+            atlas::AtlasMode::Adaptive
         } else {
             atlas::AtlasMode::Native
         };
@@ -619,6 +632,8 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         }
         let mut primary_path = PathBuf::new();
         let mut primary_bytes = 0usize;
+        let gate_budget = (expect_content && !params.atlas_fixed && !params.atlas_adaptive)
+            .then(|| atlas::budget_pot(params.atlas_max));
         for plat in &platforms {
             let rel = expected_rel_path(&sid, level, plat);
             let path = PathBuf::from(&params.out_dir)
@@ -626,7 +641,8 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
                 .join(&rel);
             let data = std::fs::read(&path)
                 .with_context(|| format!("read built bundle {}", path.display()))?;
-            let checks = self_gate_bundle_with(&data, &sid, level, plat, expect_content)?;
+            let checks =
+                self_gate_bundle_with(&data, &sid, level, plat, expect_content, gate_budget)?;
             for c in checks {
                 push_check(
                     &mut gate,

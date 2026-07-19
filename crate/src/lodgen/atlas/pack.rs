@@ -115,6 +115,15 @@ fn pot_ceil(v: u32, lo: u32, hi: u32) -> u32 {
     c.min(hi)
 }
 
+// Production pins every atlas in a bundle to one fixed per-level budget
+// (uniform slice dims are required by the client's shared texture array).
+pub(super) fn canvas_size(mode: AtlasMode, budget: u32, content_extent: u32) -> u32 {
+    match mode {
+        AtlasMode::Adaptive => pot_ceil(content_extent, NATIVE_MIN_CANVAS, budget),
+        AtlasMode::FullBleed | AtlasMode::Native => budget,
+    }
+}
+
 pub(super) fn expand_axis(a0: &mut u32, a1: &mut u32, full: u32, want: u32) {
     let want = want.min(full);
     if *a1 - *a0 < want {
@@ -144,18 +153,19 @@ fn pack_single(
                 pot_floor(tiles[0].src_w.max(tiles[0].src_h), MIN_TILE_DIM, max_pot)
             }
         }
-        AtlasMode::Native => {
-            if tiles[0].is_solid() {
+        AtlasMode::Native | AtlasMode::Adaptive => {
+            let extent = if tiles[0].is_solid() {
                 NATIVE_SOLID_DIM
             } else {
                 let (cw, ch) = crop_dims(&tiles[0], &crops[0]);
-                pot_ceil(cw.max(ch), NATIVE_MIN_CANVAS, max_pot)
-            }
+                cw.max(ch)
+            };
+            canvas_size(mode, max_pot, extent)
         }
     };
     let (w, h) = match mode {
         AtlasMode::FullBleed => (side, side),
-        AtlasMode::Native => {
+        AtlasMode::Native | AtlasMode::Adaptive => {
             if tiles[0].is_solid() {
                 (side, side)
             } else {
@@ -203,7 +213,7 @@ pub(super) fn pack_bucket(
                     (t.src_w.min(cap), t.src_h.min(cap))
                 }
             }
-            AtlasMode::Native => {
+            AtlasMode::Native | AtlasMode::Adaptive => {
                 if t.is_solid() {
                     (NATIVE_SOLID_DIM.min(cap), NATIVE_SOLID_DIM.min(cap))
                 } else {
@@ -218,12 +228,12 @@ pub(super) fn pack_bucket(
             .iter()
             .zip(natives.iter())
             .map(|(t, &(nw, nh))| {
-                if mode == AtlasMode::Native && t.is_solid() {
+                if mode != AtlasMode::FullBleed && t.is_solid() {
                     return (nw, nh);
                 }
                 let (bw, bh) = match mode {
                     AtlasMode::FullBleed => (t.src_w, t.src_h),
-                    AtlasMode::Native => (nw, nh),
+                    AtlasMode::Native | AtlasMode::Adaptive => (nw, nh),
                 };
                 (
                     ((bw as f64 * scale).round() as u32)
@@ -302,14 +312,14 @@ pub(super) fn pack_bucket(
             g *= SHRINK_STEP;
         }
     }
-    if mode == AtlasMode::Native {
+    if mode == AtlasMode::Adaptive {
         let extent = pos
             .iter()
             .zip(dims.iter())
             .map(|(&(x, y), &(w, h))| (x + w + 2 * padding).max(y + h + 2 * padding))
             .max()
             .unwrap_or(canvas);
-        let mut cand = pot_ceil(extent, NATIVE_MIN_CANVAS, canvas);
+        let mut cand = canvas_size(mode, canvas, extent);
         while cand < canvas {
             if let Some(p2) = try_pack(&dims, cand) {
                 pos = p2;

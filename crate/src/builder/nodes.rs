@@ -169,8 +169,9 @@ impl<'a> Builder<'a> {
                     child_trs,
                 )
             };
+            // LOD roots ship at the origin; the client places them at base*16.
             let (wrap_t, wrap_r, wrap_s) = match &self.lod {
-                Some(l) => (l.root_position, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0]),
+                Some(_) => ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0]),
                 None => (wrap_t, wrap_r, wrap_s),
             };
             let tr_tree =
@@ -357,9 +358,13 @@ impl<'a> Builder<'a> {
             self.build_extra_scene(scene, name.as_deref(), &roots);
         }
 
-        for mat_idx in 0..scene.materials.len() {
-            if !self.mat_pid.contains_key(&mat_idx) {
-                let _ = self.material_orphan(scene, Some(mat_idx));
+        // upstream scene bundles ship unreferenced materials; production LOD
+        // bundles never do, and each orphan drags its texture into preload
+        if self.lod.is_none() {
+            for mat_idx in 0..scene.materials.len() {
+                if !self.mat_pid.contains_key(&mat_idx) {
+                    let _ = self.material_orphan(scene, Some(mat_idx));
+                }
             }
         }
 
@@ -591,7 +596,7 @@ impl<'a> Builder<'a> {
             self.insert_role(p, r);
         }
         let (root_t, root_r, root_s) = match &self.lod {
-            Some(l) if assigning_root => (l.root_position, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0]),
+            Some(_) if assigning_root => ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0]),
             _ => (node.translation, node.rotation, node.scale),
         };
         let tr_tree = self.transform_tree(go, root_t, root_r, root_s, &child_transforms, parent_tr);

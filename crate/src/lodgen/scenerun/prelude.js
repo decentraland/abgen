@@ -1,10 +1,8 @@
 globalThis.global = globalThis;
-globalThis.module = { exports: {} };
-Object.defineProperty(globalThis, 'exports', {
-  get() {
-    return globalThis.module.exports;
-  }
-});
+// module/exports stay off globalThis: cjs_wrap passes this handle as wrapper
+// parameters, so sandboxed UMD sniffs see typeof module === 'undefined' and
+// pick their AMD branch, matching the Node manifest-builder's wrapper locals
+globalThis.__abgen_module = { exports: {} };
 
 globalThis.console = {
   log: () => {},
@@ -216,10 +214,11 @@ globalThis.require = (moduleName) => {
 
 globalThis.__tick = async (kind, dt) => {
   try {
+    const exp = globalThis.__abgen_module.exports;
     if (kind === 'start') {
-      if (globalThis.module.exports.onStart) await globalThis.module.exports.onStart();
-    } else if (globalThis.module.exports.onUpdate) {
-      await globalThis.module.exports.onUpdate(dt);
+      if (exp.onStart) await exp.onStart();
+    } else if (exp.onUpdate) {
+      await exp.onUpdate(dt);
     }
   } catch (err) {
     __abgen.log('[' + (kind === 'start' ? 'Start' : 'Update') + ' failed]: ' + err);

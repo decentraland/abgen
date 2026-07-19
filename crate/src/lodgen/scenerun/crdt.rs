@@ -402,6 +402,58 @@ mod tests {
     }
 
     #[test]
+    fn negative_zero_rotation_serializes_like_the_manifest_lane() {
+        let s2 = std::f32::consts::FRAC_1_SQRT_2;
+        let mut stream = Vec::new();
+        encode_put(
+            &mut stream,
+            600,
+            TRANSFORM,
+            1,
+            &transform_bytes([1.0, 0.0, 0.0], [-0.0, s2, -0.0, -s2], [1.0, 1.0, 1.0], 0),
+        );
+        encode_put(
+            &mut stream,
+            600,
+            GLTF_CONTAINER,
+            1,
+            &gltf_bytes("models/a.glb"),
+        );
+        let mut content = HashMap::new();
+        content.insert("models/a.glb".to_string(), "ha".to_string());
+        let got = placements_from_crdt(&stream, &content);
+        let s2d = f64::from(s2);
+        let manifest = serde_json::json!([
+            {
+                "entityId": 600,
+                "componentName": "core::Transform",
+                "data": {
+                    "position": {"x": 1.0, "y": 0.0, "z": 0.0},
+                    "rotation": {"x": 0.0, "y": s2d, "z": 0.0, "w": -s2d},
+                    "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+                    "parent": 0
+                }
+            },
+            {
+                "entityId": 600,
+                "componentName": "core::GltfContainer",
+                "data": {"src": "models/a.glb"}
+            }
+        ]);
+        let want =
+            parse_lod_manifest_full(&serde_json::to_vec(&manifest).unwrap(), &content).unwrap();
+        // f64 PartialEq calls -0.0 == 0.0, so compare the serialized bytes the
+        // parity oracle diffs
+        let got_json = serde_json::to_string_pretty(&got.placements).unwrap();
+        let want_json = serde_json::to_string_pretty(&want.placements).unwrap();
+        assert_eq!(got_json, want_json);
+        assert!(!got_json.contains("-0.0"));
+        let rot = got.placements[0].rotation;
+        assert!(rot.iter().all(|v| v.to_bits() != (-0.0f64).to_bits()));
+        assert_eq!(rot[3], f64::from(-s2));
+    }
+
+    #[test]
     fn synthetic_initial_state_matches_fixture_frames() {
         assert_eq!(TRANSFORM_DEFAULT_PAYLOAD.len(), 44);
         assert!(UI_CANVAS_INFO_PAYLOAD.is_empty());

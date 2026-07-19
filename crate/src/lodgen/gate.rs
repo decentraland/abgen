@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::lods;
 use crate::unity::bundle_file::{Bundle, FileContent};
@@ -57,7 +57,7 @@ pub fn self_gate_bundle(
     level: u32,
     platform: &str,
 ) -> Result<Vec<GateCheck>> {
-    self_gate_bundle_with(data, scene_id, level, platform, true)
+    self_gate_bundle_with(data, scene_id, level, platform, true, None)
 }
 
 pub fn self_gate_bundle_with(
@@ -66,13 +66,18 @@ pub fn self_gate_bundle_with(
     level: u32,
     platform: &str,
     expect_content: bool,
+    atlas_budget: Option<u32>,
 ) -> Result<Vec<GateCheck>> {
     let bundle = Bundle::load_bytes(data).context("parse built bundle")?;
     let sid = scene_id.to_lowercase();
     let mut go_names: HashMap<i64, String> = HashMap::new();
     let mut root_gos: Vec<i64> = Vec::new();
-    let mut materials: Vec<(String, i64, i64)> = Vec::new();
+    let mut root_positions: Vec<[f64; 3]> = Vec::new();
+    let mut materials: Vec<(String, i64, i64, i64)> = Vec::new();
+    let mut renderer_mat_pids: HashSet<i64> = HashSet::new();
     let mut textures: Vec<(String, i64, i64, i64, i64)> = Vec::new();
+    let mut mesh_extent = [0.0f64; 3];
+    let mut mesh_count = 0usize;
     let mut deps: Vec<String> = Vec::new();
     let mut metadata: Option<serde_json::Value> = None;
     let mut target_platform: Option<i32> = None;
@@ -109,6 +114,13 @@ pub fn self_gate_bundle_with(
                             .and_then(|x| x.as_i64())
                             .unwrap_or(0);
                         root_gos.push(go);
+                        let pos = v.get("m_LocalPosition");
+                        let axis = |k: &str| {
+                            pos.and_then(|p| p.get(k))
+                                .and_then(|x| x.as_f64())
+                                .unwrap_or(f64::NAN)
+                        };
+                        root_positions.push([axis("x"), axis("y"), axis("z")]);
                     }
                 }
                 21 => {
@@ -122,7 +134,25 @@ pub fn self_gate_bundle_with(
                         .and_then(|p| p.get("m_PathID"))
                         .and_then(|x| x.as_i64())
                         .unwrap_or(-1);
-                    materials.push((name, fid, pid));
+                    materials.push((name, fid, pid, obj.path_id));
+                }
+                23 | 137 => {
+                    if let Some(mats) = v.get("m_Materials").and_then(|m| m.as_array()) {
+                        for m in mats {
+                            if let Some(p) = m.get("m_PathID").and_then(|x| x.as_i64()) {
+                                renderer_mat_pids.insert(p);
+                            }
+                        }
+                    }
+                }
+                43 => {
+                    mesh_count += 1;
+                    if let Some(ext) = v.get("m_LocalAABB").and_then(|b| b.get("m_Extent")) {
+                        for (i, axis) in ["x", "y", "z"].iter().enumerate() {
+                            let e = ext.get(axis).and_then(|x| x.as_f64()).unwrap_or(0.0);
+                            mesh_extent[i] = mesh_extent[i].max(e.abs());
+                        }
+                    }
                 }
                 28 => {
                     let get = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(-1);
@@ -180,6 +210,13 @@ pub fn self_gate_bundle_with(
         got_root == want_root,
         format!("got {got_root:?} want {want_root:?}"),
     );
+    // The client places the root at base*16; a baked offset would double it.
+    push_check(
+        &mut checks,
+        "root-position",
+        root_positions.iter().all(|p| *p == [0.0, 0.0, 0.0]),
+        format!("{root_positions:?} want origin"),
+    );
     let want_tp = lod_target_platform(platform);
     push_check(
         &mut checks,
@@ -196,7 +233,7 @@ pub fn self_gate_bundle_with(
             materials.len()
         ),
     );
-    for (name, fid, pid) in &materials {
+    for (name, fid, pid, _) in &materials {
         push_check(
             &mut checks,
             format!("shader-pptr[{name}]"),
@@ -204,6 +241,22 @@ pub fn self_gate_bundle_with(
             format!("({fid}, {pid})"),
         );
     }
+    // an unreferenced material drags its texture into the preload table:
+    // dead download + resident memory on every client
+    let orphan_mats: Vec<&String> = materials
+        .iter()
+        .filter(|(_, _, _, pid)| !renderer_mat_pids.contains(pid))
+        .map(|(name, _, _, _)| name)
+        .collect();
+    push_check(
+        &mut checks,
+        "material-liveness",
+        orphan_mats.is_empty(),
+        format!(
+            "{} material(s) with no referencing renderer: {orphan_mats:?}",
+            orphan_mats.len()
+        ),
+    );
     let want_deps: Vec<String> = if expect_content {
         vec![
             crate::cabname::cab_name(&crate::shader::texarray_bundle_name(platform)).to_lowercase(),
@@ -217,6 +270,13 @@ pub fn self_gate_bundle_with(
         deps.iter().map(|d| d.to_lowercase()).collect::<Vec<_>>() == want_deps,
         format!("got {deps:?} want {want_deps:?}"),
     );
+    let extent_span = mesh_extent.iter().cloned().fold(0.0f64, f64::max);
+    push_check(
+        &mut checks,
+        "mesh-extent",
+        (mesh_count > 0 && extent_span > 0.0) == expect_content,
+        format!("{mesh_count} mesh(es), max extent {extent_span}, expect_content={expect_content}"),
+    );
     push_check(
         &mut checks,
         "texture-count",
@@ -229,13 +289,23 @@ pub fn self_gate_bundle_with(
     for (name, fmt, w, h, mips) in &textures {
         let square_pot = *w > 0 && w == h && (*w as u64).is_power_of_two() && *w <= 512;
         let full_mips = square_pot && *mips == (*w as u64).trailing_zeros() as i64 + 1;
+        let on_budget = atlas_budget.is_none_or(|b| *w == b as i64);
         push_check(
             &mut checks,
             format!("texture[{name}]"),
-            *fmt == 25 && square_pot && full_mips,
-            format!("fmt={fmt} {w}x{h} mips={mips}"),
+            *fmt == 25 && square_pot && full_mips && on_budget,
+            format!("fmt={fmt} {w}x{h} mips={mips} budget={atlas_budget:?}"),
         );
     }
+    // production ships one uniform atlas size per bundle (shared texture-array slots)
+    let tex_sizes: std::collections::BTreeSet<(i64, i64)> =
+        textures.iter().map(|(_, _, w, h, _)| (*w, *h)).collect();
+    push_check(
+        &mut checks,
+        "texture-uniform-size",
+        tex_sizes.len() <= 1,
+        format!("{} distinct size(s): {tex_sizes:?}", tex_sizes.len()),
+    );
     match &metadata {
         Some(m) => {
             push_check(
