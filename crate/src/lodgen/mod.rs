@@ -5,6 +5,8 @@ pub mod emit;
 pub mod model;
 pub mod placements;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod scenerun;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod simplify;
 pub mod simplify_meshopt;
 mod simplify_report;

@@ -9,7 +9,6 @@ use crate::lodgen::simplify::SimplifierBackend;
 
 pub const REASON_HEADER: &str = "x-abgen-reason";
 pub const JIT_ENV: &str = "ABGEN_LOD_JIT";
-pub const MANIFEST_BUILDER_ENV: &str = "ABGEN_LOD_MANIFEST_BUILDER";
 pub const CACHE_DIR_ENV: &str = "ABGEN_LOD_CACHE_DIR";
 pub const TIMEOUT_ENV: &str = "ABGEN_LOD_JIT_TIMEOUT_S";
 pub const FAIL_TTL_ENV: &str = "ABGEN_LOD_JIT_FAIL_TTL_S";
@@ -121,7 +120,6 @@ pub struct LodJit {
     pub enabled: bool,
     pub simplifier: SimplifierBackend,
     pub gltfpack: Option<PathBuf>,
-    pub manifest_builder: Option<String>,
     pub cache_dir: PathBuf,
     pub workdir: PathBuf,
     pub timeout: Duration,
@@ -141,10 +139,9 @@ impl LodJit {
         } else {
             None
         };
-        let manifest_builder = std::env::var(MANIFEST_BUILDER_ENV)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        if std::env::var_os("ABGEN_LOD_MANIFEST_BUILDER").is_some() {
+            tracing::warn!("ABGEN_LOD_MANIFEST_BUILDER ignored: the scene runtime is embedded");
+        }
         let base = std::env::var(CACHE_DIR_ENV)
             .ok()
             .map(|s| s.trim().to_string())
@@ -154,7 +151,6 @@ impl LodJit {
             want,
             simplifier,
             probe,
-            manifest_builder,
             &base,
             env_secs(TIMEOUT_ENV, 600),
             env_secs(FAIL_TTL_ENV, 3600),
@@ -167,7 +163,6 @@ impl LodJit {
         flag_on: bool,
         simplifier: SimplifierBackend,
         gltfpack_probe: Option<anyhow::Result<PathBuf>>,
-        manifest_builder: Option<String>,
         cache_base: &str,
         timeout_s: u64,
         fail_ttl_s: u64,
@@ -193,10 +188,11 @@ impl LodJit {
             }
         }
         let enabled = flag_on && disabled_reasons.is_empty();
-        if enabled && manifest_builder.is_none() {
+        #[cfg(target_arch = "wasm32")]
+        if enabled {
             tracing::warn!(
-                "ABGEN_LOD_MANIFEST_BUILDER unset — LOD JIT can only build scenes that \
-                 have a published ISS descriptor; the manifest-builder fallback is unavailable"
+                "built for wasm32 without the embedded scene runtime — LOD JIT can only build \
+                 scenes that have a published ISS descriptor"
             );
         }
         let workdir = PathBuf::from(cache_base).join("lod-work");
@@ -214,7 +210,6 @@ impl LodJit {
             enabled,
             simplifier,
             gltfpack,
-            manifest_builder,
             cache_dir: PathBuf::from(cache_base).join("lod-content"),
             workdir,
             timeout: Duration::from_secs(timeout_s.max(1)),
@@ -329,7 +324,6 @@ impl LodJit {
             levels: LOD_LEVELS.to_vec(),
             tri_cap_auto: true,
             iss: "auto".to_string(),
-            manifest_builder: self.manifest_builder.clone(),
             workdir: Some(self.workdir.clone()),
             cache: Some(self.cache_dir.clone()),
             simplifier: self.simplifier,
@@ -592,7 +586,6 @@ mod tests {
             enabled,
             simplifier: SimplifierBackend::Gltfpack,
             gltfpack: Some(PathBuf::from("/bin/true")),
-            manifest_builder: None,
             cache_dir: base.join("lod-content"),
             workdir: base.join("lod-work"),
             timeout,
@@ -681,7 +674,6 @@ mod tests {
             true,
             SimplifierBackend::Gltfpack,
             Some(Err(anyhow::anyhow!("gltfpack not found"))),
-            None,
             "/tmp/abgen-lodjit-assemble",
             600,
             3600,
@@ -694,7 +686,6 @@ mod tests {
         let jit = LodJit::assemble(
             false,
             SimplifierBackend::Gltfpack,
-            None,
             None,
             "/tmp/abgen-lodjit-assemble",
             600,
@@ -709,7 +700,6 @@ mod tests {
             true,
             SimplifierBackend::Gltfpack,
             Some(Ok(PathBuf::from("/bin/true"))),
-            Some("/mb".to_string()),
             "/tmp/abgen-lodjit-assemble",
             42,
             7,
@@ -726,7 +716,6 @@ mod tests {
             false,
             SimplifierBackend::Gltfpack,
             None,
-            None,
             "/tmp/abgen-lodjit-assemble",
             600,
             3600,
@@ -740,7 +729,6 @@ mod tests {
         let jit = LodJit::assemble(
             true,
             SimplifierBackend::Meshopt,
-            None,
             None,
             "/tmp/abgen-lodjit-assemble",
             600,

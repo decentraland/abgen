@@ -32,10 +32,20 @@ jobs:
             runner: ubuntu-22.04
             target: x86_64-pc-windows-gnu
             bin: abgen.exe
+          # rquickjs-sys 0.12.1 ships no pregenerated bindings for this triple
+          # (mingw x64 has them), so this leg alone generates them at build time
+          # via rquickjs's bindgen feature against the llvm-mingw sysroot
+          # (BINDGEN_EXTRA_CLANG_ARGS set in the toolchain step). If bindgen
+          # cannot find libclang, apt-get install libclang-dev. Ultimate
+          # fallback: build this leg with --no-default-features --features
+          # server and state in the release notes that the windows-arm64 LOD
+          # placements fallback is limited to ISS-published scenes - explicit,
+          # never silent.
           - name: aarch64-pc-windows-gnullvm
             runner: ubuntu-22.04
             target: aarch64-pc-windows-gnullvm
             bin: abgen.exe
+            cargo_flags: --features rquickjs/bindgen
           - name: aarch64-apple-darwin
             runner: macos-14
             target: aarch64-apple-darwin
@@ -98,6 +108,7 @@ jobs:
             echo "CC_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-clang"
             echo "CXX_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-clang++"
             echo "AR_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-ar"
+            echo "BINDGEN_EXTRA_CLANG_ARGS=--target=aarch64-w64-mingw32 --sysroot=/opt/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64/aarch64-w64-mingw32"
           } >> "$GITHUB_ENV"
 
       - name: reproducibility environment
@@ -119,14 +130,14 @@ jobs:
 
       - name: build (twice + bit-identical; windows-x64 once)
         run: |
-          cargo build --release --locked --target ${{ matrix.target }} --bin abgen
+          cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.cargo_flags }} --bin abgen
           if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
             echo "windows-gnu: built once; mingw ld has residual link-order non-determinism the bit-identical gate cannot pass"
             exit 0
           fi
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" /tmp/build-1
           rm -rf target
-          cargo build --release --locked --target ${{ matrix.target }} --bin abgen
+          cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.cargo_flags }} --bin abgen
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" /tmp/build-2
           h1=$(shasum -a 256 /tmp/build-1 | cut -d' ' -f1)
           h2=$(shasum -a 256 /tmp/build-2 | cut -d' ' -f1)
@@ -202,7 +213,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --title "abgen $GITHUB_REF_NAME" \
-            --notes "Reproducible builds: the linux and macOS binaries were each built twice from a clean tree in CI and required bit-identical before publishing; the windows binary is built once (mingw's linker has a residual link-order non-determinism). Toolchain: rust 1.97.0 (pinned), \`--locked\` against the committed Cargo.lock, \`SOURCE_DATE_EPOCH\` from the tagged commit. Each archive is self-contained: the \`abgen\` server binary plus the \`template/\` and \`shader/\` assets it needs, resolved from the binary's own directory (\`ABGEN_ROOT\`/\`ABGEN_SHADER_BUNDLE\` override). Runtime requirements - Linux (x64 and arm64): glibc >= 2.35 and libstdc++6/libgcc_s (present on any machine that runs node). Windows x64: none, the mingw runtime DLLs ship in the archive next to the exe. Windows arm64: none, a single static exe (llvm-mingw/libc++). macOS (Apple Silicon and Intel): system libraries only. Optional everywhere: libturbojpeg (bit-parity JPEG decode with the upstream ab-cdn pipeline; without it JPEG textures decode through a pure-Rust fallback - valid output, not guaranteed byte-identical to upstream bundles). The same binaries publish to npm as \`@dcl/abgen\` (per-platform packages as optionalDependencies; \`npx @dcl/abgen\` runs the server)." \
+            --notes "Reproducible builds: the linux and macOS binaries were each built twice from a clean tree in CI and required bit-identical before publishing; the windows binary is built once (mingw's linker has a residual link-order non-determinism). Toolchain: rust 1.97.0 (pinned), \`--locked\` against the committed Cargo.lock, \`SOURCE_DATE_EPOCH\` from the tagged commit. Each archive is self-contained: the \`abgen\` server binary plus the \`template/\` and \`shader/\` assets it needs, resolved from the binary's own directory (\`ABGEN_ROOT\`/\`ABGEN_SHADER_BUNDLE\` override). Runtime requirements - Linux (x64 and arm64): glibc >= 2.35 and libstdc++6/libgcc_s (present on any mainstream distro). Windows x64: none, the mingw runtime DLLs ship in the archive next to the exe. Windows arm64: none, a single static exe (llvm-mingw/libc++). macOS (Apple Silicon and Intel): system libraries only. Optional everywhere: libturbojpeg (bit-parity JPEG decode with the upstream ab-cdn pipeline; without it JPEG textures decode through a pure-Rust fallback - valid output, not guaranteed byte-identical to upstream bundles). The same binaries publish to npm as \`@dcl/abgen\` (per-platform packages as optionalDependencies; \`npx @dcl/abgen\` runs the server)." \
             dist/*.tar.gz dist/SHA256SUMS.txt
 
   npm:

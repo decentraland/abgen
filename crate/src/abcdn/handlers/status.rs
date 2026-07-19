@@ -104,7 +104,7 @@ pub async fn health(State(state): State<AppState>) -> Response {
             "enabled": state.lod_jit.enabled,
             "simplifier": state.lod_jit.simplifier.name(),
             "gltfpack": state.lod_jit.gltfpack.as_ref().map(|p| p.display().to_string()),
-            "manifest_builder": state.lod_jit.manifest_builder.is_some(),
+            "embedded_scene_runtime": cfg!(not(target_arch = "wasm32")),
             "disabled_reasons": state.lod_jit.disabled_reasons,
             "neg_cache_entries": state.lod_jit.neg_cache.entry_count(),
             "timeout_s": state.lod_jit.timeout.as_secs(),

@@ -11,10 +11,6 @@ pub use placements_native::*;
 pub const ISS_MANIFEST_BASE: &str =
     "https://lod-generator-unity-cdn.decentraland.org/lods-unity/manifests";
 pub const ISS_SUFFIX: &str = "_InitialSceneState.json";
-pub const MANIFEST_BUILDER_REPO: &str =
-    "https://github.com/decentraland/scene-lod-entities-manifest-builder";
-pub const MANIFEST_OUTPUT_DIR: &str = "output-manifests";
-pub const MANIFEST_SUFFIX: &str = "-lod-manifest.json";
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Placement {
@@ -156,11 +152,11 @@ fn quat_rotate(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
 }
 
 #[derive(Clone, Debug)]
-struct Trs {
-    position: [f64; 3],
-    rotation: [f64; 4],
-    scale: [f64; 3],
-    parent: i64,
+pub(crate) struct Trs {
+    pub(crate) position: [f64; 3],
+    pub(crate) rotation: [f64; 4],
+    pub(crate) scale: [f64; 3],
+    pub(crate) parent: i64,
 }
 
 impl Default for Trs {
@@ -209,11 +205,47 @@ fn world_of(eid: i64, transforms: &HashMap<i64, Trs>, visiting: &mut HashSet<i64
     compose(&parent_world, local)
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ManifestPlacements {
     pub placements: Vec<Placement>,
     pub skipped_mesh_renderer: usize,
     pub unresolved_src: usize,
+}
+
+pub(crate) fn placements_from_components(
+    transforms: HashMap<i64, Trs>,
+    gltf_srcs: Vec<(i64, String)>,
+    mesh_renderer_entities: HashSet<i64>,
+    content_by_file: &HashMap<String, String>,
+) -> ManifestPlacements {
+    let lowered: HashMap<String, &String> = content_by_file
+        .iter()
+        .map(|(k, v)| (k.to_lowercase(), v))
+        .collect();
+    let gltf_entities: HashSet<i64> = gltf_srcs.iter().map(|(e, _)| *e).collect();
+    let mut out = ManifestPlacements {
+        skipped_mesh_renderer: mesh_renderer_entities
+            .iter()
+            .filter(|e| !gltf_entities.contains(e))
+            .count(),
+        ..Default::default()
+    };
+    for (eid, src) in gltf_srcs {
+        let world = world_of(eid, &transforms, &mut HashSet::new());
+        let glb_hash = lowered.get(&src.to_lowercase()).map(|h| (*h).clone());
+        if glb_hash.is_none() {
+            out.unresolved_src += 1;
+        }
+        out.placements.push(Placement {
+            glb_hash,
+            glb_file: Some(src),
+            position: world.position,
+            rotation: world.rotation,
+            scale: world.scale,
+        });
+    }
+    sort_placements(&mut out.placements);
+    out
 }
 
 pub fn parse_lod_manifest_full(
@@ -224,13 +256,8 @@ pub fn parse_lod_manifest_full(
     let rows = v
         .as_array()
         .ok_or_else(|| anyhow!("lod manifest is not a JSON array"))?;
-    let lowered: HashMap<String, &String> = content_by_file
-        .iter()
-        .map(|(k, v)| (k.to_lowercase(), v))
-        .collect();
     let mut transforms: HashMap<i64, Trs> = HashMap::new();
     let mut gltf_srcs: Vec<(i64, String)> = Vec::new();
-    let mut gltf_entities: HashSet<i64> = HashSet::new();
     let mut mesh_renderer_entities: HashSet<i64> = HashSet::new();
     for row in rows {
         let Some(eid) = row.get("entityId").and_then(|x| x.as_i64()) else {
@@ -259,7 +286,6 @@ pub fn parse_lod_manifest_full(
             "core::GltfContainer" => {
                 if let Some(src) = data.and_then(|d| d.get("src")).and_then(|s| s.as_str()) {
                     gltf_srcs.push((eid, src.to_string()));
-                    gltf_entities.insert(eid);
                 }
             }
             "core::MeshRenderer" => {
@@ -268,29 +294,12 @@ pub fn parse_lod_manifest_full(
             _ => {}
         }
     }
-    let mut out = ManifestPlacements {
-        skipped_mesh_renderer: mesh_renderer_entities
-            .iter()
-            .filter(|e| !gltf_entities.contains(e))
-            .count(),
-        ..Default::default()
-    };
-    for (eid, src) in gltf_srcs {
-        let world = world_of(eid, &transforms, &mut HashSet::new());
-        let glb_hash = lowered.get(&src.to_lowercase()).map(|h| (*h).clone());
-        if glb_hash.is_none() {
-            out.unresolved_src += 1;
-        }
-        out.placements.push(Placement {
-            glb_hash,
-            glb_file: Some(src),
-            position: world.position,
-            rotation: world.rotation,
-            scale: world.scale,
-        });
-    }
-    sort_placements(&mut out.placements);
-    Ok(out)
+    Ok(placements_from_components(
+        transforms,
+        gltf_srcs,
+        mesh_renderer_entities,
+        content_by_file,
+    ))
 }
 
 pub fn parse_lod_manifest(

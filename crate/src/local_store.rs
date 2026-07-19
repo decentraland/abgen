@@ -11,6 +11,7 @@ pub fn mmap_file(path: &Path) -> Result<Mmap> {
 pub const ABGEN_CONTENT_ROOT_ENV: &str = "ABGEN_CONTENT_ROOT";
 pub const DEFAULT_CONTENT_ROOT: &str = "./content";
 
+#[derive(Clone)]
 pub struct LocalContentStore {
     root: PathBuf,
 }

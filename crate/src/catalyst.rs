@@ -76,6 +76,7 @@ pub(crate) fn ensure_entity_id(v: &mut serde_json::Value, id: &str) {
     }
 }
 
+#[derive(Clone)]
 pub struct CatalystClient {
     base: String,
     agent: ureq::Agent,

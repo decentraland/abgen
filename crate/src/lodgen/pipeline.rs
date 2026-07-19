@@ -50,12 +50,9 @@ pub fn scene_geometry(ent: &Scene) -> Result<((i32, i32), Vec<(i32, i32)>)> {
 }
 
 pub fn acquire_placements(
+    client: &CatalystClient,
     ent: &Scene,
-    coords: Option<&str>,
     iss: &str,
-    manifest_builder: Option<&str>,
-    workdir: Option<&Path>,
-    catalyst: &str,
 ) -> Result<Vec<placements::Placement>> {
     let iss_bytes: Option<Vec<u8>> = match iss {
         "off" => None,
@@ -78,72 +75,25 @@ pub fn acquire_placements(
             eprintln!("source: iss ({} placements)", list.len());
             Ok(list)
         }
-        None => {
-            let run_coords = match coords {
-                Some(c) => c.to_string(),
-                None => {
-                    let base = ent
-                        .metadata
-                        .get("scene")
-                        .and_then(|s| s.get("base"))
-                        .and_then(|b| b.as_str())
-                        .ok_or_else(|| {
-                            anyhow!("entity {} metadata.scene has no base", ent.entity_id)
-                        })?;
-                    base.to_string()
-                }
-            };
-            let tool_dir = manifest_builder
-                .map(|s| s.to_string())
-                .or_else(|| std::env::var("ABGEN_LOD_MANIFEST_BUILDER").ok())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "no ISS descriptor and no manifest-builder dir: pass --manifest-builder DIR or set ABGEN_LOD_MANIFEST_BUILDER to a checkout of {}",
-                        placements::MANIFEST_BUILDER_REPO
-                    )
-                })?;
-            let work_dir = match workdir {
-                Some(w) => w.to_path_buf(),
-                None => {
-                    let home = std::env::var("HOME").context("HOME not set (need --workdir)")?;
-                    PathBuf::from(home).join(".cache/abgen-lod/manifest-builder")
-                }
-            };
-            let Some(manifest_path) = placements::run_manifest_builder(
-                &run_coords,
-                Path::new(&tool_dir),
-                &work_dir,
-                catalyst,
-            )?
-            else {
+        None => match crate::lodgen::scenerun::run_scene_placements(client, ent)? {
+            None => {
                 eprintln!(
-                    "manifest-builder: scene ran to completion but emitted no manifest \
-                     (no CRDT renderer state); treating {} as an empty scene",
+                    "scene-runtime: scene ran to completion but emitted no renderer state; \
+                     treating {} as an empty scene",
                     ent.entity_id
                 );
-                return Ok(Vec::new());
-            };
-            eprintln!("manifest: {}", manifest_path.display());
-            if let Some(name) = manifest_path.file_name().and_then(|n| n.to_str()) {
-                let manifest_scene = name.trim_end_matches(placements::MANIFEST_SUFFIX);
-                if manifest_scene != ent.entity_id {
-                    eprintln!(
-                        "WARNING: manifest scene id {} != resolved entity {} (deployment drift)",
-                        manifest_scene, ent.entity_id
-                    );
-                }
+                Ok(Vec::new())
             }
-            let bytes = std::fs::read(&manifest_path)
-                .with_context(|| format!("read {}", manifest_path.display()))?;
-            let full = placements::parse_lod_manifest_full(&bytes, &ent.content_by_file())?;
-            eprintln!(
-                "source: manifest-builder ({} placements, {} mesh-renderer-only skipped, {} unresolved src)",
-                full.placements.len(),
-                full.skipped_mesh_renderer,
-                full.unresolved_src
-            );
-            Ok(full.placements)
-        }
+            Some(full) => {
+                eprintln!(
+                    "source: embedded-scene-runtime ({} placements, {} mesh-renderer-only skipped, {} unresolved src)",
+                    full.placements.len(),
+                    full.skipped_mesh_renderer,
+                    full.unresolved_src
+                );
+                Ok(full.placements)
+            }
+        },
     }
 }
 
@@ -199,7 +149,6 @@ pub struct GenerateParams {
     pub crop: bool,
     pub catalyst: String,
     pub iss: String,
-    pub manifest_builder: Option<String>,
     pub workdir: Option<PathBuf>,
     pub cache: Option<PathBuf>,
     pub simplifier: simplify::SimplifierBackend,
@@ -225,7 +174,6 @@ impl Default for GenerateParams {
             crop: true,
             catalyst: "https://peer.decentraland.org/content".to_string(),
             iss: "auto".to_string(),
-            manifest_builder: None,
             workdir: None,
             cache: None,
             simplifier: simplify::SimplifierBackend::from_env(),
@@ -471,19 +419,8 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     log.push(format!("base={},{} parcels={parcel_count}", base.0, base.1));
 
     let t_total = std::time::Instant::now();
-    let coords_hint = parse_parcel(&params.scene)
-        .ok()
-        .map(|_| params.scene.clone());
-    let mb_workdir = params.workdir.as_ref().map(|w| w.join("manifest-builder"));
     let t = std::time::Instant::now();
-    let placements = acquire_placements(
-        &ent,
-        coords_hint.as_deref(),
-        &params.iss,
-        params.manifest_builder.as_deref(),
-        mb_workdir.as_deref(),
-        &params.catalyst,
-    )?;
+    let placements = acquire_placements(&client, &ent, &params.iss)?;
     let placements_ms = t.elapsed().as_millis();
     log.push(format!("placements: {}", placements.len()));
 
