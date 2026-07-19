@@ -442,8 +442,6 @@ mod tests {
         ]);
         let want =
             parse_lod_manifest_full(&serde_json::to_vec(&manifest).unwrap(), &content).unwrap();
-        // f64 PartialEq calls -0.0 == 0.0, so compare the serialized bytes the
-        // parity oracle diffs
         let got_json = serde_json::to_string_pretty(&got.placements).unwrap();
         let want_json = serde_json::to_string_pretty(&want.placements).unwrap();
         assert_eq!(got_json, want_json);

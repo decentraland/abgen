@@ -204,11 +204,6 @@ fn extract_textures(path: &str) -> Result<Vec<Tex>, String> {
     Ok(out)
 }
 
-/// Detect Unity's AG-swizzled normal-map packing (DXT5nm convention carried
-/// into BC7): R pinned to ~255 across the image, X riding in a varying alpha,
-/// B a copy of G. Raw-decoded it looks pink; a plain normal map looks blue —
-/// both render identically through UnpackNormalmapRGorAG (X = R×A), so a
-/// packing difference alone must not count as a pixel difference.
 fn ag_swizzled(rgba: &[u8]) -> bool {
     let n = rgba.len() / 4;
     if n == 0 {
@@ -229,9 +224,6 @@ fn ag_swizzled(rgba: &[u8]) -> bool {
     r_hi * 100 >= n * 99 && a_varies * 100 >= n * 50 && bg_close * 100 >= n * 90
 }
 
-/// Re-express a normal map as reconstructed vectors `(X, Y, √(1−X²−Y²), 255)`
-/// regardless of input packing, so two packings of the same normals compare
-/// equal and real normal differences still surface.
 fn unpack_normals(rgba: &[u8], swizzled: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgba.len());
     for p in rgba.chunks_exact(4) {
@@ -245,10 +237,6 @@ fn unpack_normals(rgba: &[u8], swizzled: bool) -> Vec<u8> {
     out
 }
 
-/// Angular deviation between two reconstructed-normal buffers:
-/// `(max_degrees, ppm_of_pixels_tilted_more_than_NORMAL_ANGLE_DEG)`.
-/// Channel deltas overstate normal-map noise perceptually; what matters is
-/// how far normals tilt and over how much area.
 fn normal_angle_stats(a: &[u8], b: &[u8]) -> (f64, f64) {
     let threshold_dot = NORMAL_ANGLE_DEG.to_radians().cos();
     let mut worst_dot = 1.0f64;
@@ -275,11 +263,6 @@ fn normal_angle_stats(a: &[u8], b: &[u8]) -> (f64, f64) {
     (worst_dot.acos().to_degrees(), over as f64 * 1e6 / n as f64)
 }
 
-/// Normal-map imperceptibility, mirroring the render amnesty shape
-/// ("Δ>8 ≤200ppm"): pixels whose normal tilts more than NORMAL_ANGLE_DEG
-/// must cover at most NORMAL_ANGLE_AMNESTY_PPM of the image. BC-encoder
-/// block noise sits well inside this; an actually different normal map
-/// blows past it over broad areas.
 const NORMAL_ANGLE_DEG: f64 = 5.0;
 const NORMAL_ANGLE_AMNESTY_PPM: f64 = 200.0;
 
@@ -485,10 +468,6 @@ fn process(task: &serde_json::Value) -> serde_json::Value {
                         t.name
                     ));
                 } else {
-                    // Normal-map awareness: if either side carries the AG
-                    // swizzle, compare reconstructed normal vectors instead
-                    // of raw channels — the packings render identically, so
-                    // only actual normal differences may count.
                     let (sw_ours, sw_up) = (ag_swizzled(ra), ag_swizzled(rb));
                     let (norm_a, norm_b);
                     let (ra, rb): (&Vec<u8>, &Vec<u8>) = if sw_ours || sw_up {

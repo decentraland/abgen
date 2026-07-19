@@ -323,8 +323,6 @@ pub fn assemble_from(
         bail!("assemble: no placements");
     }
 
-    // A src missing from the content map is unloadable at runtime too, so
-    // production bakes the rest of the scene and the LOD drops that one prop.
     let mut placed: Vec<(usize, &Placement, String)> = Vec::with_capacity(placements.len());
     let mut unresolved: Vec<String> = Vec::new();
     for (i, p) in placements.iter().enumerate() {

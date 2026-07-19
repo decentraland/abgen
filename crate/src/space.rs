@@ -355,10 +355,6 @@ impl Space {
         }
     }
 
-    /// Existence probe via a signed HEAD — no body transfer, unlike `get`.
-    /// 404/403 map to `Ok(false)` (403 covers buckets that deny HEAD on
-    /// missing keys); transport errors stay errors so callers can decide
-    /// whether a failed probe should block or fall through to building.
     pub fn head(&self, key: &str) -> Result<bool> {
         let c = self.creds()?;
         let payload_hash = sha256_hex(b"");

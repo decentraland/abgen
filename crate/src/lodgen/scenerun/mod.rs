@@ -173,8 +173,6 @@ fn run_scene_with(
             .with_context(|| format!("fetch scene bundle {main} for {}", ent.entity_id))?;
         (String::from_utf8_lossy(&bundle).into_owned(), main_crdt)
     } else {
-        // sdk6 scenes run the adaption layer, which loads the scene's own
-        // game.js and assets through Runtime.readFile
         (fetch_sdk6_adaption_layer()?, None)
     };
     let read_content = content.clone();
@@ -284,7 +282,6 @@ module.exports.onUpdate = async function () {
     const SDK6_GOLDEN_ENTITY: &str = "QmVDhg6mQyBBnyk36N6YWHH8dbLYM8kpUaH2VxmwZKFj6T";
     const SDK6_GOLDEN_PLACEMENTS: &str =
         include_str!("../testdata/golden_sdk6_100_100.placements.json");
-    // the capture base GOLDENS.md records
     const GOLDEN_CATALYST: &str = "https://peer.decentraland.org/content";
 
     fn golden_scene(
@@ -427,7 +424,6 @@ module.exports.onUpdate = async function () {
                     limits: EngineLimits::default(),
                 }
             };
-            // priming run: fills the content cache so timed runs stay off the network
             QuickJsEngine.run_capture(make_job()).unwrap();
             let engines: Vec<(&'static str, Box<dyn SceneEngine>)> = vec![
                 ("quickjs", Box::new(QuickJsEngine)),

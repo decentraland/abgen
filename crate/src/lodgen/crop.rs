@@ -27,8 +27,6 @@ impl CropReport {
     }
 }
 
-// Exact parcel rect, no slack: production crops geometry to the parcel line;
-// the +/-0.05 m margin belongs only to the _PlaneClipping shader vector.
 pub fn crop_rect_rh(base: (i32, i32), parcels: &[(i32, i32)]) -> [f64; 4] {
     let min_x = parcels.iter().map(|p| p.0).min().unwrap_or(0) as f64 * 16.0;
     let max_x = parcels.iter().map(|p| p.0 + 1).max().unwrap_or(1) as f64 * 16.0;

@@ -94,9 +94,6 @@ pub(super) fn build_lod_material_tree(
         lod_tex_env("_SpecGlossMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
     ];
 
-    // Transparent-class state is pinned to production's FORCED_TRANSPARENT bake,
-    // byte-verified on every reference LOD1: depth-writing transparency
-    // (_ZWrite 1), _DstBlendAlpha 0, base alpha forced to 0.8, no RenderType tag.
     let alpha_clip = if masked { 1.0 } else { 0.0 };
     let alpha_to_mask = if masked { 1.0 } else { 0.0 };
     let cutoff = if masked { m.alpha_cutoff } else { 0.5 };

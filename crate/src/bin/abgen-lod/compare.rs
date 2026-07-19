@@ -244,9 +244,6 @@ fn approx4(a: &Option<[f64; 4]>, b: &Option<[f64; 4]>) -> bool {
     }
 }
 
-// Pre-2024-04-29 references ship integer +/-4 _PlaneClipping margins where the
-// modern lane (and ours) uses +/-0.05; inert in prod since geometry is cropped
-// to the exact rect, so a matching core rect is accepted as a vintage artifact.
 fn plane_margin_vintage(ours: &Option<[f64; 4]>, prod: &Option<[f64; 4]>) -> bool {
     let strip = |p: &[f64; 4], m: f64| [p[0] + m, p[1] - m, p[2] + m, p[3] - m];
     match (ours, prod) {

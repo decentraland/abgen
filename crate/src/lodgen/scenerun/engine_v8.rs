@@ -11,8 +11,6 @@ pub struct V8Engine;
 
 impl SceneEngine for V8Engine {
     fn run_capture(&self, job: SceneJob) -> Result<CaptureOutcome> {
-        // per-run isolate on its own thread; v8 stack depth is bounded by the
-        // thread stack (no per-isolate stack knob like quickjs)
         let worker = std::thread::Builder::new()
             .name("abgen-scenerun-v8".into())
             .stack_size(SCENE_THREAD_STACK)
@@ -70,7 +68,6 @@ extern "C" fn near_heap_limit_cb(
         let wd = unsafe { &*(data as *const Watchdog) };
         wd.terminate(&wd.oom);
     }
-    // headroom so v8 unwinds through the termination instead of aborting
     current_heap_limit + 32 * 1024 * 1024
 }
 
@@ -345,9 +342,6 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    // any behavioral divergence (clock values, dt, readFile bytes, immediate
-    // ordering) is folded into the stream as a gltf src string, so a byte
-    // compare of the streams catches it
     fn parity_scene() -> String {
         format!(
             "{SCENE_HELPERS}

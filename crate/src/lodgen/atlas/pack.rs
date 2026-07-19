@@ -115,8 +115,6 @@ fn pot_ceil(v: u32, lo: u32, hi: u32) -> u32 {
     c.min(hi)
 }
 
-// Production pins every atlas in a bundle to one fixed per-level budget
-// (uniform slice dims are required by the client's shared texture array).
 pub(super) fn canvas_size(mode: AtlasMode, budget: u32, content_extent: u32) -> u32 {
     match mode {
         AtlasMode::Adaptive => pot_ceil(content_extent, NATIVE_MIN_CANVAS, budget),

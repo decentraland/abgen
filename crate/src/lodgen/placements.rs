@@ -240,8 +240,6 @@ pub(crate) fn placements_from_components(
             glb_hash,
             glb_file: Some(src),
             position: world.position,
-            // JSON.stringify(-0) is "0", so the npm-manifest lane can never
-            // carry -0.0; normalize ours for byte parity
             rotation: world.rotation.map(|v| if v == 0.0 { 0.0 } else { v }),
             scale: world.scale,
         });

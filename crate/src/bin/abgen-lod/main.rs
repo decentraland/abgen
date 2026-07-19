@@ -157,8 +157,6 @@ generate: the full sync chain: resolve scene -> placements (iss|embedded
 }
 
 fn main() {
-    // scene-runtime failures are tracing::warn!; without a subscriber a
-    // failed scene eval ships a half-booted capture in silence
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

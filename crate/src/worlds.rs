@@ -228,10 +228,6 @@ pub fn fetch_scene_into_store(
                 .collect()
         })
         .unwrap_or_default();
-    // Progress heartbeat: large scenes (1000+ content files) otherwise sit
-    // silent for minutes and look hung. Prints at most every 2s, and only
-    // while downloads are actually happening — fully-cached entities stay
-    // quiet.
     let t0 = std::time::Instant::now();
     let total = hashes.len();
     let done = std::sync::atomic::AtomicUsize::new(0);
