@@ -1,7 +1,6 @@
 use super::*;
 use std::arch::wasm32::*;
 
-
 fn gather4(src: &[f32; 16], idxs: &[i32; 16], base: usize, cnt: usize) -> v128 {
     let mut a = [0f32; 4];
     for k in 0..cnt {
