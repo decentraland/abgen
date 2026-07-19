@@ -47,6 +47,11 @@
 
         packages.default = abgenPkg;
 
+        packages.abgen-corpus = abgenPkg.overrideAttrs (old: {
+          pname = "abgen-corpus";
+          cargoBuildFlags = [ "--bin" "abgen-corpus" ];
+        });
+
         packages.dockerImage =
           let
             runtimeData = pkgs.runCommand "abgen-runtime" { } ''
