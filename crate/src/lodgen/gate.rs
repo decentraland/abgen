@@ -210,7 +210,6 @@ pub fn self_gate_bundle_with(
         got_root == want_root,
         format!("got {got_root:?} want {want_root:?}"),
     );
-    // The client places the root at base*16; a baked offset would double it.
     push_check(
         &mut checks,
         "root-position",
@@ -241,8 +240,6 @@ pub fn self_gate_bundle_with(
             format!("({fid}, {pid})"),
         );
     }
-    // an unreferenced material drags its texture into the preload table:
-    // dead download + resident memory on every client
     let orphan_mats: Vec<&String> = materials
         .iter()
         .filter(|(_, _, _, pid)| !renderer_mat_pids.contains(pid))
@@ -297,7 +294,6 @@ pub fn self_gate_bundle_with(
             format!("fmt={fmt} {w}x{h} mips={mips} budget={atlas_budget:?}"),
         );
     }
-    // production ships one uniform atlas size per bundle (shared texture-array slots)
     let tex_sizes: std::collections::BTreeSet<(i64, i64)> =
         textures.iter().map(|(_, _, w, h, _)| (*w, *h)).collect();
     push_check(

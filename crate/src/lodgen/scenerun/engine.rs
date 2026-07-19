@@ -15,7 +15,6 @@ pub struct QuickJsEngine;
 
 impl SceneEngine for QuickJsEngine {
     fn run_capture(&self, job: SceneJob) -> Result<CaptureOutcome> {
-        // scene JS recursion must not ride the caller's (possibly small) stack
         let worker = std::thread::Builder::new()
             .name("abgen-scenerun".into())
             .stack_size(SCENE_THREAD_STACK)
@@ -135,7 +134,6 @@ fn install_host<'js>(
     capture: Rc<RefCell<CaptureOutcome>>,
 ) -> rquickjs::Result<()> {
     let parts = initial_state_parts(main_crdt.as_deref());
-    // upstream hands Uint8Arrays here; the sdk6 adaption layer reads part.buffer
     let get_state = Function::new(
         ctx.clone(),
         move |c: Ctx<'js>| -> rquickjs::Result<Array<'js>> {
@@ -386,8 +384,6 @@ module.exports.onUpdate = async function (_dt) {{
         assert!(outcome.stream.is_empty());
     }
 
-    // UMD libs sniff CommonJS via `typeof module`; a module/exports global
-    // makes them skip define() and silently half-boot SDK6 scenes
     #[test]
     fn scene_scope_hides_commonjs_globals() {
         let code = format!(

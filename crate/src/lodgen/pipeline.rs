@@ -425,8 +425,6 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     let placements = acquire_placements(&client, &ent, &params.iss)?;
     let placements_ms = t.elapsed().as_millis();
     log.push(format!("placements: {}", placements.len()));
-    // every-scale-zero means a half-booted scene, not a real layout; refuse
-    // rather than ship a bundle whose vertices all collapse to the origin
     if !placements.is_empty() && placements.iter().all(|p| p.scale.iter().all(|s| *s == 0.0)) {
         bail!(
             "scene {} produced {} placements, all scaled to zero; refusing to emit an invisible bundle",

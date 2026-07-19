@@ -1,10 +1,6 @@
 use super::*;
 use std::arch::wasm32::*;
 
-// Bit-exactness with the scalar estimator is by construction (same op
-// association, same pixel-order accumulation) and proven at runtime:
-// qualified() compares both paths on a deterministic probe set and any
-// mismatch permanently disqualifies the simd128 lane back to scalar.
 
 fn gather4(src: &[f32; 16], idxs: &[i32; 16], base: usize, cnt: usize) -> v128 {
     let mut a = [0f32; 4];

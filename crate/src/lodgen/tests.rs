@@ -341,7 +341,6 @@ fn empty_scene_bundle_passes_empty_gate_and_fails_content_gate() {
     for c in &checks {
         assert!(c.ok, "unexpected FAIL {}: {}", c.label, c.detail);
     }
-    // Nonzero base (55,-76): the bundled root must still sit at the origin.
     assert!(
         checks.iter().any(|c| c.label == "root-position" && c.ok),
         "root-position gate missing"

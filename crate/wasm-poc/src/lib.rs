@@ -92,8 +92,6 @@ fn parse_input(buf: &[u8]) -> Option<Input> {
     let magenta = *buf.get(off)? != 0;
     let lod = buf.get(off + 1).copied().unwrap_or(0) != 0;
     let mode = buf.get(off + 2).copied().unwrap_or(0);
-    // v2 tail: [mode][crop][tri_cap u32] then hash/only/table chunks; every
-    // field defaults so a v1 blob parses identically.
     let crop = buf.get(off + 3).copied().unwrap_or(0) != 0;
     off = (off + 4).min(buf.len());
     let tri_cap = read_u32(buf, &mut off).unwrap_or(0);
@@ -478,9 +476,6 @@ fn scan(input: Input) -> abgen::Result<()> {
                 "skins": scene.skins.len(),
             }));
         }
-        // parse_gltf_dep_refs is the same uri source deps_digest_for_glb and the
-        // build-time resolvers read, so this dep list is exactly the byte surface
-        // a per-file convert job needs shipped alongside the glb.
         let mut deps: Vec<String> = naming::parse_gltf_dep_refs(data, &ext)
             .map(|uris| {
                 uris.iter()
@@ -767,10 +762,6 @@ fn bake_lod(job: &LodJob) -> abgen::Result<()> {
         "images": atlased.images.len(),
     }));
 
-    // Over-cap decimation re-parses the emitted atlas GLB so the model fed to
-    // the simplifier matches the native CLI chain (atlas file -> simplify file)
-    // bit-for-bit; at or under the cap the native lane byte-copies, so the
-    // atlas model bundles directly.
     let final_model = if job.tri_cap > 0 && atlased.total_tris() as u64 > job.tri_cap as u64 {
         let pre = lodgen::emit::emit_glb(&atlased)?;
         let reparsed = lmodel::from_glb_bytes(&pre, &root_name)?;

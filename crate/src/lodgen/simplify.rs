@@ -197,9 +197,6 @@ pub fn resolve_gltfpack(flag: Option<&Path>) -> Result<PathBuf> {
     resolve_from(flag, env.as_deref(), path_var.as_deref())
 }
 
-// no -sp: permissive simplification prunes whole small components, deleting
-// salient geometry (tree canopies, alpha-class foliage) the production
-// reference preserves at the same triangle budget
 fn simplify_args(ratio: f64, aggressive: bool, error_limit: Option<f64>) -> Vec<String> {
     let mut args = vec!["-si".to_string(), format!("{ratio}")];
     if let Some(e) = error_limit {
@@ -315,9 +312,6 @@ fn merge_class(out_model: &mut LodModel, source: &LodModel, mat_idx: usize, geom
     }
 }
 
-// gltfpack's per-mesh ratio target can delete an entire material class made of
-// small scattered pieces (foliage cards); production always keeps every class,
-// so re-run vanished classes alone with a tightened error limit and merge back
 fn rescue_lost_classes(
     input: &Path,
     output: &Path,
@@ -610,8 +604,6 @@ mod tests {
         .unwrap()
     }
 
-    // a thin tall landmark with per-segment uv islands, the shape class the
-    // pre-fix flags flattened; pins that a 10x ratio never costs the skyline
     fn append_spire(prim: &mut LodPrimitive, cx: f32, cz: f32, top: f32, segments: u32) {
         let w = 0.1f32;
         for (dx, dz) in [(w, 0.0), (0.0, w)] {
