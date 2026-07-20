@@ -301,6 +301,7 @@ fn synthetic_glb() -> Vec<u8> {
 
 #[test]
 fn empty_scene_bundle_passes_empty_gate_and_fails_content_gate() {
+    // Templates live at the repo root (one level above the crate).
     std::env::set_var(
         "ABGEN_ROOT",
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -388,6 +389,7 @@ fn first_target_platform(data: &[u8]) -> i32 {
 
 #[test]
 fn multi_platform_bundles_union_manifest_and_target_platform_gate() {
+    // Templates live at the repo root (one level above the crate).
     std::env::set_var(
         "ABGEN_ROOT",
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -524,6 +526,7 @@ fn multi_platform_bundles_union_manifest_and_target_platform_gate() {
 
 #[test]
 fn multi_level_sources_build_both_levels_from_one_bake() {
+    // Templates live at the repo root (one level above the crate).
     std::env::set_var(
         "ABGEN_ROOT",
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -601,6 +604,7 @@ fn multi_level_sources_build_both_levels_from_one_bake() {
 
 #[test]
 fn self_gate_passes_on_synthetic_lod_bundle_and_catches_mismatches() {
+    // Templates live at the repo root (one level above the crate).
     std::env::set_var(
         "ABGEN_ROOT",
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
