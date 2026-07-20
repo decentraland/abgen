@@ -50,7 +50,12 @@ USAGE:
 
 bundle: stages <src.glb> as {entityIdLower}_{level}.glb and builds
   {out}/{entityIdLower}/LOD/{level}/{entityIdLower}_{level}_{platform} (+.br).
-  Scene base/parcels come from the catalyst entity unless --base/--parcels override.
+  Scene base/parcels are resolved the way the upstream converter does, unless
+  --base/--parcels override: POST /entities/active on catalyst-style hosts
+  (a stale/redeployed entity id does NOT resolve), GET /contents/{id} when
+  the host is a worlds-content-server. An unresolvable entity is a warning,
+  not an error: the bundle is built with zeroed plane/vertical clipping and
+  a zero root position, matching the upstream Unity LOD converter.
 compare: parses both bundles and prints PASS/FAIL per structural check; exits 1 on FAIL.
 placements: resolves the scene, then prints its GLB placement list as JSON.
   --iss auto (default) tries the production InitialSceneState descriptor first
@@ -212,10 +217,8 @@ fn parse_parcels(s: &str) -> Result<Vec<(i32, i32)>> {
 type EntityGeometry = ((i32, i32), Vec<(i32, i32)>);
 
 fn entity_geometry(client: &CatalystClient, entity_id: &str) -> Result<EntityGeometry> {
-    let ent = client
-        .fetch_entity(entity_id)
-        .with_context(|| format!("fetch entity {entity_id}"))?;
-    abgen::lodgen::scene_geometry(&ent)
+    lods::resolve_scene_geometry(client, entity_id)
+        .with_context(|| format!("resolve scene entity {entity_id}"))
 }
 
 fn cmd_bundle(argv: &[String]) -> Result<i32> {
@@ -294,7 +297,18 @@ fn cmd_bundle(argv: &[String]) -> Result<i32> {
     let client = CatalystClient::from_args(&catalyst, None);
     let (base_parcel, parcel_list) = match (&base, &parcels) {
         (Some(b), Some(p)) => (parse_parcel(b)?, parse_parcels(p)?),
-        (None, None) => entity_geometry(&client, &entity)?,
+        // Upstream converter behavior: an unresolvable scene entity is a
+        // warning, not an error — the bundle is built with zeroed clipping.
+        (None, None) => match entity_geometry(&client, &entity) {
+            Ok(geometry) => geometry,
+            Err(e) => {
+                eprintln!(
+                    "WARN: could not resolve scene entity {sid}: {e:#}; \
+                     converting with zeroed clipping (upstream converter behavior)"
+                );
+                ((0, 0), Vec::new())
+            }
+        },
         _ => bail!("--base and --parcels must be given together"),
     };
     println!(

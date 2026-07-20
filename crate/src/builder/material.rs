@@ -36,8 +36,13 @@ pub(super) fn build_lod_material_tree(
     t.insert("m_Name", name);
     t.insert("m_Shader", shader.clone());
 
-    let masked = m.alpha_mode == "MASK";
-    let transparent = m.alpha_mode == "BLEND";
+    // The upstream LOD converter keys the surface mode off the material NAME
+    // the LOD baker emits (`-transparent` = alpha-blend, `-cutout` =
+    // alpha-clip), not the glTF alphaMode; its transparent branch is checked
+    // first, so a name carrying both suffixes counts as transparent.
+    let lname = name.to_lowercase();
+    let transparent = lname.contains("-transparent");
+    let masked = !transparent && lname.contains("-cutout");
 
     let valid: Vec<Value> = if masked {
         vec![
@@ -96,14 +101,30 @@ pub(super) fn build_lod_material_tree(
 
     let alpha_clip = if masked { 1.0 } else { 0.0 };
     let alpha_to_mask = if masked { 1.0 } else { 0.0 };
-    let cutoff = if masked { m.alpha_cutoff } else { 0.5 };
+    // Upstream hard-codes _Cutoff 0.5 in its cutout branch; the glTF
+    // alphaCutoff is never consulted.
+    let cutoff = 0.5;
     let dst_blend = if transparent { 10.0 } else { 0.0 };
     let surface = if masked || transparent { 1.0 } else { 0.0 };
-    let floats: Vec<(&str, f64)> = vec![
+    let zwrite = if transparent { 0.0 } else { 1.0 };
+    // The suffix branches upstream also SetFloat a few HDRP-named properties
+    // Scene_TexArray does not declare; Unity still serializes them into the
+    // material sheet, so parity means emitting them for those classes only.
+    let mut floats: Vec<(&str, f64)> = vec![
         ("_AddPrecomputedVelocity", 0.0),
         ("_AlphaClip", alpha_clip),
-        ("_AlphaToMask", alpha_to_mask),
-        ("_Blend", 0.0),
+    ];
+    if masked || transparent {
+        floats.push(("_AlphaCutoffEnable", if masked { 1.0 } else { 0.0 }));
+        floats.push(("_AlphaDstBlend", dst_blend));
+        floats.push(("_AlphaSrcBlend", 1.0));
+    }
+    floats.push(("_AlphaToMask", alpha_to_mask));
+    floats.push(("_Blend", 0.0));
+    if masked || transparent {
+        floats.push(("_BlendMode", 0.0));
+    }
+    floats.extend([
         ("_BlendModePreserveSpecular", 1.0),
         ("_BumpScale", 1.0),
         ("_ClearCoatMask", 0.0),
@@ -133,16 +154,20 @@ pub(super) fn build_lod_material_tree(
         ("_UVSec", 0.0),
         ("_WorkflowMode", 1.0),
         ("_XRMotionVectorsPass", 1.0),
-        ("_ZWrite", 1.0),
-    ];
+    ]);
+    if transparent {
+        floats.push(("_ZTestDepthEqualForOpaque", 4.0));
+    }
+    floats.push(("_ZWrite", zwrite));
     let floats_v: Vec<Value> = floats.into_iter().map(|(n, v)| arr![n, v]).collect();
 
-    let mut base_color = materials::base_color_verbatim(m.base_color);
+    // Upstream forces alpha 0.8 on transparent materials (mat.color write).
+    let mut lod_base_color = materials::base_color_verbatim(m.base_color);
     if transparent {
-        base_color[3] = 0.8_f32 as f64;
+        lod_base_color[3] = 0.8;
     }
     let colors: Vec<Value> = vec![
-        lod_color("_BaseColor", base_color),
+        lod_color("_BaseColor", lod_base_color),
         lod_color("_Color", [1.0, 1.0, 1.0, 1.0]),
         lod_color("_EmissionColor", [0.0, 0.0, 0.0, 1.0]),
         lod_color("_PlaneClipping", lod.plane_clipping),

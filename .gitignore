@@ -23,6 +23,7 @@ crate/third_party/**/build/
 /abgen-compare.json
 
 # Runtime caches / output / env
+/lod-parity
 /abgen-serve-cache
 /data
 /runs

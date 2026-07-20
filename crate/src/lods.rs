@@ -28,6 +28,11 @@ pub struct LodOptions {
 
     pub keep_forward_plus: bool,
 
+    /// Explicit scene geometry override applied to every source. `None` makes
+    /// `convert_lods*` resolve each source's scene entity (the `{sceneId}` in
+    /// the `{sceneId}_{level}` filename) from the content server, falling back
+    /// to zeroed clipping with a warning when the entity cannot be resolved —
+    /// the same behavior as the upstream Unity LOD converter.
     pub lod: Option<LodGenMeta>,
 }
 
@@ -43,6 +48,11 @@ impl Default for LodOptions {
 }
 
 pub fn plane_clipping(parcels: &[(i32, i32)]) -> [f64; 4] {
+    // Empty parcels = "scene entity could not be resolved": the upstream
+    // converter zeroes the clipping planes in that state rather than failing.
+    if parcels.is_empty() {
+        return [0.0; 4];
+    }
     let min_x = parcels.iter().map(|p| p.0).min().unwrap_or(0);
     let max_x = parcels.iter().map(|p| p.0).max().unwrap_or(0);
     let min_y = parcels.iter().map(|p| p.1).min().unwrap_or(0);
@@ -200,6 +210,60 @@ fn prepare_lod_source(client: &CatalystClient, locator: &str) -> Result<(String,
     Ok((sid, level, glb))
 }
 
+/// Hostname discriminator the upstream converter uses to pick the entity
+/// API shape; a URL that fails to parse counts as catalyst-style, like there.
+#[cfg(not(target_arch = "wasm32"))]
+fn is_worlds_host(base_url: &str) -> bool {
+    let rest = base_url.split("://").nth(1).unwrap_or(base_url);
+    let host = rest.split(['/', ':']).next().unwrap_or("");
+    host.to_ascii_lowercase()
+        .starts_with("worlds-content-server")
+}
+
+/// Resolve base/parcels for a LOD scene id exactly the way the upstream
+/// converter does: `POST /entities/active` on catalyst-style hosts (so a
+/// stale/redeployed entity id does NOT resolve), `GET /contents/{id}` on
+/// worlds-content-server hosts (which have no active-entities route).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn resolve_scene_geometry(
+    client: &CatalystClient,
+    sid: &str,
+) -> Result<((i32, i32), Vec<(i32, i32)>)> {
+    let ent = if is_worlds_host(client.base_url()) {
+        client.fetch_entity(sid)?
+    } else {
+        client.fetch_active_entity_by_id(sid)?
+    };
+    crate::lodgen::scene_geometry(&ent)
+}
+
+/// Resolve a LOD source's scene geometry, mirroring the upstream Unity
+/// converter: when the entity cannot be resolved the conversion proceeds
+/// with zeroed clipping and a warning instead of failing.
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_scene_meta(client: &CatalystClient, sid: &str) -> LodGenMeta {
+    match resolve_scene_geometry(client, sid) {
+        Ok((base, parcels)) => LodGenMeta {
+            parcels,
+            base,
+            timestamp: None,
+            vertical_override: None,
+        },
+        Err(e) => {
+            eprintln!(
+                "WARN: could not resolve scene entity {sid}: {e:#}; \
+                 converting with zeroed clipping (upstream converter behavior)"
+            );
+            LodGenMeta {
+                parcels: Vec::new(),
+                base: (0, 0),
+                timestamp: None,
+                vertical_override: None,
+            }
+        }
+    }
+}
+
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn build_lod_bundle(
     glb: &[u8],
@@ -208,24 +272,26 @@ fn build_lod_bundle(
     level: u32,
     platform: &str,
     opts: &LodOptions,
+    meta: &LodGenMeta,
 ) -> Result<(LodResult, Vec<u8>)> {
     let bundle_name = lod_bundle_name(sid, level, platform);
 
     let root_hash = format!("{}_{}", sid, level);
-    let lod_params: Option<LodBuildParams> = opts.lod.as_ref().map(|m| LodBuildParams {
+    let lod_params = LodBuildParams {
         level,
-        plane_clipping: plane_clipping(&m.parcels),
-        vertical_clipping: match m.vertical_override {
+        plane_clipping: plane_clipping(&meta.parcels),
+        vertical_clipping: match meta.vertical_override {
             Some(h) => [0.0, h, 0.0, 0.0],
-            None => vertical_clipping(m.parcels.len()),
+            None => vertical_clipping(meta.parcels.len()),
         },
+        root_position: root_position(meta.base),
         main_asset: lod_main_asset(sid, level),
-        timestamp: m.timestamp,
-    });
+        timestamp: meta.timestamp,
+    };
     let build_opts = BuildOpts {
         keep_forward_plus: opts.keep_forward_plus,
         source_file: Some(locator),
-        lod: lod_params.as_ref(),
+        lod: Some(&lod_params),
         ..Default::default()
     };
     let data = build_bundle(glb, &bundle_name, &root_hash, &build_opts)
@@ -279,12 +345,20 @@ pub fn convert_lods_platforms(
 
     let mut written: BTreeMap<String, (String, Vec<u8>)> = BTreeMap::new();
     let mut scene_id: Option<String> = None;
+    let mut meta_cache: BTreeMap<String, LodGenMeta> = BTreeMap::new();
 
     for locator in sources {
         match prepare_lod_source(client, locator) {
             Ok((sid, level, glb)) => {
+                let meta = match &opts.lod {
+                    Some(m) => m.clone(),
+                    None => meta_cache
+                        .entry(sid.clone())
+                        .or_insert_with(|| resolve_scene_meta(client, &sid))
+                        .clone(),
+                };
                 for platform in &platform_list {
-                    match build_lod_bundle(&glb, locator, &sid, level, platform, opts) {
+                    match build_lod_bundle(&glb, locator, &sid, level, platform, opts, &meta) {
                         Ok((r, data)) => {
                             scene_id.get_or_insert_with(|| r.scene_id.clone());
                             written.insert(r.bundle_name.clone(), (r.rel_path.clone(), data));
@@ -398,6 +472,16 @@ fn write_lod_manifest(entity_dir: &Path, conv: &LodConversion, ab_version: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unresolved_scene_zeroes_clipping_like_upstream() {
+        // Empty parcels is the "scene entity could not be resolved" state:
+        // the upstream converter converts anyway with zeroed clipping planes,
+        // zero scene height, and the prefab left at the origin.
+        assert_eq!(plane_clipping(&[]), [0.0; 4]);
+        assert_eq!(vertical_clipping(0), [0.0; 4]);
+        assert_eq!(root_position((0, 0)), [0.0; 3]);
+    }
 
     #[test]
     fn parses_lod_filenames() {

@@ -803,88 +803,152 @@ fn build_bundle_multi_pair_standalone_texture_matches_singles() {
     }
 }
 
-fn lod_material(alpha_mode: &str) -> Value {
-    let m = crate::scene::Material {
-        alpha_mode: alpha_mode.into(),
-        base_color: [0.25, 0.5, 0.75, 1.0],
+fn lod_test_material(name: &str) -> crate::scene::Material {
+    crate::scene::Material {
+        name: name.to_string(),
+        base_color: [0.2, 0.4, 0.6, 1.0],
         ..Default::default()
-    };
+    }
+}
+
+fn lod_test_tree(m: &crate::scene::Material) -> Value {
     let lod = LodBuildParams {
         level: 1,
-        plane_clipping: [0.0; 4],
-        vertical_clipping: [0.0; 4],
-        main_asset: String::new(),
+        plane_clipping: [1.0, 2.0, 3.0, 4.0],
+        vertical_clipping: [0.0, 5.0, 0.0, 0.0],
+        root_position: [0.0, 0.0, 0.0],
+        main_asset: "scene_1.prefab".to_string(),
         timestamp: None,
     };
-    build_lod_material_tree(
-        &Value::map(),
-        &m,
-        "mat",
-        &Value::map(),
-        &std::collections::HashMap::new(),
+    super::material::build_lod_material_tree(
+        &map! {},
+        m,
+        &m.name,
+        &super::material::shader_pptr(),
+        &HashMap::new(),
         &lod,
     )
 }
 
-fn lod_saved_float(t: &Value, name: &str) -> f64 {
-    t.get("m_SavedProperties")
-        .and_then(|p| p.get("m_Floats"))
-        .and_then(|f| f.as_array())
-        .and_then(|entries| {
-            entries.iter().find_map(|e| {
-                let pair = e.as_array()?;
-                (pair.first()?.as_str()? == name).then(|| pair.get(1)?.as_f64())?
-            })
+fn lod_mat_float(tree: &Value, name: &str) -> Option<f64> {
+    let floats = tree
+        .get("m_SavedProperties")?
+        .get("m_Floats")?
+        .as_array()?;
+    for e in floats {
+        let pair = e.as_array()?;
+        if let Value::Str(n) = &pair[0] {
+            if n == name {
+                return pair[1].as_f64();
+            }
+        }
+    }
+    None
+}
+
+fn lod_mat_keywords(tree: &Value) -> Vec<String> {
+    tree.get("m_ValidKeywords")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|k| match k {
+                    Value::Str(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect()
         })
-        .unwrap_or(f64::NAN)
+        .unwrap_or_default()
+}
+
+fn lod_mat_base_color_alpha(tree: &Value) -> Option<f64> {
+    let colors = tree
+        .get("m_SavedProperties")?
+        .get("m_Colors")?
+        .as_array()?;
+    for e in colors {
+        let pair = e.as_array()?;
+        if let Value::Str(n) = &pair[0] {
+            if n == "_BaseColor" {
+                return pair[1].get("a").and_then(|v| v.as_f64());
+            }
+        }
+    }
+    None
 }
 
 #[test]
-fn lod_transparent_material_pins_forced_transparent_state() {
-    let t = lod_material("BLEND");
-    assert_eq!(lod_saved_float(&t, "_ZWrite"), 1.0);
-    assert_eq!(lod_saved_float(&t, "_DstBlendAlpha"), 0.0);
-    assert_eq!(lod_saved_float(&t, "_DstBlend"), 10.0);
-    assert_eq!(lod_saved_float(&t, "_SrcBlend"), 1.0);
-    let base = t
-        .get("m_SavedProperties")
-        .and_then(|p| p.get("m_Colors"))
-        .and_then(|c| c.as_array())
-        .and_then(|entries| {
-            entries.iter().find_map(|e| {
-                let pair = e.as_array()?;
-                (pair.first()?.as_str()? == "_BaseColor").then(|| pair.get(1).cloned())?
-            })
-        })
-        .expect("_BaseColor present");
-    let ch = |k: &str| base.get(k).and_then(|v| v.as_f64()).unwrap();
+fn lod_material_class_comes_from_name_suffix_like_upstream() {
+    // Opaque: no suffix — even with a BLEND alphaMode, upstream ignores it.
+    let mut m = lod_test_material("TextureBakeResult-mat");
+    m.alpha_mode = "BLEND".to_string();
+    let t = lod_test_tree(&m);
+    assert!(lod_mat_keywords(&t).is_empty());
+    assert_eq!(t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()), Some(-1.0));
+    assert_eq!(lod_mat_float(&t, "_Surface"), Some(0.0));
+    assert_eq!(lod_mat_float(&t, "_ZWrite"), Some(1.0));
+    assert_eq!(lod_mat_float(&t, "_AlphaCutoffEnable"), None);
+    assert_eq!(lod_mat_float(&t, "_BlendMode"), None);
+    assert_eq!(lod_mat_float(&t, "_ZTestDepthEqualForOpaque"), None);
+    assert_eq!(lod_mat_base_color_alpha(&t), Some(1.0));
+
+    // Cutout by name suffix; upstream hard-codes _Cutoff 0.5.
+    let mut m = lod_test_material("TextureBakeResult-mat-cutout");
+    m.alpha_cutoff = 0.7;
+    let t = lod_test_tree(&m);
     assert_eq!(
-        [ch("r"), ch("g"), ch("b"), ch("a")],
-        [0.25, 0.5, 0.75, 0.8_f32 as f64]
+        lod_mat_keywords(&t),
+        vec!["_ALPHATEST_ON".to_string(), "_SURFACE_TYPE_TRANSPARENT".to_string()]
     );
-    let tags = t.get("stringTagMap").and_then(|v| v.as_array()).unwrap();
-    assert!(
-        tags.is_empty(),
-        "prod ships no RenderType tag on FORCED_TRANSPARENT"
+    assert_eq!(t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()), Some(2450.0));
+    assert_eq!(lod_mat_float(&t, "_AlphaClip"), Some(1.0));
+    assert_eq!(lod_mat_float(&t, "_AlphaCutoffEnable"), Some(1.0));
+    assert_eq!(lod_mat_float(&t, "_AlphaDstBlend"), Some(0.0));
+    assert_eq!(lod_mat_float(&t, "_AlphaSrcBlend"), Some(1.0));
+    assert_eq!(lod_mat_float(&t, "_BlendMode"), Some(0.0));
+    assert_eq!(lod_mat_float(&t, "_Cutoff"), Some(0.5));
+    assert_eq!(lod_mat_float(&t, "_ZWrite"), Some(1.0));
+    assert_eq!(lod_mat_float(&t, "_ZTestDepthEqualForOpaque"), None);
+    assert_eq!(lod_mat_base_color_alpha(&t), Some(1.0));
+
+    // Transparent by name suffix; upstream forces base-color alpha 0.8.
+    let t = lod_test_tree(&lod_test_material("TextureBakeResult-mat-transparent"));
+    assert_eq!(
+        lod_mat_keywords(&t),
+        vec!["_ALPHAPREMULTIPLY_ON".to_string(), "_SURFACE_TYPE_TRANSPARENT".to_string()]
     );
-}
+    assert_eq!(t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()), Some(3000.0));
+    assert_eq!(lod_mat_float(&t, "_AlphaCutoffEnable"), Some(0.0));
+    assert_eq!(lod_mat_float(&t, "_AlphaDstBlend"), Some(10.0));
+    assert_eq!(lod_mat_float(&t, "_BlendMode"), Some(0.0));
+    assert_eq!(lod_mat_float(&t, "_ZTestDepthEqualForOpaque"), Some(4.0));
+    assert_eq!(lod_mat_float(&t, "_ZWrite"), Some(0.0));
+    assert_eq!(lod_mat_base_color_alpha(&t), Some(0.8));
 
-#[test]
-fn lod_opaque_and_cutout_materials_keep_their_state() {
-    let t = lod_material("OPAQUE");
-    assert_eq!(lod_saved_float(&t, "_ZWrite"), 1.0);
-    assert_eq!(lod_saved_float(&t, "_DstBlend"), 0.0);
-    assert_eq!(lod_saved_float(&t, "_DstBlendAlpha"), 0.0);
-    assert!(t
-        .get("stringTagMap")
-        .unwrap()
-        .as_array()
-        .unwrap()
-        .is_empty());
+    // Upstream checks -transparent first: both suffixes = transparent.
+    let t = lod_test_tree(&lod_test_material("weird-transparent-cutout"));
+    assert_eq!(t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()), Some(3000.0));
 
-    let t = lod_material("MASK");
-    assert_eq!(lod_saved_float(&t, "_ZWrite"), 1.0);
-    assert_eq!(lod_saved_float(&t, "_AlphaClip"), 1.0);
-    let tags = t.get("stringTagMap").and_then(|v| v.as_array()).unwrap();
-    assert_eq!(tags.len(), 1);
+    // Suffix match is case-insensitive (OrdinalIgnoreCase upstream).
+    let t = lod_test_tree(&lod_test_material("Foliage-CUTOUT"));
+    assert_eq!(t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()), Some(2450.0));
+
+    // m_Floats must stay sorted by property name (Unity serializes the sheet
+    // sorted; the conditional inserts must not break the order).
+    let t = lod_test_tree(&lod_test_material("TextureBakeResult-mat-transparent"));
+    let floats = t
+        .get("m_SavedProperties")
+        .and_then(|v| v.get("m_Floats"))
+        .and_then(|v| v.as_array())
+        .unwrap();
+    let names: Vec<&str> = floats
+        .iter()
+        .filter_map(|e| e.as_array())
+        .filter_map(|pair| match &pair[0] {
+            Value::Str(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "m_Floats not alphabetically ordered");
 }
