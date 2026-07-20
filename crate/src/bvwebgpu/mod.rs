@@ -11,6 +11,12 @@ pub const BVW_PLATFORM: &str = "bvwebgpu";
 pub const BVW_PROFILE: &str = "bv4";
 pub const BVW_MAX_PACK_BYTES: u64 = 256 * 1024 * 1024;
 pub const BVW_TEXTURE_MAX: u32 = 1024;
+pub const BVW_GATE_RATIO_PCT: u64 = 105;
+pub const BVW_GATE_SLACK_BYTES: u64 = 64 * 1024;
+
+pub fn gate_exceeded(pack_len: u64, raw_total: u64) -> bool {
+    pack_len * 100 > raw_total * BVW_GATE_RATIO_PCT + BVW_GATE_SLACK_BYTES * 100
+}
 
 const VIDEO_EXTS: [&str; 8] = [
     ".mp4", ".webm", ".ogg", ".ogv", ".m4a", ".mov", ".m3u8", ".ts",
@@ -111,6 +117,7 @@ impl crate::live::Proxy {
         let mut spooled: HashMap<String, PathBuf> = HashMap::new();
         let mut kinds: HashMap<String, &'static str> = HashMap::new();
         let mut spooled_bytes: u64 = 0;
+        let mut raw_bytes: u64 = 0;
         for p in &order {
             let (hash, file) = &by_path[p];
             if meta.contains_key(hash) {
@@ -119,6 +126,7 @@ impl crate::live::Proxy {
             let raw = self
                 .content_bytes_allow_empty(hash)
                 .with_context(|| format!("content {hash} ({file})"))?;
+            raw_bytes += raw.len() as u64;
             let kind = kind_for(file);
             let resolve_fn = |uri: &str| -> Option<Vec<u8>> {
                 let h = crate::naming::uri_content_hash(uri, file, content_by_file)?;
@@ -205,6 +213,13 @@ impl crate::live::Proxy {
         }
         let pack_bytes =
             std::fs::read(&pack_tmp).with_context(|| format!("read {}", pack_tmp.display()))?;
+        if gate_exceeded(pack_bytes.len() as u64, raw_bytes) {
+            let _ = std::fs::remove_file(&pack_tmp);
+            bail!(
+                "bvwebgpu pack for {cid} is {} bytes against {raw_bytes} raw bytes, over the {BVW_GATE_RATIO_PCT}% + {BVW_GATE_SLACK_BYTES}B gate",
+                pack_bytes.len()
+            );
+        }
         std::fs::rename(&pack_tmp, &pack_dst).ok();
         write("pack.json", &plan.index_json)?;
         let br = crate::compress::brotli(&pack_bytes)?;
@@ -344,6 +359,57 @@ mod tests {
             .is_file());
         let _ = std::fs::remove_dir_all(&cache);
         bytes
+    }
+
+    #[test]
+    fn gate_boundary_is_exact() {
+        assert!(!gate_exceeded(1_115_536, 1_000_000));
+        assert!(gate_exceeded(1_115_537, 1_000_000));
+        assert!(!gate_exceeded(65_536, 0));
+        assert!(gate_exceeded(65_537, 0));
+    }
+
+    #[test]
+    fn gate_rejects_index_dominated_scenes() {
+        let entity = "bafkgateent";
+        let mut content = Vec::new();
+        let mut routes: crate::live::stub::Routes = Vec::new();
+        let deep = "x".repeat(180);
+        for i in 0..800 {
+            let hash = format!("bafkgate{i:04}");
+            content.push(json!({"file": format!("data/{deep}/entry-{i:04}.bin"), "hash": hash}));
+            routes.push((format!("/contents/{hash}"), 200, vec![b'a']));
+        }
+        let ent = serde_json::to_vec(&json!({
+            "id": entity,
+            "type": "scene",
+            "pointers": ["9,9"],
+            "content": content,
+            "metadata": {}
+        }))
+        .unwrap();
+        routes.push((format!("/contents/{entity}"), 200, ent));
+        let (cat_host, _cs) = crate::live::stub::serve(routes);
+        let (space_host, _ss) = crate::live::stub::serve(vec![]);
+        let cache =
+            std::env::temp_dir().join(format!("abgen-bvwebgpu-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache);
+        std::fs::create_dir_all(&cache).unwrap();
+        let proxy = crate::live::stub::stub_proxy_at(
+            &space_host,
+            &format!("http://{cat_host}"),
+            false,
+            &cache.join("cache"),
+        );
+        let out = cache.join("out");
+        let err = proxy.build_bvwebgpu_pack(&out, entity).unwrap_err();
+        assert!(err.to_string().contains("gate"), "{err}");
+        assert!(!out
+            .join(entity)
+            .join(BVW_PLATFORM)
+            .join(pack_file_name(entity))
+            .exists());
+        let _ = std::fs::remove_dir_all(&cache);
     }
 
     #[test]
