@@ -583,9 +583,7 @@ impl<'a> Builder<'a> {
             let needs_alpha = scene.materials.iter().any(|m| {
                 let ln = m.name.to_lowercase();
                 (ln.contains("-transparent") || ln.contains("-cutout"))
-                    && m.base_color_image
-                        .as_ref()
-                        .is_some_and(|t| t.image == idx)
+                    && m.base_color_image.as_ref().is_some_and(|t| t.image == idx)
             });
             let container = scene
                 .image_bytes

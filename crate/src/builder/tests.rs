@@ -831,10 +831,7 @@ fn lod_test_tree(m: &crate::scene::Material) -> Value {
 }
 
 fn lod_mat_float(tree: &Value, name: &str) -> Option<f64> {
-    let floats = tree
-        .get("m_SavedProperties")?
-        .get("m_Floats")?
-        .as_array()?;
+    let floats = tree.get("m_SavedProperties")?.get("m_Floats")?.as_array()?;
     for e in floats {
         let pair = e.as_array()?;
         if let Value::Str(n) = &pair[0] {
@@ -861,10 +858,7 @@ fn lod_mat_keywords(tree: &Value) -> Vec<String> {
 }
 
 fn lod_mat_base_color_alpha(tree: &Value) -> Option<f64> {
-    let colors = tree
-        .get("m_SavedProperties")?
-        .get("m_Colors")?
-        .as_array()?;
+    let colors = tree.get("m_SavedProperties")?.get("m_Colors")?.as_array()?;
     for e in colors {
         let pair = e.as_array()?;
         if let Value::Str(n) = &pair[0] {
@@ -883,7 +877,10 @@ fn lod_material_class_comes_from_name_suffix_like_upstream() {
     m.alpha_mode = "BLEND".to_string();
     let t = lod_test_tree(&m);
     assert!(lod_mat_keywords(&t).is_empty());
-    assert_eq!(t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()), Some(-1.0));
+    assert_eq!(
+        t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()),
+        Some(-1.0)
+    );
     assert_eq!(lod_mat_float(&t, "_Surface"), Some(0.0));
     assert_eq!(lod_mat_float(&t, "_ZWrite"), Some(1.0));
     assert_eq!(lod_mat_float(&t, "_AlphaCutoffEnable"), None);
@@ -899,9 +896,15 @@ fn lod_material_class_comes_from_name_suffix_like_upstream() {
     let t = lod_test_tree(&m);
     assert_eq!(
         lod_mat_keywords(&t),
-        vec!["_ALPHATEST_ON".to_string(), "_SURFACE_TYPE_TRANSPARENT".to_string()]
+        vec![
+            "_ALPHATEST_ON".to_string(),
+            "_SURFACE_TYPE_TRANSPARENT".to_string()
+        ]
     );
-    assert_eq!(t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()), Some(2450.0));
+    assert_eq!(
+        t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()),
+        Some(2450.0)
+    );
     assert_eq!(lod_mat_float(&t, "_AlphaClip"), Some(1.0));
     assert_eq!(lod_mat_float(&t, "_AlphaCutoffEnable"), None);
     assert_eq!(lod_mat_float(&t, "_Cutoff"), Some(0.5));
@@ -917,9 +920,15 @@ fn lod_material_class_comes_from_name_suffix_like_upstream() {
     let t = lod_test_tree(&lod_test_material("TextureBakeResult-mat-transparent"));
     assert_eq!(
         lod_mat_keywords(&t),
-        vec!["_ALPHAPREMULTIPLY_ON".to_string(), "_SURFACE_TYPE_TRANSPARENT".to_string()]
+        vec![
+            "_ALPHAPREMULTIPLY_ON".to_string(),
+            "_SURFACE_TYPE_TRANSPARENT".to_string()
+        ]
     );
-    assert_eq!(t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()), Some(3000.0));
+    assert_eq!(
+        t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()),
+        Some(3000.0)
+    );
     assert_eq!(lod_mat_float(&t, "_SrcBlend"), Some(1.0));
     assert_eq!(lod_mat_float(&t, "_DstBlend"), Some(10.0));
     assert_eq!(lod_mat_float(&t, "_DstBlendAlpha"), Some(0.0));
@@ -931,17 +940,25 @@ fn lod_material_class_comes_from_name_suffix_like_upstream() {
     assert_eq!(lod_mat_base_color_alpha(&t), Some(0.8_f32 as f64));
     // No RenderType override tag on the transparent class.
     assert_eq!(
-        t.get("stringTagMap").and_then(|v| v.as_array()).map(|a| a.len()),
+        t.get("stringTagMap")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len()),
         Some(0)
     );
 
     // Upstream checks -transparent first: both suffixes = transparent.
     let t = lod_test_tree(&lod_test_material("weird-transparent-cutout"));
-    assert_eq!(t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()), Some(3000.0));
+    assert_eq!(
+        t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()),
+        Some(3000.0)
+    );
 
     // Suffix match is case-insensitive (OrdinalIgnoreCase upstream).
     let t = lod_test_tree(&lod_test_material("Foliage-CUTOUT"));
-    assert_eq!(t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()), Some(2450.0));
+    assert_eq!(
+        t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()),
+        Some(2450.0)
+    );
 
     // m_Floats must stay sorted by property name (Unity serializes the sheet
     // sorted; the conditional inserts must not break the order).
