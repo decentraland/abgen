@@ -820,7 +820,7 @@ fn lod_test_tree(m: &crate::scene::Material) -> Value {
         main_asset: "scene_1.prefab".to_string(),
         timestamp: None,
     };
-    super::material::build_lod_material_tree(
+    build_lod_material_tree(
         &map! {},
         m,
         &m.name,
