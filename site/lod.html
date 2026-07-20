@@ -150,6 +150,7 @@ function occOf(side){
   return t ? t.occupancy : null;
 }
 function badge(s){
+  if (s.eraSkipped) return ['b-ours', 'PRE-V49' + (s.prodAb ? ' ('+s.prodAb+')' : '')];
   if (!s.prod) return ['b-ours','OURS-ONLY'];
   const r = triRatio(s);
   const rOk = r == null || (r >= 0.6 && r <= 1.05);

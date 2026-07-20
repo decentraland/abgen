@@ -197,8 +197,12 @@ if [ "$BUILD_SITE" = 1 ]; then
   RUN_ID="lod-parity-$(date +%Y%m%d-%H%M%S)"
   echo
   echo "== lodsite run dir ($RUN_ID)"
+  # ABGEN_LOD_REGISTRY_URL='': the v49 era gate consults the production
+  # registry, which knows nothing about these locally-built pairs — both
+  # sides here come from the current converter by construction.
   ABGEN_LOD_PROD_BASE="file://$PROD_FLAT/" \
   ABGEN_LOD_CONTENT_URL="$CONTENT_URL/contents/" \
+  ABGEN_LOD_REGISTRY_URL="" \
   ABGEN_LOD_BIN="$ABGEN_LOD" \
     python3 "$REPO/pipeline/lodsite.py" --out-root "$OURS_DIR" \
       --platform "$PLATFORM" --run-id "$RUN_ID"

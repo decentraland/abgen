@@ -12,6 +12,26 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_LODS_BUCKET: &str = "https://lods-bucket-ed4300a.s3.amazonaws.com";
 
+/// LOD comparisons only target reference builds from the v49 converter era
+/// onward; older asset-bundle versions (v36 classic LODs, the webgl-era v7,
+/// …) are legacy artifacts, not comparison targets.
+pub const LOD_ERA_MIN_AB_VERSION: u32 = 49;
+
+/// Parse an asset-bundle version tag ("v49", "49") to its number.
+pub fn ab_version_num(version: &str) -> Option<u32> {
+    version
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .parse::<u32>()
+        .ok()
+}
+
+/// Era gate for LOD comparisons: true only for asset-bundle versions from
+/// v49 onward. Missing/unparseable versions gate as legacy.
+pub fn ab_version_is_lod_era(version: &str) -> bool {
+    ab_version_num(version).is_some_and(|n| n >= LOD_ERA_MIN_AB_VERSION)
+}
+
 #[derive(Clone, Debug)]
 pub struct LodGenMeta {
     pub parcels: Vec<(i32, i32)>,
@@ -472,6 +492,24 @@ fn write_lod_manifest(entity_dir: &Path, conv: &LodConversion, ab_version: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn era_gate_only_accepts_post_v49_ab_versions() {
+        assert!(ab_version_is_lod_era("v49"));
+        assert!(ab_version_is_lod_era("v50"));
+        assert!(ab_version_is_lod_era("V49"));
+        assert!(ab_version_is_lod_era("49"));
+        // Legacy classic-LOD (v36) and webgl (v7) eras.
+        assert!(!ab_version_is_lod_era("v36"));
+        assert!(!ab_version_is_lod_era("v48"));
+        assert!(!ab_version_is_lod_era("v7"));
+        // Missing/unparseable versions gate as legacy.
+        assert!(!ab_version_is_lod_era(""));
+        assert!(!ab_version_is_lod_era("v0-abgen"));
+        assert!(!ab_version_is_lod_era("garbage"));
+        assert_eq!(ab_version_num("v49"), Some(49));
+        assert_eq!(ab_version_num("v0-abgen"), None);
+    }
 
     #[test]
     fn unresolved_scene_zeroes_clipping_like_upstream() {

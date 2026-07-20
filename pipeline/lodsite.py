@@ -28,7 +28,49 @@ DEF_OUT_ROOT = os.environ.get('ABGEN_LOD_OUT_ROOT') or os.path.join(REPO, 'out')
 DEF_RUNS = os.environ.get('ABGEN_RUNS_DIR') or os.path.join(REPO, 'runs')
 PROD_BASE = os.environ.get('ABGEN_LOD_PROD_BASE') or 'https://ab-cdn.decentraland.org/LOD/1/'
 CONTENT_LOCAL = os.environ.get('ABGEN_LOD_CONTENT_URL') or 'http://127.0.0.1:5141/contents/'
+# Era gate: only compare prod LODs whose scene is registered at asset-bundle
+# version v49+ (the current LOD lane). The version is not recorded inside the
+# bundle, so it comes from the asset-bundle-registry, keyed by base pointer.
+# Set ABGEN_LOD_REGISTRY_URL='' to disable the gate (compare everything).
+REGISTRY_BASE = os.environ.get('ABGEN_LOD_REGISTRY_URL',
+                               'https://asset-bundle-registry.decentraland.org')
+MIN_AB_VERSION = 49
 UA = {'User-Agent': 'curl/8.9 (lodsite dataset builder)'}
+
+
+def ab_version_num(v):
+    try:
+        return int(str(v).strip().lstrip('vV'))
+    except (ValueError, TypeError):
+        return None
+
+
+def _registry_post(route, pointer):
+    body = json.dumps({'pointers': [pointer]}).encode()
+    req = urllib.request.Request(
+        REGISTRY_BASE.rstrip('/') + route, data=body,
+        headers={**UA, 'content-type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.load(r)
+
+
+def registry_era(scene, pointer, platform):
+    """(ab_version, is_current) for the scene at `pointer`. The registry is
+    pointer-keyed, so the version belongs to the CURRENT entity there —
+    is_current guards against a stale scene id whose legacy LOD still sits
+    on the CDN while the pointer has since been reconverted post-v49."""
+    if not REGISTRY_BASE or not pointer:
+        return '', False
+    try:
+        rows = _registry_post('/entities/versions', pointer)
+        assets = (rows[0].get('versions') or {}).get('assets') or {}
+        version = (assets.get(platform) or {}).get('version') or ''
+        active = _registry_post('/entities/active', pointer)
+        current = bool(active) and active[0].get('id') == scene
+        return version, current
+    except Exception as e:
+        print(f'  {scene}: registry era lookup failed: {e}', file=sys.stderr)
+        return '', False
 
 
 def find_tool(env, *cands):
@@ -103,9 +145,11 @@ def entity_meta(scene):
         return {'title': '', 'pointers': [], 'base': ''}
 
 
-def run_compare(ours, prod):
-    p = subprocess.run([ABGEN_LOD, 'compare', ours, prod],
-                       capture_output=True, text=True, timeout=300)
+def run_compare(ours, prod, prod_ab=''):
+    cmd = [ABGEN_LOD, 'compare', ours, prod]
+    if prod_ab:
+        cmd += ['--prod-ab', prod_ab]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     rows, fails = [], 0
     for line in p.stdout.splitlines():
         m = ROW_RE.match(line)
@@ -206,28 +250,49 @@ def main():
     print(f'{len(scenes)} scenes with published LOD1 ({args.platform})')
 
     with ThreadPoolExecutor(args.jobs) as ex:
-        prod_ok = dict(zip(
-            [s for s, _ in scenes],
-            ex.map(lambda sb: fetch_prod(sb[0], args.platform,
-                                         os.path.join(proddir, f'{sb[0]}_1_{args.platform}')),
-                   scenes)))
         metas = dict(zip([s for s, _ in scenes],
                          ex.map(lambda sb: entity_meta(sb[0]), scenes)))
+        # Era gate: resolve each scene's registered asset-bundle version and
+        # only pair prod for current v49+ scenes; older eras are tagged, not
+        # compared.
+        eras = dict(zip(
+            [s for s, _ in scenes],
+            ex.map(lambda sb: registry_era(
+                sb[0],
+                metas[sb[0]].get('base') or
+                (metas[sb[0]].get('pointers') or [''])[0], args.platform),
+                   scenes)))
+
+        def era_ok(s):
+            if not REGISTRY_BASE:
+                return True
+            version, current = eras.get(s) or ('', False)
+            return current and (ab_version_num(version) or 0) >= MIN_AB_VERSION
+
+        eligible = [(s, b) for s, b in scenes if era_ok(s)]
+        skipped_era = len(scenes) - len(eligible)
+        if skipped_era:
+            print(f'{skipped_era} scenes gated out (asset-bundle version < v{MIN_AB_VERSION})')
+        prod_ok = dict(zip(
+            [s for s, _ in eligible],
+            ex.map(lambda sb: fetch_prod(sb[0], args.platform,
+                                         os.path.join(proddir, f'{sb[0]}_1_{args.platform}')),
+                   eligible)))
 
     out_scenes = []
     for i, (scene, ours) in enumerate(scenes):
         prod = os.path.join(proddir, f'{scene}_1_{args.platform}')
         has_prod = prod_ok.get(scene) and os.path.isfile(prod)
-        row = {'id': scene, **metas[scene],
+        prod_ab = (eras.get(scene) or ('', False))[0]
+        row = {'id': scene, **metas[scene], 'prodAb': prod_ab,
+               'eraSkipped': not era_ok(scene),
                'ours': {'size': os.path.getsize(ours), 'sha': sha256(ours)[:16]},
                'prod': None, 'checks': [], 'fails': None}
         row['ours'].update(probe(ours, imgdir))
-        if row['ours'].get('probe_tris'):
-            row['ours']['tris'] = row['ours']['probe_tris']
-        if has_prod:
+        if era_ok(scene) and has_prod:
             row['prod'] = {'size': os.path.getsize(prod), 'sha': sha256(prod)[:16]}
             row['prod'].update(probe(prod, imgdir))
-            rows, fails = run_compare(ours, prod)
+            rows, fails = run_compare(ours, prod, prod_ab)
             row['checks'], row['fails'] = rows, fails
             ov, ot = mesh_totals(rows, 'ours')
             pv, pt = mesh_totals(rows, 'prod')
@@ -246,13 +311,15 @@ def main():
             print(f'  {i + 1}/{len(scenes)}')
 
     with_prod = sum(1 for r in out_scenes if r['prod'])
+    era_skipped = sum(1 for r in out_scenes if r['eraSkipped'])
     data = {
         'generated': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
         'platform': args.platform,
         'ours_base': '/LOD/1/',
         'prod_base': PROD_BASE,
         'stats': {'scenes': len(out_scenes), 'with_prod': with_prod,
-                  'ours_only': len(out_scenes) - with_prod},
+                  'ours_only': len(out_scenes) - with_prod - era_skipped,
+                  'era_skipped': era_skipped},
         'scenes': out_scenes,
     }
     dest = os.path.join(rundir, 'lod-data.json')
