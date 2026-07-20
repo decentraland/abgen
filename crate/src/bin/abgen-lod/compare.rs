@@ -4,7 +4,6 @@ use anyhow::{bail, Context, Result};
 
 #[derive(Default)]
 struct Facts {
-    engine_version: String,
     externals: Vec<String>,
     deps: Vec<String>,
     roots: Vec<(String, [f64; 3])>,

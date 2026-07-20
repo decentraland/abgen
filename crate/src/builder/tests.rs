@@ -891,7 +891,9 @@ fn lod_material_class_comes_from_name_suffix_like_upstream() {
     assert_eq!(lod_mat_float(&t, "_ZTestDepthEqualForOpaque"), None);
     assert_eq!(lod_mat_base_color_alpha(&t), Some(1.0));
 
-    // Cutout by name suffix; upstream hard-codes _Cutoff 0.5.
+    // Cutout by name suffix; upstream hard-codes _Cutoff 0.5. Undeclared
+    // HDRP-named SetFloats (_AlphaCutoffEnable, ...) do not survive the
+    // Unity build, so they must not appear here either.
     let mut m = lod_test_material("TextureBakeResult-mat-cutout");
     m.alpha_cutoff = 0.7;
     let t = lod_test_tree(&m);
@@ -901,28 +903,37 @@ fn lod_material_class_comes_from_name_suffix_like_upstream() {
     );
     assert_eq!(t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()), Some(2450.0));
     assert_eq!(lod_mat_float(&t, "_AlphaClip"), Some(1.0));
-    assert_eq!(lod_mat_float(&t, "_AlphaCutoffEnable"), Some(1.0));
-    assert_eq!(lod_mat_float(&t, "_AlphaDstBlend"), Some(0.0));
-    assert_eq!(lod_mat_float(&t, "_AlphaSrcBlend"), Some(1.0));
-    assert_eq!(lod_mat_float(&t, "_BlendMode"), Some(0.0));
+    assert_eq!(lod_mat_float(&t, "_AlphaCutoffEnable"), None);
     assert_eq!(lod_mat_float(&t, "_Cutoff"), Some(0.5));
+    assert_eq!(lod_mat_float(&t, "_DstBlend"), Some(0.0));
+    assert_eq!(lod_mat_float(&t, "_DstBlendAlpha"), Some(0.0));
     assert_eq!(lod_mat_float(&t, "_ZWrite"), Some(1.0));
-    assert_eq!(lod_mat_float(&t, "_ZTestDepthEqualForOpaque"), None);
     assert_eq!(lod_mat_base_color_alpha(&t), Some(1.0));
 
-    // Transparent by name suffix; upstream forces base-color alpha 0.8.
+    // Transparent by name suffix — FORCED_TRANSPARENT state as built by a
+    // fresh Unity 6000.2.6f2 conversion: depth-writing transparency
+    // (_ZWrite 1, _DstBlendAlpha 0), base alpha forced to the f32 0.8, and
+    // none of the undeclared HDRP floats the upstream branch SetFloats.
     let t = lod_test_tree(&lod_test_material("TextureBakeResult-mat-transparent"));
     assert_eq!(
         lod_mat_keywords(&t),
         vec!["_ALPHAPREMULTIPLY_ON".to_string(), "_SURFACE_TYPE_TRANSPARENT".to_string()]
     );
     assert_eq!(t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()), Some(3000.0));
-    assert_eq!(lod_mat_float(&t, "_AlphaCutoffEnable"), Some(0.0));
-    assert_eq!(lod_mat_float(&t, "_AlphaDstBlend"), Some(10.0));
-    assert_eq!(lod_mat_float(&t, "_BlendMode"), Some(0.0));
-    assert_eq!(lod_mat_float(&t, "_ZTestDepthEqualForOpaque"), Some(4.0));
-    assert_eq!(lod_mat_float(&t, "_ZWrite"), Some(0.0));
-    assert_eq!(lod_mat_base_color_alpha(&t), Some(0.8));
+    assert_eq!(lod_mat_float(&t, "_SrcBlend"), Some(1.0));
+    assert_eq!(lod_mat_float(&t, "_DstBlend"), Some(10.0));
+    assert_eq!(lod_mat_float(&t, "_DstBlendAlpha"), Some(0.0));
+    assert_eq!(lod_mat_float(&t, "_ZWrite"), Some(1.0));
+    assert_eq!(lod_mat_float(&t, "_AlphaCutoffEnable"), None);
+    assert_eq!(lod_mat_float(&t, "_AlphaDstBlend"), None);
+    assert_eq!(lod_mat_float(&t, "_BlendMode"), None);
+    assert_eq!(lod_mat_float(&t, "_ZTestDepthEqualForOpaque"), None);
+    assert_eq!(lod_mat_base_color_alpha(&t), Some(0.8_f32 as f64));
+    // No RenderType override tag on the transparent class.
+    assert_eq!(
+        t.get("stringTagMap").and_then(|v| v.as_array()).map(|a| a.len()),
+        Some(0)
+    );
 
     // Upstream checks -transparent first: both suffixes = transparent.
     let t = lod_test_tree(&lod_test_material("weird-transparent-cutout"));

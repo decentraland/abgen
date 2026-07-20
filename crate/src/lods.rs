@@ -94,6 +94,10 @@ pub fn client_placement(base: (i32, i32)) -> [f64; 3] {
     [base.0 as f64 * 16.0, 0.0, base.1 as f64 * 16.0]
 }
 
+pub fn root_position(base: (i32, i32)) -> [f64; 3] {
+    [base.0 as f64 * 16.0, 0.0, base.1 as f64 * 16.0]
+}
+
 pub fn lod_main_asset(scene_id: &str, level: u32) -> String {
     format!("{}_{}.prefab", scene_id.to_lowercase(), level)
 }
