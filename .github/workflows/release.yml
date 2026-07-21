@@ -139,9 +139,9 @@ jobs:
             echo "CXXFLAGS=-ffile-prefix-map=$PWD=/build"
           } >> "$GITHUB_ENV"
 
-      # the two mac legs are the slowest; warm cargo caches roughly halve them.
-      # windows legs stay uncached to keep the repo inside the 10GB cache LRU
-      - if: contains(matrix.target, 'apple')
+      # warm cargo caches leave only the abgen crate to recompile (cargo's
+      # fingerprint db in target/ is the dep-split); keys are target-scoped
+      - if: matrix.builder == 'rustup'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
