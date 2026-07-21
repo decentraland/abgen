@@ -3,10 +3,6 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    # cargo dep-split: dependency crates compile in their own derivation keyed
-    # on the manifests/lockfile, so releases only recompile the abgen crate.
-    # Release-tag pin + narHash in flake.lock; audited 2026-07-22 (pure nix
-    # lib, ~3k lines, only Cargo.lock-checksum-pinned fixed-output fetches).
     crane.url = "github:ipetkov/crane/v0.23.4";
   };
 
@@ -45,8 +41,6 @@
 
           abgenPkg = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
-            # final derivation only: on cargoArtifacts this would defeat
-            # commit-to-commit dep caching
             env.ABGEN_GIT_COMMIT = gitCommit;
             cargoExtraArgs = "--bin abgen";
           });

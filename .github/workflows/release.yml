@@ -30,8 +30,6 @@ jobs:
             runner: ubuntu-22.04
             builder: rustup
             bin: abgen.exe
-          # rquickjs-sys has no pregenerated bindings for this triple: bindgen
-          # runs against the llvm-mingw sysroot (BINDGEN_EXTRA_CLANG_ARGS below)
           - target: aarch64-pc-windows-gnullvm
             runner: ubuntu-22.04
             builder: rustup
@@ -49,8 +47,6 @@ jobs:
     steps:
       - if: matrix.builder == 'nix'
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-      # carries the crane deps-derivation closure as a nix file store; keyed
-      # like the deps drv itself (manifests + pins), restored via nix copy
       - if: matrix.builder == 'nix'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -112,7 +108,6 @@ jobs:
           set(CMAKE_CXX_COMPILER aarch64-w64-mingw32-clang++)
           set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
           EOF
-            # without the import libs, lld resolves libc++/libunwind statically
             sudo rm /opt/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64/aarch64-w64-mingw32/lib/libc++.dll.a \
                     /opt/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64/aarch64-w64-mingw32/lib/libunwind.dll.a
             echo "/opt/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
@@ -142,8 +137,6 @@ jobs:
             echo "CXXFLAGS=-ffile-prefix-map=$PWD=/build"
           } >> "$GITHUB_ENV"
 
-      # warm cargo caches leave only the abgen crate to recompile (cargo's
-      # fingerprint db in target/ is the dep-split); keys are target-scoped
       - if: matrix.builder == 'rustup'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -179,9 +172,6 @@ jobs:
           cp LICENSE README.md "$dist/"
 
           if [ "${{ matrix.builder }}" = "nix" ]; then
-            # nix binaries reference the nix store: ship the loader + closure
-            # in lib/ behind an `abgen` wrapper so the archive runs on any
-            # distro (glibc, musl, nixos) with no host requirements at all
             mkdir -p "$dist/bin" "$dist/lib"
             install -m755 result/bin/abgen "$dist/bin/abgen.bin"
             for lib in $(ldd result/bin/abgen | awk '$3 ~ /^\// {print $3}'); do
