@@ -180,3 +180,27 @@ AGPL-3.0-or-later (the Rust crate) - full text in [LICENSE](LICENSE). Vendored t
 Zlib, draco_decoder = MIT/Apache-2.0, libjpeg9c = IJG. Shader/template bundles are generated
 Decentraland content artifacts (sha256-pinned; regenerable via `scripts/bootstrap-runtime.sh`). Note:
 the lib sets `#[global_allocator] mimalloc`; any downstream embedding the lib inherits it.
+
+## Releasing
+
+The release pipeline (`.github/workflows/release.yml`) is plain shell on GitHub-hosted
+runners - no third-party or marketplace actions. Beyond the repo it trusts only rustup.rs
+(version-pinned toolchain) and the sha256-pinned llvm-mingw tarball. Every release
+operation is idempotent, so job re-runs converge on the full asset set.
+
+1. Land a `chore: release X.Y.Z` PR bumping the crate version (Cargo.toml + Cargo.lock).
+2. Tag the merge commit and push the tag:
+   `git tag vX.Y.Z <merge-sha> && git push origin vX.Y.Z`
+   Don't pre-create the release in the web UI: the pipeline adopts an existing release
+   (that is how v0.11.0 first shipped assetless), but only a CI-created one carries the
+   notes from `.github/release-notes.md`.
+3. What runs: every target builds twice in parallel jobs on separate runners
+   (windows-x64 once - mingw ld is non-deterministic); each leg packages, smoke-tests
+   (`--version` + `/readyz`), and uploads its archive with `--clobber`. The `publish` job
+   re-downloads the published assets, requires bit-identical hashes from both build
+   attempts, verifies contents, uploads the aggregated `SHA256SUMS.txt`, and publishes
+   npm (skipped explicitly when `NPM_TOKEN` is unset - why `@dcl/abgen` is not on npm).
+4. Verify: exactly 7 assets on the release page (6 archives + `SHA256SUMS.txt`).
+5. Failed leg: re-run failed jobs from the Actions UI; everything converges.
+
+`workflow_dispatch` on a branch is a build+smoke dry run (no release, no uploads).
