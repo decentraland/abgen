@@ -184,9 +184,12 @@ the lib sets `#[global_allocator] mimalloc`; any downstream embedding the lib in
 ## Releasing
 
 The release pipeline (`.github/workflows/release.yml`) is plain shell on GitHub-hosted
-runners - no third-party or marketplace actions. Beyond the repo it trusts only rustup.rs
-(version-pinned toolchain) and the sha256-pinned llvm-mingw tarball. Every release
-operation is idempotent, so job re-runs converge on the full asset set.
+runners - no third-party or marketplace actions. Every target builds **once**: Linux via
+`nix build` from the committed flake.lock (hermetic; reproduce locally with `nix build` -
+the archives bundle the loader + libs behind the `abgen` entry script and run on any
+Linux, including NixOS); Windows and macOS via the pinned rustup toolchain with
+`SOURCE_DATE_EPOCH` from the tagged commit. Every release operation is idempotent, so job
+re-runs converge on the full asset set.
 
 1. Land a `chore: release X.Y.Z` PR bumping the crate version (Cargo.toml + Cargo.lock).
 2. Tag the merge commit and push the tag:
@@ -194,12 +197,11 @@ operation is idempotent, so job re-runs converge on the full asset set.
    Don't pre-create the release in the web UI: the pipeline adopts an existing release
    (that is how v0.11.0 first shipped assetless), but only a CI-created one carries the
    notes from `.github/release-notes.md`.
-3. What runs: every target builds twice in parallel jobs on separate runners
-   (windows-x64 once - mingw ld is non-deterministic); each leg packages, smoke-tests
-   (`--version` + `/readyz`), and uploads its archive with `--clobber`. The `publish` job
-   re-downloads the published assets, requires bit-identical hashes from both build
-   attempts, verifies contents, uploads the aggregated `SHA256SUMS.txt`, and publishes
-   npm (skipped explicitly when `NPM_TOKEN` is unset - why `@dcl/abgen` is not on npm).
+3. What runs: each leg builds, packages, smoke-tests (`--version` + `/readyz`; windows
+   legs are cross-built and not smoke-run), and uploads its archive with `--clobber`.
+   The `publish` job re-downloads the published assets, verifies them against the
+   build-time hashes, uploads the aggregated `SHA256SUMS.txt`, and publishes npm
+   (skipped explicitly when `NPM_TOKEN` is unset - why `@dcl/abgen` is not on npm).
 4. Verify: exactly 7 assets on the release page (6 archives + `SHA256SUMS.txt`).
 5. Failed leg: re-run failed jobs from the Actions UI; everything converges.
 

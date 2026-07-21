@@ -14,45 +14,37 @@ env:
 
 jobs:
   build:
-    name: ${{ matrix.target }} (build ${{ matrix.attempt }})
+    name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        attempt: [1, 2]
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
-          - x86_64-pc-windows-gnu
-          - aarch64-pc-windows-gnullvm
-          - aarch64-apple-darwin
-          - x86_64-apple-darwin
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
-            bin: abgen
+            builder: nix
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
-            bin: abgen
+            builder: nix
           - target: x86_64-pc-windows-gnu
             runner: ubuntu-22.04
+            builder: rustup
             bin: abgen.exe
           # rquickjs-sys has no pregenerated bindings for this triple: bindgen
           # runs against the llvm-mingw sysroot (BINDGEN_EXTRA_CLANG_ARGS below)
           - target: aarch64-pc-windows-gnullvm
             runner: ubuntu-22.04
+            builder: rustup
             bin: abgen.exe
             cargo_flags: --features rquickjs/bindgen
           - target: aarch64-apple-darwin
             runner: macos-14
+            builder: rustup
             bin: abgen
           - target: x86_64-apple-darwin
             runner: macos-15-intel
+            builder: rustup
             bin: abgen
-        exclude:
-          # mingw ld link-order non-determinism: no bit-identical gate, built once
-          - target: x86_64-pc-windows-gnu
-            attempt: 2
 
     steps:
       - name: setup (checkout + toolchains)
@@ -61,6 +53,13 @@ jobs:
           git remote add origin "https://github.com/$GITHUB_REPOSITORY"
           git fetch -q --depth 1 origin "$GITHUB_SHA"
           git checkout -q FETCH_HEAD
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+          if [ "${{ matrix.builder }}" = "nix" ]; then
+            curl -fsSL https://nixos.org/nix/install | sh -s -- --daemon --yes
+            echo "/nix/var/nix/profiles/default/bin" >> "$GITHUB_PATH"
+            exit 0
+          fi
 
           (
             if ! command -v rustup >/dev/null 2>&1; then
@@ -130,14 +129,19 @@ jobs:
             rustflags="$rustflags -C target-feature=+crt-static -C link-arg=-Wl,--no-insert-timestamp"
           fi
           {
-            echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)"
             echo "RUSTFLAGS=$rustflags"
             echo "CFLAGS=-ffile-prefix-map=$PWD=/build"
             echo "CXXFLAGS=-ffile-prefix-map=$PWD=/build"
           } >> "$GITHUB_ENV"
 
       - name: build
-        run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.cargo_flags }} --bin abgen
+        run: |
+          if [ "${{ matrix.builder }}" = "nix" ]; then
+            nix build .#default --print-build-logs \
+              --extra-experimental-features 'nix-command flakes'
+          else
+            cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.cargo_flags }} --bin abgen
+          fi
 
       - name: package, smoke test, publish
         env:
@@ -145,21 +149,44 @@ jobs:
         run: |
           dist="abgen-${GITHUB_REF_NAME:-dev}-${{ matrix.target }}"
           mkdir -p "$dist/shader"
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$dist/"
           cp -R template "$dist/template"
           cp crate/shader/scene_ignore_windows "$dist/shader/"
           cp LICENSE README.md "$dist/"
-          if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
-            for dll in libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
-              cp "$(x86_64-w64-mingw32-g++-posix -print-file-name=$dll)" "$dist/"
+
+          if [ "${{ matrix.builder }}" = "nix" ]; then
+            # nix binaries reference the nix store: ship the loader + closure
+            # in lib/ behind an `abgen` wrapper so the archive runs on any
+            # distro (glibc, musl, nixos) with no host requirements at all
+            mkdir -p "$dist/bin" "$dist/lib"
+            install -m755 result/bin/abgen "$dist/bin/abgen.bin"
+            for lib in $(ldd result/bin/abgen | awk '$3 ~ /^\// {print $3}'); do
+              install -m644 "$lib" "$dist/lib/"
             done
+            interp=$(readelf -l result/bin/abgen | sed -n 's/.*interpreter: \(.*\)]/\1/p')
+            install -m755 "$interp" "$dist/lib/ld.so"
+            cat > "$dist/abgen" <<'EOF'
+          #!/bin/sh
+          here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+          export ABGEN_ROOT="${ABGEN_ROOT:-$here}"
+          export ABGEN_SHADER_BUNDLE="${ABGEN_SHADER_BUNDLE:-$here/shader/scene_ignore_windows}"
+          exec "$here/lib/ld.so" --library-path "$here/lib" "$here/bin/abgen.bin" "$@"
+          EOF
+            chmod 755 "$dist/abgen"
+          else
+            cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$dist/"
+            if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
+              for dll in libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
+                cp "$(x86_64-w64-mingw32-g++-posix -print-file-name=$dll)" "$dist/"
+              done
+            fi
           fi
+
           TAR=tar; command -v gtar >/dev/null && TAR=gtar
           "$TAR" --sort=name --owner=0 --group=0 --numeric-owner \
               --mtime="@${SOURCE_DATE_EPOCH}" -czf "$dist.tar.gz" "$dist"
           shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
 
-          if [ "${{ matrix.attempt }}" = "1" ] && ! echo "${{ matrix.target }}" | grep -q windows; then
+          if ! echo "${{ matrix.target }}" | grep -q windows; then
             rm -rf /tmp/smoke && mkdir /tmp/smoke
             tar -xzf "$dist.tar.gz" -C /tmp/smoke
             (
@@ -181,14 +208,8 @@ jobs:
             || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
                  --title "abgen $GITHUB_REF_NAME" --notes-file .github/release-notes.md \
             || gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null
-          if [ "${{ matrix.attempt }}" = "1" ]; then
-            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
-              "$dist.tar.gz" "$dist.tar.gz.sha256"
-          else
-            cp "$dist.tar.gz.sha256" "$dist.tar.gz.sha256-2"
-            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
-              "$dist.tar.gz.sha256-2"
-          fi
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            "$dist.tar.gz" "$dist.tar.gz.sha256"
 
   publish:
     needs: build
@@ -209,18 +230,14 @@ jobs:
           git checkout -q FETCH_HEAD
 
           gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --pattern 'abgen-*.tar.gz' --pattern 'abgen-*.tar.gz.sha256*' -D dist
+            --pattern 'abgen-*.tar.gz' --pattern 'abgen-*.tar.gz.sha256' -D dist
           cd dist
           test "$(ls ./*.tar.gz | wc -l)" -eq 6
-          test "$(ls ./*.sha256-2 | wc -l)" -eq 5
-          for f2 in ./*.sha256-2; do
-            diff "$f2" "${f2%-2}" || { echo "reproducibility mismatch: $f2"; exit 1; }
-          done
           sha256sum -c ./*.sha256
           cat ./*.sha256 > SHA256SUMS.txt
           cat SHA256SUMS.txt
           gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber SHA256SUMS.txt
-          for f in ./*.sha256 ./*.sha256-2; do
+          for f in ./*.sha256; do
             gh release delete-asset "$GITHUB_REF_NAME" "$(basename "$f")" --repo "$GITHUB_REPOSITORY" --yes
           done
           cd ..

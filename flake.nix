@@ -23,9 +23,13 @@
         ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ gcc ];
         sharedLibExt = pkgs.stdenv.hostPlatform.extensions.sharedLibrary;
 
+        crateVersion = (builtins.fromTOML (builtins.readFile ./crate/Cargo.toml)).package.version;
+        gitCommit = if self ? rev then builtins.substring 0 12 self.rev else "unknown";
+
         abgenPkg = pkgs.rustPlatform.buildRustPackage {
           pname = "abgen";
-          version = "0.9.14";
+          version = crateVersion;
+          env.ABGEN_GIT_COMMIT = gitCommit;
           src = self;
           cargoLock = {
             lockFile = ./Cargo.lock;
@@ -92,7 +96,8 @@
           in
           pkgs.rustPlatform.buildRustPackage {
             pname = "abgen-compare";
-            version = "0.9.14";
+            version = crateVersion;
+            env.ABGEN_GIT_COMMIT = gitCommit;
             src = self;
             cargoLock = {
               lockFile = ./Cargo.lock;
