@@ -137,6 +137,18 @@ jobs:
             echo "CXXFLAGS=-ffile-prefix-map=$PWD=/build"
           } >> "$GITHUB_ENV"
 
+      # the two mac legs are the slowest; warm cargo caches roughly halve them.
+      # windows legs stay uncached to keep the repo inside the 10GB cache LRU
+      - if: contains(matrix.target, 'apple')
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.target }}-1.97.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.target }}-1.97.0-
+
       - name: build
         run: |
           if [ "${{ matrix.builder }}" = "nix" ]; then
