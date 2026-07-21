@@ -21,22 +21,22 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-22.04
+            runner: ubuntu-24.04
             builder: nix
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
             builder: nix
           - target: x86_64-pc-windows-gnu
-            runner: ubuntu-22.04
+            runner: ubuntu-24.04
             builder: rustup
             bin: abgen.exe
           - target: aarch64-pc-windows-gnullvm
-            runner: ubuntu-22.04
+            runner: ubuntu-24.04
             builder: rustup
             bin: abgen.exe
             cargo_flags: --features rquickjs/bindgen
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             builder: rustup
             bin: abgen
           - target: x86_64-apple-darwin
@@ -48,10 +48,10 @@ jobs:
       - if: matrix.builder == 'nix'
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
       - if: matrix.builder == 'nix'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/nix-deps-cache
-          key: nix-deps-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crate/Cargo.toml', 'flake.lock', 'flake.nix') }}
+          key: nix-deps-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crate/Cargo.toml', 'flake.lock', 'flake.nix', 'rust-toolchain.toml') }}
 
       - name: setup (checkout + toolchains)
         run: |
@@ -72,8 +72,8 @@ jobs:
               echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
               export PATH="$HOME/.cargo/bin:$PATH"
             fi
-            rustup toolchain install 1.97.0 --profile minimal --no-self-update
-            rustup default 1.97.0
+            rustup toolchain install 1.97.1 --profile minimal --no-self-update
+            rustup default 1.97.1
             rustup target add ${{ matrix.target }}
           ) > /tmp/rustup.log 2>&1 &
           rustup_pid=$!
@@ -98,8 +98,8 @@ jobs:
           fi
 
           if [ "${{ matrix.target }}" = "aarch64-pc-windows-gnullvm" ]; then
-            curl -fsSL -o llvm-mingw.tar.xz https://github.com/mstorsjo/llvm-mingw/releases/download/20260616/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64.tar.xz
-            echo "534b92e067b22a6b4441f48ae9240a3341b17825d04d577eab0cf85c44b4deda  llvm-mingw.tar.xz" | sha256sum -c
+            curl -fsSL -o llvm-mingw.tar.xz https://github.com/mstorsjo/llvm-mingw/releases/download/20260721/llvm-mingw-20260721-ucrt-ubuntu-22.04-x86_64.tar.xz
+            echo "4a9fd7ac5bda8a0a514f33c4ad7864a76e58c56ed958be18221c5ca0ac0a2b10  llvm-mingw.tar.xz" | sha256sum -c
             sudo tar -xJf llvm-mingw.tar.xz -C /opt && rm llvm-mingw.tar.xz
             cat > /tmp/aarch64-mingw-toolchain.cmake <<'EOF'
           set(CMAKE_SYSTEM_NAME Windows)
@@ -108,16 +108,16 @@ jobs:
           set(CMAKE_CXX_COMPILER aarch64-w64-mingw32-clang++)
           set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
           EOF
-            sudo rm /opt/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64/aarch64-w64-mingw32/lib/libc++.dll.a \
-                    /opt/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64/aarch64-w64-mingw32/lib/libunwind.dll.a
-            echo "/opt/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
+            sudo rm /opt/llvm-mingw-20260721-ucrt-ubuntu-22.04-x86_64/aarch64-w64-mingw32/lib/libc++.dll.a \
+                    /opt/llvm-mingw-20260721-ucrt-ubuntu-22.04-x86_64/aarch64-w64-mingw32/lib/libunwind.dll.a
+            echo "/opt/llvm-mingw-20260721-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
             {
               echo "CMAKE_TOOLCHAIN_FILE=/tmp/aarch64-mingw-toolchain.cmake"
               echo "CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER=aarch64-w64-mingw32-clang"
               echo "CC_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-clang"
               echo "CXX_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-clang++"
               echo "AR_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-ar"
-              echo "BINDGEN_EXTRA_CLANG_ARGS=--target=aarch64-w64-mingw32 --sysroot=/opt/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64/aarch64-w64-mingw32"
+              echo "BINDGEN_EXTRA_CLANG_ARGS=--target=aarch64-w64-mingw32 --sysroot=/opt/llvm-mingw-20260721-ucrt-ubuntu-22.04-x86_64/aarch64-w64-mingw32"
             } >> "$GITHUB_ENV"
           fi
 
@@ -138,14 +138,14 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - if: matrix.builder == 'rustup'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ matrix.target }}-1.97.0-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ matrix.target }}-1.97.0-
+          key: cargo-${{ matrix.target }}-1.97.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.target }}-1.97.1-
 
       - name: build
         run: |
@@ -228,7 +228,7 @@ jobs:
 
   publish:
     needs: build
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
