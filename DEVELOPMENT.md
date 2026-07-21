@@ -184,7 +184,8 @@ the lib sets `#[global_allocator] mimalloc`; any downstream embedding the lib in
 ## Releasing
 
 The release pipeline (`.github/workflows/release.yml`) is plain shell on GitHub-hosted
-runners - no third-party or marketplace actions. Every target builds **once**: Linux via
+runners; the only third-party actions are Determinate Systems' sha-pinned nix installer
+and Magic Nix Cache on the linux legs. Every target builds **once**: Linux via
 `nix build` from the committed flake.lock (hermetic; reproduce locally with `nix build` -
 the archives bundle the loader + libs behind the `abgen` entry script and run on any
 Linux, including NixOS); Windows and macOS via the pinned rustup toolchain with

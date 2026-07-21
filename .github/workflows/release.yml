@@ -47,6 +47,11 @@ jobs:
             bin: abgen
 
     steps:
+      - if: matrix.builder == 'nix'
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - if: matrix.builder == 'nix'
+        uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+
       - name: setup (checkout + toolchains)
         run: |
           git init -q .
@@ -56,8 +61,6 @@ jobs:
           echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
 
           if [ "${{ matrix.builder }}" = "nix" ]; then
-            curl -fsSL https://nixos.org/nix/install | sh -s -- --daemon --yes
-            echo "/nix/var/nix/profiles/default/bin" >> "$GITHUB_PATH"
             exit 0
           fi
 
