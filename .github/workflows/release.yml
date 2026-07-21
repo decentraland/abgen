@@ -47,11 +47,6 @@ jobs:
     steps:
       - if: matrix.builder == 'nix'
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-      - if: matrix.builder == 'nix'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: /tmp/nix-deps-cache
-          key: nix-deps-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crate/Cargo.toml', 'flake.lock', 'flake.nix', 'rust-toolchain.toml') }}
 
       - name: setup (checkout + toolchains)
         run: |
@@ -136,6 +131,12 @@ jobs:
             echo "CFLAGS=-ffile-prefix-map=$PWD=/build"
             echo "CXXFLAGS=-ffile-prefix-map=$PWD=/build"
           } >> "$GITHUB_ENV"
+
+      - if: matrix.builder == 'nix'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/nix-deps-cache
+          key: nix-deps-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crate/Cargo.toml', 'flake.lock', 'flake.nix', 'rust-toolchain.toml') }}
 
       - if: matrix.builder == 'rustup'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
