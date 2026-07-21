@@ -3,15 +3,21 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # cargo dep-split: dependency crates compile in their own derivation keyed
+    # on the manifests/lockfile, so releases only recompile the abgen crate.
+    # Release-tag pin + narHash in flake.lock; audited 2026-07-22 (pure nix
+    # lib, ~3k lines, only Cargo.lock-checksum-pinned fixed-output fetches).
+    crane.url = "github:ipetkov/crane/v0.23.4";
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, crane }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
 
       perSystem = nixpkgs.lib.genAttrs systems (system:
         let
           pkgs = import nixpkgs { inherit system; };
+          craneLib = crane.mkLib pkgs;
 
           nativeDeps = with pkgs; [
             cargo
@@ -28,18 +34,22 @@
           crateVersion = (builtins.fromTOML (builtins.readFile ./crate/Cargo.toml)).package.version;
           gitCommit = if self ? rev then builtins.substring 0 12 self.rev else "unknown";
 
-          abgenPkg = pkgs.rustPlatform.buildRustPackage {
+          commonArgs = {
             pname = "abgen";
             version = crateVersion;
-            env.ABGEN_GIT_COMMIT = gitCommit;
             src = self;
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-            };
             nativeBuildInputs = with pkgs; [ cmake pkg-config git ];
-            cargoBuildFlags = [ "--bin" "abgen" ];
             doCheck = false;
           };
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+          abgenPkg = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
+            # final derivation only: on cargoArtifacts this would defeat
+            # commit-to-commit dep caching
+            env.ABGEN_GIT_COMMIT = gitCommit;
+            cargoExtraArgs = "--bin abgen";
+          });
         in
         {
           devShells.default = pkgs.mkShell {
@@ -53,9 +63,11 @@
 
           packages.default = abgenPkg;
 
-          packages.abgen-corpus = abgenPkg.overrideAttrs (old: {
+          packages.abgen-corpus = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
             pname = "abgen-corpus";
-            cargoBuildFlags = [ "--bin" "abgen-corpus" ];
+            env.ABGEN_GIT_COMMIT = gitCommit;
+            cargoExtraArgs = "--bin abgen-corpus";
           });
 
           packages.dockerImage =

@@ -184,10 +184,12 @@ the lib sets `#[global_allocator] mimalloc`; any downstream embedding the lib in
 ## Releasing
 
 The release pipeline (`.github/workflows/release.yml`) is plain shell on GitHub-hosted
-runners; the only non-shell steps are Determinate Systems' sha-pinned nix installer on
-the linux legs and first-party actions/cache for the mac legs' cargo caches (measured:
-warm mac caches cut those legs 2-4x; a nix binary cache moved nothing because the whole
-build is one derivation, and its ~9GB would evict the mac caches from the 10GB budget). Every target builds **once**: Linux via
+runners; the only non-shell steps are Determinate Systems' sha-pinned nix installer +
+Magic Nix Cache on the linux legs and first-party actions/cache for the mac legs' cargo
+caches. Measured rationale: warm mac cargo caches cut those legs 2-4x, and the nix cache
+only pays because the flake splits dependency compilation into its own crane derivation
+(keyed on manifests/lockfile, stable across source edits) - without the split, a store
+cache replayed nothing. Every target builds **once**: Linux via
 `nix build` from the committed flake.lock (hermetic; reproduce locally with `nix build` -
 the archives bundle the loader + libs behind the `abgen` entry script and run on any
 Linux, including NixOS); Windows and macOS via the pinned rustup toolchain with
