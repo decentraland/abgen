@@ -1,6 +1,6 @@
 [package]
 name = "abgen-gpu-kernel-ptx"
-version = "0.11.2"
+version = "0.11.3"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "rustc-native nvptx64 PTX kernels for abgen-gpu-core (nightly + -Z build-std=core; artifact consumed by host via ABGEN_GPU_PTX)"

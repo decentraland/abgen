@@ -12,11 +12,13 @@ from its code.
 ## Reproducible releases
 
 Each release is **versioned and tagged**; the release pipeline
-([`.github/workflows/release.yml`](.github/workflows/release.yml)) builds every Linux and macOS binary
-**twice from a clean tree and requires the two bit-identical** before publishing (Windows x64 builds
-once — mingw's linker has a residual link-order non-determinism). Builds are `--locked` against the
-committed `Cargo.lock`, pinned to a single Rust toolchain, with `SOURCE_DATE_EPOCH` taken from the
-tagged commit, so a given tag reproduces the same artifacts.
+([`.github/workflows/release.yml`](.github/workflows/release.yml)) builds every target **once**.
+The Linux binaries are built by **Nix from the committed `flake.lock`** — a hermetic, pinned
+derivation anyone can reproduce locally with `nix build`, which is a stronger guarantee than
+re-running the same build in CI; the archives bundle the loader and libraries behind the `abgen`
+entry script, so they run on any Linux with no host requirements. The Windows and macOS binaries
+are built with a pinned Rust toolchain, `--locked` against the committed `Cargo.lock`, and
+`SOURCE_DATE_EPOCH` from the tagged commit.
 
 ## Vendored shader bundles
 
