@@ -210,11 +210,16 @@ pub fn self_gate_bundle_with(
         got_root == want_root,
         format!("got {got_root:?} want {want_root:?}"),
     );
+    // The upstream converter bakes the scene's world position (base*16)
+    // into the prefab root — origin only when the entity was unresolvable.
+    // The gate has no scene meta, so it checks the parcel-grid invariant.
     push_check(
         &mut checks,
         "root-position",
-        root_positions.iter().all(|p| *p == [0.0, 0.0, 0.0]),
-        format!("{root_positions:?} want origin"),
+        root_positions
+            .iter()
+            .all(|p| p[1] == 0.0 && p[0] % 16.0 == 0.0 && p[2] % 16.0 == 0.0),
+        format!("{root_positions:?} want base*16 (parcel-grid multiple, y=0)"),
     );
     let want_tp = lod_target_platform(platform);
     push_check(

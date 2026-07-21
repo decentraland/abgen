@@ -577,13 +577,21 @@ impl<'a> Builder<'a> {
         let ext = self.add("Texture2D", ext_tree, Role::Tex(name.clone()));
         self.tex_pid.insert(key, ext);
         let entry_key = if self.lod.is_some() {
+            // Upstream ExtractTextures writes PNG for any texture referenced
+            // by a -transparent/-cutout material (alpha must survive) and
+            // keeps JPEG sources as .jpg otherwise.
+            let needs_alpha = scene.materials.iter().any(|m| {
+                let ln = m.name.to_lowercase();
+                (ln.contains("-transparent") || ln.contains("-cutout"))
+                    && m.base_color_image.as_ref().is_some_and(|t| t.image == idx)
+            });
             let container = scene
                 .image_bytes
                 .get(idx)
                 .and_then(|o| o.as_deref())
                 .map(detect_container)
                 .unwrap_or_default();
-            if container == "JPEG" {
+            if container == "JPEG" && !needs_alpha {
                 format!("{name}.jpg")
             } else {
                 format!("{name}.png")

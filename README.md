@@ -46,6 +46,10 @@ classifier is the spec). Setup details: [pipeline/README.md](pipeline/README.md)
 
 Plus `pipeline/abgen-compare` (Python >= 3.9, stdlib-only, run in place) and bundle-inspection examples
 (`texdump`, `matdump`, `objdump`, `crndump`, `texcmp`, `texpng`) under `target/release/examples/`.
+`scripts/lod-parity.sh` runs the same baked LOD GLB through the Unity converter (a sibling
+[asset-bundle-converter](https://github.com/decentraland/asset-bundle-converter) checkout + editor) and
+through `abgen-lod bundle`, then diffs the two bundles (`abgen-lod compare` + `matdump`); `--site`
+publishes the verdicts to the compare site's `/lod.html`.
 ## Server
 ```bash
 ABGEN_CATALYST_URL=https://peer.decentraland.org/content ./target/release/abgen

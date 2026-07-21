@@ -36,8 +36,13 @@ pub(super) fn build_lod_material_tree(
     t.insert("m_Name", name);
     t.insert("m_Shader", shader.clone());
 
-    let masked = m.alpha_mode == "MASK";
-    let transparent = m.alpha_mode == "BLEND";
+    // The upstream LOD converter keys the surface mode off the material NAME
+    // the LOD baker emits (`-transparent` = alpha-blend, `-cutout` =
+    // alpha-clip), not the glTF alphaMode; its transparent branch is checked
+    // first, so a name carrying both suffixes counts as transparent.
+    let lname = name.to_lowercase();
+    let transparent = lname.contains("-transparent");
+    let masked = !transparent && lname.contains("-cutout");
 
     let valid: Vec<Value> = if masked {
         vec![
@@ -96,9 +101,18 @@ pub(super) fn build_lod_material_tree(
 
     let alpha_clip = if masked { 1.0 } else { 0.0 };
     let alpha_to_mask = if masked { 1.0 } else { 0.0 };
-    let cutoff = if masked { m.alpha_cutoff } else { 0.5 };
+    // Upstream hard-codes _Cutoff 0.5 in its cutout branch; the glTF
+    // alphaCutoff is never consulted.
+    let cutoff = 0.5;
     let dst_blend = if transparent { 10.0 } else { 0.0 };
     let surface = if masked || transparent { 1.0 } else { 0.0 };
+    // The upstream converter's suffix branches also SetFloat several
+    // HDRP-named properties Scene_TexArray does not declare
+    // (_AlphaSrcBlend, _BlendMode, _ZTestDepthEqualForOpaque, ...) and
+    // _ZWrite 0 semantics never appear: the built bundle drops undeclared
+    // sheet entries and keeps depth-writing transparency (_ZWrite 1,
+    // _DstBlendAlpha 0) — verified on a fresh Unity 6000.2.6f2 conversion
+    // of a -transparent material and byte-checked against reference LOD1s.
     let floats: Vec<(&str, f64)> = vec![
         ("_AddPrecomputedVelocity", 0.0),
         ("_AlphaClip", alpha_clip),
@@ -137,12 +151,14 @@ pub(super) fn build_lod_material_tree(
     ];
     let floats_v: Vec<Value> = floats.into_iter().map(|(n, v)| arr![n, v]).collect();
 
-    let mut base_color = materials::base_color_verbatim(m.base_color);
+    // Upstream forces alpha 0.8 on transparent materials (mat.color write);
+    // it serializes as the f32 0.8 widened to double.
+    let mut lod_base_color = materials::base_color_verbatim(m.base_color);
     if transparent {
-        base_color[3] = 0.8_f32 as f64;
+        lod_base_color[3] = 0.8_f32 as f64;
     }
     let colors: Vec<Value> = vec![
-        lod_color("_BaseColor", base_color),
+        lod_color("_BaseColor", lod_base_color),
         lod_color("_Color", [1.0, 1.0, 1.0, 1.0]),
         lod_color("_EmissionColor", [0.0, 0.0, 0.0, 1.0]),
         lod_color("_PlaneClipping", lod.plane_clipping),

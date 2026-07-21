@@ -271,11 +271,50 @@ impl Checker {
 }
 
 pub(crate) fn cmd_compare(argv: &[String]) -> Result<i32> {
-    if argv.len() != 2 {
+    let mut paths: Vec<&String> = Vec::new();
+    let mut prod_ab: Option<String> = None;
+    let mut allow_legacy = false;
+    let mut i = 0usize;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--prod-ab" => {
+                prod_ab = Some(
+                    argv.get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--prod-ab needs a value"))?
+                        .clone(),
+                );
+                i += 1;
+            }
+            "--allow-legacy" => allow_legacy = true,
+            other if other.starts_with("--") => bail!("unknown compare flag {other:?}"),
+            _ => paths.push(&argv[i]),
+        }
+        i += 1;
+    }
+    if paths.len() != 2 {
         bail!("compare needs exactly two bundle paths");
     }
-    let ours = extract_facts(&argv[0])?;
-    let prod = extract_facts(&argv[1])?;
+
+    // Era gate: LOD comparisons only target reference builds from the v49
+    // converter era onward. The version is not recorded inside the bundle
+    // (its embedded metadata `version` is the schema version "1.0"), so the
+    // caller passes the registry-reported asset-bundle version.
+    if let Some(v) = &prod_ab {
+        if abgen::lods::ab_version_is_lod_era(v) {
+            println!("INFO era: prod asset-bundle version {v} (post-v49 lane)");
+        } else if allow_legacy {
+            println!("INFO era: prod asset-bundle version {v:?} is pre-v49 — comparing anyway (--allow-legacy)");
+        } else {
+            println!(
+                "SKIP era-gate: prod asset-bundle version {v:?} predates v49 — \
+                 pre-v49 LODs are not comparison targets (--allow-legacy to force)"
+            );
+            return Ok(2);
+        }
+    }
+
+    let ours = extract_facts(paths[0])?;
+    let prod = extract_facts(paths[1])?;
     let mut c = Checker { failures: 0 };
 
     c.check(

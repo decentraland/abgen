@@ -524,6 +524,10 @@ pub struct LodBuildParams {
     pub level: u32,
     pub plane_clipping: [f64; 4],
     pub vertical_clipping: [f64; 4],
+    /// Prefab root world position (base parcel * 16): the upstream converter
+    /// bakes `instantiated.transform.position` into the prefab (verified on a
+    /// fresh Unity 6000.2.6f2 run), zeroed when the entity is unresolvable.
+    pub root_position: [f64; 3],
     pub main_asset: String,
     pub timestamp: Option<i64>,
 }
