@@ -49,10 +49,13 @@ jobs:
     steps:
       - if: matrix.builder == 'nix'
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-      # pays off only with the crane dep-split in the flake: the deps
-      # derivation is what gets replayed across releases
+      # carries the crane deps-derivation closure as a nix file store; keyed
+      # like the deps drv itself (manifests + pins), restored via nix copy
       - if: matrix.builder == 'nix'
-        uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: /tmp/nix-deps-cache
+          key: nix-deps-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crate/Cargo.toml', 'flake.lock', 'flake.nix') }}
 
       - name: setup (checkout + toolchains)
         run: |
@@ -154,8 +157,13 @@ jobs:
       - name: build
         run: |
           if [ "${{ matrix.builder }}" = "nix" ]; then
-            nix build .#default --print-build-logs \
-              --extra-experimental-features 'nix-command flakes'
+            flags="--extra-experimental-features nix-command --extra-experimental-features flakes"
+            if [ -d /tmp/nix-deps-cache ]; then
+              nix copy $flags --from file:///tmp/nix-deps-cache --all --no-check-sigs || true
+            fi
+            nix build .#default --print-build-logs $flags
+            deps=$(nix build .#default.cargoArtifacts --print-out-paths --no-link $flags)
+            nix copy $flags --to file:///tmp/nix-deps-cache "$deps"
           else
             cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.cargo_flags }} --bin abgen
           fi
