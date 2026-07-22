@@ -154,7 +154,9 @@ mod tests {
         assert!(is_loopback_url("http://localhost:8000/content"));
         assert!(is_loopback_url("http://[::1]:8000/content"));
         assert!(!is_loopback_url("https://peer.decentraland.org/content"));
-        assert!(!is_loopback_url("https://worlds-content-server.decentraland.org"));
+        assert!(!is_loopback_url(
+            "https://worlds-content-server.decentraland.org"
+        ));
         assert!(!is_loopback_url("http://127.evil.example.com/content"));
     }
 }

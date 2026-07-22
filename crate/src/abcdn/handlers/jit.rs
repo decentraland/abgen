@@ -170,7 +170,9 @@ pub(super) async fn jit_build_entity(
     let (tx, rx) = tokio::sync::oneshot::channel::<JitBuild>();
     tokio::spawn(async move {
         let _permit = jit_build_sem().acquire().await.ok();
-        let _pin = st.jit_cache.pin(&crate::naming::fs_safe_component(&entity_owned));
+        let _pin = st
+            .jit_cache
+            .pin(&crate::naming::fs_safe_component(&entity_owned));
         let outcome = if timed_corpus_build(
             proxy,
             st.jit_root.clone(),

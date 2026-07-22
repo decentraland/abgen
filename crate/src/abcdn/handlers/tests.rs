@@ -1231,7 +1231,11 @@ async fn upstream_lane_serves_misses_and_skips_local_entities() {
             200,
             br#"{"version":"v41","files":[]}"#.to_vec(),
         ),
-        ("/v41/bafkup/Qmx_windows".to_string(), 200, b"BUNDLE".to_vec()),
+        (
+            "/v41/bafkup/Qmx_windows".to_string(),
+            200,
+            b"BUNDLE".to_vec(),
+        ),
     ]);
     let state = mk_lane_state_upstream(&dir, format!("http://{host}"));
 
