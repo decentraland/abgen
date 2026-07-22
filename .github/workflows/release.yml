@@ -93,8 +93,8 @@ jobs:
           fi
 
           if [ "${{ matrix.target }}" = "aarch64-pc-windows-gnullvm" ]; then
-            curl -fsSL -o llvm-mingw.tar.xz https://github.com/mstorsjo/llvm-mingw/releases/download/20260721/llvm-mingw-20260721-ucrt-ubuntu-22.04-x86_64.tar.xz
-            echo "4a9fd7ac5bda8a0a514f33c4ad7864a76e58c56ed958be18221c5ca0ac0a2b10  llvm-mingw.tar.xz" | sha256sum -c
+            curl -fsSL -o llvm-mingw.tar.xz https://github.com/mstorsjo/llvm-mingw/releases/download/20260616/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64.tar.xz
+            echo "534b92e067b22a6b4441f48ae9240a3341b17825d04d577eab0cf85c44b4deda  llvm-mingw.tar.xz" | sha256sum -c
             sudo tar -xJf llvm-mingw.tar.xz -C /opt && rm llvm-mingw.tar.xz
             cat > /tmp/aarch64-mingw-toolchain.cmake <<'EOF'
           set(CMAKE_SYSTEM_NAME Windows)
@@ -103,16 +103,16 @@ jobs:
           set(CMAKE_CXX_COMPILER aarch64-w64-mingw32-clang++)
           set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
           EOF
-            sudo rm /opt/llvm-mingw-20260721-ucrt-ubuntu-22.04-x86_64/aarch64-w64-mingw32/lib/libc++.dll.a \
-                    /opt/llvm-mingw-20260721-ucrt-ubuntu-22.04-x86_64/aarch64-w64-mingw32/lib/libunwind.dll.a
-            echo "/opt/llvm-mingw-20260721-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
+            sudo rm /opt/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64/aarch64-w64-mingw32/lib/libc++.dll.a \
+                    /opt/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64/aarch64-w64-mingw32/lib/libunwind.dll.a
+            echo "/opt/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
             {
               echo "CMAKE_TOOLCHAIN_FILE=/tmp/aarch64-mingw-toolchain.cmake"
               echo "CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER=aarch64-w64-mingw32-clang"
               echo "CC_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-clang"
               echo "CXX_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-clang++"
               echo "AR_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-ar"
-              echo "BINDGEN_EXTRA_CLANG_ARGS=--target=aarch64-w64-mingw32 --sysroot=/opt/llvm-mingw-20260721-ucrt-ubuntu-22.04-x86_64/aarch64-w64-mingw32"
+              echo "BINDGEN_EXTRA_CLANG_ARGS=--target=aarch64-w64-mingw32 --sysroot=/opt/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64/aarch64-w64-mingw32"
             } >> "$GITHUB_ENV"
           fi
 
