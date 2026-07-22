@@ -335,6 +335,193 @@ fn eager_build_index(state: &AppState, entities: &[ResolvedEntity]) {
     });
 }
 
+/// versions/bundles/status for one entity, ready to embed in a registry response.
+type AbRecordJson = (serde_json::Value, serde_json::Value, serde_json::Value);
+
+fn is_parcel_pointer(p: &str) -> bool {
+    match p.split_once(',') {
+        Some((x, y)) => x.trim().parse::<i64>().is_ok() && y.trim().parse::<i64>().is_ok(),
+        None => false,
+    }
+}
+
+fn upstream_registry_fetch(
+    base: &str,
+    pointers: &[String],
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    use std::io::Read as _;
+    let url = format!("{base}/entities/active");
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build()
+        .into();
+    let resp = agent
+        .post(&url)
+        .header("User-Agent", crate::catalyst::UA)
+        .header("Content-Type", "application/json")
+        .send(serde_json::json!({ "pointers": pointers }).to_string())?;
+    let mut buf: Vec<u8> = Vec::new();
+    resp.into_body().into_reader().read_to_end(&mut buf)?;
+    let parsed: serde_json::Value = serde_json::from_slice(&buf)?;
+    parsed
+        .as_array()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("{url}: response is not an array"))
+}
+
+/// Resolves the asset-bundle record for each entity: locally built bundles
+/// win; entities without local bundles are answered with the upstream
+/// registry's record (the versions the production CDN actually serves) when
+/// one is configured; only entities the upstream does not know — and every
+/// entity when no upstream registry is configured — fall back to this
+/// server's own version, the promise that a request will JIT-build them.
+/// Entities absent from the map get no record, mirroring how the production
+/// registry omits unconverted entities.
+async fn ab_records_for(
+    state: &AppState,
+    ents: &[ResolvedEntity],
+) -> std::collections::HashMap<String, AbRecordJson> {
+    use std::collections::HashMap;
+
+    let st = state.clone();
+    let probe: Vec<(String, bool)> = ents
+        .iter()
+        .map(|e| (e.entity_id.clone(), entity_buildable(&e.content)))
+        .collect();
+    // (local bundles present?, record with the JIT-promise fabrication)
+    let local: HashMap<String, (bool, Option<AbRecordJson>)> =
+        tokio::task::spawn_blocking(move || {
+            probe
+                .into_iter()
+                .map(|(id, buildable)| {
+                    let nofab = super::index::entity_ab_record(
+                        &st.out_root,
+                        &st.bundle_index,
+                        &id,
+                        false,
+                        &st.ab_version,
+                        &st.ab_date,
+                    );
+                    let fab = super::index::entity_ab_record(
+                        &st.out_root,
+                        &st.bundle_index,
+                        &id,
+                        buildable,
+                        &st.ab_version,
+                        &st.ab_date,
+                    )
+                    .map(|(v, b, s)| (v, b, serde_json::Value::from(s)));
+                    (id, (nofab.is_some(), fab))
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
+
+    let registry = state.upstream_ab_registry.clone();
+    let mut out: HashMap<String, AbRecordJson> = HashMap::new();
+    let mut ask_upstream: Vec<&ResolvedEntity> = Vec::new();
+    // Entities the upstream registry authoritatively does not know keep no
+    // record at all; `true` here means "decided, possibly with no record".
+    let mut decided: HashMap<String, bool> = HashMap::new();
+
+    for e in ents {
+        let (has_local, fab) = match local.get(&e.entity_id) {
+            Some(v) => v.clone(),
+            None => continue,
+        };
+        if has_local {
+            if let Some(rec) = fab {
+                out.insert(e.entity_id.clone(), rec);
+            }
+            decided.insert(e.entity_id.clone(), true);
+            continue;
+        }
+        // The local corpus (preview-server entities) can never exist upstream.
+        if registry.is_none() || e.entity_id.starts_with("b64-") {
+            if let Some(rec) = fab {
+                out.insert(e.entity_id.clone(), rec);
+            }
+            decided.insert(e.entity_id.clone(), true);
+            continue;
+        }
+        match state.upstream_registry_cache.get(&e.entity_id).await {
+            Some(Some(rec)) => {
+                out.insert(e.entity_id.clone(), (rec.versions, rec.bundles, rec.status));
+                decided.insert(e.entity_id.clone(), true);
+            }
+            Some(None) => {
+                decided.insert(e.entity_id.clone(), true);
+            }
+            None => ask_upstream.push(e),
+        }
+    }
+
+    if let (Some(base), false) = (registry, ask_upstream.is_empty()) {
+        let mut pointers: Vec<String> = ask_upstream
+            .iter()
+            .flat_map(|e| e.pointers.iter())
+            .filter(|p| !is_parcel_pointer(p))
+            .cloned()
+            .collect();
+        pointers.sort();
+        pointers.dedup();
+        let fetched = if pointers.is_empty() {
+            Ok(Vec::new())
+        } else {
+            tokio::task::spawn_blocking(move || upstream_registry_fetch(&base, &pointers))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("registry fetch panicked: {e}")))
+        };
+        match fetched {
+            Ok(records) => {
+                let by_id: HashMap<&str, &serde_json::Value> = records
+                    .iter()
+                    .filter_map(|r| r.get("id").and_then(|i| i.as_str()).map(|i| (i, r)))
+                    .collect();
+                for e in &ask_upstream {
+                    let asked = e.pointers.iter().any(|p| !is_parcel_pointer(p));
+                    let rec = by_id.get(e.entity_id.as_str()).and_then(|r| {
+                        Some(crate::abcdn::state::UpstreamAbRecord {
+                            versions: r.get("versions")?.clone(),
+                            bundles: r.get("bundles").cloned().unwrap_or_default(),
+                            status: r.get("status").cloned().unwrap_or_default(),
+                        })
+                    });
+                    if !asked && rec.is_none() {
+                        // none of its pointers were forwarded — not an
+                        // authoritative absence, keep today's behavior
+                        continue;
+                    }
+                    state
+                        .upstream_registry_cache
+                        .insert(e.entity_id.clone(), rec.clone())
+                        .await;
+                    if let Some(rec) = rec {
+                        out.insert(e.entity_id.clone(), (rec.versions, rec.bundles, rec.status));
+                    }
+                    decided.insert(e.entity_id.clone(), true);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "upstream ab registry fetch failed; answering with local records");
+            }
+        }
+    }
+
+    // Anything left undecided (upstream fetch failed) keeps today's behavior.
+    for e in ents {
+        if decided.contains_key(&e.entity_id) {
+            continue;
+        }
+        if let Some((_, Some(rec))) = local.get(&e.entity_id).cloned() {
+            out.insert(e.entity_id.clone(), rec);
+        }
+    }
+
+    out
+}
+
 pub async fn post_entities_versions(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
@@ -349,29 +536,19 @@ pub async fn post_entities_versions(
     };
     eager_build_index(&state, &ents);
 
-    let st = state.clone();
-    let out = tokio::task::spawn_blocking(move || {
-        ents.into_iter()
-            .filter_map(|e| {
-                let (versions, bundles, status) = super::index::entity_ab_record(
-                    &st.out_root,
-                    &st.bundle_index,
-                    &e.entity_id,
-                    entity_buildable(&e.content),
-                    &st.ab_version,
-                    &st.ab_date,
-                )?;
-                Some(serde_json::json!({
-                    "pointers": e.pointers,
-                    "versions": versions,
-                    "bundles": bundles,
-                    "status": status,
-                }))
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
-    .unwrap_or_default();
+    let recs = ab_records_for(&state, &ents).await;
+    let out: Vec<serde_json::Value> = ents
+        .into_iter()
+        .filter_map(|e| {
+            let (versions, bundles, status) = recs.get(&e.entity_id)?.clone();
+            Some(serde_json::json!({
+                "pointers": e.pointers,
+                "versions": versions,
+                "bundles": bundles,
+                "status": status,
+            }))
+        })
+        .collect();
 
     Json(out).into_response()
 }
@@ -402,18 +579,11 @@ pub async fn post_entities_active(
 }
 
 async fn entities_active_records(state: &AppState, ents: Vec<ResolvedEntity>) -> Response {
-    let st = state.clone();
-    let out = tokio::task::spawn_blocking(move || {
+    let recs = ab_records_for(state, &ents).await;
+    let out = {
         ents.into_iter()
             .filter_map(|e| {
-                let (versions, bundles, status) = super::index::entity_ab_record(
-                    &st.out_root,
-                    &st.bundle_index,
-                    &e.entity_id,
-                    entity_buildable(&e.content),
-                    &st.ab_version,
-                    &st.ab_date,
-                )?;
+                let (versions, bundles, status) = recs.get(&e.entity_id)?.clone();
                 let content: Vec<serde_json::Value> = e
                     .content
                     .iter()
@@ -433,9 +603,7 @@ async fn entities_active_records(state: &AppState, ents: Vec<ResolvedEntity>) ->
                 }))
             })
             .collect::<Vec<_>>()
-    })
-    .await
-    .unwrap_or_default();
+    };
 
     Json(out).into_response()
 }

@@ -309,8 +309,16 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
     if let Some(upstream) = &cfg.upstream_ab_cdn {
         tracing::info!(
             upstream = %upstream,
-            "upstream ab-cdn read-through ENABLED (ABGEN_UPSTREAM_AB_CDN): local+JIT misses \
-             are fetched upstream and materialized into the JIT cache"
+            "upstream ab-cdn read-through ENABLED (ABGEN_UPSTREAM_AB_CDN): local misses \
+             stream from upstream before any JIT build; nothing is persisted"
+        );
+    }
+    if let Some(registry) = &cfg.upstream_ab_registry {
+        tracing::info!(
+            registry = %registry,
+            "upstream ab registry pass-through ENABLED (ABGEN_UPSTREAM_AB_REGISTRY): \
+             registry records for entities without local bundles are answered with the \
+             upstream registry's versions instead of this server's own"
         );
     }
 
@@ -332,6 +340,7 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
     .with_worlds_content_url(crate::worlds::content_fallback_from_env())
     .with_jit(jit_root, jit_cache, roots_distinct)
     .with_dev_lanes(cfg.jit_content_digest, cfg.upstream_ab_cdn.clone())
+    .with_upstream_ab_registry(cfg.upstream_ab_registry.clone())
     .with_registry_state(Some(contents_registry));
     let inner = inner.with_content_db(content_db);
     Ok(Arc::new(inner))

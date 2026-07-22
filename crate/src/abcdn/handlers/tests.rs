@@ -1317,3 +1317,132 @@ async fn upstream_runs_before_jit_build_lanes() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registry_records_pass_through_upstream_versions() {
+    use axum::extract::State;
+    let dir = lane_temp_dir("regupstream");
+
+    // The catalyst resolves three entities: a remote emote the upstream
+    // registry knows, a remote wearable it does not, and the local corpus
+    // (b64-) preview scene.
+    let resolved = serde_json::json!([
+        {
+            "id": "bafkremoteemote",
+            "type": "emote",
+            "timestamp": 10i64,
+            "pointers": ["urn:decentraland:test:emote:1"],
+            "content": [{"file": "emote.glb", "hash": "Qmglb1"}],
+            "metadata": {},
+        },
+        {
+            "id": "bafkunknownwearable",
+            "type": "wearable",
+            "timestamp": 11i64,
+            "pointers": ["urn:decentraland:test:wearable:2"],
+            "content": [{"file": "wearable.glb", "hash": "Qmglb2"}],
+            "metadata": {},
+        },
+        {
+            "id": "b64-localscene",
+            "type": "scene",
+            "timestamp": 12i64,
+            "pointers": ["0,0"],
+            "content": [{"file": "scene.glb", "hash": "Qmglb3"}],
+            "metadata": {},
+        },
+    ]);
+    let (chost, _cseen) = crate::live::stub::serve(vec![(
+        "/entities/active".to_string(),
+        200,
+        resolved.to_string().into_bytes(),
+    )]);
+
+    // The upstream registry answers with the versions the production CDN
+    // actually serves — deliberately different from this server's own (v41).
+    let upstream_records = serde_json::json!([{
+        "id": "bafkremoteemote",
+        "pointers": ["urn:decentraland:test:emote:1"],
+        "versions": {"assets": {"mac": {"version": "v33", "buildDate": "d"}}},
+        "bundles": {"assets": {"mac": "complete"}},
+        "status": "complete",
+    }]);
+    let (rhost, rseen) = crate::live::stub::serve(vec![(
+        "/entities/active".to_string(),
+        200,
+        upstream_records.to_string().into_bytes(),
+    )]);
+
+    let state: super::super::state::AppState = {
+        use super::super::lodjit::LodJit;
+        use super::super::state::AppStateInner;
+        std::sync::Arc::new(
+            AppStateInner::new(
+                dir.to_path_buf(),
+                crate::catalyst::CatalystClient::new("http://127.0.0.1:9"),
+                std::collections::HashMap::new(),
+                None,
+                "http://c".to_string(),
+                true,
+                Vec::new(),
+                "v41".to_string(),
+                "date".to_string(),
+                "http://c".to_string(),
+                true,
+                LodJit::assemble(
+                    false,
+                    crate::lodgen::simplify::SimplifierBackend::Gltfpack,
+                    None,
+                    "/tmp/abgen-handlers-lane",
+                    600,
+                    3600,
+                    1,
+                ),
+                crate::abcdn::state::IndexBuild::disabled(),
+            )
+            .with_registry_state(Some(mk_registry_state(
+                &dir,
+                &format!("http://{chost}"),
+                None,
+            )))
+            .with_upstream_ab_registry(Some(format!("http://{rhost}"))),
+        )
+    };
+
+    let body = serde_json::json!({ "pointers": [
+        "urn:decentraland:test:emote:1",
+        "urn:decentraland:test:wearable:2",
+        "0,0",
+    ]});
+    let resp = super::post_entities_versions(State(state.clone()), axum::Json(body.clone())).await;
+    let out: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let recs = out.as_array().unwrap();
+
+    let by_pointer = |p: &str| {
+        recs.iter()
+            .find(|r| r["pointers"].as_array().unwrap().iter().any(|v| v == p))
+    };
+    // Remote emote: the upstream registry's record, verbatim.
+    let emote = by_pointer("urn:decentraland:test:emote:1").expect("emote record");
+    assert_eq!(emote["versions"]["assets"]["mac"]["version"], "v33");
+    assert_eq!(emote["status"], "complete");
+    // Remote wearable unknown upstream: omitted, like the production registry.
+    assert!(by_pointer("urn:decentraland:test:wearable:2").is_none());
+    // Local corpus entity: never asked upstream, keeps the JIT promise.
+    let scene = by_pointer("0,0").expect("local scene record");
+    assert_eq!(scene["versions"]["assets"]["mac"]["version"], "v41");
+
+    // Second request answers from the cache: still exactly one upstream POST.
+    let _ = super::post_entities_versions(State(state.clone()), axum::Json(body)).await;
+    let posts = rseen.lock().unwrap().clone();
+    assert_eq!(
+        posts
+            .iter()
+            .filter(|l| l.as_str() == "POST /entities/active")
+            .count(),
+        1,
+        "{posts:?}"
+    );
+    // Only the remote URN pointers were forwarded — never the b64 scene's parcel.
+    let _ = std::fs::remove_dir_all(&dir);
+}
