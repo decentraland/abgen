@@ -1203,43 +1203,22 @@ async fn health_reports_registry_mode() {
 }
 
 #[test]
-fn upstream_dst_maps_only_delivery_paths() {
-    let dir = lane_temp_dir("updst");
-    let state = mk_lane_state(&dir, None);
-    let f = |p: &str| super::upstream_dst(&state, p);
+fn upstream_eligibility_covers_only_delivery_paths() {
+    let f = super::upstream_eligible;
 
-    assert_eq!(
-        f("manifest/bafkup_windows.json").unwrap(),
-        dir.join("bafkup").join("windows.manifest.json")
-    );
-    assert_eq!(
-        f("v41/bafkup/Qmx_windows").unwrap(),
-        dir.join("bafkup").join("windows").join("Qmx_windows")
-    );
-    assert_eq!(
-        f("v41/bafkup/Qmx_mac.br").unwrap(),
-        dir.join("bafkup").join("mac").join("Qmx_mac.br")
-    );
-    assert_eq!(
-        f("LOD/1/bafkscene_1_mac").unwrap(),
-        dir.join("bafkscene").join("LOD").join("1").join("bafkscene_1_mac")
-    );
-    assert_eq!(
-        f("lods-unity/manifests/bafkscene_InitialSceneState.json").unwrap(),
-        dir.join("bafkscene").join("bafkscene_InitialSceneState.json")
-    );
-    assert_eq!(
-        f("v41/Qmflat_windows").unwrap(),
-        dir.join("Qmflat_windows")
-    );
+    assert!(f("manifest/bafkup_windows.json"));
+    assert!(f("v41/bafkup/Qmx_windows"));
+    assert!(f("v41/bafkup/Qmx_mac.br"));
+    assert!(f("LOD/1/bafkscene_1_mac"));
+    assert!(f("lods-unity/manifests/bafkscene_InitialSceneState.json"));
+    assert!(f("v41/Qmflat_windows"));
 
-    assert!(f("manifest/noext").is_none());
-    assert!(f("dcl/scene_ignore_windows").is_none());
-    assert!(f("v41/../Qmx_windows").is_none());
-    assert!(f("v41/bafkup/textures/file.png").is_none());
-    assert!(f("v41/bafkup/file.png").is_none());
-    assert!(f("health").is_none());
-    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!f("manifest/noext"));
+    assert!(!f("dcl/scene_ignore_windows"));
+    assert!(!f("v41/../Qmx_windows"));
+    assert!(!f("v41/bafkup/textures/file.png"));
+    assert!(!f("v41/bafkup/file.png"));
+    assert!(!f("health"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1258,16 +1237,13 @@ async fn upstream_lane_serves_misses_and_skips_local_entities() {
 
     let resp = lane_get(&state, "manifest/bafkup_windows.json").await;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(dir.join("bafkup").join("windows.manifest.json").is_file());
 
     let resp = lane_get(&state, "v41/bafkup/Qmx_windows").await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_bytes(resp).await, b"BUNDLE");
-    assert!(dir
-        .join("bafkup")
-        .join("windows")
-        .join("Qmx_windows")
-        .is_file());
+
+    // Pure pass-through: nothing upstream-served is persisted locally.
+    assert!(!dir.join("bafkup").exists());
 
     // Local preview-server ids never go upstream.
     let resp = lane_get(&state, "manifest/b64-abc_windows.json").await;

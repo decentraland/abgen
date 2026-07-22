@@ -4,16 +4,16 @@ use std::io::Read as _;
 const UPSTREAM_TIMEOUT_SECS: u64 = 60;
 
 /// Read-through to a production ab-cdn (`ABGEN_UPSTREAM_AB_CDN`). Runs after
-/// every local and JIT lane has 404'd: fetches the same path upstream,
-/// materializes the bytes into the JIT cache layout, and re-dispatches. This
-/// keeps wearables/emotes/LODs working when a client points its whole
-/// optimized-assets base URL at this server while only local scene entities
-/// are buildable here.
+/// every local and JIT lane has 404'd: streams the same path from upstream,
+/// storing nothing on disk — this server persists only what it built for
+/// local entities. Keeps wearables/emotes/LODs working when a client points
+/// its whole optimized-assets base URL at this server while only local scene
+/// entities are buildable here.
 pub(super) async fn upstream_fallback(
     state: &AppState,
     path: &str,
     method: &Method,
-    headers: &HeaderMap,
+    _headers: &HeaderMap,
     local: Response,
 ) -> Response {
     let Some(base) = state.upstream_ab_cdn.clone() else {
@@ -26,60 +26,62 @@ pub(super) async fn upstream_fallback(
     if path.split('/').any(|s| s.starts_with("b64-")) {
         return local;
     }
-    let Some(dst) = upstream_dst(state, path) else {
+    if !upstream_eligible(path) {
         return local;
-    };
+    }
     let neg_key = format!("up:{path}");
     if state.jit_fail_cache.get(&neg_key).await.is_some() {
         return with_reason(local, "upstream-miss");
     }
 
-    let jit_key = state.jit_key_of(&dst);
-    let _pin = jit_key.as_deref().and_then(|k| state.jit_cache.pin(k));
     let url = format!("{base}/{path}");
-    let dst2 = dst.clone();
-    let materialized = tokio::task::spawn_blocking(move || match upstream_get(&url) {
-        Some(bytes) => write_materialized(&dst2, &bytes),
-        None => false,
-    })
-    .await
-    .unwrap_or(false);
-    let outcome = if materialized { "hit" } else { "miss" };
+    let fetched = tokio::task::spawn_blocking(move || upstream_get(&url))
+        .await
+        .unwrap_or(None);
+    let outcome = if fetched.is_some() { "hit" } else { "miss" };
     metrics::counter!("abgen_upstream_reads_total", "outcome" => outcome).increment(1);
-    if !materialized {
+
+    let Some(bytes) = fetched else {
         state.jit_fail_cache.insert(neg_key, ()).await;
         return with_reason(local, "upstream-miss");
-    }
+    };
 
-    if let Some(k) = &jit_key {
-        let entry = state.jit_root.join(k);
-        if entry.is_dir() {
-            state.jit_record(k);
-        } else {
-            state.jit_record_file(k, &entry);
-        }
-    }
-    state.resolve_cache.invalidate(path).await;
-    let resp = dispatch_local(state, path, method, headers).await;
-    if resp.status() == StatusCode::NOT_FOUND {
-        return with_reason(local, "upstream-miss");
-    }
+    let content_type = if path.ends_with(".json") {
+        "application/json"
+    } else {
+        "application/octet-stream"
+    };
+    let len = bytes.len();
+    let mut resp = if *method == Method::HEAD {
+        StatusCode::OK.into_response()
+    } else {
+        (StatusCode::OK, bytes).into_response()
+    };
+    let h = resp.headers_mut();
+    h.insert("Content-Type", content_type.parse().unwrap());
+    h.insert("Content-Length", len.to_string().parse().unwrap());
+    h.insert("Cache-Control", "public, max-age=600".parse().unwrap());
+    h.insert("Access-Control-Allow-Origin", "*".parse().unwrap());
     resp
 }
 
-/// Maps an ab-cdn request path to the JIT-cache location where an upstream
-/// copy should be materialized. Only paths the delivery surface actually
-/// serves are eligible; anything else stays a local 404.
-pub(super) fn upstream_dst(state: &AppState, path: &str) -> Option<std::path::PathBuf> {
+/// True for ab-cdn request shapes the delivery surface serves; anything else
+/// stays a local 404 rather than being forwarded upstream.
+pub(super) fn upstream_eligible(path: &str) -> bool {
+    upstream_dst(path).is_some()
+}
+
+fn upstream_dst(path: &str) -> Option<()> {
+    let root = std::path::Path::new("");
     let segs: Vec<&str> = path.split('/').collect();
     match segs.as_slice() {
         ["manifest", name] => {
             let stem = name.strip_suffix(".json")?;
-            resolver::manifest_path(&state.jit_root, stem)
+            resolver::manifest_path(root, stem).map(|_| ())
         }
-        ["LOD", level, filename] => resolver::lod_path(&state.jit_root, level, filename),
+        ["LOD", level, filename] => resolver::lod_path(root, level, filename).map(|_| ()),
         ["lods-unity", "manifests", filename] => {
-            resolver::iss_manifest_path(&state.jit_root, filename)
+            resolver::iss_manifest_path(root, filename).map(|_| ())
         }
         [ver, entity, file] if *ver != "manifest" && *ver != "LOD" => {
             if !resolver::is_safe_component(entity) || !resolver::is_safe_component(file) {
@@ -89,14 +91,7 @@ pub(super) fn upstream_dst(state: &AppState, path: &str) -> Option<std::path::Pa
             if !is_bundle_name(raw) {
                 return None;
             }
-            let platform = resolver::platform_of(raw);
-            Some(
-                state
-                    .jit_root
-                    .join(&*crate::naming::fs_safe_component(entity))
-                    .join(platform)
-                    .join(&*crate::naming::fs_safe_component(file)),
-            )
+            Some(())
         }
         [ver, file] if *ver != "manifest" && *ver != "dcl" => {
             if !resolver::is_safe_component(ver) || !resolver::is_safe_component(file) {
@@ -106,7 +101,7 @@ pub(super) fn upstream_dst(state: &AppState, path: &str) -> Option<std::path::Pa
             if !is_bundle_name(raw) {
                 return None;
             }
-            Some(state.jit_root.join(&*crate::naming::fs_safe_component(file)))
+            Some(())
         }
         _ => None,
     }
