@@ -45,7 +45,9 @@ pub fn write_corpus_manifest(m: &CorpusManifestSpec) -> Result<PathBuf> {
         "contentServerUrl": m.content_server_url,
         "date": m.date,
     });
-    let dir = m.out_root.join(m.entity_id);
+    let dir = m
+        .out_root
+        .join(&*crate::naming::fs_safe_component(m.entity_id));
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.manifest.json", m.platform));
     let text = serde_json::to_string_pretty(&manifest)?;

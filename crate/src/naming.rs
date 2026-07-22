@@ -4,6 +4,25 @@ use std::collections::HashMap;
 
 pub const GLTF_EXTENSIONS: [&str; 2] = [".glb", ".gltf"];
 
+/// Longest id/bundle name stored verbatim as a path component. Catalyst content
+/// hashes are fixed-length (59 chars) so production names sit far below this;
+/// only unbounded ids (the sdk-commands preview server's base64-of-path pseudo
+/// hashes) exceed it. Leaves headroom under the 255-byte filesystem NAME_MAX
+/// for the `.tmp.{pid}.{n}` suffixes of atomic writes.
+const FS_COMPONENT_MAX_BYTES: usize = 200;
+
+/// Maps a served name to the component it is stored under on disk: names within
+/// the limit pass through verbatim (production behavior is byte-identical);
+/// oversized names collapse to a fixed-length digest. Must be applied
+/// symmetrically by writers and resolvers.
+pub fn fs_safe_component(name: &str) -> std::borrow::Cow<'_, str> {
+    if name.len() <= FS_COMPONENT_MAX_BYTES {
+        return std::borrow::Cow::Borrowed(name);
+    }
+    let digest = crate::hashes::sha256_hex(name.as_bytes());
+    std::borrow::Cow::Owned(format!("xn-{}", &digest[..40]))
+}
+
 const GLB_MAGIC: u32 = 0x46546C67;
 const GLB_CHUNK_TYPE_JSON: u32 = 0x4E4F534A;
 const GLB_HEADER_BYTES: usize = 12;

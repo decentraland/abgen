@@ -20,6 +20,10 @@ pub struct Config {
 
     pub abgen_root: Option<String>,
     pub content_database_url: Option<String>,
+
+    pub jit_content_digest: bool,
+
+    pub upstream_ab_cdn: Option<String>,
 }
 
 impl Config {
@@ -62,6 +66,11 @@ impl Config {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
             content_database_url: content_connection_string(),
+            jit_content_digest: crate::clihelp::env_bool("ABGEN_JIT_CONTENT_DIGEST", false),
+            upstream_ab_cdn: env::var("ABGEN_UPSTREAM_AB_CDN")
+                .ok()
+                .map(|s| s.trim().trim_end_matches('/').to_string())
+                .filter(|s| !s.is_empty()),
         })
     }
 }

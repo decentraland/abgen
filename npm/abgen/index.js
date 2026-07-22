@@ -20,10 +20,16 @@ function binPath() {
   try {
     return require.resolve(`${pkg}/${bin}`)
   } catch {
-    throw new Error(
-      `@dcl/abgen: ${pkg} is missing. It installs as an optionalDependency of @dcl/abgen - ` +
-        'reinstall without --omit=optional / --no-optional, or add it as a direct dependency.'
-    )
+    // file:/link installs resolve this module to its realpath, where the platform
+    // package is not a sibling - fall back to the consumer's working directory.
+    try {
+      return require.resolve(`${pkg}/${bin}`, { paths: [process.cwd()] })
+    } catch {
+      throw new Error(
+        `@dcl/abgen: ${pkg} is missing. It installs as an optionalDependency of @dcl/abgen - ` +
+          'reinstall without --omit=optional / --no-optional, or add it as a direct dependency.'
+      )
+    }
   }
 }
 

@@ -7,30 +7,43 @@ pub async fn dispatch(
     uri: Uri,
 ) -> Response {
     let path = uri.path().trim_start_matches('/').to_string();
-    let local = dispatch_local(&state, &path, &method, &headers).await;
+    revalidate_if_stale(&state, &path).await;
+    let resp = dispatch_with_fallbacks(&state, &path, &method, &headers).await;
+    if resp.status() == StatusCode::NOT_FOUND && state.upstream_ab_cdn.is_some() {
+        return upstream_fallback(&state, &path, &method, &headers, resp).await;
+    }
+    resp
+}
+
+async fn dispatch_with_fallbacks(
+    state: &AppState,
+    path: &str,
+    method: &Method,
+    headers: &HeaderMap,
+) -> Response {
+    let local = dispatch_local(state, path, method, headers).await;
 
     if local.status() == StatusCode::NOT_FOUND {
-        if let Some(target) = resolver::shader_target(&path) {
-            return shader_fallback(&state, &path, &target, &method, &headers, local).await;
+        if let Some(target) = resolver::shader_target(path) {
+            return shader_fallback(state, path, &target, method, headers, local).await;
         }
         if let Some(proxy) = state.live_proxy.clone() {
-            if let Some(target) = jit_target(&path) {
-                return bundle_fallback(&state, proxy, &path, &target, &method, &headers, local)
-                    .await;
+            if let Some(target) = jit_target(path) {
+                return bundle_fallback(state, proxy, path, &target, method, headers, local).await;
             }
-            if br_bundle_target(&path) {
+            if br_bundle_target(path) {
                 return with_reason(local, "br-not-built");
             }
         }
         if path.split('/').next() == Some("LOD") {
-            return lod_fallback(&state, &path, &method, &headers, local).await;
+            return lod_fallback(state, path, method, headers, local).await;
         }
         let segs: Vec<&str> = path.split('/').collect();
         if segs.len() == 3 && segs[0] == "lods-unity" && segs[1] == "manifests" {
-            return iss_fallback(&state, &path, &method, &headers, local).await;
+            return iss_fallback(state, path, method, headers, local).await;
         }
-        if let Some((bare, platform)) = flat_target(&path) {
-            return flat_fallback(&state, &path, &bare, &platform, &method, &headers, local).await;
+        if let Some((bare, platform)) = flat_target(path) {
+            return flat_fallback(state, path, &bare, &platform, method, headers, local).await;
         }
     }
     local

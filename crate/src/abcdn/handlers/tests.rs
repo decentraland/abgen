@@ -363,6 +363,40 @@ fn mk_lane_state_jit(
     )
 }
 
+fn mk_lane_state_upstream(
+    dir: &std::path::Path,
+    upstream: String,
+) -> super::super::state::AppState {
+    use super::super::lodjit::LodJit;
+    use super::super::state::AppStateInner;
+    std::sync::Arc::new(
+        AppStateInner::new(
+            dir.to_path_buf(),
+            crate::catalyst::CatalystClient::new("http://127.0.0.1:9"),
+            std::collections::HashMap::new(),
+            None,
+            "http://c".to_string(),
+            true,
+            Vec::new(),
+            "v41".to_string(),
+            "date".to_string(),
+            "http://c".to_string(),
+            true,
+            LodJit::assemble(
+                false,
+                crate::lodgen::simplify::SimplifierBackend::Gltfpack,
+                None,
+                "/tmp/abgen-handlers-lane",
+                600,
+                3600,
+                1,
+            ),
+            crate::abcdn::state::IndexBuild::disabled(),
+        )
+        .with_dev_lanes(false, Some(upstream)),
+    )
+}
+
 fn mk_stub_proxy(host: &str, read_only: bool, tag: &str) -> std::sync::Arc<crate::live::Proxy> {
     mk_stub_proxy_catalyst(host, "http://127.0.0.1:9", read_only, tag)
 }
@@ -1165,5 +1199,95 @@ async fn health_reports_registry_mode() {
     let resp = super::health(State(state)).await;
     let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     assert_eq!(body["registry"], "catalyst-proxy");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn upstream_dst_maps_only_delivery_paths() {
+    let dir = lane_temp_dir("updst");
+    let state = mk_lane_state(&dir, None);
+    let f = |p: &str| super::upstream_dst(&state, p);
+
+    assert_eq!(
+        f("manifest/bafkup_windows.json").unwrap(),
+        dir.join("bafkup").join("windows.manifest.json")
+    );
+    assert_eq!(
+        f("v41/bafkup/Qmx_windows").unwrap(),
+        dir.join("bafkup").join("windows").join("Qmx_windows")
+    );
+    assert_eq!(
+        f("v41/bafkup/Qmx_mac.br").unwrap(),
+        dir.join("bafkup").join("mac").join("Qmx_mac.br")
+    );
+    assert_eq!(
+        f("LOD/1/bafkscene_1_mac").unwrap(),
+        dir.join("bafkscene").join("LOD").join("1").join("bafkscene_1_mac")
+    );
+    assert_eq!(
+        f("lods-unity/manifests/bafkscene_InitialSceneState.json").unwrap(),
+        dir.join("bafkscene").join("bafkscene_InitialSceneState.json")
+    );
+    assert_eq!(
+        f("v41/Qmflat_windows").unwrap(),
+        dir.join("Qmflat_windows")
+    );
+
+    assert!(f("manifest/noext").is_none());
+    assert!(f("dcl/scene_ignore_windows").is_none());
+    assert!(f("v41/../Qmx_windows").is_none());
+    assert!(f("v41/bafkup/textures/file.png").is_none());
+    assert!(f("v41/bafkup/file.png").is_none());
+    assert!(f("health").is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_lane_serves_misses_and_skips_local_entities() {
+    use axum::http::StatusCode;
+    let dir = lane_temp_dir("upstream");
+    let (host, seen) = crate::live::stub::serve(vec![
+        (
+            "/manifest/bafkup_windows.json".to_string(),
+            200,
+            br#"{"version":"v41","files":[]}"#.to_vec(),
+        ),
+        ("/v41/bafkup/Qmx_windows".to_string(), 200, b"BUNDLE".to_vec()),
+    ]);
+    let state = mk_lane_state_upstream(&dir, format!("http://{host}"));
+
+    let resp = lane_get(&state, "manifest/bafkup_windows.json").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(dir.join("bafkup").join("windows.manifest.json").is_file());
+
+    let resp = lane_get(&state, "v41/bafkup/Qmx_windows").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_bytes(resp).await, b"BUNDLE");
+    assert!(dir
+        .join("bafkup")
+        .join("windows")
+        .join("Qmx_windows")
+        .is_file());
+
+    // Local preview-server ids never go upstream.
+    let resp = lane_get(&state, "manifest/b64-abc_windows.json").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Upstream misses are negative-cached: one upstream GET for two requests.
+    let miss1 = lane_get(&state, "manifest/bafkmiss_windows.json").await;
+    assert_eq!(miss1.status(), StatusCode::NOT_FOUND);
+    assert_eq!(reason_of(&miss1).as_deref(), Some("upstream-miss"));
+    let miss2 = lane_get(&state, "manifest/bafkmiss_windows.json").await;
+    assert_eq!(reason_of(&miss2).as_deref(), Some("upstream-miss"));
+
+    let log = seen.lock().unwrap().clone();
+    assert!(!log.iter().any(|l| l.contains("b64-")), "{log:?}");
+    assert_eq!(
+        log.iter()
+            .filter(|l| l.as_str() == "GET /manifest/bafkmiss_windows.json")
+            .count(),
+        1,
+        "{log:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

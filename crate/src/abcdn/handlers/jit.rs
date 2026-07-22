@@ -170,7 +170,7 @@ pub(super) async fn jit_build_entity(
     let (tx, rx) = tokio::sync::oneshot::channel::<JitBuild>();
     tokio::spawn(async move {
         let _permit = jit_build_sem().acquire().await.ok();
-        let _pin = st.jit_cache.pin(&entity_owned);
+        let _pin = st.jit_cache.pin(&crate::naming::fs_safe_component(&entity_owned));
         let outcome = if timed_corpus_build(
             proxy,
             st.jit_root.clone(),
@@ -229,7 +229,9 @@ pub(super) async fn bundle_fallback(
     if proxy.space_configured() && target.space_eligible() {
         if let Some(dst) = target.probe_path(&state.jit_root) {
             let fetch = target.space_fetch(proxy.clone());
-            let _pin = state.jit_cache.pin(target.entity());
+            let _pin = state
+                .jit_cache
+                .pin(&crate::naming::fs_safe_component(target.entity()));
             if let Some(resp) = space_lane_serve(
                 state,
                 Some("bundle"),
@@ -477,7 +479,7 @@ pub(super) fn materialize_tmp_path(dst: &std::path::Path) -> std::path::PathBuf 
     crate::tmppath::tmp_sibling(dst)
 }
 
-fn write_materialized(dst: &std::path::Path, bytes: &[u8]) -> bool {
+pub(super) fn write_materialized(dst: &std::path::Path, bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return false;
     }
@@ -527,7 +529,12 @@ impl JitTarget {
                 entity,
                 file,
                 platform,
-            } => Some(out_root.join(entity).join(platform).join(file)),
+            } => Some(
+                out_root
+                    .join(&*crate::naming::fs_safe_component(entity))
+                    .join(platform)
+                    .join(&*crate::naming::fs_safe_component(file)),
+            ),
         }
     }
 

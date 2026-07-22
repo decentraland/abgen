@@ -37,6 +37,13 @@ ENV:
                             ABGEN_GPU_BACKEND=off skips the attempt entirely (clean CPU)
   ABGEN_HASH_RESOLVE_FAIL_TTL_S  negative-cache TTL for unresolvable flat {hash}_{platform}
                             requests (default 3600)
+  ABGEN_JIT_CONTENT_DIGEST  dev-mode freshness for path-keyed content servers (the
+                            sdk-commands preview server): manifest requests re-download
+                            and sha256 entity content, pruning stale conversions when
+                            bytes changed under an unchanged hash (default off)
+  ABGEN_UPSTREAM_AB_CDN     production ab-cdn URL to read-through on local+JIT misses
+                            (keeps wearables/emotes working when a client points its
+                            whole optimized-assets base URL here); unset disables
   AB_REGISTRY_PG_CONNECTION_STRING  optional registry Postgres DB
                             (denylist + spawn overrides; migrations run on boot)
   API_ADMIN_TOKEN           optional bearer token guarding the queue/admin routes
