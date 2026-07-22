@@ -81,6 +81,12 @@ pub struct AppStateInner {
     pub jit_fail_cache: Cache<String, ()>,
 
     pub jit_inflight: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+
+    pub jit_content_digest: bool,
+
+    pub upstream_ab_cdn: Option<String>,
+
+    pub revalidate_recent: Cache<String, ()>,
 }
 
 pub type AppState = Arc<AppStateInner>;
@@ -144,7 +150,23 @@ impl AppStateInner {
                 .time_to_live(env_ttl("ABGEN_JIT_FAIL_TTL_S", 60))
                 .build(),
             jit_inflight: tokio::sync::Mutex::new(HashMap::new()),
+            jit_content_digest: false,
+            upstream_ab_cdn: None,
+            revalidate_recent: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(env_ttl("ABGEN_REVALIDATE_DEBOUNCE_S", 2))
+                .build(),
         }
+    }
+
+    pub fn with_dev_lanes(
+        mut self,
+        jit_content_digest: bool,
+        upstream_ab_cdn: Option<String>,
+    ) -> Self {
+        self.jit_content_digest = jit_content_digest;
+        self.upstream_ab_cdn = upstream_ab_cdn;
+        self
     }
 
     pub fn with_worlds_content_url(mut self, url: Option<String>) -> Self {
@@ -206,12 +228,15 @@ impl AppStateInner {
         if !self.jit_cache.enabled() {
             return;
         }
-        let dir = self.jit_root.join(entity);
+        // Key and dir both use the storage-safe component so boot-time seeding
+        // (which reads dir names) and request-time touches stay consistent.
+        let stored = crate::naming::fs_safe_component(entity);
+        let dir = self.jit_root.join(&*stored);
         let bytes = super::jitcache::dir_size(&dir);
         if bytes == 0 {
             return;
         }
-        self.jit_cache.record(entity, dir, bytes);
+        self.jit_cache.record(&stored, dir, bytes);
     }
 
     pub fn jit_record_file(&self, key: &str, path: &Path) {

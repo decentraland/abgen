@@ -79,6 +79,7 @@ pub struct Proxy {
     local: Option<LocalContentStore>,
     content: LocalContentStore,
     bundle_dir: PathBuf,
+    digests_dir: PathBuf,
     version: String,
     date: String,
     uri_cache: UriCache,
@@ -223,11 +224,14 @@ impl Proxy {
     }
 
     fn bundle(&self, cid: &str, bundle_name: &str) -> Result<Vec<u8>> {
-        let entity_dir = self.bundle_dir.join(cid);
-        let cache_path = entity_dir.join(bundle_name);
+        // The LRU cache key must match the on-disk dir name seeded at boot,
+        // so both derive from the storage-safe component.
+        let safe_cid = naming::fs_safe_component(cid);
+        let entity_dir = self.bundle_dir.join(&*safe_cid);
+        let cache_path = entity_dir.join(&*naming::fs_safe_component(bundle_name));
         if let Ok(b) = std::fs::read(&cache_path) {
             if let Some(c) = self.jit() {
-                c.touch(&format!("b:{cid}"));
+                c.touch(&format!("b:{safe_cid}"));
             }
             return Ok(b);
         }
@@ -235,12 +239,12 @@ impl Proxy {
         let _g = lock.lock().unwrap();
         if let Ok(b) = std::fs::read(&cache_path) {
             if let Some(c) = self.jit() {
-                c.touch(&format!("b:{cid}"));
+                c.touch(&format!("b:{safe_cid}"));
             }
             return Ok(b);
         }
 
-        let _pin = self.jit().and_then(|c| c.pin(&format!("b:{cid}")));
+        let _pin = self.jit().and_then(|c| c.pin(&format!("b:{safe_cid}")));
 
         let ctx = self.entity_ctx(cid)?;
         let data = self.build(&ctx, bundle_name)?;
@@ -252,7 +256,7 @@ impl Proxy {
         if let Some(c) = self.jit() {
             let bytes = crate::abcdn::jitcache::dir_size(&entity_dir);
             if bytes > 0 {
-                c.record(&format!("b:{cid}"), entity_dir.clone(), bytes);
+                c.record(&format!("b:{safe_cid}"), entity_dir.clone(), bytes);
             }
         }
         Ok(data)
@@ -611,7 +615,9 @@ impl Proxy {
         content_server_url: &str,
     ) -> Result<Vec<String>> {
         let ctx = self.entity_ctx(cid)?;
-        let pdir = out_root.join(cid).join(platform);
+        let pdir = out_root
+            .join(&*naming::fs_safe_component(cid))
+            .join(platform);
         std::fs::create_dir_all(&pdir).with_context(|| format!("mkdir {}", pdir.display()))?;
         let mut built: Vec<String> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
@@ -654,7 +660,7 @@ impl Proxy {
                 built.push(bundle_name);
                 continue;
             }
-            let dst = pdir.join(&bundle_name);
+            let dst = pdir.join(&*naming::fs_safe_component(&bundle_name));
             let existed = dst.is_file();
             match self.bundle(cid, &bundle_name) {
                 Ok(bytes) => {
@@ -663,7 +669,7 @@ impl Proxy {
                         .with_context(|| format!("write {}", tmp.display()))?;
                     std::fs::rename(&tmp, &dst).ok();
                     if bundle_name != bare_name {
-                        let alias = pdir.join(&bare_name);
+                        let alias = pdir.join(&*naming::fs_safe_component(&bare_name));
                         if !alias.exists() {
                             std::fs::hard_link(&dst, &alias).ok();
                         }
@@ -716,6 +722,136 @@ impl Proxy {
             }
         }
         Ok(built)
+    }
+
+    /// Freshness pass for content servers whose declared hashes are not
+    /// content-addressed (the sdk-commands preview server derives them from
+    /// file paths, so an edited file keeps its hash forever). Re-downloads the
+    /// entity's convertible content, digests the bytes, and when anything
+    /// differs from the digests stored on the previous pass: overwrites the
+    /// content store, drops the per-entity memory caches, prunes the affected
+    /// build-cache bundles, and removes the entity's corpus dir under
+    /// `corpus_root` so the next request rebuilds it. Unchanged assets keep
+    /// their build-cache entries, so the rebuild only reconverts what changed.
+    /// Returns the declared hashes whose bytes changed.
+    pub fn refresh_entity_content(&self, cid: &str, corpus_root: &Path) -> Result<Vec<String>> {
+        let scene = self
+            .catalyst
+            .resolve_scene(cid)
+            .with_context(|| format!("revalidate: resolve entity {cid}"))?;
+
+        let digest_path = self.digest_path(cid);
+        let old: HashMap<String, String> = std::fs::read(&digest_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+
+        let mut fresh: HashMap<String, String> = HashMap::new();
+        let mut changed: Vec<String> = Vec::new();
+        let mut glb_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for c in &scene.content {
+            let lf = c.file.to_lowercase();
+            if !CONVERTIBLE_EXTS
+                .iter()
+                .chain(DEPENDENCY_EXTS.iter())
+                .any(|e| lf.ends_with(e))
+            {
+                continue;
+            }
+            if fresh.contains_key(&c.hash) {
+                continue;
+            }
+            let bytes = match self.catalyst.fetch_content(&c.hash) {
+                Ok(b) if !b.is_empty() => b,
+                Ok(_) => {
+                    tracing::warn!(entity = %cid, file = %c.file, hash = %c.hash, "revalidate: empty content payload — skipped");
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(entity = %cid, file = %c.file, hash = %c.hash, error = %format!("{e:#}"), "revalidate: content fetch failed — skipped");
+                    continue;
+                }
+            };
+            let digest = crate::hashes::sha256_hex(&bytes);
+            if old.get(&c.hash) != Some(&digest) {
+                self.content
+                    .write(&c.hash, &bytes)
+                    .with_context(|| format!("revalidate: refresh content {}", c.hash))?;
+                self.record_content(&c.hash, bytes.len());
+                self.uri_cache.invalidate_hash(&c.hash);
+                changed.push(c.hash.clone());
+            }
+            let (is_glb, _) = is_convertible(&c.file);
+            if is_glb {
+                glb_hashes.insert(c.hash.to_lowercase());
+            }
+            fresh.insert(c.hash.clone(), digest);
+        }
+
+        if let Some(dir) = digest_path.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        let tmp = crate::tmppath::tmp_sibling(&digest_path);
+        std::fs::write(&tmp, serde_json::to_vec(&fresh)?)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &digest_path).ok();
+
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+
+        self.entities.lock().unwrap().remove(cid);
+
+        // A changed non-glb (texture/.bin) invalidates every glb bundle too:
+        // glbs inline their resolved dependencies at build time.
+        let changed_lower: std::collections::HashSet<String> =
+            changed.iter().map(|h| h.to_lowercase()).collect();
+        let dep_changed = changed_lower.iter().any(|h| !glb_hashes.contains(h));
+        prune_stale_bundles(
+            &self.bundle_dir.join(&*naming::fs_safe_component(cid)),
+            &changed_lower,
+            dep_changed,
+            &glb_hashes,
+        );
+        let _ = std::fs::remove_dir_all(corpus_root.join(&*naming::fs_safe_component(cid)));
+        Ok(changed)
+    }
+
+    fn digest_path(&self, cid: &str) -> PathBuf {
+        // Hash the id: preview-server ids are arbitrary strings, not
+        // guaranteed to be filesystem-safe.
+        let key = crate::hashes::sha256_hex(cid.as_bytes());
+        self.digests_dir.join(format!("{}.json", &key[..32]))
+    }
+}
+
+fn prune_stale_bundles(
+    dir: &Path,
+    changed: &std::collections::HashSet<String>,
+    dep_changed: bool,
+    glbs: &std::collections::HashSet<String>,
+) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else { continue };
+
+        // Digest-collapsed storage names can't be parsed back to a hash;
+        // over-invalidate them (this fn only runs when something changed).
+        if name.starts_with("xn-") {
+            let _ = std::fs::remove_file(ent.path());
+            continue;
+        }
+
+        let raw = name.strip_suffix(".br").unwrap_or(name);
+        let (_, stem) = crate::abcdn::resolver::split_platform(raw);
+        let (hash, _) = naming::split_bundle_stem(stem);
+        let h = hash.to_lowercase();
+        if changed.contains(&h) || (dep_changed && glbs.contains(&h)) {
+            let _ = std::fs::remove_file(ent.path());
+        }
     }
 }
 
@@ -815,6 +951,7 @@ impl Proxy {
         let date = cfg.date.unwrap_or_else(|| iso_from_build_id(&bid));
         let cache_root = PathBuf::from(&cfg.cache_dir);
         let content = LocalContentStore::new(cache_root.join("content"));
+        let digests_dir = cache_root.join("content-digests");
         let bundle_dir = cache_root.join("bundles").join(&bid[..16.min(bid.len())]);
         let _ = std::fs::create_dir_all(&bundle_dir);
         let space = match injected_space {
@@ -843,6 +980,7 @@ impl Proxy {
             local: cfg.local_root.map(LocalContentStore::new),
             content,
             bundle_dir,
+            digests_dir,
             version: cfg.version,
             date,
             uri_cache: UriCache::new(),
@@ -1188,6 +1326,84 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn refresh_entity_content_prunes_stale_conversions() {
+        let cache = temp_cache("revalidate");
+        let _ = std::fs::remove_dir_all(&cache);
+        std::fs::create_dir_all(&cache).unwrap();
+        let corpus = cache.join("corpus");
+
+        let entity = serde_json::json!({
+            "id": "bafkreva",
+            "type": "scene",
+            "content": [
+                {"file": "m.glb", "hash": "qmglb"},
+                {"file": "tex.png", "hash": "qmtex"},
+            ]
+        });
+        let ent_bytes = serde_json::to_vec(&entity).unwrap();
+
+        let mk = |glb: &[u8], tex: &[u8]| {
+            let (host, _seen) = super::stub::serve(vec![
+                ("/contents/bafkreva".to_string(), 200, ent_bytes.clone()),
+                ("/contents/qmglb".to_string(), 200, glb.to_vec()),
+                ("/contents/qmtex".to_string(), 200, tex.to_vec()),
+            ]);
+            Proxy::new(ProxyConfig {
+                catalyst_url: format!("http://{host}"),
+                cache_dir: cache.to_string_lossy().into_owned(),
+                ..Default::default()
+            })
+        };
+
+        // First pass seeds the digest store; everything counts as changed.
+        let p1 = mk(b"GLB1", b"TEX1");
+        let c1 = p1.refresh_entity_content("bafkreva", &corpus).unwrap();
+        assert_eq!(c1.len(), 2);
+
+        // Simulate prior build outputs.
+        let bundle_dir = p1.bundle_dir.join("bafkreva");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        let glb_bundle = bundle_dir.join("qmglb_0123456789abcdef0123456789abcdef_windows");
+        let tex_bundle = bundle_dir.join("qmtex_windows");
+        std::fs::write(&glb_bundle, b"AB").unwrap();
+        std::fs::write(&tex_bundle, b"AB").unwrap();
+        let corpus_entity = corpus.join("bafkreva");
+        std::fs::create_dir_all(&corpus_entity).unwrap();
+        std::fs::write(corpus_entity.join("windows.manifest.json"), b"{}").unwrap();
+
+        // Same bytes: nothing changes, nothing pruned.
+        let p2 = mk(b"GLB1", b"TEX1");
+        assert!(p2
+            .refresh_entity_content("bafkreva", &corpus)
+            .unwrap()
+            .is_empty());
+        assert!(glb_bundle.is_file());
+        assert!(tex_bundle.is_file());
+        assert!(corpus_entity.is_dir());
+
+        // glb bytes changed under the same hash: its bundle and the corpus
+        // dir are pruned; the texture bundle survives.
+        let p3 = mk(b"GLB2", b"TEX1");
+        let c3 = p3.refresh_entity_content("bafkreva", &corpus).unwrap();
+        assert_eq!(c3, vec!["qmglb".to_string()]);
+        assert!(!glb_bundle.exists());
+        assert!(tex_bundle.is_file());
+        assert!(!corpus_entity.exists());
+        assert_eq!(p3.content.fetch("qmglb").unwrap(), b"GLB2");
+
+        // Texture changed: dependency-capable, so glb bundles are pruned too.
+        std::fs::write(&glb_bundle, b"AB").unwrap();
+        std::fs::create_dir_all(&corpus_entity).unwrap();
+        let p4 = mk(b"GLB2", b"TEX2");
+        let c4 = p4.refresh_entity_content("bafkreva", &corpus).unwrap();
+        assert_eq!(c4, vec!["qmtex".to_string()]);
+        assert!(!glb_bundle.exists());
+        assert!(!tex_bundle.exists());
+
+        let _ = std::fs::remove_dir_all(&cache);
     }
 
     #[test]

@@ -37,6 +37,13 @@ impl UriCache {
             .or_insert_with(|| uris.clone())
             .clone()
     }
+
+    /// Drops cached URI parses for a hash whose underlying bytes changed
+    /// (content stores that key by path can serve different bytes for the
+    /// same declared hash).
+    pub fn invalidate_hash(&self, hash: &str) {
+        self.map.write().unwrap().retain(|(h, _), _| h != hash);
+    }
 }
 
 pub struct EntityScan {

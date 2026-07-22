@@ -39,7 +39,7 @@ pub fn manifest_path(root: &Path, name_with_suffix: &str) -> Option<PathBuf> {
         return None;
     }
     Some(
-        root.join(entity_id)
+        root.join(&*crate::naming::fs_safe_component(entity_id))
             .join(format!("{platform}.manifest.json")),
     )
 }
@@ -48,13 +48,17 @@ pub fn binary_path(root: &Path, entity: &str, filename: &str) -> Option<PathBuf>
     if !is_safe_component(entity) || !is_safe_component(filename) {
         return None;
     }
-    let flat = root.join(filename);
+    let stored_name = crate::naming::fs_safe_component(filename);
+    let flat = root.join(&*stored_name);
     if flat.is_file() {
         return Some(flat);
     }
     let name_for_platform = filename.strip_suffix(".br").unwrap_or(filename);
     let platform = platform_of(name_for_platform);
-    let candidate = root.join(entity).join(platform).join(filename);
+    let candidate = root
+        .join(&*crate::naming::fs_safe_component(entity))
+        .join(platform)
+        .join(&*stored_name);
     if candidate.is_file() {
         return Some(candidate);
     }
@@ -304,6 +308,31 @@ mod tests {
         assert!(iss_manifest_path(root, ".._InitialSceneState.json").is_none());
         assert!(iss_manifest_path(root, "a/b_InitialSceneState.json").is_none());
         assert!(iss_manifest_path(root, "a\\b_InitialSceneState.json").is_none());
+    }
+
+    #[test]
+    fn oversized_names_collapse_to_bounded_storage_components() {
+        let root = Path::new("/out");
+        let long_entity = format!("b64-{}", "a".repeat(300));
+        let long_file = format!("b64-{}_mac", "b".repeat(300));
+
+        let manifest = manifest_path(root, &format!("{long_entity}_mac")).unwrap();
+        let bundle = binary_path(root, &long_entity, &long_file).unwrap();
+
+        for path in [&manifest, &bundle] {
+            for component in path.components() {
+                let name = component.as_os_str().to_string_lossy();
+                assert!(name.len() <= 255, "component too long: {name}");
+            }
+        }
+
+        // Deterministic: the same served name always maps to the same storage name.
+        assert_eq!(bundle, binary_path(root, &long_entity, &long_file).unwrap());
+        assert!(bundle.to_string_lossy().contains("xn-"));
+
+        // Production-length names pass through verbatim.
+        let short = binary_path(root, "bafkScene", "Qmhash_windows").unwrap();
+        assert_eq!(short, Path::new("/out/bafkScene/windows/Qmhash_windows"));
     }
 
     #[test]

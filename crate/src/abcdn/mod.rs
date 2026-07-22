@@ -299,6 +299,21 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
         );
     }
 
+    if cfg.jit_content_digest {
+        tracing::info!(
+            "JIT content revalidation ENABLED (ABGEN_JIT_CONTENT_DIGEST): manifest requests \
+             re-download and digest entity content; stale conversions are pruned when bytes \
+             change under an unchanged declared hash"
+        );
+    }
+    if let Some(upstream) = &cfg.upstream_ab_cdn {
+        tracing::info!(
+            upstream = %upstream,
+            "upstream ab-cdn read-through ENABLED (ABGEN_UPSTREAM_AB_CDN): local+JIT misses \
+             are fetched upstream and materialized into the JIT cache"
+        );
+    }
+
     let inner = AppStateInner::new(
         out_root,
         content,
@@ -316,6 +331,7 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
     )
     .with_worlds_content_url(crate::worlds::content_fallback_from_env())
     .with_jit(jit_root, jit_cache, roots_distinct)
+    .with_dev_lanes(cfg.jit_content_digest, cfg.upstream_ab_cdn.clone())
     .with_registry_state(Some(contents_registry));
     let inner = inner.with_content_db(content_db);
     Ok(Arc::new(inner))
