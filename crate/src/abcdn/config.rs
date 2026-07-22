@@ -24,6 +24,8 @@ pub struct Config {
     pub jit_content_digest: bool,
 
     pub upstream_ab_cdn: Option<String>,
+
+    pub upstream_ab_registry: Option<String>,
 }
 
 impl Config {
@@ -39,6 +41,11 @@ impl Config {
                 );
                 "http://127.0.0.1:5141/content".to_string()
             });
+
+        let upstream_ab_cdn = env::var("ABGEN_UPSTREAM_AB_CDN")
+            .ok()
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty());
 
         // A loopback content server is a dev preview server (sdk-commands): its
         // declared hashes are path-based and never change on edit, so content
@@ -77,11 +84,30 @@ impl Config {
                 .filter(|s| !s.is_empty()),
             content_database_url: content_connection_string(),
             jit_content_digest,
-            upstream_ab_cdn: env::var("ABGEN_UPSTREAM_AB_CDN")
+            upstream_ab_cdn: upstream_ab_cdn.clone(),
+            upstream_ab_registry: match env::var("ABGEN_UPSTREAM_AB_REGISTRY")
                 .ok()
                 .map(|s| s.trim().trim_end_matches('/').to_string())
-                .filter(|s| !s.is_empty()),
+            {
+                Some(s) if s.eq_ignore_ascii_case("off") => None,
+                Some(s) if !s.is_empty() => Some(s),
+                // Registry answers must name the versions the CDN actually
+                // serves, so the default pairs with the upstream CDN.
+                _ => upstream_ab_cdn.as_deref().and_then(registry_for_ab_cdn),
+            },
         })
+    }
+}
+
+fn registry_for_ab_cdn(cdn: &str) -> Option<String> {
+    match cdn {
+        "https://ab-cdn.decentraland.org" => {
+            Some("https://asset-bundle-registry.decentraland.org".to_string())
+        }
+        "https://ab-cdn.decentraland.zone" => {
+            Some("https://asset-bundle-registry.decentraland.zone".to_string())
+        }
+        _ => None,
     }
 }
 fn content_connection_string() -> Option<String> {
