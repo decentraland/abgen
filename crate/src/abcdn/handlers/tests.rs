@@ -367,6 +367,14 @@ fn mk_lane_state_upstream(
     dir: &std::path::Path,
     upstream: String,
 ) -> super::super::state::AppState {
+    mk_lane_state_upstream_with_proxy(dir, upstream, None)
+}
+
+fn mk_lane_state_upstream_with_proxy(
+    dir: &std::path::Path,
+    upstream: String,
+    proxy: Option<std::sync::Arc<crate::live::Proxy>>,
+) -> super::super::state::AppState {
     use super::super::lodjit::LodJit;
     use super::super::state::AppStateInner;
     std::sync::Arc::new(
@@ -374,7 +382,7 @@ fn mk_lane_state_upstream(
             dir.to_path_buf(),
             crate::catalyst::CatalystClient::new("http://127.0.0.1:9"),
             std::collections::HashMap::new(),
-            None,
+            proxy,
             "http://c".to_string(),
             true,
             Vec::new(),
@@ -1268,6 +1276,44 @@ async fn upstream_lane_serves_misses_and_skips_local_entities() {
             .count(),
         1,
         "{log:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn upstream_runs_before_jit_build_lanes() {
+    use axum::http::StatusCode;
+    let dir = lane_temp_dir("upstream-first");
+    let (uphost, _upseen) = crate::live::stub::serve(vec![(
+        "/manifest/bafkremote_windows.json".to_string(),
+        200,
+        br#"{"version":"v41","files":[]}"#.to_vec(),
+    )]);
+    let (spacehost, _) = crate::live::stub::serve(vec![]);
+    let (cathost, catseen) = crate::live::stub::serve(vec![]);
+    let proxy = mk_stub_proxy_catalyst(&spacehost, &format!("http://{cathost}"), false, "upfirst");
+    let state = mk_lane_state_upstream_with_proxy(&dir, format!("http://{uphost}"), Some(proxy));
+
+    // An upstream hit is served without probing the entity with a local JIT
+    // build: the catalyst (entity resolver) must never be consulted.
+    let resp = lane_get(&state, "manifest/bafkremote_windows.json").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    {
+        let cat = catseen.lock().unwrap().clone();
+        assert!(
+            cat.is_empty(),
+            "upstream hit reached the build lane: {cat:?}"
+        );
+    }
+
+    // An upstream miss still falls through to the JIT build lane, which
+    // resolves the entity against the catalyst.
+    let resp = lane_get(&state, "manifest/bafkmiss_windows.json").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let cat = catseen.lock().unwrap().clone();
+    assert!(
+        cat.iter().any(|l| l.contains("bafkmiss")),
+        "upstream miss did not fall through to the build lane: {cat:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -8,11 +8,7 @@ pub async fn dispatch(
 ) -> Response {
     let path = uri.path().trim_start_matches('/').to_string();
     revalidate_if_stale(&state, &path).await;
-    let resp = dispatch_with_fallbacks(&state, &path, &method, &headers).await;
-    if resp.status() == StatusCode::NOT_FOUND && state.upstream_ab_cdn.is_some() {
-        return upstream_fallback(&state, &path, &method, &headers, resp).await;
-    }
-    resp
+    dispatch_with_fallbacks(&state, &path, &method, &headers).await
 }
 
 async fn dispatch_with_fallbacks(
@@ -22,29 +18,47 @@ async fn dispatch_with_fallbacks(
     headers: &HeaderMap,
 ) -> Response {
     let local = dispatch_local(state, path, method, headers).await;
+    if local.status() != StatusCode::NOT_FOUND {
+        return local;
+    }
 
-    if local.status() == StatusCode::NOT_FOUND {
-        if let Some(target) = resolver::shader_target(path) {
-            return shader_fallback(state, path, &target, method, headers, local).await;
+    if let Some(target) = resolver::shader_target(path) {
+        return shader_fallback(state, path, &target, method, headers, local).await;
+    }
+
+    // Upstream before any build lane: when a production ab-cdn is configured,
+    // entities it already serves (wearables, emotes, remote scenes) should
+    // stream from it rather than be probed with a local JIT build — against a
+    // preview content server that build can only fail its entity resolve and
+    // log a write-back warning per entity. Local-corpus ids (b64-) and
+    // upstream misses fall through to the build lanes as before.
+    let local = if state.upstream_ab_cdn.is_some() {
+        let up = upstream_fallback(state, path, method, headers, local).await;
+        if up.status() != StatusCode::NOT_FOUND {
+            return up;
         }
-        if let Some(proxy) = state.live_proxy.clone() {
-            if let Some(target) = jit_target(path) {
-                return bundle_fallback(state, proxy, path, &target, method, headers, local).await;
-            }
-            if br_bundle_target(path) {
-                return with_reason(local, "br-not-built");
-            }
+        up
+    } else {
+        local
+    };
+
+    if let Some(proxy) = state.live_proxy.clone() {
+        if let Some(target) = jit_target(path) {
+            return bundle_fallback(state, proxy, path, &target, method, headers, local).await;
         }
-        if path.split('/').next() == Some("LOD") {
-            return lod_fallback(state, path, method, headers, local).await;
+        if br_bundle_target(path) {
+            return with_reason(local, "br-not-built");
         }
-        let segs: Vec<&str> = path.split('/').collect();
-        if segs.len() == 3 && segs[0] == "lods-unity" && segs[1] == "manifests" {
-            return iss_fallback(state, path, method, headers, local).await;
-        }
-        if let Some((bare, platform)) = flat_target(path) {
-            return flat_fallback(state, path, &bare, &platform, method, headers, local).await;
-        }
+    }
+    if path.split('/').next() == Some("LOD") {
+        return lod_fallback(state, path, method, headers, local).await;
+    }
+    let segs: Vec<&str> = path.split('/').collect();
+    if segs.len() == 3 && segs[0] == "lods-unity" && segs[1] == "manifests" {
+        return iss_fallback(state, path, method, headers, local).await;
+    }
+    if let Some((bare, platform)) = flat_target(path) {
+        return flat_fallback(state, path, &bare, &platform, method, headers, local).await;
     }
     local
 }
