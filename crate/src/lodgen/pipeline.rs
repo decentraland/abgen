@@ -470,7 +470,10 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
             &placements,
             levels[0],
             params.cache.as_deref(),
-            params.emissive_channel,
+            model::MatLane {
+                emissive_channel: params.emissive_channel,
+                ..Default::default()
+            },
         )?;
         assemble_ms = t.elapsed().as_millis();
         if params.crop {

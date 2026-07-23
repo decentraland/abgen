@@ -59,6 +59,37 @@ pub struct LodMaterial {
     pub double_sided: bool,
     pub emissive: [f64; 3],
     pub emissive_image: Option<usize>,
+    pub metallic: f64,
+    pub roughness: f64,
+    pub mr_image: Option<usize>,
+    pub normal_image: Option<usize>,
+    pub emissive_strength: f64,
+}
+
+impl Default for LodMaterial {
+    fn default() -> Self {
+        LodMaterial {
+            name: String::new(),
+            class: AlphaClass::Opaque,
+            base_color: [1.0, 1.0, 1.0, 1.0],
+            cutoff: 0.5,
+            image: None,
+            double_sided: false,
+            emissive: [0.0; 3],
+            emissive_image: None,
+            metallic: 0.0,
+            roughness: 1.0,
+            mr_image: None,
+            normal_image: None,
+            emissive_strength: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct MatLane {
+    pub emissive_channel: bool,
+    pub raw_materials: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -378,13 +409,7 @@ fn walk(
                 if fallback.is_none() {
                     model.materials.push(LodMaterial {
                         name: "default".to_string(),
-                        class: AlphaClass::Opaque,
-                        base_color: [1.0, 1.0, 1.0, 1.0],
-                        cutoff: 0.5,
-                        image: None,
-                        double_sided: false,
-                        emissive: [0.0; 3],
-                        emissive_image: None,
+                        ..Default::default()
                     });
                     *fallback = Some(model.materials.len() - 1);
                 }
@@ -453,6 +478,7 @@ pub fn from_glb_bytes_with(
             double_sided: m.double_sided,
             emissive,
             emissive_image,
+            ..Default::default()
         });
     }
     let scene_mat_count = scene.materials.len();

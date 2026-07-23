@@ -32,8 +32,8 @@ USAGE:
             [--catalyst URL]
   abgen-lod assemble (--scene <entityId|X,Y> | --entity-json FILE) -o out.glb
             [--catalyst URL] [--iss FILE|auto|off] [--cache DIR] [--level 1]
-            [--no-crop] [--no-atlas] [--max-size 256] [--padding 2] [--atlas-fixed]
-            [--atlas-adaptive]
+            [--no-crop] [--no-atlas] [--raw-materials] [--max-size 256]
+            [--padding 2] [--atlas-fixed] [--atlas-adaptive]
   abgen-lod atlas -i in.glb -o out.glb [--max-size 256] [--padding 2]
             [--atlas-fixed] [--atlas-adaptive] [--crop-base X,Y --crop-parcels 'x,y;x,y;...']
   abgen-lod simplify -i in.glb -o out.glb [--ratio 0.1] [--tri-cap N]
@@ -81,7 +81,13 @@ assemble: resolves placements like `placements`, fetches every referenced GLB
   not dropped; the +-0.05 margin exists only in the _PlaneClipping shader
   vector; disable with --no-crop), atlases it into per-alpha-class
   TextureBakeResult materials
-  (disable with --no-atlas) and writes it to -o.
+  (disable with --no-atlas) and writes it to -o. --raw-materials (requires
+  --no-atlas) keeps SOURCE material truth in the emitted glb instead of the
+  LOD normalization: explicit source metallicFactor/roughnessFactor (spec
+  default 1.0 written as 1.0, never forced to 0), metallicRoughnessTexture,
+  normalTexture, doubleSided, and the UNfolded baseColorFactor with the raw
+  emissiveFactor/emissiveTexture (+KHR_materials_emissive_strength) — the
+  ground-truth reference lane for material-fidelity comparisons.
 atlas: re-runs only the atlas stage on an existing merged GLB: dedupe +
   skyline-pack tiles into one square power-of-two atlas per alpha class
   (opaque JPEG, mask/transparent PNG after alpha bleed), merge each class
@@ -513,6 +519,7 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
     let mut level: u32 = 1;
     let mut no_crop = false;
     let mut no_atlas = false;
+    let mut raw_materials = false;
     let mut max_size: u32 = 256;
     let mut padding: u32 = 2;
     let mut atlas_fixed = false;
@@ -564,6 +571,9 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
             "--no-atlas" => {
                 no_atlas = true;
             }
+            "--raw-materials" => {
+                raw_materials = true;
+            }
             "--max-size" => {
                 max_size = need(i)?.parse().context("--max-size")?;
                 i += 1;
@@ -584,6 +594,9 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
         i += 1;
     }
     let out = out.ok_or_else(|| anyhow!("assemble needs -o <out.glb>"))?;
+    if raw_materials && !no_atlas {
+        bail!("--raw-materials requires --no-atlas: the atlased lane would re-normalize the materials it claims to preserve");
+    }
 
     let client = CatalystClient::from_args(&catalyst, None);
     let ent = match &entity_json {
@@ -611,7 +624,17 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
     if let Some(dir) = cache_dir {
         std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
     }
-    let mut model = assemble::assemble(&client, &ent, &list, level, cache_dir, false)?;
+    let mut model = assemble::assemble(
+        &client,
+        &ent,
+        &list,
+        level,
+        cache_dir,
+        abgen::lodgen::model::MatLane {
+            raw_materials,
+            ..Default::default()
+        },
+    )?;
     if !no_crop {
         let (base, parcels) = abgen::lodgen::scene_geometry(&ent)?;
         let rects = abgen::lodgen::crop::crop_rects_rh(base, &parcels);

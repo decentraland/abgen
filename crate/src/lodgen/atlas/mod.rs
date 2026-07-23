@@ -350,6 +350,7 @@ pub fn atlas_with_rects(
                 [0.0; 3]
             },
             emissive_image: emis_idx,
+            ..Default::default()
         });
         let s = packed.canvas as f64;
         let mut merged = LodPrimitive {

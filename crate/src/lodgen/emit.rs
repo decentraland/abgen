@@ -169,15 +169,18 @@ pub fn emit_glb(model: &LodModel) -> Result<Vec<u8>> {
     }
 
     let mut mats_json: Vec<Value> = Vec::new();
+    let mut uses_strength_ext = false;
     for (mi, m) in model.materials.iter().enumerate() {
-        if let Some(i) = m.image {
-            if i >= model.images.len() {
-                bail!("emit_glb: material {mi} references missing image {i}");
-            }
-        }
-        if let Some(i) = m.emissive_image {
-            if i >= model.images.len() {
-                bail!("emit_glb: material {mi} references missing emissive image {i}");
+        for (slot, img) in [
+            ("image", m.image),
+            ("emissive image", m.emissive_image),
+            ("metallic-roughness image", m.mr_image),
+            ("normal image", m.normal_image),
+        ] {
+            if let Some(i) = img {
+                if i >= model.images.len() {
+                    bail!("emit_glb: material {mi} references missing {slot} {i}");
+                }
             }
         }
         let mut pbr = Map::new();
@@ -185,8 +188,11 @@ pub fn emit_glb(model: &LodModel) -> Result<Vec<u8>> {
         if let Some(i) = m.image {
             pbr.insert("baseColorTexture".to_string(), json!({"index": i}));
         }
-        pbr.insert("metallicFactor".to_string(), json!(0.0));
-        pbr.insert("roughnessFactor".to_string(), json!(1.0));
+        pbr.insert("metallicFactor".to_string(), json!(m.metallic));
+        if let Some(i) = m.mr_image {
+            pbr.insert("metallicRoughnessTexture".to_string(), json!({"index": i}));
+        }
+        pbr.insert("roughnessFactor".to_string(), json!(m.roughness));
         let mut mat = Map::new();
         if m.class == AlphaClass::Mask {
             mat.insert("alphaCutoff".to_string(), json!(m.cutoff));
@@ -197,11 +203,21 @@ pub fn emit_glb(model: &LodModel) -> Result<Vec<u8>> {
         }
         if m.emissive != [0.0; 3] {
             mat.insert("emissiveFactor".to_string(), json!(m.emissive));
+            if m.emissive_strength != 1.0 {
+                uses_strength_ext = true;
+                mat.insert(
+                    "extensions".to_string(),
+                    json!({"KHR_materials_emissive_strength":
+                        {"emissiveStrength": m.emissive_strength}}),
+                );
+            }
         }
         if let Some(i) = m.emissive_image {
             mat.insert("emissiveTexture".to_string(), json!({"index": i}));
         }
-
+        if let Some(i) = m.normal_image {
+            mat.insert("normalTexture".to_string(), json!({"index": i}));
+        }
         mat.insert("name".to_string(), json!(m.name));
         mat.insert("pbrMetallicRoughness".to_string(), Value::Object(pbr));
         mats_json.push(Value::Object(mat));
@@ -215,6 +231,12 @@ pub fn emit_glb(model: &LodModel) -> Result<Vec<u8>> {
         "asset".to_string(),
         json!({"generator": "abgen-lodgen", "version": "2.0"}),
     );
+    if uses_strength_ext {
+        root.insert(
+            "extensionsUsed".to_string(),
+            json!(["KHR_materials_emissive_strength"]),
+        );
+    }
     root.insert("bufferViews".to_string(), Value::Array(views));
     root.insert("buffers".to_string(), json!([{"byteLength": bin.len()}]));
     if !images_json.is_empty() {
@@ -317,8 +339,7 @@ mod tests {
                     cutoff: 0.5,
                     image: Some(0),
                     double_sided: false,
-                    emissive: [0.0; 3],
-                    emissive_image: None,
+                    ..Default::default()
                 },
                 LodMaterial {
                     name: "matB".to_string(),
@@ -327,8 +348,7 @@ mod tests {
                     cutoff: 0.5,
                     image: None,
                     double_sided: true,
-                    emissive: [0.0; 3],
-                    emissive_image: None,
+                    ..Default::default()
                 },
             ],
             images: vec![LodImage {
@@ -357,8 +377,7 @@ mod tests {
                 cutoff: 0.5,
                 image: None,
                 double_sided: false,
-                emissive: [0.0; 3],
-                emissive_image: None,
+                ..Default::default()
             }],
             images: Vec::new(),
             log: Vec::new(),
@@ -478,8 +497,7 @@ mod tests {
                 cutoff: 0.5,
                 image: None,
                 double_sided: false,
-                emissive: [0.0; 3],
-                emissive_image: None,
+                ..Default::default()
             }],
             images: Vec::new(),
             log: Vec::new(),
@@ -668,6 +686,62 @@ mod tests {
         for m in json["materials"].as_array().unwrap() {
             assert!(m.get("emissiveFactor").is_none(), "{m}");
             assert!(m.get("emissiveTexture").is_none(), "{m}");
+        }
+    }
+
+    #[test]
+    fn raw_material_truth_emits_and_default_lane_is_normalized() {
+        let mut model = sample_model();
+        model.materials[0].metallic = 1.0;
+        model.materials[0].roughness = 0.9;
+        model.materials[0].mr_image = Some(0);
+        model.materials[0].normal_image = Some(0);
+        model.materials[0].emissive = [0.25, 0.5, 0.75];
+        model.materials[0].emissive_strength = 2.0;
+        let glb = emit_glb(&model).unwrap();
+        let (json, _) = chunks(&glb);
+        let m0 = &json["materials"][0];
+        let pbr = &m0["pbrMetallicRoughness"];
+        assert_eq!(pbr["metallicFactor"], serde_json::json!(1.0));
+        assert_eq!(pbr["roughnessFactor"], serde_json::json!(0.9));
+        assert_eq!(pbr["metallicRoughnessTexture"]["index"], 0);
+        assert_eq!(m0["normalTexture"]["index"], 0);
+        assert_eq!(m0["emissiveFactor"], serde_json::json!([0.25, 0.5, 0.75]));
+        assert_eq!(
+            m0["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"],
+            serde_json::json!(2.0)
+        );
+        assert_eq!(
+            json["extensionsUsed"],
+            serde_json::json!(["KHR_materials_emissive_strength"])
+        );
+
+        // the untouched material and the plain model keep today's normalized shape
+        let m1 = &json["materials"][1];
+        assert_eq!(
+            m1["pbrMetallicRoughness"]["metallicFactor"],
+            serde_json::json!(0.0)
+        );
+        assert_eq!(
+            m1["pbrMetallicRoughness"]["roughnessFactor"],
+            serde_json::json!(1.0)
+        );
+        assert!(m1.get("normalTexture").is_none());
+        assert!(m1.get("extensions").is_none());
+        let (plain_json, _) = chunks(&emit_glb(&sample_model()).unwrap());
+        assert!(plain_json.get("extensionsUsed").is_none());
+        for m in plain_json["materials"].as_array().unwrap() {
+            assert_eq!(
+                m["pbrMetallicRoughness"]["metallicFactor"],
+                serde_json::json!(0.0)
+            );
+            assert_eq!(
+                m["pbrMetallicRoughness"]["roughnessFactor"],
+                serde_json::json!(1.0)
+            );
+            assert!(m["pbrMetallicRoughness"]
+                .get("metallicRoughnessTexture")
+                .is_none());
         }
     }
 

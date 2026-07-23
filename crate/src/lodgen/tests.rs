@@ -289,8 +289,7 @@ fn synthetic_glb() -> Vec<u8> {
             cutoff: 0.5,
             image: Some(0),
             double_sided: false,
-            emissive: [0.0; 3],
-            emissive_image: None,
+            ..Default::default()
         }],
         images: vec![LodImage {
             bytes: tiny_png(),
@@ -332,8 +331,7 @@ fn post_order_reingest_and_atlas_on_emitted_raw_glb() {
                 cutoff: 0.5,
                 image: Some(0),
                 double_sided: false,
-                emissive: [0.0; 3],
-                emissive_image: None,
+                ..Default::default()
             },
             LodMaterial {
                 name: "glass".to_string(),
@@ -342,8 +340,7 @@ fn post_order_reingest_and_atlas_on_emitted_raw_glb() {
                 cutoff: 0.5,
                 image: None,
                 double_sided: true,
-                emissive: [0.0; 3],
-                emissive_image: None,
+                ..Default::default()
             },
         ],
         images: vec![LodImage {
@@ -800,8 +797,7 @@ fn orphan_material_is_dropped_from_lod_bundle() {
                 cutoff: 0.5,
                 image: Some(0),
                 double_sided: false,
-                emissive: [0.0; 3],
-                emissive_image: None,
+                ..Default::default()
             },
             LodMaterial {
                 name: "TextureBakeResult-mat-transparent".to_string(),
@@ -810,8 +806,7 @@ fn orphan_material_is_dropped_from_lod_bundle() {
                 cutoff: 0.5,
                 image: Some(0),
                 double_sided: false,
-                emissive: [0.0; 3],
-                emissive_image: None,
+                ..Default::default()
             },
         ],
         images: vec![LodImage {

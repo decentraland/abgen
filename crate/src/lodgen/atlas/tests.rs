@@ -40,8 +40,7 @@ fn mat(name: &str, class: AlphaClass, base_color: [f64; 4], image: Option<usize>
         cutoff: 0.5,
         image,
         double_sided: false,
-        emissive: [0.0; 3],
-        emissive_image: None,
+        ..Default::default()
     }
 }
 
