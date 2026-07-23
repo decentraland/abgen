@@ -7,7 +7,48 @@
 let exports = null;
 let module = null;
 let jobId = 0;
+let sabI32 = null;
+let sabU8 = null;
 const td = new TextDecoder();
+const SAB_HDR = 16;
+
+// WebGPU bridge (see gpu-worker.js for the SAB protocol). Blocks this worker
+// on Atomics.wait while the GPU sibling encodes; returns bytes written into
+// out_ptr, or 0 to send the module down its CPU path (no bridge, oversized
+// request, GPU failure, timeout).
+function hostEncodeBc7(reqPtr, reqLen, outPtr, outCap) {
+  if (!sabI32) return 0;
+  if (reqLen > sabU8.length - SAB_HDR) return 0;
+  while (Atomics.compareExchange(sabI32, 0, 0, 1) !== 0) Atomics.wait(sabI32, 0, 1);
+  let n = 0;
+  try {
+    sabU8.set(new Uint8Array(exports.memory.buffer, reqPtr, reqLen), SAB_HDR);
+    sabI32[2] = reqLen;
+    Atomics.store(sabI32, 1, 1);
+    Atomics.notify(sabI32, 1);
+    let s;
+    for (;;) {
+      const r = Atomics.wait(sabI32, 1, 1, 20000);
+      s = Atomics.load(sabI32, 1);
+      if (s !== 1) break;
+      if (r === 'timed-out') { s = 3; break; } // gpu worker gone; fail to CPU
+    }
+    if (s === 2) {
+      const outLen = sabI32[3];
+      if (outLen === outCap) {
+        new Uint8Array(exports.memory.buffer, outPtr, outLen)
+          .set(sabU8.subarray(SAB_HDR, SAB_HDR + outLen));
+        n = outLen;
+      }
+    }
+    Atomics.store(sabI32, 1, 0);
+    Atomics.notify(sabI32, 1);
+  } finally {
+    Atomics.store(sabI32, 0, 0);
+    Atomics.notify(sabI32, 0);
+  }
+  return n;
+}
 
 function hostEmit(kind, ptr, len) {
   const view = new Uint8Array(exports.memory.buffer, ptr, len);
@@ -72,11 +113,25 @@ const wasi = new Proxy(wasiStubs, {
   get: (t, k) => k in t ? t[k] : ((...a) => { console.warn('wasi stub miss:', k); return 52; }),
 });
 
+// Residual wasm-bindgen placeholder imports: linked-but-dead shims from the
+// wgpu dependency (the live WebGPU lane runs in the separate bindgen-built
+// gpu module). Nothing calls them without bindgen glue — stub to satisfy
+// instantiation, throw loudly if one ever fires.
+const wbindgenPlaceholder = new Proxy({}, {
+  get: (_, k) => (() => { throw new Error(`wasm-bindgen placeholder called: ${String(k)}`); }),
+});
+const wbindgenExternref = {
+  __wbindgen_externref_table_grow: () => -1,
+  __wbindgen_externref_table_set_null: () => {},
+};
+
 async function ensureWasm() {
   if (exports) return;
   const imports = {
-    env: { host_emit: hostEmit },
+    env: { host_emit: hostEmit, host_encode_bc7: hostEncodeBc7 },
     wasi_snapshot_preview1: wasi,
+    __wbindgen_placeholder__: wbindgenPlaceholder,
+    __wbindgen_externref_xform__: wbindgenExternref,
   };
   const r = module
     ? await WebAssembly.instantiate(module, imports)
@@ -127,6 +182,10 @@ onmessage = async (e) => {
   const m = e.data;
   if (m.cmd === 'init') {
     module = m.module;
+    if (m.sab) {
+      sabI32 = new Int32Array(m.sab);
+      sabU8 = new Uint8Array(m.sab);
+    }
     try {
       await ensureWasm();
     } catch (err) {

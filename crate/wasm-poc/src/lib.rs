@@ -8,6 +8,45 @@ use abgen::validate::{validate_bundle, Severity, ValidateCtx};
 #[link(wasm_import_module = "env")]
 unsafe extern "C" {
     fn host_emit(kind: u32, ptr: *const u8, len: usize);
+    // WebGPU bridge: the hosting worker forwards BC7 encode requests to a
+    // WebGPU sibling worker (SharedArrayBuffer + Atomics.wait) and writes the
+    // encoded chain into out_ptr. Returns bytes written; 0/negative means no
+    // GPU (not isolated, unsupported, failed) and the CPU path runs instead.
+    fn host_encode_bc7(req_ptr: *const u8, req_len: usize, out_ptr: *mut u8, out_cap: usize)
+        -> i32;
+}
+
+/// bc7_pure wasm hook: serialize one encode request for the host.
+/// Layout (LE): u32 width, u32 height, i32 mips, u32 flags
+/// (bit0 flip, bit1 srgb, bit2 perceptual, bit3 profile-basic), rgba bytes.
+fn gpu_host_encode(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    mip_count: Option<i32>,
+    flip: bool,
+    srgb: bool,
+    perceptual: bool,
+    profile: abgen::bc7_pure::Bc7Profile,
+) -> Option<(Vec<u8>, i32)> {
+    use abgen::bc7_pure::{compute_default_mip_count, compute_mip_chain_size, Bc7Profile};
+    let mips = mip_count.unwrap_or_else(|| compute_default_mip_count(width, height));
+    let flags: u32 = (flip as u32)
+        | ((srgb as u32) << 1)
+        | ((perceptual as u32) << 2)
+        | ((matches!(profile, Bc7Profile::Basic) as u32) << 3);
+    let mut req = Vec::with_capacity(16 + rgba.len());
+    req.extend_from_slice(&width.to_le_bytes());
+    req.extend_from_slice(&height.to_le_bytes());
+    req.extend_from_slice(&mips.to_le_bytes());
+    req.extend_from_slice(&flags.to_le_bytes());
+    req.extend_from_slice(rgba);
+    let mut out = vec![0u8; compute_mip_chain_size(width, height, mips)];
+    let n = unsafe { host_encode_bc7(req.as_ptr(), req.len(), out.as_mut_ptr(), out.len()) };
+    if n <= 0 || n as usize != out.len() {
+        return None;
+    }
+    Some((out, mips))
 }
 
 fn emit(kind: u32, bytes: &[u8]) {
@@ -45,6 +84,7 @@ pub extern "C" fn poc_init() {
         .num_threads(1)
         .use_current_thread()
         .build_global();
+    abgen::bc7_pure::set_encode_hook(gpu_host_encode);
 }
 
 struct Input {

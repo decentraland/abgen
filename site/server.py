@@ -674,6 +674,14 @@ class H(SimpleHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def end_headers(self):
+        # crossOriginIsolated: the wasm converter's WebGPU bridge needs
+        # SharedArrayBuffer + Atomics.wait in workers. Everything the site
+        # loads is same-origin, so isolation costs nothing.
+        self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
+        self.send_header('Cross-Origin-Embedder-Policy', 'require-corp')
+        super().end_headers()
+
     def send_json(self, obj, code=200, headers=None):
         body = json.dumps(obj).encode()
         self.send_response(code)

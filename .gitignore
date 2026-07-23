@@ -44,3 +44,7 @@ __pycache__/
 *.swp
 node_modules/
 npm/local/
+
+# wasm WebGPU module build artifacts — crate/wasm-poc/build.sh regenerates
+/crate/wasm-gpu/target/
+/site/wasm/gpu/

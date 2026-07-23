@@ -15,8 +15,12 @@ mod opt_tables;
 mod pack;
 mod partition;
 mod tables;
+#[cfg(target_arch = "wasm32")]
+mod wasm_hook;
 
 pub use mip::*;
+#[cfg(target_arch = "wasm32")]
+pub use wasm_hook::{set_encode_hook, EncodeHook};
 
 use alpha::*;
 use bits::*;

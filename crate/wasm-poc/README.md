@@ -78,15 +78,22 @@ bundles.
   flag raises the module floor to engines with wasm SIMD (Chrome 91+,
   Firefox 89+, Safari 16.4+, Node 16.4+ — older engines reject the module
   at validation).
-- WebGPU encode is a documented follow-up, deliberately descoped: the
-  module is a bindgen-free cdylib with a synchronous `poc_convert`, while
-  browser WebGPU buffer readback is async-only, and wgpu's browser backend
-  requires wasm-bindgen glue. Doing it honestly means a resumable convert —
-  a dedicated texture-encode job phase that awaits GPU readbacks between
-  module calls (a natural fit over the worker-pool job protocol), reusing
-  the native GPU lane's bit-exact WGSL kernels and its per-device
-  self-qualification contract. Until then the native CUDA/wgpu lane is the
-  GPU story.
+- WebGPU encode is wired via a bridge that keeps `poc_convert` synchronous:
+  a separate wasm-bindgen module (`crate/wasm-gpu`, the native GPU lane's
+  bit-exact WGSL kernels behind `abgen::gpu`'s wasm32 API) runs in its own
+  worker, and convert workers block on a SharedArrayBuffer + `Atomics.wait`
+  handshake (`bc7_pure::set_encode_hook` → `host_encode_bc7` import →
+  `site/wasm/gpu-worker.js`, which stays async via `Atomics.waitAsync` for
+  GPU readback). Needs crossOriginIsolated (site/server.py sends COOP/COEP);
+  anything missing degrades to the CPU-SIMD path with a note. The native
+  per-device self-qualification contract carries over: `gpu_init` refuses
+  any adapter whose output is not bit-identical to the in-module CPU oracle
+  across the native qualification matrix. Status: Chrome's WGSL compiler
+  (Tint→MSL) is NOT currently bit-exact on Apple Metal — the same kernels
+  qualify under native wgpu (Naga) on the same GPU — so the lane arms only
+  on adapters that pass; hardening the WGSL against Tint codegen is the
+  open follow-up. `site/wasm/gputest.html` is the end-to-end harness (runs
+  CPU-forced vs GPU-enabled and byte-compares every bundle).
 
 Formerly a gap, now real: libjpeg error recovery uses actual setjmp/longjmp
 via wasi-libc's `libsetjmp.a` (the LLVM Wasm-SjLj transform over wasm
