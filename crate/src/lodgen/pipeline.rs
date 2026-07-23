@@ -7,7 +7,7 @@ use crate::lods;
 
 use super::gate::{push_check, self_gate_bundle_with, tri_cap_check, GateCheck};
 use super::model::LodModel;
-use super::{assemble, atlas, crop, emit, placements, simplify, simplify_meshopt};
+use super::{assemble, atlas, crop, emit, model, placements, reclamp, simplify, simplify_meshopt};
 
 pub fn parse_parcel(s: &str) -> Result<(i32, i32)> {
     let parts: Vec<&str> = s.trim().split(',').collect();
@@ -156,6 +156,7 @@ pub struct GenerateParams {
     pub gltfpack: Option<PathBuf>,
     pub allow_unsimplified: bool,
     pub keep_glb: bool,
+    pub uv_reclamp: bool,
 }
 
 impl Default for GenerateParams {
@@ -170,7 +171,7 @@ impl Default for GenerateParams {
             tri_cap: None,
             tri_cap_auto: true,
             atlas_max: 256,
-            atlas_padding: 0,
+            atlas_padding: 2,
             atlas_fixed: false,
             atlas_adaptive: false,
             crop: true,
@@ -182,6 +183,7 @@ impl Default for GenerateParams {
             gltfpack: None,
             allow_unsimplified: false,
             keep_glb: false,
+            uv_reclamp: true,
         }
     }
 }
@@ -477,7 +479,8 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         } else {
             atlas::AtlasMode::Native
         };
-        let model = atlas::atlas_with(&model, params.atlas_max, params.atlas_padding, mode)?;
+        let (model, atlas_rects) =
+            atlas::atlas_with_rects(&model, params.atlas_max, params.atlas_padding, mode)?;
         atlas_ms = t.elapsed().as_millis();
         log.extend(model.log.iter().cloned());
         source_tris = model.total_tris();
@@ -502,6 +505,20 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
             )?;
             simplify_ms += t.elapsed().as_millis();
             log.push(format!("simplify[{level}]: {}", sim.summary()));
+            if params.uv_reclamp && !sim.passthrough {
+                let bytes =
+                    std::fs::read(&out).with_context(|| format!("read {}", out.display()))?;
+                let mut clamped = model::from_glb_bytes(&bytes, "reclamp")?;
+                let rep = reclamp::reclamp_model(&mut clamped, &atlas_rects);
+                if rep.reclamped > 0 {
+                    std::fs::write(&out, emit::emit_glb(&clamped)?)
+                        .with_context(|| format!("write {}", out.display()))?;
+                }
+                log.push(format!(
+                    "reclamp[{level}]: {} of {} tris crossed atlas tile rects; snapped to majority tile",
+                    rep.reclamped, rep.scanned
+                ));
+            }
             staged.push((level, out, sim));
         }
     } else {

@@ -8,10 +8,19 @@ pub enum AlphaClass {
     Blend,
 }
 
+pub fn fold_emissive(base: [f64; 4], emissive: [f64; 3]) -> [f64; 4] {
+    [
+        (base[0] + emissive[0]).min(1.0),
+        (base[1] + emissive[1]).min(1.0),
+        (base[2] + emissive[2]).min(1.0),
+        base[3],
+    ]
+}
+
 impl AlphaClass {
     pub fn from_alpha_mode(mode: &str) -> AlphaClass {
         match mode {
-            "MASK" => AlphaClass::Mask,
+            "MASK" => AlphaClass::Blend,
             "BLEND" => AlphaClass::Blend,
             _ => AlphaClass::Opaque,
         }
@@ -406,7 +415,7 @@ pub fn from_glb_bytes(bytes: &[u8], root_name: &str) -> Result<LodModel> {
         model.materials.push(LodMaterial {
             name: m.name.clone(),
             class: AlphaClass::from_alpha_mode(&m.alpha_mode),
-            base_color: m.base_color,
+            base_color: fold_emissive(m.base_color, m.emissive),
             cutoff: m.alpha_cutoff,
             image,
             double_sided: m.double_sided,
@@ -435,7 +444,7 @@ mod tests {
     #[test]
     fn alpha_mode_mapping() {
         assert_eq!(AlphaClass::from_alpha_mode("OPAQUE"), AlphaClass::Opaque);
-        assert_eq!(AlphaClass::from_alpha_mode("MASK"), AlphaClass::Mask);
+        assert_eq!(AlphaClass::from_alpha_mode("MASK"), AlphaClass::Blend);
         assert_eq!(AlphaClass::from_alpha_mode("BLEND"), AlphaClass::Blend);
         assert_eq!(AlphaClass::from_alpha_mode(""), AlphaClass::Opaque);
         assert_eq!(AlphaClass::from_alpha_mode("mask"), AlphaClass::Opaque);

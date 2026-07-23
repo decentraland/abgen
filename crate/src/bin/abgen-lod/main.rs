@@ -32,9 +32,9 @@ USAGE:
             [--catalyst URL]
   abgen-lod assemble (--scene <entityId|X,Y> | --entity-json FILE) -o out.glb
             [--catalyst URL] [--iss FILE|auto|off] [--cache DIR] [--level 1]
-            [--no-crop] [--no-atlas] [--max-size 256] [--padding 0] [--atlas-fixed]
+            [--no-crop] [--no-atlas] [--max-size 256] [--padding 2] [--atlas-fixed]
             [--atlas-adaptive]
-  abgen-lod atlas -i in.glb -o out.glb [--max-size 256] [--padding 0]
+  abgen-lod atlas -i in.glb -o out.glb [--max-size 256] [--padding 2]
             [--atlas-fixed] [--atlas-adaptive] [--crop-base X,Y --crop-parcels 'x,y;x,y;...']
   abgen-lod simplify -i in.glb -o out.glb [--ratio 0.1] [--tri-cap N]
             [--simplifier meshopt|gltfpack] [--gltfpack PATH]
@@ -46,7 +46,7 @@ USAGE:
             [--iss FILE|auto|off]
             [--workdir DIR] [--cache DIR] [--simplifier meshopt|gltfpack]
             [--gltfpack PATH]
-            [--allow-unsimplified] [--keep-glb] [--gpu]
+            [--allow-unsimplified] [--keep-glb] [--no-uv-reclamp] [--gpu]
 
 bundle: stages <src.glb> as {entityIdLower}_{level}.glb and builds
   {out}/{entityIdLower}/LOD/{level}/{entityIdLower}_{level}_{platform} (+.br).
@@ -103,14 +103,15 @@ simplify: decimates a GLB. --simplifier picks the backend (default from
   topology-preserving pass with a loose error bound so the count target
   dominates, a sloppy (topology-ignoring) retry when that stops early
   above target, then orphan-vertex compaction; a capped result still over
-  budget is a hard error. gltfpack shells out (-si <ratio> -sp -noq;
-  binary resolved --gltfpack > ABGEN_GLTFPACK > PATH): --tri-cap N re-runs
-  up to 3 times with the ratio rescaled by target/actual*0.9 (-sa on the
-  final attempt); if the cap is still unreached at gltfpack's default -se
-  error bound it binary-searches a relaxed -se (aggressive) for the
-  largest result under the cap, else it fills back toward [0.8*cap, cap]
-  when the input was above the cap. In both backends inputs already
-  satisfying ratio>=1 + cap pass through untouched.
+  budget is a hard error. gltfpack shells out (-si <ratio> -noq;
+  binary resolved --gltfpack > ABGEN_GLTFPACK > PATH): --tri-cap N: when
+  the plain quality pass stays over the cap, the ladder re-runs at the
+  budget-true ratio (cap/source) escalating the error limit
+  (-sp -se 0.03|0.1|0.3|1.0) and stops at the mildest rung that fits; -sa
+  is a genuine last resort. A fit below 0.8*cap fills back toward the cap
+  by bisecting -se on the quality path (ratio without -sa on a plain fit;
+  -sa bisection only when the fit itself was -sa). In both backends inputs
+  already satisfying ratio>=1 + cap pass through untouched.
   --allow-unsimplified copies the input through verbatim (loud warning)
   when the simplifier is unavailable or fails.
 generate/placements/assemble run without node: scenes lacking an ISS
@@ -132,7 +133,8 @@ generate: the full sync chain: resolve scene -> placements (iss|embedded
   --tri-cap auto: cap = 500 x parcels, the production budget, so the final
   mesh is min(source, 500 x parcels) tris. Scenes at or under the cap pass
   through bit-identically (without resolving gltfpack); larger scenes are
-  decimated into [0.8*cap, cap] (hard error if the cap is unreachable).
+  decimated with the -se escalation ladder into [0.8*cap, cap] (hard error
+  if the cap is unreachable).
   --tri-cap N overrides the cap; --tri-cap off restores the legacy
   ratio-only lane (pass-through at or under 500 x parcels, else an
   uncapped ratio decimation). --simplifier picks the decimation backend
@@ -500,7 +502,7 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
     let mut no_crop = false;
     let mut no_atlas = false;
     let mut max_size: u32 = 256;
-    let mut padding: u32 = 0;
+    let mut padding: u32 = 2;
     let mut atlas_fixed = false;
     let mut atlas_adaptive = false;
 
@@ -683,7 +685,7 @@ fn cmd_atlas(argv: &[String]) -> Result<i32> {
     let mut input: Option<String> = None;
     let mut out: Option<String> = None;
     let mut max_size: u32 = 256;
-    let mut padding: u32 = 0;
+    let mut padding: u32 = 2;
     let mut atlas_fixed = false;
     let mut atlas_adaptive = false;
     let mut crop_base: Option<String> = None;
@@ -1008,6 +1010,9 @@ fn cmd_generate(argv: &[String]) -> Result<i32> {
             }
             "--keep-glb" => {
                 params.keep_glb = true;
+            }
+            "--no-uv-reclamp" => {
+                params.uv_reclamp = false;
             }
             "--gpu" => {
                 gpu_flag = true;

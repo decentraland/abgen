@@ -15,18 +15,19 @@ use compose::{compose, encode_atlas, native_crops, weld_primitive};
 use pack::pack_skyline;
 use pack::{pack_bucket, Packed};
 use tile::{
-    average_color, clamp_to_cap, intern_tile, repeat_pixels, solid_color, solid_tile, tint_bits,
-    tinted_pixels, uv_plan, Bucket, Tile, TileKey, UvMap, UvPlan,
+    average_color, fused_repeat_bake, intern_tile, premultiplied_filtering, prim_area, solid_color,
+    solid_tile, tint_bits, tinted_pixels, uv_plan, Bucket, Tile, TileKey, UvMap, UvPlan,
 };
 
 const MIN_TILE_DIM: u32 = 4;
 const UV_EPS: f64 = 1e-4;
-const MAX_REPEATS: i64 = 2;
 const JPEG_QUALITY: u8 = 85;
 const TARGET_OCCUPANCY: f64 = 0.75;
 const SHRINK_STEP: f64 = 0.95;
 const MAX_PACK_TRIES: u32 = 200;
 const GROW_TRIES: u32 = 12;
+const TILE_FLOOR_DIV: u32 = 16;
+const LOSSLESS_OPAQUE_MIN_BUDGET: u32 = 512;
 
 const NATIVE_SOLID_DIM: u32 = 8;
 const NATIVE_MIN_CANVAS: u32 = 8;
@@ -82,6 +83,15 @@ pub fn atlas_with(
     padding: u32,
     mode: AtlasMode,
 ) -> Result<LodModel> {
+    Ok(atlas_with_rects(model, max_size, padding, mode)?.0)
+}
+
+pub fn atlas_with_rects(
+    model: &LodModel,
+    max_size: u32,
+    padding: u32,
+    mode: AtlasMode,
+) -> Result<(LodModel, Vec<super::reclamp::ClassRects>)> {
     if model.primitives.is_empty() {
         bail!("atlas: model has no primitives");
     }
@@ -164,11 +174,17 @@ pub fn atlas_with(
                     };
                     let ti = intern_tile(bucket, key, || {
                         let tinted = tinted_pixels(img, mat.base_color);
-                        let (px, w, h) =
-                            repeat_pixels(tinted, img.width(), img.height(), reps.0, reps.1);
-                        let (px, w, h) = clamp_to_cap(px, w, h, max_pot);
+                        let (px, w, h) = fused_repeat_bake(
+                            tinted,
+                            img.width(),
+                            img.height(),
+                            reps,
+                            max_pot,
+                            premultiplied_filtering(mat.class),
+                        );
                         Tile::from_pixels(px, w, h)
                     });
+                    bucket.weights[ti] += prim_area(prim);
                     bucket.prims.push((
                         pi,
                         ti,
@@ -178,14 +194,14 @@ pub fn atlas_with(
                         },
                     ));
                 }
-                UvPlan::Fallback { span } => {
+                UvPlan::Fallback => {
                     bucket.fallbacks += 1;
                     log.push(format!(
-                        "atlas: WARN fallback prim {pi} material {:?}: uv span {:.3}x{:.3} exceeds {MAX_REPEATS}x{MAX_REPEATS} repeats, collapsed to average-color tile",
-                        mat.name, span[0], span[1]
+                        "atlas: WARN fallback prim {pi} material {:?}: non-finite uvs, collapsed to average-color tile",
+                        mat.name
                     ));
                     let tinted = tinted_pixels(img, mat.base_color);
-                    let color = average_color(&tinted);
+                    let color = average_color(mat.class, &tinted);
                     let ti = intern_tile(bucket, TileKey::Solid(color), || solid_tile(color));
                     bucket.prims.push((pi, ti, UvMap::Center));
                 }
@@ -210,15 +226,29 @@ pub fn atlas_with(
                     AtlasMode::Native | AtlasMode::Adaptive => native_crops(bucket, model),
                     AtlasMode::FullBleed => vec![None; bucket.tiles.len()],
                 };
-                let packed = pack_bucket(&mut bucket.tiles, &mut crops, mode, max_pot, padding)?;
-                let canvas_px =
-                    compose(&bucket.tiles, &crops, &packed.rects, packed.canvas, padding);
-                let img = encode_atlas(class, canvas_px, packed.canvas)?;
+                let packed = pack_bucket(
+                    &mut bucket.tiles,
+                    &mut crops,
+                    &bucket.weights,
+                    mode,
+                    max_pot,
+                    padding,
+                )?;
+                let canvas_px = compose(
+                    &bucket.tiles,
+                    &crops,
+                    &packed.rects,
+                    packed.canvas,
+                    padding,
+                    premultiplied_filtering(class),
+                );
+                let img = encode_atlas(class, canvas_px, packed.canvas, max_pot)?;
                 Ok((packed, img, crops))
             })())
         })
         .collect();
     let mut total_fallbacks = 0usize;
+    let mut rect_tables = Vec::new();
     for (ci, item) in heavy.into_iter().enumerate() {
         let Some(res) = item else {
             continue;
@@ -294,6 +324,15 @@ pub fn atlas_with(
             mime
         ));
         total_fallbacks += bucket.fallbacks;
+        rect_tables.push(super::reclamp::ClassRects {
+            material: class_material_name(class).to_string(),
+            canvas: packed.canvas,
+            rects: packed
+                .rects
+                .iter()
+                .map(|&(x, y, w, h)| [x, y, w, h])
+                .collect(),
+        });
         out.primitives.push(merged);
     }
     if out.primitives.is_empty() {
@@ -316,5 +355,5 @@ pub fn atlas_with(
         }
     ));
     out.log = log;
-    Ok(out)
+    Ok((out, rect_tables))
 }

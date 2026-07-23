@@ -308,9 +308,9 @@ mod tests {
                 },
                 LodMaterial {
                     name: "matB".to_string(),
-                    class: AlphaClass::Mask,
+                    class: AlphaClass::Blend,
                     base_color: [1.0, 0.5, 0.25, 0.8],
-                    cutoff: 0.7,
+                    cutoff: 0.5,
                     image: None,
                     double_sided: true,
                 },

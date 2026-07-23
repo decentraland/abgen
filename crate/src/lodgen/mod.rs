@@ -4,6 +4,7 @@ pub mod crop;
 pub mod emit;
 pub mod model;
 pub mod placements;
+pub mod reclamp;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod scenerun;
 #[cfg(not(target_arch = "wasm32"))]

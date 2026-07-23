@@ -1,7 +1,9 @@
 use image::RgbaImage;
 use std::collections::HashMap;
 
-use super::{MAX_REPEATS, MIN_TILE_DIM, UV_EPS};
+use super::{MIN_TILE_DIM, UV_EPS};
+use crate::bc7_pure::{linear_to_srgb_u8, srgb_to_linear_u8};
+use crate::lodgen::model::{AlphaClass, LodPrimitive};
 
 enum TileKind {
     Solid([u8; 4]),
@@ -52,7 +54,13 @@ impl Tile {
         matches!(self.kind, TileKind::Solid(_))
     }
 
-    pub(super) fn render_cropped(&self, crop: Option<[u32; 4]>, w: u32, h: u32) -> Vec<u8> {
+    pub(super) fn render_cropped(
+        &self,
+        crop: Option<[u32; 4]>,
+        w: u32,
+        h: u32,
+        premul: bool,
+    ) -> Vec<u8> {
         match &self.kind {
             TileKind::Solid(c) => {
                 let mut px = Vec::with_capacity(w as usize * h as usize * 4);
@@ -79,12 +87,13 @@ impl Tile {
                 if (w, h) == (cw, ch) {
                     window
                 } else {
-                    crate::resize::box_downscale_rgba(
+                    downscale(
                         &window,
                         cw as usize,
                         ch as usize,
                         w as usize,
                         h as usize,
+                        premul,
                     )
                 }
             }
@@ -109,24 +118,66 @@ pub(super) enum UvMap {
 
 pub(super) enum UvPlan {
     Rect { shift: [f64; 2], reps: (u32, u32) },
-    Fallback { span: [f64; 2] },
+    Fallback,
 }
 
 #[derive(Default)]
 pub(super) struct Bucket {
     pub(super) tiles: Vec<Tile>,
+    pub(super) weights: Vec<f64>,
     by_key: HashMap<TileKey, usize>,
     pub(super) prims: Vec<(usize, usize, UvMap)>,
     pub(super) refs: usize,
     pub(super) fallbacks: usize,
 }
 
+pub(super) fn prim_area(p: &LodPrimitive) -> f64 {
+    let mut area = 0.0f64;
+    for t in p.indices.chunks_exact(3) {
+        let a = p.positions[t[0] as usize].map(|v| v as f64);
+        let b = p.positions[t[1] as usize].map(|v| v as f64);
+        let c = p.positions[t[2] as usize].map(|v| v as f64);
+        let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let x = u[1] * v[2] - u[2] * v[1];
+        let y = u[2] * v[0] - u[0] * v[2];
+        let z = u[0] * v[1] - u[1] * v[0];
+        area += (x * x + y * y + z * z).sqrt() * 0.5;
+    }
+    if area.is_finite() {
+        area
+    } else {
+        0.0
+    }
+}
+
 pub(super) fn tint_bits(c: [f64; 4]) -> [u64; 4] {
     c.map(|v| v.to_bits())
 }
 
+pub(super) fn srgb_encode(v: f64) -> f64 {
+    if v <= 0.003_130_8 {
+        v * 12.92
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+pub(super) fn srgb_decode(v: f64) -> f64 {
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 pub(super) fn solid_color(c: [f64; 4]) -> [u8; 4] {
-    c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+    [
+        (srgb_encode(c[0].clamp(0.0, 1.0)) * 255.0).round() as u8,
+        (srgb_encode(c[1].clamp(0.0, 1.0)) * 255.0).round() as u8,
+        (srgb_encode(c[2].clamp(0.0, 1.0)) * 255.0).round() as u8,
+        (c[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+    ]
 }
 
 pub(super) fn tinted_pixels(img: &RgbaImage, tint: [f64; 4]) -> Vec<u8> {
@@ -136,64 +187,103 @@ pub(super) fn tinted_pixels(img: &RgbaImage, tint: [f64; 4]) -> Vec<u8> {
     }
     let mut out = Vec::with_capacity(img.as_raw().len());
     for px in img.as_raw().chunks_exact(4) {
-        for ch in 0..4 {
-            out.push((px[ch] as f64 * t[ch]).round().clamp(0.0, 255.0) as u8);
+        for ch in 0..3 {
+            let lin = srgb_decode(px[ch] as f64 / 255.0) * t[ch];
+            out.push((srgb_encode(lin.clamp(0.0, 1.0)) * 255.0).round() as u8);
         }
+        out.push((px[3] as f64 * t[3]).round().clamp(0.0, 255.0) as u8);
     }
     out
 }
 
-pub(super) fn repeat_pixels(
+pub(super) fn fused_repeat_bake(
     pixels: Vec<u8>,
     w: u32,
     h: u32,
-    ru: u32,
-    rv: u32,
+    reps: (u32, u32),
+    cap: u32,
+    premul: bool,
 ) -> (Vec<u8>, u32, u32) {
-    if ru == 1 && rv == 1 {
+    let (ru, rv) = reps;
+    let full = (w as u64 * ru as u64).max(h as u64 * rv as u64);
+    let (pixels, w, h) = if full <= cap as u64 {
+        (pixels, w, h)
+    } else {
+        let scale = cap as f64 / full as f64;
+        let pw = ((w as f64 * scale).floor() as u32).clamp(1, cap);
+        let ph = ((h as f64 * scale).floor() as u32).clamp(1, cap);
+        let out = downscale(
+            &pixels,
+            w as usize,
+            h as usize,
+            pw as usize,
+            ph as usize,
+            premul,
+        );
+        (out, pw, ph)
+    };
+    let tw = (w as u64 * ru as u64).min(cap as u64) as u32;
+    let th = (h as u64 * rv as u64).min(cap as u64) as u32;
+    if (tw, th) == (w, h) {
         return (pixels, w, h);
     }
-    let nw = w * ru;
-    let nh = h * rv;
-    let mut out = vec![0u8; nw as usize * nh as usize * 4];
-    for y in 0..nh as usize {
-        let sy = y % h as usize;
-        for x in 0..nw as usize {
-            let sx = x % w as usize;
-            let d = (y * nw as usize + x) * 4;
-            let s = (sy * w as usize + sx) * 4;
+    let mut out = vec![0u8; tw as usize * th as usize * 4];
+    for y in 0..th as usize {
+        let srow = (y % h as usize) * w as usize;
+        for x in 0..tw as usize {
+            let d = (y * tw as usize + x) * 4;
+            let s = (srow + x % w as usize) * 4;
             out[d..d + 4].copy_from_slice(&pixels[s..s + 4]);
         }
     }
-    (out, nw, nh)
+    (out, tw, th)
 }
 
-pub(super) fn clamp_to_cap(pixels: Vec<u8>, w: u32, h: u32, cap: u32) -> (Vec<u8>, u32, u32) {
-    if w <= cap && h <= cap {
-        return (pixels, w, h);
+pub(super) fn premultiplied_filtering(class: AlphaClass) -> bool {
+    class != AlphaClass::Opaque
+}
+
+pub(super) fn downscale(
+    px: &[u8],
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+    premul: bool,
+) -> Vec<u8> {
+    if premul {
+        crate::resize::premul_downscale_rgba(px, sw, sh, dw, dh)
+    } else {
+        crate::resize::box_downscale_rgba(px, sw, sh, dw, dh, true)
     }
-    let scale = cap as f64 / w.max(h) as f64;
-    let nw = ((w as f64 * scale).floor() as u32).clamp(1, cap);
-    let nh = ((h as f64 * scale).floor() as u32).clamp(1, cap);
-    let out = crate::resize::box_downscale_rgba(
-        &pixels,
-        w as usize,
-        h as usize,
-        nw as usize,
-        nh as usize,
-    );
-    (out, nw, nh)
 }
 
-pub(super) fn average_color(pixels: &[u8]) -> [u8; 4] {
+pub(super) fn average_color(class: AlphaClass, pixels: &[u8]) -> [u8; 4] {
     let n = (pixels.len() / 4).max(1) as f64;
-    let mut acc = [0f64; 4];
+    let mut weighted = [0f64; 3];
+    let mut unweighted = [0f64; 3];
+    let mut asum = 0f64;
     for px in pixels.chunks_exact(4) {
-        for ch in 0..4 {
-            acc[ch] += px[ch] as f64;
+        let a = px[3] as f64 / 255.0;
+        for ch in 0..3 {
+            let lin = srgb_to_linear_u8(px[ch]) as f64;
+            weighted[ch] += lin * a;
+            unweighted[ch] += lin;
         }
+        asum += a;
     }
-    acc.map(|v| (v / n).round().clamp(0.0, 255.0) as u8)
+    let alpha_weighted = premultiplied_filtering(class) && asum > 0.0;
+    let mut out = [0u8; 4];
+    for ch in 0..3 {
+        let lin = if alpha_weighted {
+            weighted[ch] / asum
+        } else {
+            unweighted[ch] / n
+        };
+        out[ch] = linear_to_srgb_u8(lin as f32);
+    }
+    out[3] = (asum / n * 255.0).round().clamp(0.0, 255.0) as u8;
+    out
 }
 
 pub(super) fn solid_tile(color: [u8; 4]) -> Tile {
@@ -211,19 +301,14 @@ pub(super) fn uv_plan(uvs: &[[f32; 2]]) -> UvPlan {
         }
     }
     if !mn.iter().chain(mx.iter()).all(|v| v.is_finite()) {
-        return UvPlan::Fallback {
-            span: [f64::NAN, f64::NAN],
-        };
+        return UvPlan::Fallback;
     }
     let shift = [mn[0].floor(), mn[1].floor()];
     let smax = [mx[0] - shift[0], mx[1] - shift[1]];
     let reps = [
-        (((smax[0] - UV_EPS).ceil() as i64).max(1)),
-        (((smax[1] - UV_EPS).ceil() as i64).max(1)),
+        ((smax[0] - UV_EPS).ceil() as i64).clamp(1, u32::MAX as i64),
+        ((smax[1] - UV_EPS).ceil() as i64).clamp(1, u32::MAX as i64),
     ];
-    if reps[0] > MAX_REPEATS || reps[1] > MAX_REPEATS {
-        return UvPlan::Fallback { span: smax };
-    }
     UvPlan::Rect {
         shift,
         reps: (reps[0] as u32, reps[1] as u32),
@@ -236,6 +321,7 @@ pub(super) fn intern_tile(bucket: &mut Bucket, key: TileKey, make: impl FnOnce()
     }
     let i = bucket.tiles.len();
     bucket.tiles.push(make());
+    bucket.weights.push(0.0);
     bucket.by_key.insert(key, i);
     i
 }

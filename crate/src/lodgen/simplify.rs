@@ -8,6 +8,8 @@ use super::model::LodModel;
 
 pub const CLASS_SURVIVAL_MIN_TRIS: usize = 200;
 pub const CLASS_RESCUE_ERROR_LIMIT: f64 = 0.001;
+pub const LADDER_ERROR_RUNGS: [f64; 4] = [0.03, 0.1, 0.3, 1.0];
+const GLTFPACK_DEFAULT_SE: f64 = 0.01;
 
 pub const GLTFPACK_NIX_RECIPE: &str =
     "nix-shell -p meshoptimizer --run 'gltfpack -i <in.glb> -o <out.glb> -si 0.1 -noq'";
@@ -197,8 +199,16 @@ pub fn resolve_gltfpack(flag: Option<&Path>) -> Result<PathBuf> {
     resolve_from(flag, env.as_deref(), path_var.as_deref())
 }
 
-fn simplify_args(ratio: f64, aggressive: bool, error_limit: Option<f64>) -> Vec<String> {
+fn simplify_args(
+    ratio: f64,
+    aggressive: bool,
+    permissive: bool,
+    error_limit: Option<f64>,
+) -> Vec<String> {
     let mut args = vec!["-si".to_string(), format!("{ratio}")];
+    if permissive {
+        args.push("-sp".to_string());
+    }
     if let Some(e) = error_limit {
         args.push("-se".to_string());
         args.push(format!("{e}"));
@@ -216,11 +226,12 @@ fn run_gltfpack(
     output: &Path,
     ratio: f64,
     aggressive: bool,
+    permissive: bool,
     error_limit: Option<f64>,
 ) -> Result<()> {
     let mut cmd = Command::new(gltfpack);
     cmd.arg("-i").arg(input).arg("-o").arg(output);
-    cmd.args(simplify_args(ratio, aggressive, error_limit));
+    cmd.args(simplify_args(ratio, aggressive, permissive, error_limit));
     let out = run_with_deadline(
         cmd,
         subproc_deadline(),
@@ -341,6 +352,7 @@ fn rescue_lost_classes(
             &sub_out,
             ratio,
             false,
+            false,
             Some(CLASS_RESCUE_ERROR_LIMIT),
         )?;
         let rescued = glb_model(&sub_out)?;
@@ -429,92 +441,112 @@ pub fn simplify(
         tris_before,
         ..Default::default()
     };
-    let mut current = ratio.clamp(1e-3, 1.0);
-    let mut tris_after = tris_before;
-    for attempt in 0..4 {
-        let aggressive = attempt == 3;
-        run_gltfpack(gltfpack, input, output, current, aggressive, None)?;
-        report.ratios_run.push(current);
-        report.aggressive_final = aggressive;
-        tris_after = glb_tris(output)?;
-        if under_cap(tris_after) || aggressive {
-            break;
-        }
-        current = if attempt == 2 {
-            rescale_ratio(1.0, tris_before as u64, tri_cap.unwrap_or(1))
-        } else {
-            rescale_ratio(current, tris_after as u64, tri_cap.unwrap_or(1))
-        };
+    let current = ratio.clamp(1e-3, 1.0);
+    run_gltfpack(gltfpack, input, output, current, false, false, None)?;
+    report.ratios_run.push(current);
+    let mut tris_after = glb_tris(output)?;
+    enum Fit {
+        Plain,
+        Rung(usize),
+        Sa,
     }
-    let mut error_relaxed = false;
-    if let Some(cap) = tri_cap {
-        if tris_after as u64 > cap {
-            error_relaxed = true;
-            let ratio_sa = rescale_ratio(1.0, tris_before as u64, cap.max(1));
-            let (mut lo, mut hi) = (0.01f64, 1.0f64);
-            let mut best: Option<(usize, Vec<u8>)> = None;
-            for _ in 0..6 {
-                let se = (lo + hi) / 2.0;
-                run_gltfpack(gltfpack, input, output, ratio_sa, true, Some(se))?;
-                report.ratios_run.push(ratio_sa);
-                report.aggressive_final = true;
-                let t = glb_tris(output)?;
-                if t as u64 <= cap {
-                    hi = se;
-                    if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
-                        best = Some((t, std::fs::read(output)?));
-                    }
-                } else {
-                    lo = se;
-                }
+    let mut fit = Fit::Plain;
+    if !under_cap(tris_after) {
+        let cap = tri_cap.unwrap_or(1);
+        let r = (cap as f64 / tris_before.max(1) as f64).clamp(1e-3, 1.0);
+        let mut fitted = false;
+        for (i, &se) in LADDER_ERROR_RUNGS.iter().enumerate() {
+            run_gltfpack(gltfpack, input, output, r, false, true, Some(se))?;
+            report.ratios_run.push(r);
+            report.se_run.push(se);
+            tris_after = glb_tris(output)?;
+            if under_cap(tris_after) {
+                fit = Fit::Rung(i);
+                fitted = true;
+                break;
             }
-            match best {
-                Some((t, bytes)) => {
-                    std::fs::write(output, &bytes)?;
-                    tris_after = t;
-                }
-                None => bail!(
-                    "tri cap {cap} not reached after {} gltfpack attempts (final {} tris, ratios {:?})",
-                    report.ratios_run.len(),
+        }
+        if !fitted {
+            run_gltfpack(gltfpack, input, output, r, true, false, None)?;
+            report.ratios_run.push(r);
+            report.aggressive_final = true;
+            tris_after = glb_tris(output)?;
+            fit = Fit::Sa;
+            if !under_cap(tris_after) {
+                bail!(
+                    "tri cap {cap} not reached after the -se ladder and -sa (final {} tris, ratios {:?}, se rungs {:?})",
                     tris_after,
-                    report.ratios_run
-                ),
+                    report.ratios_run,
+                    report.se_run
+                );
             }
         }
     }
-    if let Some(cap) = tri_cap.filter(|_| !error_relaxed) {
+    if let Some(cap) = tri_cap {
         let floor = (cap as f64 * 0.8) as usize;
         if tris_after > 0
             && (tris_before as u64) > cap
             && (tris_after as u64) <= cap
             && tris_after < floor
         {
-            let mut lo_ratio = report.ratios_run.last().copied().unwrap_or(current);
-            let mut hi_ratio: Option<f64> = None;
             let mut best = std::fs::read(output)?;
-            for _ in 0..6 {
-                if tris_after >= floor {
-                    break;
+            match fit {
+                Fit::Rung(i) => {
+                    let r = (cap as f64 / tris_before.max(1) as f64).clamp(1e-3, 1.0);
+                    let mut hi_se = LADDER_ERROR_RUNGS[i];
+                    let mut lo_se = if i == 0 {
+                        GLTFPACK_DEFAULT_SE
+                    } else {
+                        LADDER_ERROR_RUNGS[i - 1]
+                    };
+                    for _ in 0..6 {
+                        if tris_after >= floor || hi_se - lo_se < 1e-4 {
+                            break;
+                        }
+                        let cand = (lo_se + hi_se) / 2.0;
+                        run_gltfpack(gltfpack, input, output, r, false, true, Some(cand))?;
+                        let t = glb_tris(output)?;
+                        if t as u64 > cap {
+                            lo_se = cand;
+                        } else {
+                            hi_se = cand;
+                            if t > tris_after {
+                                tris_after = t;
+                                best = std::fs::read(output)?;
+                                report.se_run.push(cand);
+                            }
+                        }
+                    }
                 }
-                let cand = match hi_ratio {
-                    None => (cap as f64 * 0.9 / tris_before as f64)
-                        .max(lo_ratio * 2.0)
-                        .clamp(1e-3, 1.0),
-                    Some(h) => (lo_ratio + h) / 2.0,
-                };
-                if (cand - lo_ratio).abs() < 1e-6 {
-                    break;
-                }
-                run_gltfpack(gltfpack, input, output, cand, true, None)?;
-                let t = glb_tris(output)?;
-                if t as u64 > cap {
-                    hi_ratio = Some(cand);
-                } else {
-                    lo_ratio = cand;
-                    if t > tris_after {
-                        tris_after = t;
-                        best = std::fs::read(output)?;
-                        report.ratios_run.push(cand);
+                Fit::Plain | Fit::Sa => {
+                    let aggressive = matches!(fit, Fit::Sa);
+                    let mut lo_ratio = report.ratios_run.last().copied().unwrap_or(current);
+                    let mut hi_ratio: Option<f64> = None;
+                    for _ in 0..6 {
+                        if tris_after >= floor {
+                            break;
+                        }
+                        let cand = match hi_ratio {
+                            None => (cap as f64 * 0.9 / tris_before as f64)
+                                .max(lo_ratio * 2.0)
+                                .clamp(1e-3, 1.0),
+                            Some(h) => (lo_ratio + h) / 2.0,
+                        };
+                        if (cand - lo_ratio).abs() < 1e-6 {
+                            break;
+                        }
+                        run_gltfpack(gltfpack, input, output, cand, aggressive, false, None)?;
+                        let t = glb_tris(output)?;
+                        if t as u64 > cap {
+                            hi_ratio = Some(cand);
+                        } else {
+                            lo_ratio = cand;
+                            if t > tris_after {
+                                tris_after = t;
+                                best = std::fs::read(output)?;
+                                report.ratios_run.push(cand);
+                            }
+                        }
                     }
                 }
             }
@@ -813,22 +845,31 @@ mod tests {
     }
 
     #[test]
-    fn simplify_args_are_feature_preserving() {
-        assert_eq!(simplify_args(0.1, false, None), vec!["-si", "0.1", "-noq"]);
-        assert_eq!(
-            simplify_args(0.25, true, None),
-            vec!["-si", "0.25", "-sa", "-noq"]
-        );
-        assert_eq!(
-            simplify_args(0.1, false, Some(CLASS_RESCUE_ERROR_LIMIT)),
-            vec!["-si", "0.1", "-se", "0.001", "-noq"]
-        );
-        for lever in ["-sp", "-sa"] {
+    fn simplify_args_ladder_shapes() {
+        for lever in ["-sp", "-sa", "-se"] {
             assert!(
-                !simplify_args(0.1, false, None).iter().any(|a| a == lever),
+                !simplify_args(0.1, false, false, None)
+                    .iter()
+                    .any(|a| a == lever),
                 "{lever} must not be in the default invocation"
             );
         }
+        assert_eq!(
+            simplify_args(0.1, false, false, None),
+            vec!["-si", "0.1", "-noq"]
+        );
+        assert_eq!(
+            simplify_args(0.156, false, true, Some(0.03)),
+            vec!["-si", "0.156", "-sp", "-se", "0.03", "-noq"]
+        );
+        assert_eq!(
+            simplify_args(0.25, true, false, None),
+            vec!["-si", "0.25", "-sa", "-noq"]
+        );
+        assert_eq!(
+            simplify_args(0.1, false, false, Some(CLASS_RESCUE_ERROR_LIMIT)),
+            vec!["-si", "0.1", "-se", "0.001", "-noq"]
+        );
     }
 
     #[test]
@@ -904,6 +945,112 @@ mod tests {
         assert_eq!(by_mat.get("op").copied().unwrap_or(0), 128);
         assert!(by_mat.get("bl").copied().unwrap_or(0) > 0, "{by_mat:?}");
         assert_eq!(report.tris_after, out.total_tris());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn strip_uv_cards(material: usize, count: u32, size: f32) -> LodPrimitive {
+        let mut prim = LodPrimitive {
+            material,
+            ..Default::default()
+        };
+        for k in 0..count {
+            let x = (k % 12) as f32 * 0.8;
+            let z = (k / 12) as f32 * 0.8;
+            let u0 = k as f32 / count as f32;
+            let u1 = (k + 1) as f32 / count as f32;
+            let base = prim.positions.len() as u32;
+            for (dx, dy, u, v) in [
+                (0.0, 0.0, u0, 0.0),
+                (size, 0.0, u1, 0.0),
+                (0.0, size, u0, 1.0),
+                (size, size, u1, 1.0),
+            ] {
+                prim.positions.push([x + dx, 1.0 + dy, z]);
+                prim.normals.push([0.0, 0.0, 1.0]);
+                prim.uvs.push([u, v]);
+            }
+            prim.indices.extend_from_slice(&[
+                base,
+                base + 2,
+                base + 1,
+                base + 1,
+                base + 2,
+                base + 3,
+            ]);
+        }
+        prim
+    }
+
+    fn leaf_stats(model: &LodModel) -> (usize, f32) {
+        let mut tris = 0usize;
+        let mut max_span = 0f32;
+        for prim in &model.primitives {
+            let Some(mat) = model.materials.get(prim.material) else {
+                continue;
+            };
+            if mat.name != "leaf" {
+                continue;
+            }
+            for t in prim.indices.chunks_exact(3) {
+                tris += 1;
+                let us: Vec<f32> = t.iter().map(|&i| prim.uvs[i as usize][0]).collect();
+                let span = us.iter().cloned().fold(f32::MIN, f32::max)
+                    - us.iter().cloned().fold(f32::MAX, f32::min);
+                max_span = max_span.max(span);
+            }
+        }
+        (tris, max_span)
+    }
+
+    #[test]
+    fn capped_ladder_keeps_cutout_foliage_present_and_unsmeared() {
+        let Ok(bin) = resolve_gltfpack(None) else {
+            eprintln!("SKIP: gltfpack not resolvable ({GLTFPACK_NIX_RECIPE})");
+            return;
+        };
+        let dir = temp_dir("foliage");
+        let cards = 150u32;
+        let full = LodModel {
+            root_name: "foliage".to_string(),
+            primitives: vec![grid_primitive(48), strip_uv_cards(1, cards, 0.5)],
+            materials: vec![
+                material("op", AlphaClass::Opaque),
+                material("leaf", AlphaClass::Blend),
+            ],
+            images: Vec::new(),
+            log: Vec::new(),
+        };
+        let input = dir.join("in.glb");
+        let output = dir.join("out.glb");
+        std::fs::write(&input, emit_glb(&full).unwrap()).unwrap();
+
+        let report = simplify(&input, &output, 1.0, Some(600), &bin).unwrap();
+        let out = glb_model(&output).unwrap();
+        let (leaf_tris, max_span) = leaf_stats(&out);
+        assert!(leaf_tris > 0, "cutout foliage deleted: {report:?}");
+        let strip = 1.0 / cards as f32;
+        assert!(
+            max_span <= 2.5 * strip,
+            "foliage uvs smeared across cards: span {max_span} vs strip {strip} ({report:?})"
+        );
+        assert!(
+            !report.aggressive_final,
+            "quality ladder fell through to -sa: {report:?}"
+        );
+
+        let sa_out = dir.join("sa.glb");
+        let r = 600.0 / full.total_tris() as f64;
+        run_gltfpack(&bin, &input, &sa_out, r, true, false, None).unwrap();
+        let sa = glb_model(&sa_out).unwrap();
+        let (sa_tris, sa_span) = leaf_stats(&sa);
+        assert!(
+            leaf_tris >= sa_tris,
+            "ladder kept less foliage than -sa: {leaf_tris} vs {sa_tris}"
+        );
+        assert!(
+            max_span <= sa_span.max(2.5 * strip),
+            "ladder smeared more than -sa: {max_span} vs {sa_span}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

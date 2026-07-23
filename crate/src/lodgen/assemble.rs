@@ -415,12 +415,13 @@ pub fn assemble_from(
                 }
                 _ => None,
             };
+            let eff = model::fold_emissive(m.base_color, m.emissive);
             let key = MatKey {
                 base_color: [
-                    m.base_color[0].to_bits(),
-                    m.base_color[1].to_bits(),
-                    m.base_color[2].to_bits(),
-                    m.base_color[3].to_bits(),
+                    eff[0].to_bits(),
+                    eff[1].to_bits(),
+                    eff[2].to_bits(),
+                    eff[3].to_bits(),
                 ],
                 class: AlphaClass::from_alpha_mode(&m.alpha_mode),
                 cutoff: m.alpha_cutoff.to_bits(),
