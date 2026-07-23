@@ -100,6 +100,28 @@ pub struct Proxy {
     magenta_missing: bool,
     jit_cache: OnceLock<Arc<crate::abcdn::jitcache::JitDiskCache>>,
     asset_reuse: bool,
+    build_progress: Mutex<HashMap<String, BuildProgress>>,
+}
+
+/// Live per-entity corpus-build progress, for the /progress/{entity} route.
+/// Purely informational: nothing gates on it, and it vanishes with the build.
+#[derive(Clone)]
+pub struct BuildProgress {
+    pub done: usize,
+    pub total: usize,
+    pub file: String,
+}
+
+/// Clears an entity's progress on every exit path of a corpus build.
+struct ProgressGuard<'a> {
+    proxy: &'a Proxy,
+    cid: &'a str,
+}
+
+impl Drop for ProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.proxy.progress_clear(self.cid);
+    }
 }
 
 impl Proxy {
@@ -109,6 +131,29 @@ impl Proxy {
 
     pub fn set_jit_cache(&self, c: Arc<crate::abcdn::jitcache::JitDiskCache>) {
         let _ = self.jit_cache.set(c);
+    }
+
+    pub fn progress_snapshot(&self, cid: &str) -> Option<BuildProgress> {
+        self.build_progress.lock().ok()?.get(cid).cloned()
+    }
+
+    fn progress_update(&self, cid: &str, done: usize, total: usize, file: &str) {
+        if let Ok(mut g) = self.build_progress.lock() {
+            g.insert(
+                cid.to_string(),
+                BuildProgress {
+                    done,
+                    total,
+                    file: file.to_string(),
+                },
+            );
+        }
+    }
+
+    fn progress_clear(&self, cid: &str) {
+        if let Ok(mut g) = self.build_progress.lock() {
+            g.remove(cid);
+        }
     }
 
     pub(crate) fn cache_roots(&self) -> (&Path, &Path) {
@@ -623,11 +668,24 @@ impl Proxy {
         let mut failed: Vec<String> = Vec::new();
         let mut tolerated: usize = 0;
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let total = ctx
+            .scene
+            .content
+            .iter()
+            .filter(|c| {
+                let lf = c.file.to_lowercase();
+                CONVERTIBLE_EXTS.iter().any(|e| lf.ends_with(e))
+            })
+            .count();
+        let mut processed: usize = 0;
+        let _progress = ProgressGuard { proxy: self, cid };
         for c in &ctx.scene.content {
             let lf = c.file.to_lowercase();
             if !CONVERTIBLE_EXTS.iter().any(|e| lf.ends_with(e)) {
                 continue;
             }
+            self.progress_update(cid, processed, total, &c.file);
+            processed += 1;
             let (is_glb, _) = is_convertible(&c.file);
             let case_hash = if platform == "mac" {
                 c.hash.to_lowercase()
@@ -1007,6 +1065,7 @@ impl Proxy {
             magenta_missing,
             jit_cache: OnceLock::new(),
             asset_reuse,
+            build_progress: Mutex::new(HashMap::new()),
         })
     }
 
