@@ -40,6 +40,8 @@ fn mat(name: &str, class: AlphaClass, base_color: [f64; 4], image: Option<usize>
         cutoff: 0.5,
         image,
         double_sided: false,
+        emissive: [0.0; 3],
+        emissive_image: None,
     }
 }
 
@@ -989,6 +991,85 @@ fn uncapped_reps_bake_bounded_and_deterministic() {
         want[ch] = linear_to_srgb_u8(avg[ch] as f32);
     }
     assert_eq!(canvas.get_pixel(5, 5).0, want);
+}
+
+#[test]
+fn emission_atlas_shares_rects_and_bakes_factor() {
+    let base_png = flat_image(8, 8, [255, 255, 255, 255]);
+    let emis_png = flat_image(8, 8, [200, 40, 120, 255]);
+    let factor = [0.5, 1.0, 0.25];
+    let mut glow = mat("g", AlphaClass::Mask, [1.0; 4], Some(0));
+    glow.emissive = factor;
+    glow.emissive_image = Some(1);
+    let dark = mat("d", AlphaClass::Mask, [1.0; 4], Some(0));
+    let m = model_of(
+        vec![glow, dark],
+        vec![prim(0, tri_uvs()), prim(1, tri_uvs())],
+        vec![base_png, emis_png],
+    );
+    let out = atlas(&m, 64, 2).unwrap();
+    assert_eq!(out.images.len(), 2);
+    assert_eq!(out.materials.len(), 1);
+    assert_eq!(out.materials[0].image, Some(0));
+    assert_eq!(out.materials[0].emissive, [1.0; 3]);
+    assert_eq!(out.materials[0].emissive_image, Some(1));
+    let base = decode(&out.images[0]);
+    let emis = decode(&out.images[1]);
+    assert_eq!((base.width(), base.height()), (emis.width(), emis.height()));
+    let line = log_line(&out, "class=mask");
+    assert!(line.contains("unique=2"), "{line}");
+    assert!(line.contains("emissive_image=1"), "{line}");
+
+    let s = base.width() as f64;
+    let expect: [u8; 4] = {
+        let texel = [200.0, 40.0, 120.0];
+        let mut px = [0u8; 4];
+        for ch in 0..3 {
+            let lin = srgb_decode(texel[ch] / 255.0) * factor[ch];
+            px[ch] = (srgb_encode(lin) * 255.0).round() as u8;
+        }
+        px[3] = 255;
+        px
+    };
+    let uv0 = out.primitives[0].uvs[0];
+    let gx = (uv0[0] as f64 * s).round() as u32;
+    let gy = (uv0[1] as f64 * s).round() as u32;
+    assert_eq!(emis.get_pixel(gx + 1, gy + 1).0, expect);
+    assert_eq!(base.get_pixel(gx + 1, gy + 1).0, [255, 255, 255, 255]);
+    let uv3 = out.primitives[0].uvs[3];
+    let dx = (uv3[0] as f64 * s).round() as u32;
+    let dy = (uv3[1] as f64 * s).round() as u32;
+    assert_eq!(emis.get_pixel(dx + 1, dy + 1).0, [0, 0, 0, 255]);
+}
+
+#[test]
+fn no_glow_scene_emits_no_emission_image() {
+    let png = flat_image(8, 8, [10, 20, 30, 255]);
+    let m = model_of(
+        vec![mat("a", AlphaClass::Mask, [1.0; 4], Some(0))],
+        vec![prim(0, tri_uvs())],
+        vec![png],
+    );
+    let out = atlas(&m, 64, 2).unwrap();
+    assert_eq!(out.images.len(), 1);
+    assert_eq!(out.materials[0].emissive, [0.0; 3]);
+    assert_eq!(out.materials[0].emissive_image, None);
+}
+
+#[test]
+fn solid_glowing_material_gets_solid_emission_tile() {
+    let mut gm = mat("g", AlphaClass::Blend, [0.0, 0.5, 1.0, 1.0], None);
+    gm.emissive = [0.25, 0.5, 0.75];
+    let m = model_of(vec![gm], vec![prim(0, tri_uvs())], vec![]);
+    let out = atlas(&m, 64, 2).unwrap();
+    assert_eq!(out.images.len(), 2);
+    assert_eq!(out.materials[0].emissive_image, Some(1));
+    let emis = decode(&out.images[1]);
+    let s = emis.width() as f64;
+    let uv0 = out.primitives[0].uvs[0];
+    let x = (uv0[0] as f64 * s) as u32;
+    let y = (uv0[1] as f64 * s) as u32;
+    assert_eq!(emis.get_pixel(x, y).0, emissive_solid([0.25, 0.5, 0.75]));
 }
 
 #[test]

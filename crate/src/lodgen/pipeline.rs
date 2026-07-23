@@ -158,6 +158,7 @@ pub struct GenerateParams {
     pub keep_glb: bool,
     pub uv_reclamp: bool,
     pub bake_after_simplify: bool,
+    pub emissive_channel: bool,
 }
 
 impl Default for GenerateParams {
@@ -186,6 +187,7 @@ impl Default for GenerateParams {
             keep_glb: false,
             uv_reclamp: true,
             bake_after_simplify: false,
+            emissive_channel: false,
         }
     }
 }
@@ -468,6 +470,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
             &placements,
             levels[0],
             params.cache.as_deref(),
+            params.emissive_channel,
         )?;
         assemble_ms = t.elapsed().as_millis();
         if params.crop {
@@ -515,7 +518,8 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
                 let t = std::time::Instant::now();
                 let bytes =
                     std::fs::read(&dec).with_context(|| format!("read {}", dec.display()))?;
-                let decimated = model::from_glb_bytes(&bytes, &root_name)?;
+                let decimated =
+                    model::from_glb_bytes_with(&bytes, &root_name, params.emissive_channel)?;
                 let atlased =
                     atlas::atlas_with(&decimated, params.atlas_max, params.atlas_padding, mode)?;
                 atlas_ms += t.elapsed().as_millis();
@@ -560,7 +564,8 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
                 if params.uv_reclamp && !sim.passthrough {
                     let bytes =
                         std::fs::read(&out).with_context(|| format!("read {}", out.display()))?;
-                    let mut clamped = model::from_glb_bytes(&bytes, "reclamp")?;
+                    let mut clamped =
+                        model::from_glb_bytes_with(&bytes, "reclamp", params.emissive_channel)?;
                     let rep = reclamp::reclamp_model(&mut clamped, &atlas_rects);
                     if rep.reclamped > 0 {
                         std::fs::write(&out, emit::emit_glb(&clamped)?)

@@ -287,10 +287,13 @@ pub(super) fn parse_impl(
             .get("extensions")
             .and_then(|e| e.get("KHR_materials_specular"));
         let specular_color_tex_info = specular_ext.and_then(|sx| sx.get("specularColorTexture"));
-        let uses_emissive_strength = m
+        let emissive_strength_ext = m
             .get("extensions")
-            .and_then(|e| e.get("KHR_materials_emissive_strength"))
-            .is_some();
+            .and_then(|e| e.get("KHR_materials_emissive_strength"));
+        let uses_emissive_strength = emissive_strength_ext.is_some();
+        let emissive_strength = emissive_strength_ext
+            .and_then(|x| jf(x, "emissiveStrength"))
+            .unwrap_or(1.0);
 
         let mut tex_transforms: std::collections::BTreeMap<String, TexTransform> =
             std::collections::BTreeMap::new();
@@ -374,6 +377,7 @@ pub(super) fn parse_impl(
             glossiness_factor: sg_glossiness_factor,
             specular_color_image: tex_ref(specular_color_tex_info),
             uses_emissive_strength,
+            emissive_strength,
         });
     }
 

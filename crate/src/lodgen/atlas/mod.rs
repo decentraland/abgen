@@ -15,8 +15,9 @@ use compose::{compose, encode_atlas, native_crops, weld_primitive};
 use pack::pack_skyline;
 use pack::{pack_bucket, Packed};
 use tile::{
-    average_color, fused_repeat_bake, intern_tile, premultiplied_filtering, prim_area, solid_color,
-    solid_tile, tint_bits, tinted_pixels, uv_plan, Bucket, Tile, TileKey, UvMap, UvPlan,
+    average_color, emissive_pixels, emissive_solid, emissive_tile, fused_repeat_bake, glows,
+    intern_tile, premultiplied_filtering, prim_area, solid_color, solid_tile, tint_bits,
+    tinted_pixels, uv_plan, Bucket, EmisKey, Tile, TileKey, UvMap, UvPlan,
 };
 
 const MIN_TILE_DIM: u32 = 4;
@@ -106,17 +107,22 @@ pub fn atlas_with_rects(
     let atlas_ms: u128 = 0;
     let mut log = model.log.clone();
     let mut needed = vec![false; model.images.len()];
+    let mut any_glow = false;
     for prim in &model.primitives {
         if prim.positions.is_empty() || prim.indices.len() < 3 {
             continue;
         }
-        if let Some(idx) = model
-            .materials
-            .get(prim.material)
-            .and_then(|m| m.image)
-            .filter(|&i| i < needed.len())
-        {
+        let Some(mat) = model.materials.get(prim.material) else {
+            continue;
+        };
+        if let Some(idx) = mat.image.filter(|&i| i < needed.len()) {
             needed[idx] = true;
+        }
+        if glows(mat) {
+            any_glow = true;
+            if let Some(idx) = mat.emissive_image.filter(|&i| i < needed.len()) {
+                needed[idx] = true;
+            }
         }
     }
     let decoded: Vec<Option<(RgbaImage, String)>> = needed
@@ -159,18 +165,44 @@ pub fn atlas_with_rects(
             Some(idx) if idx < model.images.len() => decoded[idx].as_ref(),
             _ => None,
         };
+        let emis_ref: Option<&(RgbaImage, String)> = match mat.emissive_image {
+            Some(idx) if glows(mat) && idx < model.images.len() => decoded[idx].as_ref(),
+            _ => None,
+        };
         match img_ref {
             None => {
+                let ekey = if glows(mat) {
+                    EmisKey::Solid(emissive_solid(mat.emissive))
+                } else {
+                    EmisKey::Dark
+                };
                 let color = solid_color(mat.base_color);
-                let ti = intern_tile(bucket, TileKey::Solid(color), || solid_tile(color));
+                let ti = intern_tile(bucket, TileKey::Solid(color, ekey.clone()), || {
+                    let e = match &ekey {
+                        EmisKey::Solid(c) => solid_tile(*c),
+                        _ => solid_tile([0, 0, 0, 255]),
+                    };
+                    (solid_tile(color), e)
+                });
                 bucket.prims.push((pi, ti, UvMap::Center));
             }
             Some((img, img_hash)) => match uv_plan(&prim.uvs) {
                 UvPlan::Rect { shift, reps } => {
+                    let ekey = if !glows(mat) {
+                        EmisKey::Dark
+                    } else if let Some((_, ehash)) = emis_ref {
+                        EmisKey::Image {
+                            hash: ehash.clone(),
+                            factor: mat.emissive.map(|v| v.to_bits()),
+                        }
+                    } else {
+                        EmisKey::Solid(emissive_solid(mat.emissive))
+                    };
                     let key = TileKey::Image {
                         hash: img_hash.clone(),
                         tint: tint_bits(mat.base_color),
                         reps,
+                        emis: ekey.clone(),
                     };
                     let ti = intern_tile(bucket, key, || {
                         let tinted = tinted_pixels(img, mat.base_color);
@@ -182,7 +214,18 @@ pub fn atlas_with_rects(
                             max_pot,
                             premultiplied_filtering(mat.class),
                         );
-                        Tile::from_pixels(px, w, h)
+                        let e = match (&ekey, emis_ref) {
+                            (EmisKey::Image { .. }, Some((eimg, _))) => emissive_tile(
+                                eimg,
+                                mat.emissive,
+                                (img.width(), img.height()),
+                                reps,
+                                max_pot,
+                            ),
+                            (EmisKey::Solid(c), _) => solid_tile(*c),
+                            _ => solid_tile([0, 0, 0, 255]),
+                        };
+                        (Tile::from_pixels(px, w, h), e)
                     });
                     bucket.weights[ti] += prim_area(prim);
                     bucket.prims.push((
@@ -202,7 +245,23 @@ pub fn atlas_with_rects(
                     ));
                     let tinted = tinted_pixels(img, mat.base_color);
                     let color = average_color(mat.class, &tinted);
-                    let ti = intern_tile(bucket, TileKey::Solid(color), || solid_tile(color));
+                    let ekey = if !glows(mat) {
+                        EmisKey::Dark
+                    } else if let Some((eimg, _)) = emis_ref {
+                        let mut avg =
+                            average_color(mat.class, &emissive_pixels(eimg, mat.emissive));
+                        avg[3] = 255;
+                        EmisKey::Solid(avg)
+                    } else {
+                        EmisKey::Solid(emissive_solid(mat.emissive))
+                    };
+                    let ti = intern_tile(bucket, TileKey::Solid(color, ekey.clone()), || {
+                        let e = match &ekey {
+                            EmisKey::Solid(c) => solid_tile(*c),
+                            _ => solid_tile([0, 0, 0, 255]),
+                        };
+                        (solid_tile(color), e)
+                    });
                     bucket.prims.push((pi, ti, UvMap::Center));
                 }
             },
@@ -213,7 +272,7 @@ pub fn atlas_with_rects(
         root_name: model.root_name.clone(),
         ..Default::default()
     };
-    type HeavyOut = (Packed, LodImage, Vec<Option<[u32; 4]>>);
+    type HeavyOut = (Packed, LodImage, Option<LodImage>, Vec<Option<[u32; 4]>>);
     let heavy: Vec<Option<Result<HeavyOut>>> = CLASS_ORDER
         .par_iter()
         .zip(buckets.par_iter_mut())
@@ -243,7 +302,20 @@ pub fn atlas_with_rects(
                     premultiplied_filtering(class),
                 );
                 let img = encode_atlas(class, canvas_px, packed.canvas, max_pot)?;
-                Ok((packed, img, crops))
+                let emis_img = if any_glow {
+                    let emis_px = compose(
+                        &bucket.emis,
+                        &crops,
+                        &packed.rects,
+                        packed.canvas,
+                        padding,
+                        false,
+                    );
+                    Some(encode_atlas(class, emis_px, packed.canvas, max_pot)?)
+                } else {
+                    None
+                };
+                Ok((packed, img, emis_img, crops))
             })())
         })
         .collect();
@@ -253,12 +325,17 @@ pub fn atlas_with_rects(
         let Some(res) = item else {
             continue;
         };
-        let (packed, img, crops) = res?;
+        let (packed, img, emis_img, crops) = res?;
         let class = CLASS_ORDER[ci];
         let bucket = &buckets[ci];
         let mime = img.mime.clone();
         let img_idx = out.images.len();
         out.images.push(img);
+        let emis_idx = emis_img.map(|e| {
+            let i = out.images.len();
+            out.images.push(e);
+            i
+        });
         let mat_idx = out.materials.len();
         out.materials.push(LodMaterial {
             name: class_material_name(class).to_string(),
@@ -267,6 +344,12 @@ pub fn atlas_with_rects(
             cutoff: 0.5,
             image: Some(img_idx),
             double_sided: false,
+            emissive: if emis_idx.is_some() {
+                [1.0; 3]
+            } else {
+                [0.0; 3]
+            },
+            emissive_image: emis_idx,
         });
         let s = packed.canvas as f64;
         let mut merged = LodPrimitive {
@@ -311,8 +394,12 @@ pub fn atlas_with_rects(
             .sum::<f64>()
             / (s * s)
             * 100.0;
+        let emis_note = match emis_idx {
+            Some(i) => format!(" emissive_image={} ({})", i, out.images[i].mime),
+            None => String::new(),
+        };
         log.push(format!(
-            "atlas: class={} material={} size={} refs={} unique={} occupancy={:.1}% fallbacks={} scale={:.3} mime={}",
+            "atlas: class={} material={} size={} refs={} unique={} occupancy={:.1}% fallbacks={} scale={:.3} mime={}{}",
             class_tag(class),
             class_material_name(class),
             packed.canvas,
@@ -321,7 +408,8 @@ pub fn atlas_with_rects(
             occupancy,
             bucket.fallbacks,
             packed.scale,
-            mime
+            mime,
+            emis_note
         ));
         total_fallbacks += bucket.fallbacks;
         rect_tables.push(super::reclamp::ClassRects {

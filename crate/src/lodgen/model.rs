@@ -17,6 +17,14 @@ pub fn fold_emissive(base: [f64; 4], emissive: [f64; 3]) -> [f64; 4] {
     ]
 }
 
+pub fn scaled_emissive(m: &crate::scene::Material) -> [f64; 3] {
+    [
+        (m.emissive[0] * m.emissive_strength).clamp(0.0, 1.0),
+        (m.emissive[1] * m.emissive_strength).clamp(0.0, 1.0),
+        (m.emissive[2] * m.emissive_strength).clamp(0.0, 1.0),
+    ]
+}
+
 impl AlphaClass {
     pub fn from_alpha_mode(mode: &str) -> AlphaClass {
         match mode {
@@ -49,6 +57,8 @@ pub struct LodMaterial {
     pub cutoff: f64,
     pub image: Option<usize>,
     pub double_sided: bool,
+    pub emissive: [f64; 3],
+    pub emissive_image: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -373,6 +383,8 @@ fn walk(
                         cutoff: 0.5,
                         image: None,
                         double_sided: false,
+                        emissive: [0.0; 3],
+                        emissive_image: None,
                     });
                     *fallback = Some(model.materials.len() - 1);
                 }
@@ -394,6 +406,14 @@ fn walk(
 }
 
 pub fn from_glb_bytes(bytes: &[u8], root_name: &str) -> Result<LodModel> {
+    from_glb_bytes_with(bytes, root_name, false)
+}
+
+pub fn from_glb_bytes_with(
+    bytes: &[u8],
+    root_name: &str,
+    emissive_channel: bool,
+) -> Result<LodModel> {
     let scene = crate::gltf::parse(bytes, ".glb", None, false, true)?;
     let mut model = LodModel {
         root_name: root_name.to_string(),
@@ -402,7 +422,7 @@ pub fn from_glb_bytes(bytes: &[u8], root_name: &str) -> Result<LodModel> {
     let mut by_hash: HashMap<String, usize> = HashMap::new();
     let mut image_slot: Vec<Option<Option<usize>>> = vec![None; scene.images.len()];
     for m in &scene.materials {
-        let image = match m.base_color_image {
+        let mut intern = |tr: Option<crate::scene::TexRef>| match tr {
             Some(tr) if tr.image < scene.images.len() => {
                 if image_slot[tr.image].is_none() {
                     image_slot[tr.image] =
@@ -412,13 +432,27 @@ pub fn from_glb_bytes(bytes: &[u8], root_name: &str) -> Result<LodModel> {
             }
             _ => None,
         };
+        let image = intern(m.base_color_image);
+        let (base_color, emissive, emissive_image) = if emissive_channel {
+            let e = scaled_emissive(m);
+            let eimg = if e != [0.0; 3] {
+                intern(m.emissive_image)
+            } else {
+                None
+            };
+            (m.base_color, e, eimg)
+        } else {
+            (fold_emissive(m.base_color, m.emissive), [0.0; 3], None)
+        };
         model.materials.push(LodMaterial {
             name: m.name.clone(),
             class: AlphaClass::from_alpha_mode(&m.alpha_mode),
-            base_color: fold_emissive(m.base_color, m.emissive),
+            base_color,
             cutoff: m.alpha_cutoff,
             image,
             double_sided: m.double_sided,
+            emissive,
+            emissive_image,
         });
     }
     let scene_mat_count = scene.materials.len();

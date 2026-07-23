@@ -268,6 +268,8 @@ mod tests {
                 cutoff: 0.5,
                 image: None,
                 double_sided: false,
+                emissive: [0.0; 3],
+                emissive_image: None,
             }],
             images: Vec::new(),
             log: Vec::new(),

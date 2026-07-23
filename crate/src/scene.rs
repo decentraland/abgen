@@ -125,6 +125,7 @@ pub struct Material {
     pub glossiness_factor: f64,
     pub specular_color_image: Option<TexRef>,
     pub uses_emissive_strength: bool,
+    pub emissive_strength: f64,
 }
 
 #[derive(Clone, Debug, Default)]

@@ -46,7 +46,8 @@ USAGE:
             [--no-crop] [--catalyst URL] [--iss FILE|auto|off]
             [--workdir DIR] [--cache DIR] [--simplifier meshopt|gltfpack]
             [--gltfpack PATH]
-            [--allow-unsimplified] [--keep-glb] [--no-uv-reclamp] [--gpu]
+            [--allow-unsimplified] [--keep-glb] [--no-uv-reclamp] [--emissive]
+            [--gpu]
 
 bundle: stages <src.glb> as {entityIdLower}_{level}.glb and builds
   {out}/{entityIdLower}/LOD/{level}/{entityIdLower}_{level}_{platform} (+.br).
@@ -167,7 +168,13 @@ generate: the full sync chain: resolve scene -> placements (iss|embedded
   /lods-unity/manifests/{sceneId}_InitialSceneState.json and an
   iss-descriptor self-gate check re-parses it. Every run ends with a
   structural self-gate; any FAIL exits nonzero. --keep-glb keeps the
-  intermediate merged GLBs in the workdir.
+  intermediate merged GLBs in the workdir. --emissive (default off) carries
+  glTF emission through instead of folding emissiveFactor into the base
+  colour: a second atlas per alpha class is baked with the same packed rects
+  (emissive texel x factor in linear light, black for non-glowing sources)
+  and bound as _EmissionMap with _EmissionColor white in the bundle, so
+  glowing materials glow in the client; scenes with no glowing material
+  emit no emission atlas.
 
 --help/-h prints this help; --version/-V prints the version."
 }
@@ -604,7 +611,7 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
     if let Some(dir) = cache_dir {
         std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
     }
-    let mut model = assemble::assemble(&client, &ent, &list, level, cache_dir)?;
+    let mut model = assemble::assemble(&client, &ent, &list, level, cache_dir, false)?;
     if !no_crop {
         let (base, parcels) = abgen::lodgen::scene_geometry(&ent)?;
         let rects = abgen::lodgen::crop::crop_rects_rh(base, &parcels);
@@ -1026,6 +1033,9 @@ fn cmd_generate(argv: &[String]) -> Result<i32> {
             }
             "--no-uv-reclamp" => {
                 params.uv_reclamp = false;
+            }
+            "--emissive" => {
+                params.emissive_channel = true;
             }
             "--gpu" => {
                 gpu_flag = true;

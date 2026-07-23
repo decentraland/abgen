@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use super::{MIN_TILE_DIM, UV_EPS};
 use crate::bc7_pure::{linear_to_srgb_u8, srgb_to_linear_u8};
-use crate::lodgen::model::{AlphaClass, LodPrimitive};
+use crate::lodgen::model::{AlphaClass, LodMaterial, LodPrimitive};
 
 enum TileKind {
     Solid([u8; 4]),
@@ -102,13 +102,21 @@ impl Tile {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
+pub(super) enum EmisKey {
+    Dark,
+    Solid([u8; 4]),
+    Image { hash: String, factor: [u64; 3] },
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) enum TileKey {
     Image {
         hash: String,
         tint: [u64; 4],
         reps: (u32, u32),
+        emis: EmisKey,
     },
-    Solid([u8; 4]),
+    Solid([u8; 4], EmisKey),
 }
 
 pub(super) enum UvMap {
@@ -124,6 +132,7 @@ pub(super) enum UvPlan {
 #[derive(Default)]
 pub(super) struct Bucket {
     pub(super) tiles: Vec<Tile>,
+    pub(super) emis: Vec<Tile>,
     pub(super) weights: Vec<f64>,
     by_key: HashMap<TileKey, usize>,
     pub(super) prims: Vec<(usize, usize, UvMap)>,
@@ -194,6 +203,51 @@ pub(super) fn tinted_pixels(img: &RgbaImage, tint: [f64; 4]) -> Vec<u8> {
         out.push((px[3] as f64 * t[3]).round().clamp(0.0, 255.0) as u8);
     }
     out
+}
+
+pub(super) fn emissive_pixels(img: &RgbaImage, factor: [f64; 3]) -> Vec<u8> {
+    let f = factor.map(|v| v.clamp(0.0, 1.0));
+    let mut out = Vec::with_capacity(img.as_raw().len());
+    for px in img.as_raw().chunks_exact(4) {
+        for ch in 0..3 {
+            let lin = srgb_decode(px[ch] as f64 / 255.0) * f[ch];
+            out.push((srgb_encode(lin.clamp(0.0, 1.0)) * 255.0).round() as u8);
+        }
+        out.push(255);
+    }
+    out
+}
+
+pub(super) fn emissive_solid(factor: [f64; 3]) -> [u8; 4] {
+    solid_color([factor[0], factor[1], factor[2], 1.0])
+}
+
+pub(super) fn glows(m: &LodMaterial) -> bool {
+    m.emissive != [0.0; 3]
+}
+
+pub(super) fn emissive_tile(
+    eimg: &RgbaImage,
+    factor: [f64; 3],
+    base_dims: (u32, u32),
+    reps: (u32, u32),
+    cap: u32,
+) -> Tile {
+    let mut px = emissive_pixels(eimg, factor);
+    let (mut w, mut h) = (eimg.width(), eimg.height());
+    if (w, h) != base_dims {
+        px = crate::resize::box_downscale_rgba(
+            &px,
+            w as usize,
+            h as usize,
+            base_dims.0 as usize,
+            base_dims.1 as usize,
+            true,
+        );
+        (w, h) = base_dims;
+    }
+    let (px, w, h) = fused_repeat_bake(px, w, h, reps, cap, false);
+    Tile::from_pixels(px, w, h)
 }
 
 pub(super) fn fused_repeat_bake(
@@ -315,12 +369,18 @@ pub(super) fn uv_plan(uvs: &[[f32; 2]]) -> UvPlan {
     }
 }
 
-pub(super) fn intern_tile(bucket: &mut Bucket, key: TileKey, make: impl FnOnce() -> Tile) -> usize {
+pub(super) fn intern_tile(
+    bucket: &mut Bucket,
+    key: TileKey,
+    make: impl FnOnce() -> (Tile, Tile),
+) -> usize {
     if let Some(&i) = bucket.by_key.get(&key) {
         return i;
     }
     let i = bucket.tiles.len();
-    bucket.tiles.push(make());
+    let (base, emis) = make();
+    bucket.tiles.push(base);
+    bucket.emis.push(emis);
     bucket.weights.push(0.0);
     bucket.by_key.insert(key, i);
     i

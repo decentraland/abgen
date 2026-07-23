@@ -87,11 +87,12 @@ pub(super) fn build_lod_material_tree(
         Some(x) => ((x.scale[0], x.scale[1]), (x.offset[0], x.offset[1])),
         None => ((1.0, 1.0), (0.0, 0.0)),
     };
+    let emis_pid = tex_pid.get("_EmissionMap").copied().unwrap_or((0, 0));
     let tex_envs: Vec<Value> = vec![
         lod_tex_env("_BaseMap", base_pid, base_scale, base_offset),
         lod_tex_env("_BaseMapArr", (0, 0), (1.0, 1.0), (0.0, 0.0)),
         lod_tex_env("_BumpMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
-        lod_tex_env("_EmissionMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
+        lod_tex_env("_EmissionMap", emis_pid, (1.0, 1.0), (0.0, 0.0)),
         lod_tex_env("_MainTex", (0, 0), (1.0, 1.0), (0.0, 0.0)),
         lod_tex_env("_MetallicGlossMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
         lod_tex_env("_OcclusionMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
@@ -157,10 +158,15 @@ pub(super) fn build_lod_material_tree(
     if transparent {
         lod_base_color[3] = 0.8_f32 as f64;
     }
+    let emission_color = if emis_pid != (0, 0) {
+        [1.0, 1.0, 1.0, 1.0]
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    };
     let colors: Vec<Value> = vec![
         lod_color("_BaseColor", lod_base_color),
         lod_color("_Color", [1.0, 1.0, 1.0, 1.0]),
-        lod_color("_EmissionColor", [0.0, 0.0, 0.0, 1.0]),
+        lod_color("_EmissionColor", emission_color),
         lod_color("_PlaneClipping", lod.plane_clipping),
         lod_color(
             "_SpecColor",

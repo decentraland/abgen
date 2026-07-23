@@ -94,6 +94,8 @@ struct MatKey {
     cutoff: u64,
     double_sided: bool,
     image: Option<usize>,
+    emissive: [u64; 3],
+    emissive_image: Option<usize>,
 }
 
 struct Prepared {
@@ -148,6 +150,12 @@ fn intern_material(
         cutoff: f64::from_bits(key.cutoff),
         image: key.image,
         double_sided: key.double_sided,
+        emissive: [
+            f64::from_bits(key.emissive[0]),
+            f64::from_bits(key.emissive[1]),
+            f64::from_bits(key.emissive[2]),
+        ],
+        emissive_image: key.emissive_image,
     });
     mat_by_key.insert(key, i);
     i
@@ -160,6 +168,8 @@ fn default_mat_key() -> MatKey {
         cutoff: 0.5f64.to_bits(),
         double_sided: false,
         image: None,
+        emissive: [0f64.to_bits(); 3],
+        emissive_image: None,
     }
 }
 
@@ -294,6 +304,7 @@ pub fn assemble(
     placements: &[Placement],
     level: u32,
     cache_dir: Option<&Path>,
+    emissive_channel: bool,
 ) -> Result<LodModel> {
     let by_file = scene.content_by_file();
     let mut file_by_hash: HashMap<&str, &str> = HashMap::new();
@@ -309,6 +320,7 @@ pub fn assemble(
         &file_by_hash,
         placements,
         &fetch,
+        emissive_channel,
     )
 }
 
@@ -318,6 +330,7 @@ pub fn assemble_from(
     file_by_hash: &HashMap<&str, &str>,
     placements: &[Placement],
     fetch: &(dyn Fn(&str) -> Result<Vec<u8>> + Sync),
+    emissive_channel: bool,
 ) -> Result<LodModel> {
     if placements.is_empty() {
         bail!("assemble: no placements");
@@ -401,7 +414,7 @@ pub fn assemble_from(
         let mut mats = Vec::with_capacity(src.materials.len());
         let mut bakes = Vec::with_capacity(src.materials.len());
         for m in &src.materials {
-            let image = match m.base_color_image {
+            let mut intern = |tr: Option<crate::scene::TexRef>| match tr {
                 Some(tr) if tr.image < src.images.len() => {
                     if image_slot[tr.image].is_none() {
                         image_slot[tr.image] = Some(model::intern_image(
@@ -415,7 +428,22 @@ pub fn assemble_from(
                 }
                 _ => None,
             };
-            let eff = model::fold_emissive(m.base_color, m.emissive);
+            let image = intern(m.base_color_image);
+            let (eff, emissive, emissive_image) = if emissive_channel {
+                let e = model::scaled_emissive(m);
+                let eimg = if e != [0.0; 3] {
+                    intern(m.emissive_image)
+                } else {
+                    None
+                };
+                (m.base_color, e, eimg)
+            } else {
+                (
+                    model::fold_emissive(m.base_color, m.emissive),
+                    [0.0; 3],
+                    None,
+                )
+            };
             let key = MatKey {
                 base_color: [
                     eff[0].to_bits(),
@@ -427,6 +455,12 @@ pub fn assemble_from(
                 cutoff: m.alpha_cutoff.to_bits(),
                 double_sided: m.double_sided,
                 image,
+                emissive: [
+                    emissive[0].to_bits(),
+                    emissive[1].to_bits(),
+                    emissive[2].to_bits(),
+                ],
+                emissive_image,
             };
             mats.push(intern_material(
                 key,
@@ -575,6 +609,8 @@ mod tests {
             cutoff: 0.5,
             image: None,
             double_sided: false,
+            emissive: [0.0; 3],
+            emissive_image: None,
         }
     }
 
@@ -715,6 +751,7 @@ mod tests {
             }],
             1,
             Some(&cache),
+            false,
         )
         .unwrap();
         assert_eq!(model.total_tris(), 1);
@@ -744,6 +781,7 @@ mod tests {
             std::slice::from_ref(&placement),
             1,
             Some(&cache),
+            false,
         )
         .unwrap();
         assert_eq!(model.primitives.len(), 1);
@@ -783,6 +821,7 @@ mod tests {
             }],
             1,
             Some(&cache),
+            false,
         )
         .unwrap();
         let (mn, mx) = model.bounds();
@@ -812,6 +851,7 @@ mod tests {
             }],
             1,
             Some(&cache),
+            false,
         )
         .unwrap();
         assert!((signed_volume(&plain) - 1.0).abs() < 1e-4);
@@ -825,6 +865,7 @@ mod tests {
             }],
             1,
             Some(&cache),
+            false,
         )
         .unwrap();
         assert!(
@@ -885,13 +926,29 @@ mod tests {
             glb_hash: Some(h.to_string()),
             ..Default::default()
         };
-        let plain = assemble(&dummy_client(), &ent, &[mk("hplain")], 1, Some(&cache)).unwrap();
+        let plain = assemble(
+            &dummy_client(),
+            &ent,
+            &[mk("hplain")],
+            1,
+            Some(&cache),
+            false,
+        )
+        .unwrap();
         let uv = plain.primitives[0].uvs[0];
         assert!(
             (uv[0] - 0.25).abs() < 1e-6 && (uv[1] - 0.5).abs() < 1e-6,
             "{uv:?}"
         );
-        let baked = assemble(&dummy_client(), &ent, &[mk("hxform")], 1, Some(&cache)).unwrap();
+        let baked = assemble(
+            &dummy_client(),
+            &ent,
+            &[mk("hxform")],
+            1,
+            Some(&cache),
+            false,
+        )
+        .unwrap();
         let uv = baked.primitives[0].uvs[0];
         assert!(
             (uv[0] - 0.6).abs() < 1e-5 && (uv[1] - 1.7).abs() < 1e-5,
@@ -924,6 +981,7 @@ mod tests {
             ],
             1,
             Some(&cache),
+            false,
         )
         .unwrap();
         assert_eq!(model.images.len(), 1);
@@ -954,6 +1012,7 @@ mod tests {
             &[mk("ha"), mk("hb")],
             1,
             Some(&cache),
+            false,
         )
         .unwrap();
         assert_eq!(model.materials.len(), 2);
@@ -981,6 +1040,7 @@ mod tests {
             &[mk(0.0), mk(10.0), mk(20.0)],
             1,
             Some(&cache),
+            false,
         )
         .unwrap();
         assert_eq!(model.total_tris(), 3);
@@ -1002,6 +1062,7 @@ mod tests {
             }],
             1,
             None,
+            false,
         )
         .unwrap_err();
         let msg = format!("{err:#}");
@@ -1038,6 +1099,7 @@ mod tests {
             ],
             1,
             Some(&cache),
+            false,
         )
         .unwrap();
         assert_eq!(model.total_tris(), 1);
@@ -1083,6 +1145,7 @@ mod tests {
             }],
             1,
             Some(&cache),
+            false,
         )
         .unwrap();
         assert_eq!(model.total_tris(), 1);
@@ -1104,6 +1167,7 @@ mod tests {
             }],
             1,
             Some(&cache),
+            false,
         )
         .unwrap();
         let out = emit_glb(&model).unwrap();

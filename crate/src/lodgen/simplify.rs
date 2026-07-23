@@ -278,7 +278,7 @@ fn glb_tris(path: &Path) -> Result<usize> {
 
 fn glb_model(path: &Path) -> Result<LodModel> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    super::model::from_glb_bytes(&bytes, "simplify-check")
+    super::model::from_glb_bytes_with(&bytes, "simplify-check", true)
         .with_context(|| format!("reparse {}", path.display()))
 }
 
@@ -309,14 +309,21 @@ fn class_submodel(model: &LodModel, key: &str, granularity: RescueGranularity) -
         let sub_mi = *mat_map.entry(prim.material).or_insert_with(|| {
             let mut m = LodMaterial {
                 image: None,
+                emissive_image: None,
                 ..mat.clone()
             };
-            if let Some(img) = mat.image {
-                let si = *img_map.entry(img).or_insert_with(|| {
-                    sub.images.push(model.images[img].clone());
-                    sub.images.len() - 1
-                });
-                m.image = Some(si);
+            let slots = [
+                (&mut m.image, mat.image),
+                (&mut m.emissive_image, mat.emissive_image),
+            ];
+            for (slot, src) in slots {
+                if let Some(img) = src {
+                    let si = *img_map.entry(img).or_insert_with(|| {
+                        sub.images.push(model.images[img].clone());
+                        sub.images.len() - 1
+                    });
+                    *slot = Some(si);
+                }
             }
             sub.materials.push(m);
             sub.materials.len() - 1
@@ -336,11 +343,16 @@ fn merge_model(out_model: &mut LodModel, rescued: &LodModel) {
             None => {
                 let mut m = LodMaterial {
                     image: None,
+                    emissive_image: None,
                     ..mat.clone()
                 };
                 if let Some(img) = mat.image {
                     out_model.images.push(rescued.images[img].clone());
                     m.image = Some(out_model.images.len() - 1);
+                }
+                if let Some(img) = mat.emissive_image {
+                    out_model.images.push(rescued.images[img].clone());
+                    m.emissive_image = Some(out_model.images.len() - 1);
                 }
                 out_model.materials.push(m);
                 out_model.materials.len() - 1
@@ -669,6 +681,8 @@ mod tests {
             cutoff: 0.5,
             image: None,
             double_sided: false,
+            emissive: [0.0; 3],
+            emissive_image: None,
         }
     }
 
