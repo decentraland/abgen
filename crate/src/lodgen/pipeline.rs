@@ -157,6 +157,7 @@ pub struct GenerateParams {
     pub allow_unsimplified: bool,
     pub keep_glb: bool,
     pub uv_reclamp: bool,
+    pub bake_after_simplify: bool,
 }
 
 impl Default for GenerateParams {
@@ -184,6 +185,7 @@ impl Default for GenerateParams {
             allow_unsimplified: false,
             keep_glb: false,
             uv_reclamp: true,
+            bake_after_simplify: false,
         }
     }
 }
@@ -278,8 +280,13 @@ fn run_gltfpack_lane(
     ratio: f64,
     cap: Option<u64>,
 ) -> Result<simplify::SimplifyReport> {
+    let granularity = if params.bake_after_simplify {
+        simplify::RescueGranularity::AlphaClass
+    } else {
+        simplify::RescueGranularity::Material
+    };
     match simplify::resolve_gltfpack(params.gltfpack.as_deref()) {
-        Ok(bin) => match simplify::simplify(pre, out, ratio, cap, &bin) {
+        Ok(bin) => match simplify::simplify_with(pre, out, ratio, cap, &bin, granularity) {
             Ok(r) => Ok(r),
             Err(e) if params.allow_unsimplified => {
                 eprintln!("WARNING: gltfpack failed ({e:#}); --allow-unsimplified passthrough");
@@ -479,47 +486,93 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         } else {
             atlas::AtlasMode::Native
         };
-        let (model, atlas_rects) =
-            atlas::atlas_with_rects(&model, params.atlas_max, params.atlas_padding, mode)?;
-        atlas_ms = t.elapsed().as_millis();
-        log.extend(model.log.iter().cloned());
-        source_tris = model.total_tris();
-
-        let t = std::time::Instant::now();
-        let glb = emit::emit_glb(&model)?;
-        std::fs::write(&pre, &glb).with_context(|| format!("write {}", pre.display()))?;
-        emit_ms = t.elapsed().as_millis();
-
-        for &level in &levels {
-            let out = staging.join(staged_glb_name(&sid, level));
+        if params.bake_after_simplify {
+            log.extend(model.log.iter().cloned());
+            let root_name = model.root_name.clone();
+            source_tris = model.total_tris();
             let t = std::time::Instant::now();
-            let sim = run_simplify(
-                &model,
-                &pre,
-                &out,
-                params,
-                level,
-                source_tris,
-                parcel_count,
-                &mut log,
-            )?;
-            simplify_ms += t.elapsed().as_millis();
-            log.push(format!("simplify[{level}]: {}", sim.summary()));
-            if params.uv_reclamp && !sim.passthrough {
+            let glb = emit::emit_glb(&model)?;
+            std::fs::write(&pre, &glb).with_context(|| format!("write {}", pre.display()))?;
+            emit_ms = t.elapsed().as_millis();
+
+            for &level in &levels {
+                let out = staging.join(staged_glb_name(&sid, level));
+                let dec = staging.join(format!("{}_{}.dec.glb", sid, level));
+                let t = std::time::Instant::now();
+                let sim = run_simplify(
+                    &model,
+                    &pre,
+                    &dec,
+                    params,
+                    level,
+                    source_tris,
+                    parcel_count,
+                    &mut log,
+                )?;
+                simplify_ms += t.elapsed().as_millis();
+                log.push(format!("simplify[{level}]: {}", sim.summary()));
+
+                let t = std::time::Instant::now();
                 let bytes =
-                    std::fs::read(&out).with_context(|| format!("read {}", out.display()))?;
-                let mut clamped = model::from_glb_bytes(&bytes, "reclamp")?;
-                let rep = reclamp::reclamp_model(&mut clamped, &atlas_rects);
-                if rep.reclamped > 0 {
-                    std::fs::write(&out, emit::emit_glb(&clamped)?)
-                        .with_context(|| format!("write {}", out.display()))?;
+                    std::fs::read(&dec).with_context(|| format!("read {}", dec.display()))?;
+                let decimated = model::from_glb_bytes(&bytes, &root_name)?;
+                let atlased =
+                    atlas::atlas_with(&decimated, params.atlas_max, params.atlas_padding, mode)?;
+                atlas_ms += t.elapsed().as_millis();
+                log.extend(atlased.log.iter().cloned());
+
+                let t = std::time::Instant::now();
+                let glb = emit::emit_glb(&atlased)?;
+                std::fs::write(&out, &glb).with_context(|| format!("write {}", out.display()))?;
+                emit_ms += t.elapsed().as_millis();
+                if !params.keep_glb {
+                    let _ = std::fs::remove_file(&dec);
                 }
-                log.push(format!(
-                    "reclamp[{level}]: {} of {} tris crossed atlas tile rects; snapped to majority tile",
-                    rep.reclamped, rep.scanned
-                ));
+                staged.push((level, out, sim));
             }
-            staged.push((level, out, sim));
+        } else {
+            let (model, atlas_rects) =
+                atlas::atlas_with_rects(&model, params.atlas_max, params.atlas_padding, mode)?;
+            atlas_ms = t.elapsed().as_millis();
+            log.extend(model.log.iter().cloned());
+            source_tris = model.total_tris();
+
+            let t = std::time::Instant::now();
+            let glb = emit::emit_glb(&model)?;
+            std::fs::write(&pre, &glb).with_context(|| format!("write {}", pre.display()))?;
+            emit_ms = t.elapsed().as_millis();
+
+            for &level in &levels {
+                let out = staging.join(staged_glb_name(&sid, level));
+                let t = std::time::Instant::now();
+                let sim = run_simplify(
+                    &model,
+                    &pre,
+                    &out,
+                    params,
+                    level,
+                    source_tris,
+                    parcel_count,
+                    &mut log,
+                )?;
+                simplify_ms += t.elapsed().as_millis();
+                log.push(format!("simplify[{level}]: {}", sim.summary()));
+                if params.uv_reclamp && !sim.passthrough {
+                    let bytes =
+                        std::fs::read(&out).with_context(|| format!("read {}", out.display()))?;
+                    let mut clamped = model::from_glb_bytes(&bytes, "reclamp")?;
+                    let rep = reclamp::reclamp_model(&mut clamped, &atlas_rects);
+                    if rep.reclamped > 0 {
+                        std::fs::write(&out, emit::emit_glb(&clamped)?)
+                            .with_context(|| format!("write {}", out.display()))?;
+                    }
+                    log.push(format!(
+                        "reclamp[{level}]: {} of {} tris crossed atlas tile rects; snapped to majority tile",
+                        rep.reclamped, rep.scanned
+                    ));
+                }
+                staged.push((level, out, sim));
+            }
         }
     } else {
         log.push("empty scene: no placements; emitting content-free LOD bundles".to_string());

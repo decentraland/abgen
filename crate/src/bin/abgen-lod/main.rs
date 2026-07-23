@@ -42,8 +42,8 @@ USAGE:
   abgen-lod generate --scene <pointer|entityId> --out DIR
             [--platform windows|mac|linux[,windows|mac|linux...]]
             [--level 0,1] [--ratio 0.1] [--tri-cap N|auto|off] [--atlas-max 256]
-            [--atlas-fixed] [--atlas-adaptive] [--no-crop] [--catalyst URL]
-            [--iss FILE|auto|off]
+            [--atlas-fixed] [--atlas-adaptive] [--bake-order pre|post]
+            [--no-crop] [--catalyst URL] [--iss FILE|auto|off]
             [--workdir DIR] [--cache DIR] [--simplifier meshopt|gltfpack]
             [--gltfpack PATH]
             [--allow-unsimplified] [--keep-glb] [--no-uv-reclamp] [--gpu]
@@ -137,7 +137,12 @@ generate: the full sync chain: resolve scene -> placements (iss|embedded
   if the cap is unreachable).
   --tri-cap N overrides the cap; --tri-cap off restores the legacy
   ratio-only lane (pass-through at or under 500 x parcels, else an
-  uncapped ratio decimation). --simplifier picks the decimation backend
+  uncapped ratio decimation). --bake-order post reorders the chain to
+  production's ordering: assemble -> crop -> raw multi-material GLB ->
+  simplify -> re-ingest -> atlas -> bundle, so atlas UVs are baked onto the
+  final decimated triangles and simplification can never smear them across
+  atlas tiles; the default pre keeps the atlas-then-simplify chain.
+  --simplifier picks the decimation backend
   exactly as in `simplify` above (default from ABGEN_SIMPLIFIER, else
   meshopt). Every capped run adds a tri-cap self-gate
   check (tris_after <= cap); an --allow-unsimplified verbatim copy passes
@@ -972,6 +977,14 @@ fn cmd_generate(argv: &[String]) -> Result<i32> {
             }
             "--atlas-adaptive" => {
                 params.atlas_adaptive = true;
+            }
+            "--bake-order" => {
+                match need(i)?.as_str() {
+                    "pre" => params.bake_after_simplify = false,
+                    "post" => params.bake_after_simplify = true,
+                    other => bail!("--bake-order must be pre|post, got {other:?}"),
+                }
+                i += 1;
             }
             "--no-crop" => {
                 params.crop = false;

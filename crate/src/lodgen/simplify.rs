@@ -1,10 +1,27 @@
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use super::model::LodModel;
+use super::model::{AlphaClass, LodMaterial, LodModel};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RescueGranularity {
+    Material,
+    AlphaClass,
+}
+
+fn rescue_key(mat: &LodMaterial, granularity: RescueGranularity) -> String {
+    match granularity {
+        RescueGranularity::Material => mat.name.clone(),
+        RescueGranularity::AlphaClass => match mat.class {
+            AlphaClass::Opaque => "alpha:opaque".to_string(),
+            AlphaClass::Mask => "alpha:mask".to_string(),
+            AlphaClass::Blend => "alpha:blend".to_string(),
+        },
+    }
+}
 
 pub const CLASS_SURVIVAL_MIN_TRIS: usize = 200;
 pub const CLASS_RESCUE_ERROR_LIMIT: f64 = 0.001;
@@ -265,58 +282,70 @@ fn glb_model(path: &Path) -> Result<LodModel> {
         .with_context(|| format!("reparse {}", path.display()))
 }
 
-fn tris_by_material(model: &LodModel) -> HashMap<String, usize> {
+fn tris_by_key(model: &LodModel, granularity: RescueGranularity) -> HashMap<String, usize> {
     let mut counts = HashMap::new();
     for prim in &model.primitives {
         if let Some(mat) = model.materials.get(prim.material) {
-            *counts.entry(mat.name.clone()).or_insert(0) += prim.indices.len() / 3;
+            *counts.entry(rescue_key(mat, granularity)).or_insert(0) += prim.indices.len() / 3;
         }
     }
     counts
 }
 
-fn class_submodel(model: &LodModel, mat_idx: usize) -> LodModel {
-    let mat = &model.materials[mat_idx];
+fn class_submodel(model: &LodModel, key: &str, granularity: RescueGranularity) -> LodModel {
     let mut sub = LodModel {
         root_name: format!("{}-rescue", model.root_name),
-        materials: vec![super::model::LodMaterial {
-            image: None,
-            ..mat.clone()
-        }],
         ..Default::default()
     };
-    if let Some(img) = mat.image {
-        sub.images.push(model.images[img].clone());
-        sub.materials[0].image = Some(0);
-    }
+    let mut mat_map: HashMap<usize, usize> = HashMap::new();
+    let mut img_map: HashMap<usize, usize> = HashMap::new();
     for prim in &model.primitives {
-        if prim.material == mat_idx {
-            let mut p = prim.clone();
-            p.material = 0;
-            sub.primitives.push(p);
+        let Some(mat) = model.materials.get(prim.material) else {
+            continue;
+        };
+        if rescue_key(mat, granularity) != key {
+            continue;
         }
-    }
-    sub
-}
-
-fn merge_class(out_model: &mut LodModel, source: &LodModel, mat_idx: usize, geometry: &LodModel) {
-    let mat = &source.materials[mat_idx];
-    let merged_mat = match out_model.materials.iter().position(|m| m.name == mat.name) {
-        Some(i) => i,
-        None => {
-            let mut m = super::model::LodMaterial {
+        let sub_mi = *mat_map.entry(prim.material).or_insert_with(|| {
+            let mut m = LodMaterial {
                 image: None,
                 ..mat.clone()
             };
             if let Some(img) = mat.image {
-                out_model.images.push(source.images[img].clone());
-                m.image = Some(out_model.images.len() - 1);
+                let si = *img_map.entry(img).or_insert_with(|| {
+                    sub.images.push(model.images[img].clone());
+                    sub.images.len() - 1
+                });
+                m.image = Some(si);
             }
-            out_model.materials.push(m);
-            out_model.materials.len() - 1
-        }
-    };
-    for prim in &geometry.primitives {
+            sub.materials.push(m);
+            sub.materials.len() - 1
+        });
+        let mut p = prim.clone();
+        p.material = sub_mi;
+        sub.primitives.push(p);
+    }
+    sub
+}
+
+fn merge_model(out_model: &mut LodModel, rescued: &LodModel) {
+    for prim in &rescued.primitives {
+        let mat = &rescued.materials[prim.material];
+        let merged_mat = match out_model.materials.iter().position(|m| m.name == mat.name) {
+            Some(i) => i,
+            None => {
+                let mut m = LodMaterial {
+                    image: None,
+                    ..mat.clone()
+                };
+                if let Some(img) = mat.image {
+                    out_model.images.push(rescued.images[img].clone());
+                    m.image = Some(out_model.images.len() - 1);
+                }
+                out_model.materials.push(m);
+                out_model.materials.len() - 1
+            }
+        };
         let mut p = prim.clone();
         p.material = merged_mat;
         out_model.primitives.push(p);
@@ -328,20 +357,25 @@ fn rescue_lost_classes(
     output: &Path,
     ratio: f64,
     gltfpack: &Path,
+    granularity: RescueGranularity,
     report: &mut SimplifyReport,
 ) -> Result<()> {
     let in_model = glb_model(input)?;
-    let in_tris = tris_by_material(&in_model);
+    let in_tris = tris_by_key(&in_model, granularity);
     let mut out_model = glb_model(output)?;
-    let out_tris = tris_by_material(&out_model);
+    let out_tris = tris_by_key(&out_model, granularity);
     let mut changed = false;
-    for mat_idx in 0..in_model.materials.len() {
-        let name = in_model.materials[mat_idx].name.clone();
-        let before = in_tris.get(&name).copied().unwrap_or(0);
-        if before < CLASS_SURVIVAL_MIN_TRIS || out_tris.get(&name).copied().unwrap_or(0) > 0 {
+    let mut seen: HashSet<String> = HashSet::new();
+    for mat in &in_model.materials {
+        let key = rescue_key(mat, granularity);
+        if !seen.insert(key.clone()) {
             continue;
         }
-        let sub = class_submodel(&in_model, mat_idx);
+        let before = in_tris.get(&key).copied().unwrap_or(0);
+        if before < CLASS_SURVIVAL_MIN_TRIS || out_tris.get(&key).copied().unwrap_or(0) > 0 {
+            continue;
+        }
+        let sub = class_submodel(&in_model, &key, granularity);
         let sub_in = output.with_extension("rescue-in.glb");
         let sub_out = output.with_extension("rescue-out.glb");
         std::fs::write(&sub_in, super::emit::emit_glb(&sub)?)
@@ -360,24 +394,19 @@ fn rescue_lost_classes(
         let _ = std::fs::remove_file(&sub_out);
         if rescued.total_tris() > 0 {
             eprintln!(
-                "simplify: class {name:?} vanished at ratio {ratio} ({before} source tris); \
+                "simplify: class {key:?} vanished at ratio {ratio} ({before} source tris); \
                  rescued alone with -se {CLASS_RESCUE_ERROR_LIMIT} ({} tris)",
                 rescued.total_tris()
             );
-            merge_class(&mut out_model, &in_model, mat_idx, &rescued);
+            merge_model(&mut out_model, &rescued);
         } else {
             eprintln!(
-                "simplify: class {name:?} vanished at ratio {ratio} ({before} source tris) and \
+                "simplify: class {key:?} vanished at ratio {ratio} ({before} source tris) and \
                  the -se {CLASS_RESCUE_ERROR_LIMIT} retry also emptied it; merging it verbatim"
             );
-            merge_class(
-                &mut out_model,
-                &in_model,
-                mat_idx,
-                &class_submodel(&in_model, mat_idx),
-            );
+            merge_model(&mut out_model, &sub);
         }
-        report.rescued_classes.push(name);
+        report.rescued_classes.push(key);
         changed = true;
     }
     if changed {
@@ -425,6 +454,24 @@ pub fn simplify(
     ratio: f64,
     tri_cap: Option<u64>,
     gltfpack: &Path,
+) -> Result<SimplifyReport> {
+    simplify_with(
+        input,
+        output,
+        ratio,
+        tri_cap,
+        gltfpack,
+        RescueGranularity::Material,
+    )
+}
+
+pub fn simplify_with(
+    input: &Path,
+    output: &Path,
+    ratio: f64,
+    tri_cap: Option<u64>,
+    gltfpack: &Path,
+    granularity: RescueGranularity,
 ) -> Result<SimplifyReport> {
     let tris_before = glb_tris(input)?;
     let under_cap = |tris: usize| tri_cap.is_none_or(|c| tris as u64 <= c);
@@ -555,7 +602,7 @@ pub fn simplify(
     }
     report.tris_after = tris_after;
     let ratio_run = report.ratios_run.last().copied().unwrap_or(current);
-    rescue_lost_classes(input, output, ratio_run, gltfpack, &mut report)?;
+    rescue_lost_classes(input, output, ratio_run, gltfpack, granularity, &mut report)?;
     Ok(report)
 }
 
@@ -938,11 +985,74 @@ mod tests {
         std::fs::write(&output, emit_glb(&lost).unwrap()).unwrap();
 
         let mut report = SimplifyReport::default();
-        rescue_lost_classes(&input, &output, 0.1, &bin, &mut report).unwrap();
+        rescue_lost_classes(
+            &input,
+            &output,
+            0.1,
+            &bin,
+            RescueGranularity::Material,
+            &mut report,
+        )
+        .unwrap();
         assert_eq!(report.rescued_classes, vec!["bl".to_string()]);
         let out = glb_model(&output).unwrap();
-        let by_mat = tris_by_material(&out);
+        let by_mat = tris_by_key(&out, RescueGranularity::Material);
         assert_eq!(by_mat.get("op").copied().unwrap_or(0), 128);
+        assert!(by_mat.get("bl").copied().unwrap_or(0) > 0, "{by_mat:?}");
+        assert_eq!(report.tris_after, out.total_tris());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn alpha_granularity_rescues_lost_class_not_lost_materials() {
+        let Ok(bin) = resolve_gltfpack(None) else {
+            eprintln!("SKIP: gltfpack not resolvable ({GLTFPACK_NIX_RECIPE})");
+            return;
+        };
+        let dir = temp_dir("alpharescue");
+        let materials = vec![
+            material("op-big", AlphaClass::Opaque),
+            material("bl", AlphaClass::Blend),
+            material("op-small", AlphaClass::Opaque),
+        ];
+        let full = LodModel {
+            root_name: "alpharescue".to_string(),
+            primitives: vec![
+                grid_primitive(32),
+                scattered_quads(1, 150, 0.5),
+                scattered_quads(2, 150, 0.5),
+            ],
+            materials: materials.clone(),
+            images: Vec::new(),
+            log: Vec::new(),
+        };
+        let lost = LodModel {
+            root_name: "alpharescue".to_string(),
+            primitives: vec![grid_primitive(8)],
+            materials,
+            images: Vec::new(),
+            log: Vec::new(),
+        };
+        let input = dir.join("in.glb");
+        let output = dir.join("out.glb");
+        std::fs::write(&input, emit_glb(&full).unwrap()).unwrap();
+        std::fs::write(&output, emit_glb(&lost).unwrap()).unwrap();
+
+        let mut report = SimplifyReport::default();
+        rescue_lost_classes(
+            &input,
+            &output,
+            0.1,
+            &bin,
+            RescueGranularity::AlphaClass,
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!(report.rescued_classes, vec!["alpha:blend".to_string()]);
+        let out = glb_model(&output).unwrap();
+        let by_mat = tris_by_key(&out, RescueGranularity::Material);
+        assert_eq!(by_mat.get("op-big").copied().unwrap_or(0), 128);
+        assert_eq!(by_mat.get("op-small").copied().unwrap_or(0), 0);
         assert!(by_mat.get("bl").copied().unwrap_or(0) > 0, "{by_mat:?}");
         assert_eq!(report.tris_after, out.total_tris());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1024,7 +1134,15 @@ mod tests {
         let output = dir.join("out.glb");
         std::fs::write(&input, emit_glb(&full).unwrap()).unwrap();
 
-        let report = simplify(&input, &output, 1.0, Some(600), &bin).unwrap();
+        let report = simplify_with(
+            &input,
+            &output,
+            1.0,
+            Some(600),
+            &bin,
+            RescueGranularity::Material,
+        )
+        .unwrap();
         let out = glb_model(&output).unwrap();
         let (leaf_tris, max_span) = leaf_stats(&out);
         assert!(leaf_tris > 0, "cutout foliage deleted: {report:?}");
