@@ -77,17 +77,17 @@ ABGEN_ROOT="$PWD" cargo test --workspace --lib -- --test-threads=1
 ```
 `--test-threads=1` is required: the lib tests share process-wide `ABGEN_ROOT` state.
 ## wasm lab
-`crate/wasm-poc/` compiles the converter lib (default features off) to `wasm32-unknown-unknown` behind
+`crate/abgen-wasm/` compiles the converter lib (default features off) to `wasm32-unknown-unknown` behind
 a hand-rolled C ABI and drives it from the static pages in `site/wasm/` - drop a glb/gltf/zip, get real
 UnityFS bundles in the browser. It is a plain cargo package with its own committed `Cargo.lock`,
 excluded from the workspace: nothing in CI or the release matrix ever needs a wasm toolchain (the
-pinned one lives in `crate/wasm-poc/toolchain/flake.nix`). `crate/wasm-poc/README.md` documents the
+pinned one lives in `crate/abgen-wasm/toolchain/flake.nix`). `crate/abgen-wasm/README.md` documents the
 build, the headless driver, the native-vs-wasm byte-parity gate and its decoder contract. Layout
 caveat: this repo places `site/` and `template/` at the repo root, while the wasm lane's helper scripts
 and the wasm32-only `include_bytes!` template paths in `crate/src/builder/templates.rs` assume the
 source layout where both are siblings of the crate — an in-repo wasm32 build needs those relative paths
 bumped one level (`../../template/` -> `../../../template/`, and the `../site` copy in
-`crate/wasm-poc/build.sh` adjusted likewise). No workspace target compiles for wasm32, so the
+`crate/abgen-wasm/build.sh` adjusted likewise). No workspace target compiles for wasm32, so the
 divergence never touches CI. Self-hosting the lab: `site/` is fully static - any file server works,
 but it must serve `.wasm` with the `application/wasm` MIME type or `WebAssembly.instantiateStreaming`
 falls over.

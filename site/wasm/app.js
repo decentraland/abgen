@@ -185,7 +185,7 @@ convertBtn.addEventListener('click', () => {
   t0 = performance.now();
   for (const i of [1, 2, 3]) $('ss' + i).textContent = '—';
 
-  wasmModule ||= WebAssembly.compileStreaming(fetch('abgen_poc.wasm'));
+  wasmModule ||= WebAssembly.compileStreaming(fetch('abgen_wasm.wasm'));
   runConvert({
     files,
     module: wasmModule,

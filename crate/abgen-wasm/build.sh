@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Rebuild both wasm modules and refresh the site copies. wasm-poc and
+# Rebuild both wasm modules and refresh the site copies. abgen-wasm and
 # wasm-gpu are excluded from the parent workspace, so each builds from its
 # own dir against its own committed Cargo.lock.
-#   abgen_poc.wasm       — bindgen-free C-ABI converter (CPU-SIMD)
+#   abgen_wasm.wasm       — bindgen-free C-ABI converter (CPU-SIMD)
 #   wasm/gpu/…           — wasm-bindgen WebGPU encode module + glue
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -16,5 +16,5 @@ nix develop "path:$PWD/toolchain" --command bash -euo pipefail -c "
   wasm-bindgen --target web --out-dir $SITE/gpu \
     ../wasm-gpu/target/wasm32-unknown-unknown/release/abgen_wasm_gpu.wasm
 "
-cp target/wasm32-unknown-unknown/release/abgen_wasm_poc.wasm "$SITE/abgen_poc.wasm"
-ls -la "$SITE/abgen_poc.wasm" "$SITE/gpu/abgen_wasm_gpu_bg.wasm"
+cp target/wasm32-unknown-unknown/release/abgen_wasm.wasm "$SITE/abgen_wasm.wasm"
+ls -la "$SITE/abgen_wasm.wasm" "$SITE/gpu/abgen_wasm_gpu_bg.wasm"

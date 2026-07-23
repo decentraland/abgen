@@ -468,7 +468,7 @@ fn convert(input: Input) -> abgen::Result<()> {
     let mut files_field = built.clone();
     files_field.push("dcl".to_string());
     let manifest = serde_json::json!({
-        "version": "v-wasm-poc",
+        "version": "v-abgen-wasm",
         "files": files_field,
         "exitCode": if failures == 0 { 0 } else { 12 },
         "contentServerUrl": "wasm://in-browser",

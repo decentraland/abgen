@@ -52,7 +52,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "abgen-wasm-poc"
+name = "abgen-wasm"
 version = "0.11.3"
 dependencies = [
  "abgen",

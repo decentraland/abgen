@@ -4,7 +4,7 @@ version = "0.11.3"
 edition = "2021"
 publish = false
 
-# Excluded from the parent workspace (like wasm-poc): wasm-only artifact with
+# Excluded from the parent workspace (like abgen-wasm): wasm-only artifact with
 # its own lockfile. wasm-bindgen is pinned to the toolchain flake's CLI.
 [workspace]
 

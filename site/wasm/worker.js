@@ -135,7 +135,7 @@ async function ensureWasm() {
   };
   const r = module
     ? await WebAssembly.instantiate(module, imports)
-    : await WebAssembly.instantiateStreaming(fetch('abgen_poc.wasm'), imports);
+    : await WebAssembly.instantiateStreaming(fetch('abgen_wasm.wasm'), imports);
   exports = (r.instance || r).exports;
   exports.poc_init();
   postMessage({ type: 'ready' });

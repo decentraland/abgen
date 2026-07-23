@@ -1,11 +1,11 @@
 # Rust
 /target
 /crate/target
-/crate/wasm-poc/target/
+/crate/abgen-wasm/target/
 .cargo-home/
 
-# wasm lab build artifact — crate/wasm-poc/build.sh regenerates it
-/site/wasm/abgen_poc.wasm
+# wasm lab build artifact — crate/abgen-wasm/build.sh regenerates it
+/site/wasm/abgen_wasm.wasm
 
 # Generated C/C++ build artifacts (cmake out-of-source builds in the vendored
 # third_party crates). Must never be committed: the cmake cache bakes an
@@ -45,6 +45,6 @@ __pycache__/
 node_modules/
 npm/local/
 
-# wasm WebGPU module build artifacts — crate/wasm-poc/build.sh regenerates
+# wasm WebGPU module build artifacts — crate/abgen-wasm/build.sh regenerates
 /crate/wasm-gpu/target/
 /site/wasm/gpu/

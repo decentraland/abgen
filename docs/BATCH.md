@@ -112,4 +112,4 @@ No full-corpus CPU wall time has been measured; no CPU projections are published
 fast in practice: the live browser wasm demo converts an 88 kB wearable GLB to a validated UnityFS
 bundle in ~0.3 s (0.8 s cold with module load) and a 3.1 MB scene NPC GLB in ~1.2 s including the
 LOD1 bake, single-threaded CPU wasm - the native binary (SIMD/GPU, multithreaded) is faster still.
-The wasm lab ships in this repo (`crate/wasm-poc/` + `site/wasm/`).
+The wasm lab ships in this repo (`crate/abgen-wasm/` + `site/wasm/`).

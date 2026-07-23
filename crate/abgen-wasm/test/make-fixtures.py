@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Generates the wasm-lab test fixtures into wasm-poc/test/fixtures/:
+# Generates the wasm-lab test fixtures into abgen-wasm/test/fixtures/:
 #   jpeg-quad.glb       quad with a JPEG baseColorTexture (libjpeg lane)
 #   normal-quad.glb     PNG baseColor + PNG normal map + authored tangents
 #                       (crunched-DXT5 normal lane; no-transcendental control)

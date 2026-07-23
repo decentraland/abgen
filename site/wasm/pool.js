@@ -174,7 +174,7 @@ export async function runConvert(opts, cb) {
 
   built.sort();
   const manifest = {
-    version: 'v-wasm-poc',
+    version: 'v-abgen-wasm',
     files: [...built.filter((b, i) => i === 0 || b !== built[i - 1]), 'dcl'],
     exitCode: failures ? 12 : 0,
     contentServerUrl: 'wasm://in-browser',

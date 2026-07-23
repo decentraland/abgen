@@ -7,7 +7,7 @@
 //! native per-device contract. `gpu_encode` then services one request at a
 //! time from the convert workers' SharedArrayBuffer bridge.
 //!
-//! Request layout (LE, mirrors wasm-poc's gpu_host_encode): u32 width,
+//! Request layout (LE, mirrors abgen-wasm's gpu_host_encode): u32 width,
 //! u32 height, i32 mips, u32 flags (bit0 flip, bit1 srgb, bit2 perceptual,
 //! bit3 profile-basic), then rgba bytes. Response: the raw BC7 mip chain.
 

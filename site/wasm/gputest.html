@@ -48,7 +48,7 @@ try {
   const files = await Promise.all(ASSETS.map(async (n) => ({
     name: n, data: await (await fetch(`test-assets/${n}`)).arrayBuffer(),
   })));
-  const module = WebAssembly.compileStreaming(fetch('abgen_poc.wasm'));
+  const module = WebAssembly.compileStreaming(fetch('abgen_wasm.wasm'));
   log('--- CPU pass ---');
   const cpu = await convert(false, files.map((f) => ({ name: f.name, data: f.data.slice(0) })), module);
   log(`cpu: exit=${cpu.code} wall=${cpu.wall}s bundles=${cpu.hashes.size}`);

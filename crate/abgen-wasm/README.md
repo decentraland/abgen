@@ -10,15 +10,15 @@ manifest. Nothing leaves the browser.
 ## Run it
 
 ```bash
-bash wasm-poc/build.sh          # build site/wasm/abgen_poc.wasm (gitignored artifact)
-bash wasm-poc/serve.sh          # http://127.0.0.1:5189/wasm/
+bash abgen-wasm/build.sh          # build site/wasm/abgen_wasm.wasm (gitignored artifact)
+bash abgen-wasm/serve.sh          # http://127.0.0.1:5189/wasm/
 ```
 
-`site/wasm/abgen_poc.wasm` (~4.3 MB) is never committed — `build.sh`
+`site/wasm/abgen_wasm.wasm` (~4.3 MB) is never committed — `build.sh`
 regenerates it from the tree. The module is a plain cargo package at
-`wasm-poc/` with its own committed `Cargo.lock`, excluded from the parent
+`abgen-wasm/` with its own committed `Cargo.lock`, excluded from the parent
 workspace so the default workspace build/check/test never needs a wasm
-toolchain. The toolchain is pinned in `wasm-poc/toolchain/flake.nix`
+toolchain. The toolchain is pinned in `abgen-wasm/toolchain/flake.nix`
 (rust 1.97.0 + wasm32 target); no wasm-bindgen — the module speaks a
 hand-rolled C ABI (`poc_init` / `poc_alloc` / `poc_convert`, events stream
 back through the imported `env.host_emit`).
@@ -101,7 +101,7 @@ exception handling, legacy `try`/`catch` encoding — Chrome 95+, Firefox
 100+, Safari 15.2+, Node 17+). A malformed JPEG now fails per-image exactly
 like native instead of trapping the module; the EH compile flags are scoped
 to the libjpeg9c build (`third_party/libjpeg9c/build.rs`), and the final
-link adds `libsetjmp.a` in `wasm-poc/build.rs`. crnlib's bundled `jpgd`
+link adds `libsetjmp.a` in `abgen-wasm/build.rs`. crnlib's bundled `jpgd`
 file loader is never called — unchanged.
 
 ## wasm C/C++ port notes
@@ -110,22 +110,22 @@ file loader is never called — unchanged.
   devShell pins `CC/CXX/AR_wasm32_unknown_unknown` and appends
   `--target=wasm32-unknown-wasi` via `CFLAGS`/`CXXFLAGS` (env flags land
   last, overriding cc-rs's `--target=wasm32-unknown-unknown`).
-- `wasm-poc/build.rs` links wasi-libc's `libc.a` plus `libc++.a`/`libc++abi.a`
+- `abgen-wasm/build.rs` links wasi-libc's `libc.a` plus `libc++.a`/`libc++abi.a`
   into the final cdylib; the resulting `wasi_snapshot_preview1` imports
   (stdio/env/prestat) are stubbed in `site/wasm/worker.js` — `fd_prestat_get`
   must return EBADF(8) so libc's preopen scan terminates.
 - `poc_init` calls `__wasm_call_ctors` explicitly (reactor model); without
   that reference wasm-ld wraps every export in command-model ctor/dtor calls
   and the first export invocation traps in `__funcs_on_exit`.
-- Headless verification: `wasm-poc/test/make-fixtures.py` + `node
-  wasm-poc/test/headless.mjs <out> windows '' <fixture.glb>` (single
+- Headless verification: `abgen-wasm/test/make-fixtures.py` + `node
+  abgen-wasm/test/headless.mjs <out> windows '' <fixture.glb>` (single
   instance) or `headless-pool.mjs` (the same page pool over a
   worker_threads shim, `--workers=N`); full cross-target gate:
-  `bash wasm-poc/test/parity.sh`.
+  `bash abgen-wasm/test/parity.sh`.
 
 ## Cross-target byte gate
 
-`bash wasm-poc/test/parity.sh` rebuilds the wasm module and the native
+`bash abgen-wasm/test/parity.sh` rebuilds the wasm module and the native
 `abgen`/`abgen-lod` binaries from the same tree, regenerates the fixtures,
 converts every one on both sides (native under `ABGEN_JPEG_GLB_9C=1`, per
 the decoder rule above), and sha256-compares each produced artifact across

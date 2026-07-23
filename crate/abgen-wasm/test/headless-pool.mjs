@@ -47,7 +47,7 @@ const files = paths.map((p) => {
     data: buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
   };
 });
-const wasmBytes = readFileSync(new URL('../../../site/wasm/abgen_poc.wasm', import.meta.url));
+const wasmBytes = readFileSync(new URL('../../../site/wasm/abgen_wasm.wasm', import.meta.url));
 
 const t0 = performance.now();
 let exit = 0;
