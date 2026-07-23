@@ -535,6 +535,7 @@ pub fn api_router() -> Router<AppState> {
         .route("/health", get(handlers::health))
         .route("/livez", get(handlers::livez))
         .route("/readyz", get(handlers::readyz))
+        .route("/progress/{entity}", get(handlers::get_build_progress))
         .route(
             "/metrics",
             get(move |headers: axum::http::HeaderMap| {

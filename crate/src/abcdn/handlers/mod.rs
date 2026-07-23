@@ -26,7 +26,7 @@ use upstream::*;
 
 pub use dispatch::dispatch;
 pub use entities::{post_entities_active, post_entities_versions};
-pub use status::{health, livez, metrics, ping, readyz};
+pub use status::{get_build_progress, health, livez, metrics, ping, readyz};
 
 #[cfg(test)]
 mod tests;
