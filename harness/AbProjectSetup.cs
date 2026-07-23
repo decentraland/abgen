@@ -56,6 +56,8 @@ public static class AbProjectSetup
 
         var pipeline = UniversalRenderPipelineAsset.Create(rendererData);
         pipeline.msaaSampleCount = 1; // determinism
+        pipeline.supportsHDR = true;
+        pipeline.colorGradingMode = ColorGradingMode.HighDynamicRange;
         AssetDatabase.CreateAsset(pipeline, "Assets/Settings/AbUrp.asset");
 
         GraphicsSettings.defaultRenderPipeline = pipeline;
