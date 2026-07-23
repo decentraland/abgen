@@ -668,6 +668,7 @@ impl Proxy {
         let mut failed: Vec<String> = Vec::new();
         let mut tolerated: usize = 0;
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut collapsed_names: HashMap<String, String> = HashMap::new();
         let total = ctx
             .scene
             .content
@@ -718,7 +719,11 @@ impl Proxy {
                 built.push(bundle_name);
                 continue;
             }
-            let dst = pdir.join(&*naming::fs_safe_component(&bundle_name));
+            let stored_name = naming::fs_safe_component(&bundle_name);
+            if *stored_name != bundle_name {
+                collapsed_names.insert(stored_name.to_string(), c.hash.to_lowercase());
+            }
+            let dst = pdir.join(&*stored_name);
             let existed = dst.is_file();
             match self.bundle(cid, &bundle_name) {
                 Ok(bytes) => {
@@ -727,7 +732,11 @@ impl Proxy {
                         .with_context(|| format!("write {}", tmp.display()))?;
                     std::fs::rename(&tmp, &dst).ok();
                     if bundle_name != bare_name {
-                        let alias = pdir.join(&*naming::fs_safe_component(&bare_name));
+                        let stored_alias = naming::fs_safe_component(&bare_name);
+                        if *stored_alias != bare_name {
+                            collapsed_names.insert(stored_alias.to_string(), c.hash.to_lowercase());
+                        }
+                        let alias = pdir.join(&*stored_alias);
                         if !alias.exists() {
                             std::fs::hard_link(&dst, &alias).ok();
                         }
@@ -758,6 +767,7 @@ impl Proxy {
                 }
             }
         }
+        self.merge_names_index(cid, &collapsed_names);
         let manifest_path =
             crate::manifest::write_corpus_manifest(&crate::manifest::CorpusManifestSpec {
                 out_root,
@@ -870,6 +880,7 @@ impl Proxy {
             &changed_lower,
             dep_changed,
             &glb_hashes,
+            &self.load_names_index(cid),
         );
         let _ = std::fs::remove_dir_all(corpus_root.join(&*naming::fs_safe_component(cid)));
         Ok(changed)
@@ -881,6 +892,44 @@ impl Proxy {
         let key = crate::hashes::sha256_hex(cid.as_bytes());
         self.digests_dir.join(format!("{}.json", &key[..32]))
     }
+
+    /// Storage names collapsed by fs_safe_component (xn-…) can't be parsed
+    /// back to their source hash, so the corpus build records the mapping and
+    /// revalidation uses it to prune those entries as precisely as verbatim
+    /// ones — instead of sweeping (and reconverting) the whole class per edit.
+    fn names_index_path(&self, cid: &str) -> PathBuf {
+        let key = crate::hashes::sha256_hex(cid.as_bytes());
+        self.digests_dir.join(format!("{}.names.json", &key[..32]))
+    }
+
+    fn load_names_index(&self, cid: &str) -> HashMap<String, String> {
+        std::fs::read(self.names_index_path(cid))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn merge_names_index(&self, cid: &str, new_entries: &HashMap<String, String>) {
+        if new_entries.is_empty() {
+            return;
+        }
+        let mut index = self.load_names_index(cid);
+        let before = index.len();
+        index.extend(new_entries.iter().map(|(k, v)| (k.clone(), v.clone())));
+        if index.len() == before && new_entries.iter().all(|(k, v)| index.get(k) == Some(v)) {
+            return;
+        }
+        let path = self.names_index_path(cid);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        if let Ok(bytes) = serde_json::to_vec(&index) {
+            let tmp = crate::tmppath::tmp_sibling(&path);
+            if std::fs::write(&tmp, bytes).is_ok() {
+                std::fs::rename(&tmp, &path).ok();
+            }
+        }
+    }
 }
 
 fn prune_stale_bundles(
@@ -888,6 +937,7 @@ fn prune_stale_bundles(
     changed: &std::collections::HashSet<String>,
     dep_changed: bool,
     glbs: &std::collections::HashSet<String>,
+    collapsed_names: &HashMap<String, String>,
 ) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -895,18 +945,25 @@ fn prune_stale_bundles(
     for ent in rd.flatten() {
         let name = ent.file_name();
         let Some(name) = name.to_str() else { continue };
-
-        // Digest-collapsed storage names can't be parsed back to a hash;
-        // over-invalidate them (this fn only runs when something changed).
-        if name.starts_with("xn-") {
-            let _ = std::fs::remove_file(ent.path());
-            continue;
-        }
-
         let raw = name.strip_suffix(".br").unwrap_or(name);
-        let (_, stem) = crate::abcdn::resolver::split_platform(raw);
-        let (hash, _) = naming::split_bundle_stem(stem);
-        let h = hash.to_lowercase();
+
+        // Digest-collapsed storage names (xn-…) can't be parsed back to a
+        // hash; the corpus build records their source hash in the names
+        // index, so they prune exactly like verbatim names. Entries the
+        // index doesn't know are unmappable leftovers: sweep them.
+        let h = if raw.starts_with("xn-") {
+            match collapsed_names.get(raw) {
+                Some(h) => h.clone(),
+                None => {
+                    let _ = std::fs::remove_file(ent.path());
+                    continue;
+                }
+            }
+        } else {
+            let (_, stem) = crate::abcdn::resolver::split_platform(raw);
+            let (hash, _) = naming::split_bundle_stem(stem);
+            hash.to_lowercase()
+        };
         if changed.contains(&h) || (dep_changed && glbs.contains(&h)) {
             let _ = std::fs::remove_file(ent.path());
         }
@@ -1481,5 +1538,48 @@ mod tests {
         proxy.index_content_hashes(vec![("QmAbC".to_string(), "bafkowner".to_string())]);
         assert_eq!(proxy.entity_for_hash("qmabc").as_deref(), Some("bafkowner"));
         assert_eq!(proxy.entity_for_hash("QmAbC").as_deref(), Some("bafkowner"));
+    }
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    #[test]
+    fn prune_uses_names_index_for_collapsed_entries() {
+        let dir = std::env::temp_dir().join(format!("abgen-prune-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in [
+            "xn-changed",
+            "xn-changed.br",
+            "xn-kept",
+            "xn-kept.br",
+            "xn-unknown",
+            "HASHA_mac",
+            "HASHB_mac",
+        ] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let changed: std::collections::HashSet<String> = ["hasha".to_string(), "hxn1".to_string()]
+            .into_iter()
+            .collect();
+        let glbs: std::collections::HashSet<String> = Default::default();
+        let mut index: HashMap<String, String> = HashMap::new();
+        index.insert("xn-changed".to_string(), "hxn1".to_string());
+        index.insert("xn-kept".to_string(), "hxn2".to_string());
+
+        prune_stale_bundles(&dir, &changed, false, &glbs, &index);
+
+        // indexed collapsed names prune exactly like verbatim ones (.br sidecars too)
+        assert!(!dir.join("xn-changed").exists());
+        assert!(!dir.join("xn-changed.br").exists());
+        assert!(dir.join("xn-kept").exists());
+        assert!(dir.join("xn-kept.br").exists());
+        // unmappable collapsed names are swept
+        assert!(!dir.join("xn-unknown").exists());
+        assert!(!dir.join("HASHA_mac").exists());
+        assert!(dir.join("HASHB_mac").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
