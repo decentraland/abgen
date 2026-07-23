@@ -15,11 +15,12 @@ pub(super) fn compose(
     canvas: u32,
     padding: u32,
     premul: bool,
+    srgb: bool,
 ) -> Vec<u8> {
     let s = canvas as usize;
     let mut out = vec![0u8; s * s * 4];
     for ((t, crop), &(x, y, w, h)) in tiles.iter().zip(crops.iter()).zip(rects.iter()) {
-        let px = t.render_cropped(*crop, w, h, premul);
+        let px = t.render_cropped(*crop, w, h, premul, srgb);
         let x0 = x.saturating_sub(padding) as usize;
         let y0 = y.saturating_sub(padding) as usize;
         let x1 = (x + w + padding).min(canvas) as usize;

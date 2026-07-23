@@ -90,6 +90,13 @@ impl Default for LodMaterial {
 pub struct MatLane {
     pub emissive_channel: bool,
     pub raw_materials: bool,
+    pub fidelity: bool,
+}
+
+pub const METAL_MIN_METALLIC: f64 = 0.5;
+
+pub fn is_metal(m: &LodMaterial) -> bool {
+    m.class == AlphaClass::Opaque && (m.metallic >= METAL_MIN_METALLIC || m.mr_image.is_some())
 }
 
 #[derive(Clone, Debug, Default)]
@@ -469,6 +476,7 @@ pub fn from_glb_bytes_with(
         } else {
             (fold_emissive(m.base_color, m.emissive), [0.0; 3], None)
         };
+        let mr_image = intern(m.metallic_roughness_image);
         model.materials.push(LodMaterial {
             name: m.name.clone(),
             class: AlphaClass::from_alpha_mode(&m.alpha_mode),
@@ -478,6 +486,9 @@ pub fn from_glb_bytes_with(
             double_sided: m.double_sided,
             emissive,
             emissive_image,
+            metallic: m.metallic,
+            roughness: m.roughness,
+            mr_image,
             ..Default::default()
         });
     }

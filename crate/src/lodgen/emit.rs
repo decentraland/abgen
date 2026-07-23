@@ -716,7 +716,6 @@ mod tests {
             serde_json::json!(["KHR_materials_emissive_strength"])
         );
 
-        // the untouched material and the plain model keep today's normalized shape
         let m1 = &json["materials"][1];
         assert_eq!(
             m1["pbrMetallicRoughness"]["metallicFactor"],
@@ -743,6 +742,43 @@ mod tests {
                 .get("metallicRoughnessTexture")
                 .is_none());
         }
+    }
+
+    #[test]
+    fn metallic_roughness_round_trip_through_raw_glb() {
+        let mut model = sample_model();
+        model.materials[0].metallic = 0.8;
+        model.materials[0].roughness = 0.3;
+        let glb = emit_glb(&model).unwrap();
+        let back = from_glb_bytes(&glb, "sample_root").unwrap();
+        assert_eq!(back.materials[0].metallic, 0.8);
+        assert_eq!(back.materials[0].roughness, 0.3);
+        assert_eq!(back.materials[1].metallic, 0.0);
+        assert_eq!(back.materials[1].roughness, 1.0);
+    }
+
+    #[test]
+    fn mr_texture_round_trips_through_raw_glb() {
+        let mut model = sample_model();
+        model.materials[0].metallic = 0.9;
+        model.materials[0].roughness = 0.3;
+        model.materials[0].mr_image = Some(0);
+        let glb = emit_glb(&model).unwrap();
+        let (json, _) = chunks(&glb);
+        assert!(json["materials"][0]["pbrMetallicRoughness"]
+            .get("metallicRoughnessTexture")
+            .is_some());
+
+        let back = from_glb_bytes(&glb, "sample_root").unwrap();
+        assert_eq!(back.materials[0].mr_image, Some(0));
+        assert_eq!(back.materials[0].metallic, 0.9);
+        assert_eq!(back.materials[0].roughness, 0.3);
+        assert_eq!(back.materials[1].mr_image, None);
+        let again = emit_glb(&back).unwrap();
+        let (json2, _) = chunks(&again);
+        assert!(json2["materials"][0]["pbrMetallicRoughness"]
+            .get("metallicRoughnessTexture")
+            .is_some());
     }
 
     #[test]

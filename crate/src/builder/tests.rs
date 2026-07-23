@@ -812,6 +812,10 @@ fn lod_test_material(name: &str) -> crate::scene::Material {
 }
 
 fn lod_test_tree(m: &crate::scene::Material) -> Value {
+    lod_test_tree_with(m, false)
+}
+
+fn lod_test_tree_with(m: &crate::scene::Material, fidelity: bool) -> Value {
     let lod = LodBuildParams {
         level: 1,
         plane_clipping: [1.0, 2.0, 3.0, 4.0],
@@ -819,6 +823,7 @@ fn lod_test_tree(m: &crate::scene::Material) -> Value {
         root_position: [0.0, 0.0, 0.0],
         main_asset: "scene_1.prefab".to_string(),
         timestamp: None,
+        fidelity,
     };
     build_lod_material_tree(
         &map! {},
@@ -828,6 +833,155 @@ fn lod_test_tree(m: &crate::scene::Material) -> Value {
         &HashMap::new(),
         &lod,
     )
+}
+
+fn lod_mat_color_r(tree: &Value, name: &str) -> Option<f64> {
+    let colors = tree.get("m_SavedProperties")?.get("m_Colors")?.as_array()?;
+    for e in colors {
+        let pair = e.as_array()?;
+        if let Value::Str(n) = &pair[0] {
+            if n == name {
+                return pair[1].get("r").and_then(|v| v.as_f64());
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn lod_fidelity_metal_material_carries_floats() {
+    let m = crate::scene::Material {
+        alpha_mode: "OPAQUE".into(),
+        base_color: [1.0, 1.0, 1.0, 1.0],
+        metallic: 0.8,
+        roughness: 0.3,
+        ..Default::default()
+    };
+    let mk = |fidelity: bool| {
+        let lod = LodBuildParams {
+            level: 1,
+            plane_clipping: [0.0; 4],
+            vertical_clipping: [0.0; 4],
+            root_position: [0.0, 0.0, 0.0],
+            main_asset: String::new(),
+            timestamp: None,
+            fidelity,
+        };
+        build_lod_material_tree(
+            &map! {},
+            &m,
+            "mat",
+            &super::material::shader_pptr(),
+            &HashMap::new(),
+            &lod,
+        )
+    };
+    let t = mk(true);
+    assert_eq!(lod_mat_float(&t, "_Metallic"), Some(0.8));
+    assert!((lod_mat_float(&t, "_Smoothness").unwrap() - 0.7).abs() < 1e-6);
+    let t = mk(false);
+    assert_eq!(lod_mat_float(&t, "_Metallic"), Some(0.0));
+    assert_eq!(lod_mat_float(&t, "_Smoothness"), Some(0.0));
+}
+
+fn lod_keywords_of(t: &Value) -> Vec<String> {
+    lod_mat_keywords(t)
+}
+
+fn lod_tex_env_pid(t: &Value, slot: &str) -> (i64, i64) {
+    t.get("m_SavedProperties")
+        .and_then(|p| p.get("m_TexEnvs"))
+        .and_then(|e| e.as_array())
+        .and_then(|entries| {
+            entries.iter().find_map(|e| {
+                let pair = e.as_array()?;
+                if let Value::Str(n) = &pair[0] {
+                    if n != slot {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+                let tex = pair.get(1)?.get("m_Texture")?;
+                Some((
+                    tex.get("m_FileID")?.as_i64()?,
+                    tex.get("m_PathID")?.as_i64()?,
+                ))
+            })
+        })
+        .unwrap_or((-1, -1))
+}
+
+#[test]
+fn lod_metal_gloss_map_binds_with_keyword_and_multiplier_floats() {
+    let m = crate::scene::Material {
+        alpha_mode: "OPAQUE".into(),
+        base_color: [1.0, 1.0, 1.0, 1.0],
+        metallic: 1.0,
+        roughness: 0.0,
+        metallic_roughness_image: Some(crate::scene::TexRef {
+            image: 0,
+            sampler: None,
+        }),
+        ..Default::default()
+    };
+    let lod = LodBuildParams {
+        level: 1,
+        plane_clipping: [0.0; 4],
+        vertical_clipping: [0.0; 4],
+        root_position: [0.0, 0.0, 0.0],
+        main_asset: String::new(),
+        timestamp: None,
+        fidelity: true,
+    };
+    let mut tex_pid: HashMap<String, (i64, i64)> = HashMap::new();
+    tex_pid.insert("_MetallicGlossMap".to_string(), (0, 4242));
+    let t = build_lod_material_tree(
+        &map! {},
+        &m,
+        "TextureBakeResult-mat-metal",
+        &super::material::shader_pptr(),
+        &tex_pid,
+        &lod,
+    );
+    assert_eq!(lod_tex_env_pid(&t, "_MetallicGlossMap"), (0, 4242));
+    assert!(lod_keywords_of(&t).contains(&"_METALLICSPECGLOSSMAP".to_string()));
+    assert_eq!(lod_mat_float(&t, "_Metallic"), Some(1.0));
+    assert_eq!(lod_mat_float(&t, "_Smoothness"), Some(1.0));
+    assert_eq!(lod_mat_float(&t, "_SmoothnessTextureChannel"), Some(0.0));
+
+    let t = build_lod_material_tree(
+        &map! {},
+        &m,
+        "TextureBakeResult-mat-metal",
+        &super::material::shader_pptr(),
+        &HashMap::new(),
+        &lod,
+    );
+    assert_eq!(lod_tex_env_pid(&t, "_MetallicGlossMap"), (0, 0));
+    assert!(!lod_keywords_of(&t).contains(&"_METALLICSPECGLOSSMAP".to_string()));
+}
+
+#[test]
+fn lod_fidelity_transparent_material_restores_gltf_blend_state() {
+    let m = lod_test_material("TextureBakeResult-mat-transparent");
+    let t = lod_test_tree_with(&m, true);
+    assert_eq!(lod_mat_float(&t, "_ZWrite"), Some(0.0));
+    assert_eq!(lod_mat_float(&t, "_SpecularHighlights"), Some(0.0));
+    assert_eq!(lod_mat_float(&t, "_EnvironmentReflections"), Some(0.0));
+    assert_eq!(lod_mat_float(&t, "_DstBlend"), Some(10.0));
+    assert_eq!(lod_mat_float(&t, "_SrcBlend"), Some(1.0));
+    assert_eq!(lod_mat_base_color_alpha(&t), Some(1.0));
+    assert_eq!(
+        lod_mat_color_r(&t, "_SpecColor"),
+        Some(super::material::FIDELITY_SPEC_COLOR)
+    );
+
+    let t = lod_test_tree_with(&lod_test_material("TextureBakeResult-mat"), true);
+    assert_eq!(lod_mat_float(&t, "_ZWrite"), Some(1.0));
+    assert_eq!(lod_mat_float(&t, "_SpecularHighlights"), Some(1.0));
+    let t = lod_test_tree_with(&lod_test_material("TextureBakeResult-mat-cutout"), true);
+    assert_eq!(lod_mat_float(&t, "_ZWrite"), Some(1.0));
 }
 
 fn lod_mat_float(tree: &Value, name: &str) -> Option<f64> {

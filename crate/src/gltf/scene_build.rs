@@ -297,9 +297,18 @@ pub(super) fn parse_impl(
 
         let mut tex_transforms: std::collections::BTreeMap<String, TexTransform> =
             std::collections::BTreeMap::new();
+        let mut tex_uv_channels: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
         let mut record_xform = |slot: &str, info: Option<&J>| {
             if let Some(x) = tex_transform(info) {
                 tex_transforms.insert(slot.to_string(), x);
+            }
+            if let Some(n) = info
+                .and_then(|j| j.get("texCoord"))
+                .and_then(|v| v.as_i64())
+                .filter(|&n| n != 0)
+            {
+                tex_uv_channels.insert(slot.to_string(), n);
             }
         };
         let base_color_tex_info = if uses_spec_gloss {
@@ -370,6 +379,7 @@ pub(super) fn parse_impl(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
             tex_transforms,
+            tex_uv_channels,
             uses_uv_channel_select,
             uses_spec_gloss,
             spec_gloss_image: tex_ref(sg_spec_gloss_tex_info),

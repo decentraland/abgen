@@ -16,6 +16,7 @@ fn rescue_key(mat: &LodMaterial, granularity: RescueGranularity) -> String {
     match granularity {
         RescueGranularity::Material => mat.name.clone(),
         RescueGranularity::AlphaClass => match mat.class {
+            AlphaClass::Opaque if super::model::is_metal(mat) => "alpha:metal".to_string(),
             AlphaClass::Opaque => "alpha:opaque".to_string(),
             AlphaClass::Mask => "alpha:mask".to_string(),
             AlphaClass::Blend => "alpha:blend".to_string(),
@@ -310,11 +311,13 @@ fn class_submodel(model: &LodModel, key: &str, granularity: RescueGranularity) -
             let mut m = LodMaterial {
                 image: None,
                 emissive_image: None,
+                mr_image: None,
                 ..mat.clone()
             };
             let slots = [
                 (&mut m.image, mat.image),
                 (&mut m.emissive_image, mat.emissive_image),
+                (&mut m.mr_image, mat.mr_image),
             ];
             for (slot, src) in slots {
                 if let Some(img) = src {
@@ -344,6 +347,7 @@ fn merge_model(out_model: &mut LodModel, rescued: &LodModel) {
                 let mut m = LodMaterial {
                     image: None,
                     emissive_image: None,
+                    mr_image: None,
                     ..mat.clone()
                 };
                 if let Some(img) = mat.image {
@@ -353,6 +357,10 @@ fn merge_model(out_model: &mut LodModel, rescued: &LodModel) {
                 if let Some(img) = mat.emissive_image {
                     out_model.images.push(rescued.images[img].clone());
                     m.emissive_image = Some(out_model.images.len() - 1);
+                }
+                if let Some(img) = mat.mr_image {
+                    out_model.images.push(rescued.images[img].clone());
+                    m.mr_image = Some(out_model.images.len() - 1);
                 }
                 out_model.materials.push(m);
                 out_model.materials.len() - 1
@@ -796,6 +804,25 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("meshoptimizer"), "{msg}");
         assert!(msg.contains("nix-shell"), "{msg}");
+    }
+
+    #[test]
+    fn metal_material_gets_its_own_rescue_class() {
+        let mut m = material("gold", AlphaClass::Opaque);
+        m.metallic = 1.0;
+        assert_eq!(rescue_key(&m, RescueGranularity::AlphaClass), "alpha:metal");
+        assert_eq!(rescue_key(&m, RescueGranularity::Material), "gold");
+        let plain = material("wall", AlphaClass::Opaque);
+        assert_eq!(
+            rescue_key(&plain, RescueGranularity::AlphaClass),
+            "alpha:opaque"
+        );
+        let mut blend = material("glass", AlphaClass::Blend);
+        blend.metallic = 1.0;
+        assert_eq!(
+            rescue_key(&blend, RescueGranularity::AlphaClass),
+            "alpha:blend"
+        );
     }
 
     #[test]

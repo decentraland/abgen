@@ -60,6 +60,7 @@ impl Tile {
         w: u32,
         h: u32,
         premul: bool,
+        srgb: bool,
     ) -> Vec<u8> {
         match &self.kind {
             TileKind::Solid(c) => {
@@ -94,6 +95,7 @@ impl Tile {
                         w as usize,
                         h as usize,
                         premul,
+                        srgb,
                     )
                 }
             }
@@ -109,14 +111,22 @@ pub(super) enum EmisKey {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
+pub(super) enum MrKey {
+    None,
+    Solid([u8; 2]),
+    Image { hash: String, factors: [u64; 2] },
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) enum TileKey {
     Image {
         hash: String,
         tint: [u64; 4],
         reps: (u32, u32),
         emis: EmisKey,
+        mr: MrKey,
     },
-    Solid([u8; 4], EmisKey),
+    Solid([u8; 4], EmisKey, MrKey),
 }
 
 pub(super) enum UvMap {
@@ -133,11 +143,16 @@ pub(super) enum UvPlan {
 pub(super) struct Bucket {
     pub(super) tiles: Vec<Tile>,
     pub(super) emis: Vec<Tile>,
+    pub(super) mr: Vec<Tile>,
+    pub(super) has_mr_tex: bool,
     pub(super) weights: Vec<f64>,
     by_key: HashMap<TileKey, usize>,
     pub(super) prims: Vec<(usize, usize, UvMap)>,
     pub(super) refs: usize,
     pub(super) fallbacks: usize,
+    pub(super) met_sum: f64,
+    pub(super) rough_sum: f64,
+    pub(super) met_tris: f64,
 }
 
 pub(super) fn prim_area(p: &LodPrimitive) -> f64 {
@@ -246,7 +261,68 @@ pub(super) fn emissive_tile(
         );
         (w, h) = base_dims;
     }
-    let (px, w, h) = fused_repeat_bake(px, w, h, reps, cap, false);
+    let (px, w, h) = fused_repeat_bake(px, w, h, reps, cap, false, true);
+    Tile::from_pixels(px, w, h)
+}
+
+pub(super) fn mr_pixels(img: &RgbaImage, metallic: f64, roughness: f64) -> Vec<u8> {
+    let mf = metallic.clamp(0.0, 1.0);
+    let rf = roughness.clamp(0.0, 1.0);
+    let mut out = Vec::with_capacity(img.as_raw().len());
+    for px in img.as_raw().chunks_exact(4) {
+        let m = (px[2] as f64 * mf).round().clamp(0.0, 255.0) as u8;
+        let s = 255 - (px[1] as f64 * rf).round().clamp(0.0, 255.0) as u8;
+        out.extend_from_slice(&[m, m, m, s]);
+    }
+    out
+}
+
+pub(super) fn mr_solid_bytes(metallic: f64, roughness: f64) -> [u8; 2] {
+    [
+        (metallic.clamp(0.0, 1.0) * 255.0).round() as u8,
+        ((1.0 - roughness).clamp(0.0, 1.0) * 255.0).round() as u8,
+    ]
+}
+
+pub(super) fn mr_solid_tile(ms: [u8; 2]) -> Tile {
+    Tile::solid([ms[0], ms[0], ms[0], ms[1]])
+}
+
+pub(super) fn mr_average(pixels: &[u8]) -> [u8; 2] {
+    let n = (pixels.len() / 4).max(1) as f64;
+    let (mut m, mut s) = (0f64, 0f64);
+    for px in pixels.chunks_exact(4) {
+        m += px[0] as f64;
+        s += px[3] as f64;
+    }
+    [
+        (m / n).round().clamp(0.0, 255.0) as u8,
+        (s / n).round().clamp(0.0, 255.0) as u8,
+    ]
+}
+
+pub(super) fn mr_tile(
+    mimg: &RgbaImage,
+    metallic: f64,
+    roughness: f64,
+    base_dims: (u32, u32),
+    reps: (u32, u32),
+    cap: u32,
+) -> Tile {
+    let mut px = mr_pixels(mimg, metallic, roughness);
+    let (mut w, mut h) = (mimg.width(), mimg.height());
+    if (w, h) != base_dims {
+        px = crate::resize::box_downscale_rgba(
+            &px,
+            w as usize,
+            h as usize,
+            base_dims.0 as usize,
+            base_dims.1 as usize,
+            false,
+        );
+        (w, h) = base_dims;
+    }
+    let (px, w, h) = fused_repeat_bake(px, w, h, reps, cap, false, false);
     Tile::from_pixels(px, w, h)
 }
 
@@ -257,6 +333,7 @@ pub(super) fn fused_repeat_bake(
     reps: (u32, u32),
     cap: u32,
     premul: bool,
+    srgb: bool,
 ) -> (Vec<u8>, u32, u32) {
     let (ru, rv) = reps;
     let full = (w as u64 * ru as u64).max(h as u64 * rv as u64);
@@ -273,6 +350,7 @@ pub(super) fn fused_repeat_bake(
             pw as usize,
             ph as usize,
             premul,
+            srgb,
         );
         (out, pw, ph)
     };
@@ -304,11 +382,12 @@ pub(super) fn downscale(
     dw: usize,
     dh: usize,
     premul: bool,
+    srgb: bool,
 ) -> Vec<u8> {
     if premul {
         crate::resize::premul_downscale_rgba(px, sw, sh, dw, dh)
     } else {
-        crate::resize::box_downscale_rgba(px, sw, sh, dw, dh, true)
+        crate::resize::box_downscale_rgba(px, sw, sh, dw, dh, srgb)
     }
 }
 
@@ -372,15 +451,16 @@ pub(super) fn uv_plan(uvs: &[[f32; 2]]) -> UvPlan {
 pub(super) fn intern_tile(
     bucket: &mut Bucket,
     key: TileKey,
-    make: impl FnOnce() -> (Tile, Tile),
+    make: impl FnOnce() -> (Tile, Tile, Tile),
 ) -> usize {
     if let Some(&i) = bucket.by_key.get(&key) {
         return i;
     }
     let i = bucket.tiles.len();
-    let (base, emis) = make();
+    let (base, emis, mr) = make();
     bucket.tiles.push(base);
     bucket.emis.push(emis);
+    bucket.mr.push(mr);
     bucket.weights.push(0.0);
     bucket.by_key.insert(key, i);
     i

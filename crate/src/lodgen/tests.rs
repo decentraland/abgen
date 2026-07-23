@@ -357,7 +357,7 @@ fn post_order_reingest_and_atlas_on_emitted_raw_glb() {
         assert_eq!(a.class, b.class);
         assert_eq!(a.double_sided, b.double_sided);
     }
-    let atlased = atlas::atlas_with(&back, 64, 0, atlas::AtlasMode::Native).unwrap();
+    let atlased = atlas::atlas_with(&back, 64, 0, atlas::AtlasMode::Native, false).unwrap();
     assert_eq!(atlased.total_tris(), raw.total_tris());
     assert!(atlased
         .materials
@@ -395,6 +395,7 @@ fn empty_scene_bundle_passes_empty_gate_and_fails_content_gate() {
             base: (55, -76),
             timestamp: None,
             vertical_override: None,
+            fidelity: false,
         }),
         ..Default::default()
     };
@@ -483,6 +484,7 @@ fn multi_platform_bundles_union_manifest_and_target_platform_gate() {
             base: (8, -83),
             timestamp: None,
             vertical_override: None,
+            fidelity: false,
         }),
         ..Default::default()
     };
@@ -626,6 +628,7 @@ fn multi_level_sources_build_both_levels_from_one_bake() {
             base: (8, -83),
             timestamp: None,
             vertical_override: None,
+            fidelity: false,
         }),
         ..Default::default()
     };
@@ -698,6 +701,7 @@ fn self_gate_passes_on_synthetic_lod_bundle_and_catches_mismatches() {
             base: (8, -83),
             timestamp: None,
             vertical_override: None,
+            fidelity: false,
         }),
         ..Default::default()
     };
@@ -826,6 +830,7 @@ fn orphan_material_is_dropped_from_lod_bundle() {
             base: (1, 2),
             timestamp: None,
             vertical_override: None,
+            fidelity: false,
         }),
         ..Default::default()
     };

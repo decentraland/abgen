@@ -300,6 +300,35 @@ fn walk_instance(
     }
 }
 
+fn effective_metallic(m: &crate::scene::Material, scene: &crate::scene::Scene) -> f64 {
+    let tex_mean = m
+        .metallic_roughness_image
+        .and_then(|tr| scene.images.get(tr.image))
+        .and_then(|img| img.as_ref())
+        .map(|img| {
+            let raw = img.as_raw();
+            if raw.is_empty() {
+                return 1.0;
+            }
+            let sum: u64 = raw.chunks_exact(4).map(|px| px[2] as u64).sum();
+            sum as f64 / (raw.len() / 4) as f64 / 255.0
+        })
+        .unwrap_or(1.0);
+    (m.metallic * tex_mean).clamp(0.0, 1.0)
+}
+
+fn mr_texture_usable(m: &crate::scene::Material) -> bool {
+    if m.metallic_roughness_image.is_none() || m.base_color_image.is_none() {
+        return false;
+    }
+    let uvc = |slot: &str| m.tex_uv_channels.get(slot).copied().unwrap_or(0);
+    if uvc("_BaseMap") != 0 || uvc("_MetallicGlossMap") != 0 {
+        return false;
+    }
+    let xf = |slot: &str| m.tex_transforms.get(slot).copied();
+    xf("_MetallicGlossMap") == xf("_BaseMap")
+}
+
 fn scene_needs_fallback(scene: &crate::scene::Scene) -> bool {
     scene.nodes.iter().any(|n| {
         n.primitives.iter().any(|p| {
@@ -445,6 +474,16 @@ pub fn assemble_from(
             };
             let image = intern(m.base_color_image);
             let mut key = default_mat_key();
+            if lane.fidelity {
+                if mr_texture_usable(m) {
+                    key.metallic = m.metallic.to_bits();
+                    key.roughness = m.roughness.to_bits();
+                    key.mr_image = intern(m.metallic_roughness_image);
+                } else {
+                    key.metallic = effective_metallic(m, &src).to_bits();
+                    key.roughness = m.roughness.to_bits();
+                }
+            }
             let (eff, emissive, emissive_image) = if lane.raw_materials {
                 let eimg = if m.emissive != [0.0; 3] {
                     intern(m.emissive_image)
@@ -1053,8 +1092,6 @@ mod tests {
             log: Vec::new(),
         })
         .unwrap();
-        // drop the explicit metallicFactor: the spec-default-1.0 case the
-        // normalized lane has been rewriting to 0
         let (mut json, bin) = chunks(&src);
         json["materials"][0]["pbrMetallicRoughness"]
             .as_object_mut()
@@ -1130,6 +1167,137 @@ mod tests {
             model::fold_emissive([0.1854, 0.0007, 0.6921, 1.0], [0.25, 0.5, 0.75])
         );
         assert_eq!(plain.images.len(), 1);
+    }
+
+    fn mr_test_glb() -> Vec<u8> {
+        let base_png = tiny_png(7);
+        let mut img = image::RgbaImage::new(4, 4);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([0, 90, 204, 255]);
+        }
+        let mut cur = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut cur, image::ImageFormat::Png).unwrap();
+        let mr_png = cur.into_inner();
+
+        emit_glb(&LodModel {
+            root_name: "met".to_string(),
+            primitives: vec![LodPrimitive {
+                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                normals: vec![[0.0, 0.0, 1.0]; 3],
+                uvs: vec![[0.25, 0.5], [1.0, 0.0], [0.0, 1.0]],
+                indices: vec![0, 1, 2],
+                material: 0,
+                ..Default::default()
+            }],
+            materials: vec![LodMaterial {
+                name: "Gold".to_string(),
+                image: Some(0),
+                metallic: 1.0,
+                roughness: 0.25,
+                mr_image: Some(1),
+                ..base_material()
+            }],
+            images: [&base_png, &mr_png]
+                .iter()
+                .map(|b| LodImage {
+                    bytes: b.to_vec(),
+                    mime: "image/png".to_string(),
+                })
+                .collect(),
+            log: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn assemble_lane(cache: &Path, hash: &str, lane: model::MatLane) -> LodModel {
+        let ent = entity(&[("met.glb", hash)]);
+        let place = Placement {
+            glb_hash: Some(hash.to_string()),
+            ..Default::default()
+        };
+        assemble(
+            &dummy_client(),
+            &ent,
+            std::slice::from_ref(&place),
+            1,
+            Some(cache),
+            lane,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn fidelity_lane_carries_usable_mr_texture_per_texel() {
+        let cache = temp_cache("mrcarry");
+        stage(&cache, "hmet", &mr_test_glb());
+
+        let fid = assemble_lane(
+            &cache,
+            "hmet",
+            model::MatLane {
+                fidelity: true,
+                ..Default::default()
+            },
+        );
+        let m = &fid.materials[0];
+        assert_eq!(m.metallic, 1.0);
+        assert_eq!(m.roughness, 0.25);
+        assert!(m.mr_image.is_some());
+        assert!(model::is_metal(m));
+        assert_eq!(fid.images.len(), 2);
+
+        let plain = assemble_lane(&cache, "hmet", Default::default());
+        assert_eq!(plain.materials[0].metallic, 0.0);
+        assert_eq!(plain.materials[0].roughness, 1.0);
+        assert_eq!(plain.materials[0].mr_image, None);
+        assert_eq!(plain.images.len(), 1);
+    }
+
+    #[test]
+    fn fidelity_lane_folds_mismatched_mr_texture_into_effective_metallic() {
+        let (mut json, bin) = chunks(&mr_test_glb());
+        json["materials"][0]["pbrMetallicRoughness"]["metallicRoughnessTexture"]["texCoord"] =
+            serde_json::json!(1);
+        let src = rebuild(&json, &bin);
+        let cache = temp_cache("mrfold");
+        stage(&cache, "hmet", &src);
+
+        let fid = assemble_lane(
+            &cache,
+            "hmet",
+            model::MatLane {
+                fidelity: true,
+                ..Default::default()
+            },
+        );
+        let m = &fid.materials[0];
+        assert!((m.metallic - 0.8).abs() < 1e-3, "{}", m.metallic);
+        assert_eq!(m.roughness, 0.25);
+        assert_eq!(m.mr_image, None);
+        assert_eq!(fid.images.len(), 1);
+    }
+
+    #[test]
+    fn fidelity_lane_folds_mr_texture_with_foreign_transform() {
+        let (mut json, bin) = chunks(&mr_test_glb());
+        json["materials"][0]["pbrMetallicRoughness"]["metallicRoughnessTexture"]["extensions"] =
+            serde_json::json!({"KHR_texture_transform": {"scale": [2.0, 2.0]}});
+        let src = rebuild(&json, &bin);
+        let cache = temp_cache("mrxf");
+        stage(&cache, "hmet", &src);
+
+        let fid = assemble_lane(
+            &cache,
+            "hmet",
+            model::MatLane {
+                fidelity: true,
+                ..Default::default()
+            },
+        );
+        let m = &fid.materials[0];
+        assert!((m.metallic - 0.8).abs() < 1e-3, "{}", m.metallic);
+        assert_eq!(m.mr_image, None);
+        assert_eq!(fid.images.len(), 1);
     }
 
     #[test]

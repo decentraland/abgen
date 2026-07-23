@@ -47,7 +47,7 @@ USAGE:
             [--workdir DIR] [--cache DIR] [--simplifier meshopt|gltfpack]
             [--gltfpack PATH]
             [--allow-unsimplified] [--keep-glb] [--no-uv-reclamp] [--emissive]
-            [--gpu]
+            [--fidelity] [--gpu]
 
 bundle: stages <src.glb> as {entityIdLower}_{level}.glb and builds
   {out}/{entityIdLower}/LOD/{level}/{entityIdLower}_{level}_{platform} (+.br).
@@ -180,7 +180,26 @@ generate: the full sync chain: resolve scene -> placements (iss|embedded
   (emissive texel x factor in linear light, black for non-glowing sources)
   and bound as _EmissionMap with _EmissionColor white in the bundle, so
   glowing materials glow in the client; scenes with no glowing material
-  emit no emission atlas.
+  emit no emission atlas. --fidelity (default off; off is byte-identical to
+  the production-parity bake) restores source material state production
+  normalizes away. Transparent class: double-sided glass gets its back
+  faces (source doubleSided OR per alpha class -> _Cull 0) together with
+  glTF BLEND depth semantics (_ZWrite 0 - the pair ships as one change),
+  the forced 0.8 base alpha becomes the data-true per-texel atlas alpha,
+  and the constant spec sheen is killed (_SpecColor 0.05,
+  _SpecularHighlights/_EnvironmentReflections 0). The opaque class keeps
+  production culling: ~95% of source opaque materials are doubleSided
+  (exporter default), so restoring them would flip the whole class. Metal
+  class: opaque materials with effective metallic >= 0.5 or a usable MR
+  texture split into a 4th merged material carrying _Metallic/_Smoothness
+  floats; when a source MR texture rides the same UV set and transform as
+  _BaseMap it is carried per-texel into a metal-rough atlas plane on the
+  base rects, repacked from glTF ORM to Unity layout (metallic = B x
+  metallicFactor in R, smoothness = 1 - G x roughnessFactor in A, linear
+  BC7) and bound as _MetallicGlossMap with the _METALLICSPECGLOSSMAP
+  keyword and _Metallic/_Smoothness pinned to 1; factor-only metals keep
+  the keyword-free float path and scenes without a usable MR texture emit
+  no MR plane.
 
 --help/-h prints this help; --version/-V prints the version."
 }
@@ -373,6 +392,7 @@ fn cmd_bundle(argv: &[String]) -> Result<i32> {
             base: base_parcel,
             timestamp,
             vertical_override: vertical_clip,
+            fidelity: false,
         }),
         ..Default::default()
     };
@@ -651,7 +671,7 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
         } else {
             abgen::lodgen::atlas::AtlasMode::Native
         };
-        abgen::lodgen::atlas::atlas_with(&model, max_size, padding, mode)?
+        abgen::lodgen::atlas::atlas_with(&model, max_size, padding, mode, false)?
     };
     for line in &model.log {
         eprintln!("{line}");
@@ -797,7 +817,7 @@ fn cmd_atlas(argv: &[String]) -> Result<i32> {
     } else {
         abgen::lodgen::atlas::AtlasMode::Native
     };
-    let atlased = abgen::lodgen::atlas::atlas_with(&model, max_size, padding, mode)?;
+    let atlased = abgen::lodgen::atlas::atlas_with(&model, max_size, padding, mode, false)?;
     for line in atlased.log.iter().filter(|l| l.starts_with("atlas:")) {
         println!("{line}");
     }
@@ -1059,6 +1079,9 @@ fn cmd_generate(argv: &[String]) -> Result<i32> {
             }
             "--emissive" => {
                 params.emissive_channel = true;
+            }
+            "--fidelity" => {
+                params.fidelity = true;
             }
             "--gpu" => {
                 gpu_flag = true;

@@ -38,6 +38,7 @@ pub struct LodGenMeta {
     pub base: (i32, i32),
     pub timestamp: Option<i64>,
     pub vertical_override: Option<f64>,
+    pub fidelity: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -272,6 +273,7 @@ fn resolve_scene_meta(client: &CatalystClient, sid: &str) -> LodGenMeta {
             base,
             timestamp: None,
             vertical_override: None,
+            fidelity: false,
         },
         Err(e) => {
             eprintln!(
@@ -283,6 +285,7 @@ fn resolve_scene_meta(client: &CatalystClient, sid: &str) -> LodGenMeta {
                 base: (0, 0),
                 timestamp: None,
                 vertical_override: None,
+                fidelity: false,
             }
         }
     }
@@ -311,6 +314,7 @@ fn build_lod_bundle(
         root_position: root_position(meta.base),
         main_asset: lod_main_asset(sid, level),
         timestamp: meta.timestamp,
+        fidelity: meta.fidelity,
     };
     let build_opts = BuildOpts {
         keep_forward_plus: opts.keep_forward_plus,

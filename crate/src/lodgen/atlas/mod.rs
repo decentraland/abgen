@@ -16,8 +16,9 @@ use pack::pack_skyline;
 use pack::{pack_bucket, Packed};
 use tile::{
     average_color, emissive_pixels, emissive_solid, emissive_tile, fused_repeat_bake, glows,
-    intern_tile, premultiplied_filtering, prim_area, solid_color, solid_tile, tint_bits,
-    tinted_pixels, uv_plan, Bucket, EmisKey, Tile, TileKey, UvMap, UvPlan,
+    intern_tile, mr_average, mr_pixels, mr_solid_bytes, mr_solid_tile, mr_tile,
+    premultiplied_filtering, prim_area, solid_color, solid_tile, tint_bits, tinted_pixels, uv_plan,
+    Bucket, EmisKey, MrKey, Tile, TileKey, UvMap, UvPlan,
 };
 
 const MIN_TILE_DIM: u32 = 4;
@@ -33,7 +34,17 @@ const LOSSLESS_OPAQUE_MIN_BUDGET: u32 = 512;
 const NATIVE_SOLID_DIM: u32 = 8;
 const NATIVE_MIN_CANVAS: u32 = 8;
 
-const CLASS_ORDER: [AlphaClass; 3] = [AlphaClass::Opaque, AlphaClass::Mask, AlphaClass::Blend];
+const BUCKET_SPECS: [(AlphaClass, &str, &str); 4] = [
+    (AlphaClass::Opaque, "TextureBakeResult-mat", "opaque"),
+    (AlphaClass::Mask, "TextureBakeResult-mat-cutout", "mask"),
+    (
+        AlphaClass::Blend,
+        "TextureBakeResult-mat-transparent",
+        "blend",
+    ),
+    (AlphaClass::Opaque, "TextureBakeResult-mat-metal", "metal"),
+];
+const METAL_BUCKET: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AtlasMode {
@@ -51,18 +62,14 @@ pub fn budget_pot(max_size: u32) -> u32 {
 }
 
 pub fn class_material_name(class: AlphaClass) -> &'static str {
-    match class {
-        AlphaClass::Opaque => "TextureBakeResult-mat",
-        AlphaClass::Mask => "TextureBakeResult-mat-cutout",
-        AlphaClass::Blend => "TextureBakeResult-mat-transparent",
-    }
+    BUCKET_SPECS[class_index(class)].1
 }
 
-fn class_tag(class: AlphaClass) -> &'static str {
-    match class {
-        AlphaClass::Opaque => "opaque",
-        AlphaClass::Mask => "mask",
-        AlphaClass::Blend => "blend",
+fn bucket_index(mat: &LodMaterial, fidelity: bool) -> usize {
+    if fidelity && super::model::is_metal(mat) {
+        METAL_BUCKET
+    } else {
+        class_index(mat.class)
     }
 }
 
@@ -75,7 +82,7 @@ fn class_index(class: AlphaClass) -> usize {
 }
 
 pub fn atlas(model: &LodModel, max_size: u32, padding: u32) -> Result<LodModel> {
-    atlas_with(model, max_size, padding, AtlasMode::FullBleed)
+    atlas_with(model, max_size, padding, AtlasMode::FullBleed, false)
 }
 
 pub fn atlas_with(
@@ -83,8 +90,9 @@ pub fn atlas_with(
     max_size: u32,
     padding: u32,
     mode: AtlasMode,
+    fidelity: bool,
 ) -> Result<LodModel> {
-    Ok(atlas_with_rects(model, max_size, padding, mode)?.0)
+    Ok(atlas_with_rects(model, max_size, padding, mode, fidelity)?.0)
 }
 
 pub fn atlas_with_rects(
@@ -92,6 +100,7 @@ pub fn atlas_with_rects(
     max_size: u32,
     padding: u32,
     mode: AtlasMode,
+    fidelity: bool,
 ) -> Result<(LodModel, Vec<super::reclamp::ClassRects>)> {
     if model.primitives.is_empty() {
         bail!("atlas: model has no primitives");
@@ -124,6 +133,11 @@ pub fn atlas_with_rects(
                 needed[idx] = true;
             }
         }
+        if fidelity && super::model::is_metal(mat) {
+            if let Some(idx) = mat.mr_image.filter(|&i| i < needed.len()) {
+                needed[idx] = true;
+            }
+        }
     }
     let decoded: Vec<Option<(RgbaImage, String)>> = needed
         .par_iter()
@@ -149,7 +163,8 @@ pub fn atlas_with_rects(
             ));
         }
     }
-    let mut buckets: [Bucket; 3] = std::array::from_fn(|_| Bucket::default());
+    let mut buckets: [Bucket; 4] = std::array::from_fn(|_| Bucket::default());
+    let mut class_double_sided = [false; 4];
 
     for (pi, prim) in model.primitives.iter().enumerate() {
         if prim.positions.is_empty() || prim.indices.len() < 3 {
@@ -159,8 +174,18 @@ pub fn atlas_with_rects(
             .materials
             .get(prim.material)
             .ok_or_else(|| anyhow!("atlas: primitive {pi} references missing material"))?;
-        let bucket = &mut buckets[class_index(mat.class)];
+        let bi = bucket_index(mat, fidelity);
+        let bucket = &mut buckets[bi];
         bucket.refs += 1;
+        if bi == METAL_BUCKET {
+            let tris = (prim.indices.len() / 3) as f64;
+            bucket.met_sum += mat.metallic * tris;
+            bucket.rough_sum += mat.roughness * tris;
+            bucket.met_tris += tris;
+        }
+        if fidelity && mat.class != AlphaClass::Opaque && mat.double_sided {
+            class_double_sided[bi] = true;
+        }
         let img_ref: Option<&(RgbaImage, String)> = match mat.image {
             Some(idx) if idx < model.images.len() => decoded[idx].as_ref(),
             _ => None,
@@ -169,6 +194,19 @@ pub fn atlas_with_rects(
             Some(idx) if glows(mat) && idx < model.images.len() => decoded[idx].as_ref(),
             _ => None,
         };
+        let mr_ref: Option<&(RgbaImage, String)> = match mat.mr_image {
+            Some(idx) if bi == METAL_BUCKET && idx < model.images.len() => decoded[idx].as_ref(),
+            _ => None,
+        };
+        let mrkey_solid = if bi == METAL_BUCKET {
+            MrKey::Solid(mr_solid_bytes(mat.metallic, mat.roughness))
+        } else {
+            MrKey::None
+        };
+        let mr_from_key = |mk: &MrKey| match mk {
+            MrKey::Solid(ms) => mr_solid_tile(*ms),
+            _ => solid_tile([0, 0, 0, 0]),
+        };
         match img_ref {
             None => {
                 let ekey = if glows(mat) {
@@ -176,14 +214,19 @@ pub fn atlas_with_rects(
                 } else {
                     EmisKey::Dark
                 };
+                let mkey = mrkey_solid;
                 let color = solid_color(mat.base_color);
-                let ti = intern_tile(bucket, TileKey::Solid(color, ekey.clone()), || {
-                    let e = match &ekey {
-                        EmisKey::Solid(c) => solid_tile(*c),
-                        _ => solid_tile([0, 0, 0, 255]),
-                    };
-                    (solid_tile(color), e)
-                });
+                let ti = intern_tile(
+                    bucket,
+                    TileKey::Solid(color, ekey.clone(), mkey.clone()),
+                    || {
+                        let e = match &ekey {
+                            EmisKey::Solid(c) => solid_tile(*c),
+                            _ => solid_tile([0, 0, 0, 255]),
+                        };
+                        (solid_tile(color), e, mr_from_key(&mkey))
+                    },
+                );
                 bucket.prims.push((pi, ti, UvMap::Center));
             }
             Some((img, img_hash)) => match uv_plan(&prim.uvs) {
@@ -198,11 +241,21 @@ pub fn atlas_with_rects(
                     } else {
                         EmisKey::Solid(emissive_solid(mat.emissive))
                     };
+                    let mkey = if let Some((_, mhash)) = mr_ref {
+                        bucket.has_mr_tex = true;
+                        MrKey::Image {
+                            hash: mhash.clone(),
+                            factors: [mat.metallic.to_bits(), mat.roughness.to_bits()],
+                        }
+                    } else {
+                        mrkey_solid
+                    };
                     let key = TileKey::Image {
                         hash: img_hash.clone(),
                         tint: tint_bits(mat.base_color),
                         reps,
                         emis: ekey.clone(),
+                        mr: mkey.clone(),
                     };
                     let ti = intern_tile(bucket, key, || {
                         let tinted = tinted_pixels(img, mat.base_color);
@@ -213,6 +266,7 @@ pub fn atlas_with_rects(
                             reps,
                             max_pot,
                             premultiplied_filtering(mat.class),
+                            true,
                         );
                         let e = match (&ekey, emis_ref) {
                             (EmisKey::Image { .. }, Some((eimg, _))) => emissive_tile(
@@ -225,7 +279,18 @@ pub fn atlas_with_rects(
                             (EmisKey::Solid(c), _) => solid_tile(*c),
                             _ => solid_tile([0, 0, 0, 255]),
                         };
-                        (Tile::from_pixels(px, w, h), e)
+                        let mrt = match (&mkey, mr_ref) {
+                            (MrKey::Image { .. }, Some((mimg, _))) => mr_tile(
+                                mimg,
+                                mat.metallic,
+                                mat.roughness,
+                                (img.width(), img.height()),
+                                reps,
+                                max_pot,
+                            ),
+                            _ => mr_from_key(&mkey),
+                        };
+                        (Tile::from_pixels(px, w, h), e, mrt)
                     });
                     bucket.weights[ti] += prim_area(prim);
                     bucket.prims.push((
@@ -255,13 +320,22 @@ pub fn atlas_with_rects(
                     } else {
                         EmisKey::Solid(emissive_solid(mat.emissive))
                     };
-                    let ti = intern_tile(bucket, TileKey::Solid(color, ekey.clone()), || {
-                        let e = match &ekey {
-                            EmisKey::Solid(c) => solid_tile(*c),
-                            _ => solid_tile([0, 0, 0, 255]),
-                        };
-                        (solid_tile(color), e)
-                    });
+                    let mkey = if let Some((mimg, _)) = mr_ref {
+                        MrKey::Solid(mr_average(&mr_pixels(mimg, mat.metallic, mat.roughness)))
+                    } else {
+                        mrkey_solid
+                    };
+                    let ti = intern_tile(
+                        bucket,
+                        TileKey::Solid(color, ekey.clone(), mkey.clone()),
+                        || {
+                            let e = match &ekey {
+                                EmisKey::Solid(c) => solid_tile(*c),
+                                _ => solid_tile([0, 0, 0, 255]),
+                            };
+                            (solid_tile(color), e, mr_from_key(&mkey))
+                        },
+                    );
                     bucket.prims.push((pi, ti, UvMap::Center));
                 }
             },
@@ -272,11 +346,17 @@ pub fn atlas_with_rects(
         root_name: model.root_name.clone(),
         ..Default::default()
     };
-    type HeavyOut = (Packed, LodImage, Option<LodImage>, Vec<Option<[u32; 4]>>);
-    let heavy: Vec<Option<Result<HeavyOut>>> = CLASS_ORDER
+    type HeavyOut = (
+        Packed,
+        LodImage,
+        Option<LodImage>,
+        Option<LodImage>,
+        Vec<Option<[u32; 4]>>,
+    );
+    let heavy: Vec<Option<Result<HeavyOut>>> = BUCKET_SPECS
         .par_iter()
         .zip(buckets.par_iter_mut())
-        .map(|(&class, bucket)| {
+        .map(|(&(class, _, _), bucket)| {
             if bucket.prims.is_empty() {
                 return None;
             }
@@ -300,6 +380,7 @@ pub fn atlas_with_rects(
                     packed.canvas,
                     padding,
                     premultiplied_filtering(class),
+                    true,
                 );
                 let img = encode_atlas(class, canvas_px, packed.canvas, max_pot)?;
                 let emis_img = if any_glow {
@@ -310,12 +391,34 @@ pub fn atlas_with_rects(
                         packed.canvas,
                         padding,
                         false,
+                        true,
                     );
                     Some(encode_atlas(class, emis_px, packed.canvas, max_pot)?)
                 } else {
                     None
                 };
-                Ok((packed, img, emis_img, crops))
+                let mr_img = if bucket.has_mr_tex {
+                    let mr_px = compose(
+                        &bucket.mr,
+                        &crops,
+                        &packed.rects,
+                        packed.canvas,
+                        padding,
+                        false,
+                        false,
+                    );
+                    let img = RgbaImage::from_raw(packed.canvas, packed.canvas, mr_px)
+                        .ok_or_else(|| anyhow!("atlas mr buffer"))?;
+                    let mut cur = std::io::Cursor::new(Vec::new());
+                    img.write_to(&mut cur, image::ImageFormat::Png)?;
+                    Some(LodImage {
+                        bytes: cur.into_inner(),
+                        mime: "image/png".to_string(),
+                    })
+                } else {
+                    None
+                };
+                Ok((packed, img, emis_img, mr_img, crops))
             })())
         })
         .collect();
@@ -325,8 +428,8 @@ pub fn atlas_with_rects(
         let Some(res) = item else {
             continue;
         };
-        let (packed, img, emis_img, crops) = res?;
-        let class = CLASS_ORDER[ci];
+        let (packed, img, emis_img, mr_img, crops) = res?;
+        let (class, mat_name, tag) = BUCKET_SPECS[ci];
         let bucket = &buckets[ci];
         let mime = img.mime.clone();
         let img_idx = out.images.len();
@@ -336,20 +439,38 @@ pub fn atlas_with_rects(
             out.images.push(e);
             i
         });
+        let mr_idx = mr_img.map(|e| {
+            let i = out.images.len();
+            out.images.push(e);
+            i
+        });
         let mat_idx = out.materials.len();
+        let (metallic, roughness) = if mr_idx.is_some() {
+            (1.0, 0.0)
+        } else if ci == METAL_BUCKET && bucket.met_tris > 0.0 {
+            (
+                bucket.met_sum / bucket.met_tris,
+                bucket.rough_sum / bucket.met_tris,
+            )
+        } else {
+            (0.0, 1.0)
+        };
         out.materials.push(LodMaterial {
-            name: class_material_name(class).to_string(),
+            name: mat_name.to_string(),
             class,
             base_color: [1.0, 1.0, 1.0, 1.0],
             cutoff: 0.5,
             image: Some(img_idx),
-            double_sided: false,
+            double_sided: class_double_sided[ci],
             emissive: if emis_idx.is_some() {
                 [1.0; 3]
             } else {
                 [0.0; 3]
             },
             emissive_image: emis_idx,
+            metallic,
+            roughness,
+            mr_image: mr_idx,
             ..Default::default()
         });
         let s = packed.canvas as f64;
@@ -399,10 +520,14 @@ pub fn atlas_with_rects(
             Some(i) => format!(" emissive_image={} ({})", i, out.images[i].mime),
             None => String::new(),
         };
+        let mr_note = match mr_idx {
+            Some(i) => format!(" metal_rough_image={} ({})", i, out.images[i].mime),
+            None => String::new(),
+        };
         log.push(format!(
-            "atlas: class={} material={} size={} refs={} unique={} occupancy={:.1}% fallbacks={} scale={:.3} mime={}{}",
-            class_tag(class),
-            class_material_name(class),
+            "atlas: class={} material={} size={} refs={} unique={} occupancy={:.1}% fallbacks={} scale={:.3} mime={}{}{}",
+            tag,
+            mat_name,
             packed.canvas,
             bucket.refs,
             bucket.tiles.len(),
@@ -410,11 +535,12 @@ pub fn atlas_with_rects(
             bucket.fallbacks,
             packed.scale,
             mime,
-            emis_note
+            emis_note,
+            mr_note
         ));
         total_fallbacks += bucket.fallbacks;
         rect_tables.push(super::reclamp::ClassRects {
-            material: class_material_name(class).to_string(),
+            material: mat_name.to_string(),
             canvas: packed.canvas,
             rects: packed
                 .rects

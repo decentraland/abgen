@@ -159,6 +159,7 @@ pub struct GenerateParams {
     pub uv_reclamp: bool,
     pub bake_after_simplify: bool,
     pub emissive_channel: bool,
+    pub fidelity: bool,
 }
 
 impl Default for GenerateParams {
@@ -188,6 +189,7 @@ impl Default for GenerateParams {
             uv_reclamp: true,
             bake_after_simplify: false,
             emissive_channel: false,
+            fidelity: false,
         }
     }
 }
@@ -472,6 +474,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
             params.cache.as_deref(),
             model::MatLane {
                 emissive_channel: params.emissive_channel,
+                fidelity: params.fidelity,
                 ..Default::default()
             },
         )?;
@@ -523,8 +526,13 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
                     std::fs::read(&dec).with_context(|| format!("read {}", dec.display()))?;
                 let decimated =
                     model::from_glb_bytes_with(&bytes, &root_name, params.emissive_channel)?;
-                let atlased =
-                    atlas::atlas_with(&decimated, params.atlas_max, params.atlas_padding, mode)?;
+                let atlased = atlas::atlas_with(
+                    &decimated,
+                    params.atlas_max,
+                    params.atlas_padding,
+                    mode,
+                    params.fidelity,
+                )?;
                 atlas_ms += t.elapsed().as_millis();
                 log.extend(atlased.log.iter().cloned());
 
@@ -538,8 +546,13 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
                 staged.push((level, out, sim));
             }
         } else {
-            let (model, atlas_rects) =
-                atlas::atlas_with_rects(&model, params.atlas_max, params.atlas_padding, mode)?;
+            let (model, atlas_rects) = atlas::atlas_with_rects(
+                &model,
+                params.atlas_max,
+                params.atlas_padding,
+                mode,
+                params.fidelity,
+            )?;
             atlas_ms = t.elapsed().as_millis();
             log.extend(model.log.iter().cloned());
             source_tris = model.total_tris();
@@ -608,6 +621,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
             base,
             timestamp: None,
             vertical_override: None,
+            fidelity: params.fidelity,
         }),
         ..Default::default()
     };
