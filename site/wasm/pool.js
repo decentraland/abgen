@@ -100,7 +100,10 @@ export async function runConvert(opts, cb) {
   const wantLod = !!opts.lod;
   const jobCount = jobs.length + (wantLod ? 1 : 0);
   const hc = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
-  const N = Math.max(1, Math.min(opts.size || hc, jobCount, 8));
+  // Default to 3/4 of the machine's cores: enough to saturate the encode
+  // without starving the page, the GPU worker, and the rest of the system.
+  const cap = Math.max(1, Math.ceil((hc * 3) / 4));
+  const N = Math.max(1, Math.min(opts.size || cap, jobCount, cap));
   cb({ type: 'event', data: { ev: 'note', msg: `worker pool: ${N} workers, ${jobCount} job(s)` } });
   while (slots.length < N) mkSlot(slots.length);
 
