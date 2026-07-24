@@ -234,7 +234,11 @@ impl Harness {
 fn compare(entry: String, cases: u32, stride_bytes: u32, got: &[u8], want: &[u8]) -> EntryResult {
     if got.len() != want.len() {
         return EntryResult {
-            entry: format!("{entry} [length mismatch got {} want {}]", got.len(), want.len()),
+            entry: format!(
+                "{entry} [length mismatch got {} want {}]",
+                got.len(),
+                want.len()
+            ),
             cases,
             pass: false,
             first_diff: Some(FirstDiff {
@@ -254,7 +258,8 @@ fn compare(entry: String, cases: u32, stride_bytes: u32, got: &[u8], want: &[u8]
         },
         Some(i) => {
             let w = i / 4 * 4;
-            let word = |b: &[u8], w: usize| u32::from_le_bytes([b[w], b[w + 1], b[w + 2], b[w + 3]]);
+            let word =
+                |b: &[u8], w: usize| u32::from_le_bytes([b[w], b[w + 1], b[w + 2], b[w + 3]]);
             let stride = if stride_bytes > 0 { stride_bytes } else { 4 };
             // Diff distribution: how many words differ, over how many cases,
             // plus the first few (word_index, got, want) triples — enough to
@@ -917,7 +922,14 @@ impl Harness {
         let out = vec![0u8; cases.len() * 2 * 4];
         let total = cases.len() as u32;
         match self
-            .run_kernel(g, entry, total, 0, &[(4, &words_bytes(&input)), (3, &out)], 3)
+            .run_kernel(
+                g,
+                entry,
+                total,
+                0,
+                &[(4, &words_bytes(&input)), (3, &out)],
+                3,
+            )
             .await
         {
             Ok(got) => compare(entry.to_string(), total, 8, &got, &words_bytes(&want)),
@@ -2201,10 +2213,11 @@ impl Harness {
         let mut input: Vec<u32> = Vec::new();
         let mut want: Vec<u8> = Vec::new();
         let mut total = 0usize;
-        let mut push_case = |input: &mut Vec<u32>, want: &mut Vec<u8>, cr: usize, cg: usize, cb: usize, ca: i32| {
-            input.extend_from_slice(&[cr as u32, cg as u32, cb as u32, ca as u32]);
-            want.extend_from_slice(&probe::block_solid(cr, cg, cb, ca, &t));
-        };
+        let mut push_case =
+            |input: &mut Vec<u32>, want: &mut Vec<u8>, cr: usize, cg: usize, cb: usize, ca: i32| {
+                input.extend_from_slice(&[cr as u32, cg as u32, cb as u32, ca as u32]);
+                want.extend_from_slice(&probe::block_solid(cr, cg, cb, ca, &t));
+            };
         for (i, &cr) in axis.iter().enumerate() {
             for (j, &cg) in axis.iter().enumerate() {
                 for (k, &cb) in axis.iter().enumerate() {
@@ -2679,11 +2692,7 @@ impl Harness {
                     for (level, w, h) in pyramid(&tex, w0, h0, srgb) {
                         let (bw, bh) = mips::level_block_dims(w, h);
                         items.extend(super::pack_item_bytes(
-                            lvl_px,
-                            blk_off,
-                            w as u32,
-                            h as u32,
-                            srgb,
+                            lvl_px, blk_off, w as u32, h as u32, srgb,
                         ));
                         prefixes.push(total_blocks);
                         for by in 0..bh {
@@ -2947,22 +2956,18 @@ fn expected_plan(cp: &Params, blocks: &[u8]) -> (Vec<u32>, Vec<bool>) {
     }
     for gstart in (0..nb).step_by(GROUP_WIDTH) {
         let gn = GROUP_WIDTH.min(nb - gstart);
-        let alpha_blocks: Vec<usize> =
-            (gstart..gstart + gn).filter(|&b| clss[b] == 1).collect();
+        let alpha_blocks: Vec<usize> = (gstart..gstart + gn).filter(|&b| clss[b] == 1).collect();
         let opaque_blocks: Vec<usize> = (gstart..gstart + gn)
             .filter(|&b| clss[b] == 2 && !cp.mode6_only)
             .collect();
         if !alpha_blocks.is_empty() && cp.use_mode7 {
             let lanes: Vec<&[[i32; 4]; 16]> = alpha_blocks.iter().map(|&b| &pxs[b]).collect();
-            let lists =
-                probe::estimate_partition_list_lanes(7, cp, cp.al_max_mode7 as i32, &lanes);
+            let lists = probe::estimate_partition_list_lanes(7, cp, cp.al_max_mode7 as i32, &lanes);
             for (k, &b) in alpha_blocks.iter().enumerate() {
                 set_plan_list(&mut want, &mut mask, b * PLAN_STRIDE + 85, &lists[k]);
             }
         }
-        if !opaque_blocks.is_empty()
-            && (cp.use_mode[1] || cp.use_mode[3])
-            && cp.op_max_mode13 != 1
+        if !opaque_blocks.is_empty() && (cp.use_mode[1] || cp.use_mode[3]) && cp.op_max_mode13 != 1
         {
             let lanes: Vec<&[[i32; 4]; 16]> = opaque_blocks.iter().map(|&b| &pxs[b]).collect();
             let lists =
@@ -3072,9 +3077,7 @@ impl Harness {
                 bucket_blocks += nb as u32;
                 let want = encode_blocks_cpu(&cp, &t, blocks);
                 let classes: Vec<u32> = (0..nb)
-                    .map(|b| {
-                        group_signature(&blocks[b * 64..(b + 1) * 64], 1) as u32
-                    })
+                    .map(|b| group_signature(&blocks[b * 64..(b + 1) * 64], 1) as u32)
                     .collect();
                 // Stage 1: the three plan passes, scratch threaded through.
                 let mut scratch = vec![0u8; nb * PLAN_STRIDE * 4];

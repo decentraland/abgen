@@ -602,8 +602,7 @@ pub mod probe {
         max_solutions: i32,
         lanes_px: &[&[[i32; 4]; 16]],
     ) -> Vec<SolList> {
-        let cols: Vec<[super::ColorI; 16]> =
-            lanes_px.iter().map(|px| colors_from(px)).collect();
+        let cols: Vec<[super::ColorI; 16]> = lanes_px.iter().map(|px| colors_from(px)).collect();
         let lanes: Vec<&[super::ColorI; 16]> = cols.iter().collect();
         let mut out = vec![super::SolutionList::new(); lanes_px.len()];
         super::estimate_partition_list_group(mode, &lanes, cp, max_solutions, &mut out);
