@@ -1,5 +1,5 @@
 [package]
-name = "abgen-wasm-poc"
+name = "abgen-wasm"
 version = "0.11.3"
 edition = "2021"
 publish = false

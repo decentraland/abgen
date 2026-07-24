@@ -289,6 +289,7 @@ fn synthetic_glb() -> Vec<u8> {
             cutoff: 0.5,
             image: Some(0),
             double_sided: false,
+            ..Default::default()
         }],
         images: vec![LodImage {
             bytes: tiny_png(),
@@ -297,6 +298,77 @@ fn synthetic_glb() -> Vec<u8> {
         log: Vec::new(),
     })
     .unwrap()
+}
+
+#[test]
+fn post_order_reingest_and_atlas_on_emitted_raw_glb() {
+    assert!(!GenerateParams::default().bake_after_simplify);
+    let raw = LodModel {
+        root_name: "raw".to_string(),
+        primitives: vec![
+            LodPrimitive {
+                positions: vec![[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 0.0, 4.0]],
+                normals: vec![[0.0, 1.0, 0.0]; 3],
+                uvs: vec![[0.25, 0.25], [1.75, 0.25], [0.25, 1.75]],
+                indices: vec![0, 1, 2],
+                material: 0,
+                ..Default::default()
+            },
+            LodPrimitive {
+                positions: vec![[0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [0.0, 2.0, 0.0]],
+                normals: vec![[0.0, 0.0, 1.0]; 3],
+                uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+                indices: vec![0, 1, 2],
+                material: 1,
+                ..Default::default()
+            },
+        ],
+        materials: vec![
+            LodMaterial {
+                name: "ground".to_string(),
+                class: AlphaClass::Opaque,
+                base_color: [0.9, 0.8, 0.7, 1.0],
+                cutoff: 0.5,
+                image: Some(0),
+                double_sided: false,
+                ..Default::default()
+            },
+            LodMaterial {
+                name: "glass".to_string(),
+                class: AlphaClass::Blend,
+                base_color: [0.2, 0.4, 0.9, 0.5],
+                cutoff: 0.5,
+                image: None,
+                double_sided: true,
+                ..Default::default()
+            },
+        ],
+        images: vec![LodImage {
+            bytes: tiny_png(),
+            mime: "image/png".to_string(),
+        }],
+        log: Vec::new(),
+    };
+    let glb = emit_glb(&raw).unwrap();
+    let back = model::from_glb_bytes(&glb, "raw").unwrap();
+    assert_eq!(back.materials.len(), 2);
+    for (a, b) in raw.materials.iter().zip(back.materials.iter()) {
+        assert_eq!(a.base_color, b.base_color);
+        assert_eq!(a.class, b.class);
+        assert_eq!(a.double_sided, b.double_sided);
+    }
+    let atlased = atlas::atlas_with(&back, 64, 0, atlas::AtlasMode::Native, false).unwrap();
+    assert_eq!(atlased.total_tris(), raw.total_tris());
+    assert!(atlased
+        .materials
+        .iter()
+        .all(|m| m.name.starts_with("TextureBakeResult")));
+    for p in &atlased.primitives {
+        for uv in &p.uvs {
+            assert!((-1e-6..=1.0 + 1e-6).contains(&(uv[0] as f64)), "{uv:?}");
+            assert!((-1e-6..=1.0 + 1e-6).contains(&(uv[1] as f64)), "{uv:?}");
+        }
+    }
 }
 
 #[test]
@@ -323,6 +395,7 @@ fn empty_scene_bundle_passes_empty_gate_and_fails_content_gate() {
             base: (55, -76),
             timestamp: None,
             vertical_override: None,
+            fidelity: false,
         }),
         ..Default::default()
     };
@@ -411,6 +484,7 @@ fn multi_platform_bundles_union_manifest_and_target_platform_gate() {
             base: (8, -83),
             timestamp: None,
             vertical_override: None,
+            fidelity: false,
         }),
         ..Default::default()
     };
@@ -554,6 +628,7 @@ fn multi_level_sources_build_both_levels_from_one_bake() {
             base: (8, -83),
             timestamp: None,
             vertical_override: None,
+            fidelity: false,
         }),
         ..Default::default()
     };
@@ -626,6 +701,7 @@ fn self_gate_passes_on_synthetic_lod_bundle_and_catches_mismatches() {
             base: (8, -83),
             timestamp: None,
             vertical_override: None,
+            fidelity: false,
         }),
         ..Default::default()
     };
@@ -725,6 +801,7 @@ fn orphan_material_is_dropped_from_lod_bundle() {
                 cutoff: 0.5,
                 image: Some(0),
                 double_sided: false,
+                ..Default::default()
             },
             LodMaterial {
                 name: "TextureBakeResult-mat-transparent".to_string(),
@@ -733,6 +810,7 @@ fn orphan_material_is_dropped_from_lod_bundle() {
                 cutoff: 0.5,
                 image: Some(0),
                 double_sided: false,
+                ..Default::default()
             },
         ],
         images: vec![LodImage {
@@ -752,6 +830,7 @@ fn orphan_material_is_dropped_from_lod_bundle() {
             base: (1, 2),
             timestamp: None,
             vertical_override: None,
+            fidelity: false,
         }),
         ..Default::default()
     };

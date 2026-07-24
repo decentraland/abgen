@@ -11,8 +11,43 @@ const sha256 = async (data) =>
   [...new Uint8Array(await crypto.subtle.digest('SHA-256', data))]
     .map((b) => b.toString(16).padStart(2, '0')).join('');
 
+// WebGPU bridge: one GPU worker (bit-exact qualified at init) services all
+// convert workers over a SharedArrayBuffer. Needs crossOriginIsolated (COOP/
+// COEP — server.py sends them) + WebGPU + Atomics.waitAsync; anything missing
+// or failing degrades to the CPU-SIMD path with a note.
+async function initGpu(opts, cb) {
+  if (opts.gpu === false) return null;
+  const off = (why) => {
+    cb({ type: 'event', data: { ev: 'note', msg: `WebGPU encode: off (${why}) — CPU-SIMD path active` } });
+    return null;
+  };
+  if (typeof SharedArrayBuffer === 'undefined'
+      || (typeof crossOriginIsolated !== 'undefined' && !crossOriginIsolated)) {
+    return off('needs crossOriginIsolated; serve with COOP/COEP headers');
+  }
+  if (typeof navigator === 'undefined' || !navigator.gpu) return off('no WebGPU in this browser');
+  if (typeof Atomics.waitAsync !== 'function') return off('no Atomics.waitAsync');
+  const sab = new SharedArrayBuffer(16 + (64 << 20) + 4096);
+  const spawnGpu = opts.spawnGpu
+    || (() => new Worker(new URL('./gpu-worker.js', import.meta.url), { type: 'module' }));
+  const w = spawnGpu();
+  const res = await new Promise((resolve) => {
+    const t = setTimeout(() => resolve({ ok: false, err: 'gpu worker init timeout' }), 30000);
+    w.onmessage = (e) => { clearTimeout(t); resolve(e.data); };
+    w.onerror = (e) => { clearTimeout(t); resolve({ ok: false, err: String((e && (e.message || e.type)) || e) }); };
+    w.postMessage({ cmd: 'init', sab });
+  });
+  if (!res.ok) {
+    try { w.terminate(); } catch (_) {}
+    return off(res.err);
+  }
+  cb({ type: 'event', data: { ev: 'note', msg: `WebGPU encode: ON — ${res.adapter} (bit-exact qualified)` } });
+  return { sab, w };
+}
+
 export async function runConvert(opts, cb) {
   const module = await opts.module;
+  const gpu = await initGpu(opts, cb);
   const spawn = opts.spawn || (() => new Worker(new URL('./worker.js', import.meta.url)));
   const files = opts.files;
   const table = await Promise.all(files.map(async (f) => [f.name, await sha256(f.data)]));
@@ -63,7 +98,7 @@ export async function runConvert(opts, cb) {
       const w = spawn();
       w.onmessage = (e) => pool.onMsg(slot, e.data);
       w.onerror = (e) => pool.onCrash(slot, String((e && (e.message || e.type)) || e));
-      w.postMessage({ cmd: 'init', module });
+      w.postMessage({ cmd: 'init', module, sab: gpu && gpu.sab });
       slot.w = w;
     };
     slot.attach();
@@ -78,6 +113,7 @@ export async function runConvert(opts, cb) {
 
   const finish = (code, workers, jobCount) => {
     for (const s of slots) { try { s.w.terminate(); } catch (_) {} }
+    if (gpu) { try { gpu.w.terminate(); } catch (_) {} }
     cb({ type: 'done', code, workers, jobs: jobCount });
   };
 
@@ -100,7 +136,10 @@ export async function runConvert(opts, cb) {
   const wantLod = !!opts.lod;
   const jobCount = jobs.length + (wantLod ? 1 : 0);
   const hc = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
-  const N = Math.max(1, Math.min(opts.size || hc, jobCount, 8));
+  // Default to 3/4 of the machine's cores: enough to saturate the encode
+  // without starving the page, the GPU worker, and the rest of the system.
+  const cap = Math.max(1, Math.ceil((hc * 3) / 4));
+  const N = Math.max(1, Math.min(opts.size || cap, jobCount, cap));
   cb({ type: 'event', data: { ev: 'note', msg: `worker pool: ${N} workers, ${jobCount} job(s)` } });
   while (slots.length < N) mkSlot(slots.length);
 
@@ -135,7 +174,7 @@ export async function runConvert(opts, cb) {
 
   built.sort();
   const manifest = {
-    version: 'v-wasm-poc',
+    version: 'v-abgen-wasm',
     files: [...built.filter((b, i) => i === 0 || b !== built[i - 1]), 'dcl'],
     exitCode: failures ? 12 : 0,
     contentServerUrl: 'wasm://in-browser',

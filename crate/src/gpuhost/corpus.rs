@@ -540,6 +540,7 @@ fn process_texture(
                 h as usize,
                 prof.target_w as usize,
                 prof.target_h as usize,
+                prof.color_space == 1,
             ),
             prof.target_w,
             prof.target_h,

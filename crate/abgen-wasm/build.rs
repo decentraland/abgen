@@ -3,9 +3,9 @@ fn main() {
         return;
     }
     let libc_dir = std::env::var("WASI_LIBC_LIB")
-        .expect("WASI_LIBC_LIB not set — build inside wasm-poc/toolchain's devShell");
+        .expect("WASI_LIBC_LIB not set — build inside abgen-wasm/toolchain's devShell");
     let libcxx_dir = std::env::var("WASI_LIBCXX_LIB")
-        .expect("WASI_LIBCXX_LIB not set — build inside wasm-poc/toolchain's devShell");
+        .expect("WASI_LIBCXX_LIB not set — build inside abgen-wasm/toolchain's devShell");
     println!("cargo:rustc-link-search=native={libc_dir}");
     println!("cargo:rustc-link-search=native={libcxx_dir}");
     println!("cargo:rustc-link-lib=static=setjmp");

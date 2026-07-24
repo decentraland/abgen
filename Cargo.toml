@@ -6,5 +6,5 @@ exclude = [
     "crate/third_party/crunch",
     "crate/third_party/libjpeg9c",
     "crate/kernel-ptx",
-    "crate/wasm-poc",
+    "crate/abgen-wasm",
 ]

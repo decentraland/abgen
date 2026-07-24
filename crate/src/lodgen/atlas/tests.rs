@@ -1,5 +1,7 @@
 use super::pack::canvas_size;
+use super::tile::{srgb_decode, srgb_encode};
 use super::*;
+use crate::bc7_pure::{linear_to_srgb_u8, srgb_to_linear_u8};
 
 fn png_bytes(img: &RgbaImage) -> Vec<u8> {
     let mut cur = std::io::Cursor::new(Vec::new());
@@ -38,6 +40,7 @@ fn mat(name: &str, class: AlphaClass, base_color: [f64; 4], image: Option<usize>
         cutoff: 0.5,
         image,
         double_sided: false,
+        ..Default::default()
     }
 }
 
@@ -243,11 +246,41 @@ fn repeat_bake_2x2_pixels() {
 }
 
 #[test]
-fn span_three_falls_back_to_solid() {
+fn span_three_bakes_three_repeats() {
     let (png, colors) = quad_image();
     let m = model_of(
         vec![mat("a", AlphaClass::Mask, [1.0; 4], Some(0))],
         vec![prim(0, vec![[0.0, 0.0], [3.0, 0.0], [0.0, 3.0]])],
+        vec![png],
+    );
+    let out = atlas_with(&m, 64, 2, AtlasMode::Native, false).unwrap();
+    let line = log_line(&out, "class=mask");
+    assert!(line.contains("fallbacks=0"), "{line}");
+    assert!(line.contains("unique=1"), "{line}");
+    let canvas = decode(&out.images[0]);
+    let s = canvas.width() as f64;
+    let uv0 = out.primitives[0].uvs[0];
+    let rx = (uv0[0] as f64 * s).round() as u32;
+    let ry = (uv0[1] as f64 * s).round() as u32;
+    for py in 0..6u32 {
+        for px in 0..6u32 {
+            let want = colors[((py % 2) * 2 + px % 2) as usize];
+            let got = canvas.get_pixel(rx + px, ry + py).0;
+            assert_eq!(got, want, "baked pixel ({px},{py})");
+        }
+    }
+}
+
+fn fallback_uvs() -> Vec<[f32; 2]> {
+    vec![[f32::NAN, f32::NAN]; 3]
+}
+
+#[test]
+fn non_finite_uvs_fall_back_to_average_solid() {
+    let (png, colors) = quad_image();
+    let m = model_of(
+        vec![mat("a", AlphaClass::Mask, [1.0; 4], Some(0))],
+        vec![prim(0, fallback_uvs())],
         vec![png],
     );
     let out = atlas(&m, 64, 2).unwrap();
@@ -256,19 +289,100 @@ fn span_three_falls_back_to_solid() {
     assert_eq!(uvs[0], uvs[2]);
     let line = log_line(&out, "class=mask");
     assert!(line.contains("fallbacks=1"), "{line}");
-    assert!(log_line(&out, "WARN fallback").contains("3.000"));
+    assert!(log_line(&out, "WARN fallback").contains("non-finite"));
     let canvas = decode(&out.images[0]);
     let s = canvas.width() as f64;
     let cx = (uvs[0][0] as f64 * s) as u32;
     let cy = (uvs[0][1] as f64 * s) as u32;
-    let mut avg = [0f64; 4];
+    let mut avg = [0f64; 3];
     for c in colors {
-        for ch in 0..4 {
-            avg[ch] += c[ch] as f64 / 4.0;
+        for ch in 0..3 {
+            avg[ch] += srgb_to_linear_u8(c[ch]) as f64 / 4.0;
         }
     }
-    let want = avg.map(|v| v.round() as u8);
+    let mut want = [255u8; 4];
+    for ch in 0..3 {
+        want[ch] = linear_to_srgb_u8(avg[ch] as f32);
+    }
     assert_eq!(canvas.get_pixel(cx, cy).0, want);
+}
+
+#[test]
+fn fallback_average_ignores_invisible_texels() {
+    let mut img = RgbaImage::new(16, 16);
+    for p in img.pixels_mut() {
+        *p = image::Rgba([0, 0, 0, 0]);
+    }
+    img.put_pixel(3, 3, image::Rgba([255, 255, 255, 255]));
+    let m = model_of(
+        vec![mat("a", AlphaClass::Blend, [1.0; 4], Some(0))],
+        vec![prim(0, fallback_uvs())],
+        vec![png_bytes(&img)],
+    );
+    let out = atlas(&m, 64, 2).unwrap();
+    let canvas = decode(&out.images[0]);
+    let s = canvas.width() as f64;
+    let uv0 = out.primitives[0].uvs[0];
+    let px = canvas
+        .get_pixel((uv0[0] as f64 * s) as u32, (uv0[1] as f64 * s) as u32)
+        .0;
+    assert_eq!(&px[0..3], &[255, 255, 255], "ghost pane colour: {px:?}");
+    assert_eq!(px[3], 1);
+}
+
+#[test]
+fn fully_transparent_fallback_deterministic() {
+    let build = || {
+        let mut img = RgbaImage::new(8, 8);
+        for (x, _y, p) in img.enumerate_pixels_mut() {
+            let v = if x < 4 { 0 } else { 255 };
+            *p = image::Rgba([v, v, v, 0]);
+        }
+        model_of(
+            vec![mat("a", AlphaClass::Blend, [1.0; 4], Some(0))],
+            vec![prim(0, fallback_uvs())],
+            vec![png_bytes(&img)],
+        )
+    };
+    let out1 = atlas(&build(), 64, 2).unwrap();
+    let out2 = atlas(&build(), 64, 2).unwrap();
+    assert_eq!(out1.images[0].bytes, out2.images[0].bytes);
+    let canvas = decode(&out1.images[0]);
+    let g = linear_to_srgb_u8(0.5);
+    assert_eq!(canvas.get_pixel(1, 1).0, [g, g, g, 0]);
+}
+
+#[test]
+fn blend_downscale_does_not_drag_hidden_rgb() {
+    let mut img = RgbaImage::new(128, 64);
+    for (x, _y, p) in img.enumerate_pixels_mut() {
+        *p = if x < 64 {
+            image::Rgba([255, 0, 0, 255])
+        } else {
+            image::Rgba([0, 255, 0, 0])
+        };
+    }
+    let m = model_of(
+        vec![mat("a", AlphaClass::Blend, [1.0; 4], Some(0))],
+        vec![prim(0, tri_uvs())],
+        vec![png_bytes(&img)],
+    );
+    let out = atlas(&m, 64, 2).unwrap();
+    let canvas = decode(&out.images[0]);
+    for p in canvas.pixels() {
+        assert_eq!(p.0[1], 0, "hidden green leaked: {:?}", p.0);
+        if p.0[3] > 0 {
+            assert_eq!(p.0[0], 255, "visible red thinned: {:?}", p.0);
+        }
+    }
+}
+
+#[test]
+fn srgb_roundtrip_all_bytes() {
+    for v in 0u16..=255 {
+        let enc = (srgb_encode(srgb_decode(v as f64 / 255.0)) * 255.0).round() as u16;
+        assert_eq!(enc, v);
+    }
 }
 
 #[test]
@@ -340,7 +454,7 @@ fn untextured_solid_tile_color() {
     let uv0 = out.primitives[0].uvs[0];
     let x = (uv0[0] as f64 * s) as u32;
     let y = (uv0[1] as f64 * s) as u32;
-    assert_eq!(canvas.get_pixel(x, y).0, [0, 128, 255, 255]);
+    assert_eq!(canvas.get_pixel(x, y).0, [0, 188, 255, 255]);
     assert_eq!(out.primitives[0].uvs[0], out.primitives[0].uvs[1]);
 }
 
@@ -398,6 +512,10 @@ fn mimes_decode_back() {
         vec![png],
     );
     let out = atlas(&m, 1024, 2).unwrap();
+    assert_eq!(out.images[0].mime, "image/png");
+    assert_eq!(out.images[1].mime, "image/png");
+    assert_eq!(&out.images[0].bytes[0..4], &[0x89, b'P', b'N', b'G']);
+    let out = atlas(&m, 256, 2).unwrap();
     assert_eq!(out.images[0].mime, "image/jpeg");
     assert_eq!(out.images[1].mime, "image/png");
     assert_eq!(&out.images[0].bytes[0..3], &[0xFF, 0xD8, 0xFF]);
@@ -509,7 +627,7 @@ fn full_bleed_solid_fills_canvas() {
     assert_eq!(canvas.height(), 64);
     for &(x, y) in &[(0u32, 0u32), (63, 0), (0, 63), (63, 63), (31, 31)] {
         let px = canvas.get_pixel(x, y).0;
-        assert_eq!(&px[0..3], &[51, 102, 153], "pixel ({x},{y})");
+        assert_eq!(&px[0..3], &[124, 170, 203], "pixel ({x},{y})");
     }
 }
 
@@ -588,12 +706,12 @@ fn adaptive_single_solid_tile_is_8x8() {
         vec![prim(0, tri_uvs())],
         vec![],
     );
-    let out = atlas_with(&m, 512, 0, AtlasMode::Adaptive).unwrap();
+    let out = atlas_with(&m, 512, 0, AtlasMode::Adaptive, false).unwrap();
     let canvas = decode(&out.images[0]);
     assert_eq!(canvas.width(), 8);
     assert_eq!(canvas.height(), 8);
-    assert_eq!(&canvas.get_pixel(4, 4).0[0..3], &[51, 102, 153]);
-    let fixed = atlas_with(&m, 512, 0, AtlasMode::FullBleed).unwrap();
+    assert_eq!(&canvas.get_pixel(4, 4).0[0..3], &[124, 170, 203]);
+    let fixed = atlas_with(&m, 512, 0, AtlasMode::FullBleed, false).unwrap();
     assert_eq!(decode(&fixed.images[0]).width(), 512);
 }
 
@@ -620,12 +738,12 @@ fn native_single_solid_fills_budget() {
         vec![prim(0, tri_uvs())],
         vec![],
     );
-    let out = atlas_with(&m, 256, 0, AtlasMode::Native).unwrap();
+    let out = atlas_with(&m, 256, 0, AtlasMode::Native, false).unwrap();
     let canvas = decode(&out.images[0]);
     assert_eq!(canvas.width(), 256);
     assert_eq!(canvas.height(), 256);
     for &(x, y) in &[(0u32, 0u32), (255, 0), (0, 255), (255, 255), (128, 128)] {
-        assert_eq!(&canvas.get_pixel(x, y).0[0..3], &[51, 102, 153]);
+        assert_eq!(&canvas.get_pixel(x, y).0[0..3], &[124, 170, 203]);
     }
 }
 
@@ -637,7 +755,7 @@ fn native_small_image_pads_canvas_to_budget() {
         vec![prim(0, vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])],
         vec![png],
     );
-    let out = atlas_with(&m, 256, 0, AtlasMode::Native).unwrap();
+    let out = atlas_with(&m, 256, 0, AtlasMode::Native, false).unwrap();
     let canvas = decode(&out.images[0]);
     assert_eq!(canvas.width(), 256);
     assert_eq!(canvas.height(), 256);
@@ -659,13 +777,13 @@ fn native_all_classes_share_budget_size() {
         vec![prim(0, tri_uvs()), prim(1, tri_uvs()), prim(2, tri_uvs())],
         vec![png],
     );
-    let out = atlas_with(&m, 256, 0, AtlasMode::Native).unwrap();
+    let out = atlas_with(&m, 256, 0, AtlasMode::Native, false).unwrap();
     assert_eq!(out.images.len(), 3);
     for img in &out.images {
         let d = decode(img);
         assert_eq!((d.width(), d.height()), (256, 256));
     }
-    let adaptive = atlas_with(&m, 256, 0, AtlasMode::Adaptive).unwrap();
+    let adaptive = atlas_with(&m, 256, 0, AtlasMode::Adaptive, false).unwrap();
     let dims: Vec<u32> = adaptive.images.iter().map(|i| decode(i).width()).collect();
     assert!(dims.iter().any(|&w| w < 256), "{dims:?}");
 }
@@ -686,7 +804,7 @@ fn native_multi_tile_canvas_stays_budget() {
         prims.push(prim(i as usize, vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]));
     }
     let m = model_of(mats, prims, images);
-    let out = atlas_with(&m, 256, 0, AtlasMode::Native).unwrap();
+    let out = atlas_with(&m, 256, 0, AtlasMode::Native, false).unwrap();
     let canvas = decode(&out.images[0]);
     assert_eq!(canvas.width(), 256);
     assert_eq!(canvas.height(), 256);
@@ -704,7 +822,7 @@ fn adaptive_crops_single_image_tile_to_uv_window() {
         vec![prim(0, vec![[0.25, 0.25], [0.3, 0.25], [0.25, 0.3]])],
         vec![png],
     );
-    let out = atlas_with(&m, 512, 0, AtlasMode::Adaptive).unwrap();
+    let out = atlas_with(&m, 512, 0, AtlasMode::Adaptive, false).unwrap();
     let canvas = decode(&out.images[0]);
     assert_eq!(canvas.width(), 8);
     assert_eq!(canvas.height(), 8);
@@ -727,7 +845,7 @@ fn adaptive_full_span_single_image_keeps_native_size() {
         vec![prim(0, vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])],
         vec![png],
     );
-    let out = atlas_with(&m, 512, 0, AtlasMode::Adaptive).unwrap();
+    let out = atlas_with(&m, 512, 0, AtlasMode::Adaptive, false).unwrap();
     let canvas = decode(&out.images[0]);
     assert_eq!(canvas.width(), 32);
     assert_eq!(canvas.get_pixel(0, 0).0, [10, 200, 30, 255]);
@@ -749,7 +867,7 @@ fn adaptive_canvas_shrinks_to_packed_extent() {
         prims.push(prim(i as usize, vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]));
     }
     let m = model_of(mats, prims, images);
-    let out = atlas_with(&m, 512, 0, AtlasMode::Adaptive).unwrap();
+    let out = atlas_with(&m, 512, 0, AtlasMode::Adaptive, false).unwrap();
     let canvas = decode(&out.images[0]);
     assert!(
         canvas.width() <= 64,
@@ -786,6 +904,324 @@ fn weld_merges_one_ulp_normal_duplicates_only() {
     assert_eq!(p.normals[0], [-1.0, 0.0, 4.371_138_5e-8]);
 }
 
+fn area_quad(material: usize, size: f32) -> LodPrimitive {
+    LodPrimitive {
+        positions: vec![
+            [0.0, 0.0, 0.0],
+            [size, 0.0, 0.0],
+            [size, 0.0, size],
+            [0.0, 0.0, size],
+        ],
+        normals: vec![[0.0, 1.0, 0.0]; 4],
+        uvs: vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+        indices: vec![0, 1, 2, 0, 2, 3],
+        material,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn area_weighted_rects_follow_world_area_with_floor() {
+    let heavy_png = flat_image(128, 128, [200, 40, 40, 255]);
+    let light_png = flat_image(128, 128, [40, 200, 40, 255]);
+    let m = model_of(
+        vec![
+            mat("heavy", AlphaClass::Opaque, [1.0; 4], Some(0)),
+            mat("light", AlphaClass::Opaque, [1.0; 4], Some(1)),
+        ],
+        vec![area_quad(0, 100.0), area_quad(1, 1.0)],
+        vec![heavy_png, light_png],
+    );
+    let (_, tables) = atlas_with_rects(&m, 256, 2, AtlasMode::Native, false).unwrap();
+    let rects = &tables[0].rects;
+    assert_eq!(rects.len(), 2);
+    let heavy = rects[0];
+    let light = rects[1];
+    assert_eq!((heavy[2], heavy[3]), (128, 128), "{rects:?}");
+    assert_eq!((light[2], light[3]), (16, 16), "{rects:?}");
+}
+
+#[test]
+fn degenerate_weight_pool_keeps_legacy_scaling() {
+    let a_png = flat_image(8, 8, [200, 40, 40, 255]);
+    let b_png = flat_image(8, 8, [40, 200, 40, 255]);
+    let build = || {
+        model_of(
+            vec![
+                mat("a", AlphaClass::Opaque, [1.0; 4], Some(0)),
+                mat("b", AlphaClass::Opaque, [1.0; 4], Some(1)),
+            ],
+            vec![prim(0, tri_uvs()), prim(1, tri_uvs())],
+            vec![a_png.clone(), b_png.clone()],
+        )
+    };
+    let (out1, tables) = atlas_with_rects(&build(), 256, 2, AtlasMode::Native, false).unwrap();
+    let (out2, _) = atlas_with_rects(&build(), 256, 2, AtlasMode::Native, false).unwrap();
+    assert_eq!(out1.images[0].bytes, out2.images[0].bytes);
+    for r in &tables[0].rects {
+        assert_eq!((r[2], r[3]), (8, 8), "{:?}", tables[0].rects);
+    }
+}
+
+#[test]
+fn uncapped_reps_bake_bounded_and_deterministic() {
+    let (png, colors) = quad_image();
+    let build = || {
+        model_of(
+            vec![mat("a", AlphaClass::Mask, [1.0; 4], Some(0))],
+            vec![prim(0, vec![[0.0, 0.0], [300.0, 0.0], [0.0, 300.0]])],
+            vec![png.clone()],
+        )
+    };
+    let out = atlas_with(&build(), 64, 2, AtlasMode::Native, false).unwrap();
+    let line = log_line(&out, "class=mask");
+    assert!(line.contains("fallbacks=0"), "{line}");
+    let out2 = atlas_with(&build(), 64, 2, AtlasMode::Native, false).unwrap();
+    assert_eq!(out.images[0].bytes, out2.images[0].bytes);
+    let canvas = decode(&out.images[0]);
+    let mut avg = [0f64; 3];
+    for c in colors {
+        for ch in 0..3 {
+            avg[ch] += srgb_to_linear_u8(c[ch]) as f64 / 4.0;
+        }
+    }
+    let mut want = [255u8; 4];
+    for ch in 0..3 {
+        want[ch] = linear_to_srgb_u8(avg[ch] as f32);
+    }
+    assert_eq!(canvas.get_pixel(5, 5).0, want);
+}
+
+#[test]
+fn fidelity_splits_metal_bucket_with_tri_weighted_floats() {
+    let png = flat_image(8, 8, [120, 120, 120, 255]);
+    let build = || {
+        let mut gold = mat("gold", AlphaClass::Opaque, [1.0; 4], Some(0));
+        gold.metallic = 1.0;
+        gold.roughness = 0.2;
+        let mut steel = mat("steel", AlphaClass::Opaque, [0.5, 0.5, 0.5, 1.0], Some(0));
+        steel.metallic = 0.6;
+        steel.roughness = 0.4;
+        let wall = mat("wall", AlphaClass::Opaque, [1.0; 4], Some(0));
+        model_of(
+            vec![gold, steel, wall],
+            vec![prim(0, tri_uvs()), prim(1, tri_uvs()), prim(2, tri_uvs())],
+            vec![png.clone()],
+        )
+    };
+    let fid = atlas_with(&build(), 64, 2, AtlasMode::Native, true).unwrap();
+    assert_eq!(fid.materials.len(), 2);
+    let metal = fid
+        .materials
+        .iter()
+        .find(|m| m.name == "TextureBakeResult-mat-metal")
+        .unwrap();
+    assert_eq!(metal.class, AlphaClass::Opaque);
+    assert!((metal.metallic - 0.8).abs() < 1e-9, "{}", metal.metallic);
+    assert!((metal.roughness - 0.3).abs() < 1e-9, "{}", metal.roughness);
+    assert!(!metal.double_sided);
+    assert_eq!(fid.images.len(), 2);
+    let nonmetal = fid
+        .materials
+        .iter()
+        .find(|m| m.name == "TextureBakeResult-mat")
+        .unwrap();
+    assert_eq!(nonmetal.metallic, 0.0);
+    assert_eq!(nonmetal.roughness, 1.0);
+    let line = log_line(&fid, "class=metal");
+    assert!(line.contains("TextureBakeResult-mat-metal"), "{line}");
+
+    let plain = atlas_with(&build(), 64, 2, AtlasMode::Native, false).unwrap();
+    assert_eq!(plain.materials.len(), 1);
+    assert_eq!(plain.materials[0].metallic, 0.0);
+    assert_eq!(plain.images.len(), 1);
+}
+
+#[test]
+fn mr_repack_gltf_orm_to_unity_r_a() {
+    let mut img = RgbaImage::new(2, 2);
+    for p in img.pixels_mut() {
+        *p = image::Rgba([10, 90, 204, 255]);
+    }
+    let px = mr_pixels(&img, 0.5, 0.5);
+    assert_eq!(&px[0..4], &[102, 102, 102, 210]);
+    assert_eq!(mr_solid_bytes(1.0, 0.2), [255, 204]);
+    assert_eq!(mr_solid_bytes(0.6, 1.0), [153, 0]);
+    assert_eq!(mr_average(&px), [102, 210]);
+}
+
+#[test]
+fn metal_bucket_mr_plane_shares_rects_and_binds_map() {
+    let base_png = flat_image(8, 8, [255, 255, 255, 255]);
+    let orm_png = flat_image(8, 8, [10, 90, 204, 255]);
+    let build = || {
+        let mut rocket = mat("rocket", AlphaClass::Opaque, [1.0; 4], Some(0));
+        rocket.metallic = 1.0;
+        rocket.roughness = 1.0;
+        rocket.mr_image = Some(1);
+        let mut gold = mat("gold", AlphaClass::Opaque, [1.0; 4], Some(0));
+        gold.metallic = 1.0;
+        gold.roughness = 0.2;
+        let wall = mat("wall", AlphaClass::Opaque, [1.0; 4], Some(0));
+        model_of(
+            vec![rocket, gold, wall],
+            vec![prim(0, tri_uvs()), prim(1, tri_uvs()), prim(2, tri_uvs())],
+            vec![base_png.clone(), orm_png.clone()],
+        )
+    };
+    let fid = atlas_with(&build(), 64, 2, AtlasMode::Native, true).unwrap();
+    assert_eq!(fid.materials.len(), 2);
+    assert_eq!(fid.images.len(), 3);
+    let metal = fid
+        .materials
+        .iter()
+        .find(|m| m.name == "TextureBakeResult-mat-metal")
+        .unwrap();
+    assert_eq!(metal.mr_image, Some(2));
+    assert_eq!(metal.metallic, 1.0);
+    assert_eq!(metal.roughness, 0.0);
+    let nonmetal = fid
+        .materials
+        .iter()
+        .find(|m| m.name == "TextureBakeResult-mat")
+        .unwrap();
+    assert_eq!(nonmetal.mr_image, None);
+    let base = decode(&fid.images[1]);
+    let mrp = decode(&fid.images[2]);
+    assert_eq!((base.width(), base.height()), (mrp.width(), mrp.height()));
+    let line = log_line(&fid, "class=metal");
+    assert!(line.contains("unique=2"), "{line}");
+    assert!(line.contains("metal_rough_image=2 (image/png)"), "{line}");
+
+    let metal_prim = fid.primitives.iter().find(|p| p.material == 1).unwrap();
+    let s = mrp.width() as f64;
+    let uv0 = metal_prim.uvs[0];
+    let gx = (uv0[0] as f64 * s).round() as u32;
+    let gy = (uv0[1] as f64 * s).round() as u32;
+    assert_eq!(mrp.get_pixel(gx + 1, gy + 1).0, [204, 204, 204, 165]);
+    assert_eq!(base.get_pixel(gx + 1, gy + 1).0, [255, 255, 255, 255]);
+    let uv3 = metal_prim.uvs[3];
+    let cx = (uv3[0] as f64 * s) as u32;
+    let cy = (uv3[1] as f64 * s) as u32;
+    assert_eq!(mrp.get_pixel(cx, cy).0, [255, 255, 255, 204]);
+
+    let plain = atlas_with(&build(), 64, 2, AtlasMode::Native, false).unwrap();
+    assert_eq!(plain.materials.len(), 1);
+    assert_eq!(plain.images.len(), 1);
+    assert_eq!(plain.materials[0].mr_image, None);
+}
+
+#[test]
+fn fidelity_restores_alpha_class_double_sided_only() {
+    let png = flat_image(8, 8, [50, 100, 150, 200]);
+    let build = || {
+        let mut glass = mat("glass", AlphaClass::Blend, [1.0; 4], Some(0));
+        glass.double_sided = true;
+        let mut wall = mat("wall", AlphaClass::Opaque, [1.0; 4], Some(0));
+        wall.double_sided = true;
+        model_of(
+            vec![glass, wall],
+            vec![prim(0, tri_uvs()), prim(1, tri_uvs())],
+            vec![png.clone()],
+        )
+    };
+    let fid = atlas_with(&build(), 64, 2, AtlasMode::Native, true).unwrap();
+    let blend = fid
+        .materials
+        .iter()
+        .find(|m| m.class == AlphaClass::Blend)
+        .unwrap();
+    assert!(blend.double_sided);
+    let opaque = fid
+        .materials
+        .iter()
+        .find(|m| m.class == AlphaClass::Opaque)
+        .unwrap();
+    assert!(!opaque.double_sided, "opaque back-face restore is held");
+
+    let plain = atlas_with(&build(), 64, 2, AtlasMode::Native, false).unwrap();
+    assert!(plain.materials.iter().all(|m| !m.double_sided));
+}
+
+#[test]
+fn emission_atlas_shares_rects_and_bakes_factor() {
+    let base_png = flat_image(8, 8, [255, 255, 255, 255]);
+    let emis_png = flat_image(8, 8, [200, 40, 120, 255]);
+    let factor = [0.5, 1.0, 0.25];
+    let mut glow = mat("g", AlphaClass::Mask, [1.0; 4], Some(0));
+    glow.emissive = factor;
+    glow.emissive_image = Some(1);
+    let dark = mat("d", AlphaClass::Mask, [1.0; 4], Some(0));
+    let m = model_of(
+        vec![glow, dark],
+        vec![prim(0, tri_uvs()), prim(1, tri_uvs())],
+        vec![base_png, emis_png],
+    );
+    let out = atlas(&m, 64, 2).unwrap();
+    assert_eq!(out.images.len(), 2);
+    assert_eq!(out.materials.len(), 1);
+    assert_eq!(out.materials[0].image, Some(0));
+    assert_eq!(out.materials[0].emissive, [1.0; 3]);
+    assert_eq!(out.materials[0].emissive_image, Some(1));
+    let base = decode(&out.images[0]);
+    let emis = decode(&out.images[1]);
+    assert_eq!((base.width(), base.height()), (emis.width(), emis.height()));
+    let line = log_line(&out, "class=mask");
+    assert!(line.contains("unique=2"), "{line}");
+    assert!(line.contains("emissive_image=1"), "{line}");
+
+    let s = base.width() as f64;
+    let expect: [u8; 4] = {
+        let texel = [200.0, 40.0, 120.0];
+        let mut px = [0u8; 4];
+        for ch in 0..3 {
+            let lin = srgb_decode(texel[ch] / 255.0) * factor[ch];
+            px[ch] = (srgb_encode(lin) * 255.0).round() as u8;
+        }
+        px[3] = 255;
+        px
+    };
+    let uv0 = out.primitives[0].uvs[0];
+    let gx = (uv0[0] as f64 * s).round() as u32;
+    let gy = (uv0[1] as f64 * s).round() as u32;
+    assert_eq!(emis.get_pixel(gx + 1, gy + 1).0, expect);
+    assert_eq!(base.get_pixel(gx + 1, gy + 1).0, [255, 255, 255, 255]);
+    let uv3 = out.primitives[0].uvs[3];
+    let dx = (uv3[0] as f64 * s).round() as u32;
+    let dy = (uv3[1] as f64 * s).round() as u32;
+    assert_eq!(emis.get_pixel(dx + 1, dy + 1).0, [0, 0, 0, 255]);
+}
+
+#[test]
+fn no_glow_scene_emits_no_emission_image() {
+    let png = flat_image(8, 8, [10, 20, 30, 255]);
+    let m = model_of(
+        vec![mat("a", AlphaClass::Mask, [1.0; 4], Some(0))],
+        vec![prim(0, tri_uvs())],
+        vec![png],
+    );
+    let out = atlas(&m, 64, 2).unwrap();
+    assert_eq!(out.images.len(), 1);
+    assert_eq!(out.materials[0].emissive, [0.0; 3]);
+    assert_eq!(out.materials[0].emissive_image, None);
+}
+
+#[test]
+fn solid_glowing_material_gets_solid_emission_tile() {
+    let mut gm = mat("g", AlphaClass::Blend, [0.0, 0.5, 1.0, 1.0], None);
+    gm.emissive = [0.25, 0.5, 0.75];
+    let m = model_of(vec![gm], vec![prim(0, tri_uvs())], vec![]);
+    let out = atlas(&m, 64, 2).unwrap();
+    assert_eq!(out.images.len(), 2);
+    assert_eq!(out.materials[0].emissive_image, Some(1));
+    let emis = decode(&out.images[1]);
+    let s = emis.width() as f64;
+    let uv0 = out.primitives[0].uvs[0];
+    let x = (uv0[0] as f64 * s) as u32;
+    let y = (uv0[1] as f64 * s) as u32;
+    assert_eq!(emis.get_pixel(x, y).0, emissive_solid([0.25, 0.5, 0.75]));
+}
+
 #[test]
 fn atlased_model_emits_and_reparses() {
     let (png, _) = quad_image();
@@ -797,7 +1233,7 @@ fn atlased_model_emits_and_reparses() {
         vec![prim(0, tri_uvs()), prim(1, tri_uvs())],
         vec![png],
     );
-    let out = atlas(&m, 1024, 2).unwrap();
+    let out = atlas(&m, 256, 2).unwrap();
     let glb = crate::lodgen::emit::emit_glb(&out).unwrap();
     let back = super::super::model::from_glb_bytes(&glb, "root").unwrap();
     assert_eq!(back.total_tris(), out.total_tris());

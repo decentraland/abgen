@@ -94,6 +94,13 @@ struct MatKey {
     cutoff: u64,
     double_sided: bool,
     image: Option<usize>,
+    emissive: [u64; 3],
+    emissive_image: Option<usize>,
+    metallic: u64,
+    roughness: u64,
+    mr_image: Option<usize>,
+    normal_image: Option<usize>,
+    emissive_strength: u64,
 }
 
 struct Prepared {
@@ -148,6 +155,17 @@ fn intern_material(
         cutoff: f64::from_bits(key.cutoff),
         image: key.image,
         double_sided: key.double_sided,
+        emissive: [
+            f64::from_bits(key.emissive[0]),
+            f64::from_bits(key.emissive[1]),
+            f64::from_bits(key.emissive[2]),
+        ],
+        emissive_image: key.emissive_image,
+        metallic: f64::from_bits(key.metallic),
+        roughness: f64::from_bits(key.roughness),
+        mr_image: key.mr_image,
+        normal_image: key.normal_image,
+        emissive_strength: f64::from_bits(key.emissive_strength),
     });
     mat_by_key.insert(key, i);
     i
@@ -160,6 +178,13 @@ fn default_mat_key() -> MatKey {
         cutoff: 0.5f64.to_bits(),
         double_sided: false,
         image: None,
+        emissive: [0f64.to_bits(); 3],
+        emissive_image: None,
+        metallic: 0f64.to_bits(),
+        roughness: 1f64.to_bits(),
+        mr_image: None,
+        normal_image: None,
+        emissive_strength: 1f64.to_bits(),
     }
 }
 
@@ -275,6 +300,35 @@ fn walk_instance(
     }
 }
 
+fn effective_metallic(m: &crate::scene::Material, scene: &crate::scene::Scene) -> f64 {
+    let tex_mean = m
+        .metallic_roughness_image
+        .and_then(|tr| scene.images.get(tr.image))
+        .and_then(|img| img.as_ref())
+        .map(|img| {
+            let raw = img.as_raw();
+            if raw.is_empty() {
+                return 1.0;
+            }
+            let sum: u64 = raw.chunks_exact(4).map(|px| px[2] as u64).sum();
+            sum as f64 / (raw.len() / 4) as f64 / 255.0
+        })
+        .unwrap_or(1.0);
+    (m.metallic * tex_mean).clamp(0.0, 1.0)
+}
+
+fn mr_texture_usable(m: &crate::scene::Material) -> bool {
+    if m.metallic_roughness_image.is_none() || m.base_color_image.is_none() {
+        return false;
+    }
+    let uvc = |slot: &str| m.tex_uv_channels.get(slot).copied().unwrap_or(0);
+    if uvc("_BaseMap") != 0 || uvc("_MetallicGlossMap") != 0 {
+        return false;
+    }
+    let xf = |slot: &str| m.tex_transforms.get(slot).copied();
+    xf("_MetallicGlossMap") == xf("_BaseMap")
+}
+
 fn scene_needs_fallback(scene: &crate::scene::Scene) -> bool {
     scene.nodes.iter().any(|n| {
         n.primitives.iter().any(|p| {
@@ -294,6 +348,7 @@ pub fn assemble(
     placements: &[Placement],
     level: u32,
     cache_dir: Option<&Path>,
+    lane: model::MatLane,
 ) -> Result<LodModel> {
     let by_file = scene.content_by_file();
     let mut file_by_hash: HashMap<&str, &str> = HashMap::new();
@@ -309,6 +364,7 @@ pub fn assemble(
         &file_by_hash,
         placements,
         &fetch,
+        lane,
     )
 }
 
@@ -318,6 +374,7 @@ pub fn assemble_from(
     file_by_hash: &HashMap<&str, &str>,
     placements: &[Placement],
     fetch: &(dyn Fn(&str) -> Result<Vec<u8>> + Sync),
+    lane: model::MatLane,
 ) -> Result<LodModel> {
     if placements.is_empty() {
         bail!("assemble: no placements");
@@ -401,7 +458,7 @@ pub fn assemble_from(
         let mut mats = Vec::with_capacity(src.materials.len());
         let mut bakes = Vec::with_capacity(src.materials.len());
         for m in &src.materials {
-            let image = match m.base_color_image {
+            let mut intern = |tr: Option<crate::scene::TexRef>| match tr {
                 Some(tr) if tr.image < src.images.len() => {
                     if image_slot[tr.image].is_none() {
                         image_slot[tr.image] = Some(model::intern_image(
@@ -415,18 +472,61 @@ pub fn assemble_from(
                 }
                 _ => None,
             };
-            let key = MatKey {
-                base_color: [
-                    m.base_color[0].to_bits(),
-                    m.base_color[1].to_bits(),
-                    m.base_color[2].to_bits(),
-                    m.base_color[3].to_bits(),
-                ],
-                class: AlphaClass::from_alpha_mode(&m.alpha_mode),
-                cutoff: m.alpha_cutoff.to_bits(),
-                double_sided: m.double_sided,
-                image,
+            let image = intern(m.base_color_image);
+            let mut key = default_mat_key();
+            if lane.fidelity {
+                if mr_texture_usable(m) {
+                    key.metallic = m.metallic.to_bits();
+                    key.roughness = m.roughness.to_bits();
+                    key.mr_image = intern(m.metallic_roughness_image);
+                } else {
+                    key.metallic = effective_metallic(m, &src).to_bits();
+                    key.roughness = m.roughness.to_bits();
+                }
+            }
+            let (eff, emissive, emissive_image) = if lane.raw_materials {
+                let eimg = if m.emissive != [0.0; 3] {
+                    intern(m.emissive_image)
+                } else {
+                    None
+                };
+                key.metallic = m.metallic.to_bits();
+                key.roughness = m.roughness.to_bits();
+                key.mr_image = intern(m.metallic_roughness_image);
+                key.normal_image = intern(m.normal_image);
+                key.emissive_strength = m.emissive_strength.to_bits();
+                (m.base_color, m.emissive, eimg)
+            } else if lane.emissive_channel {
+                let e = model::scaled_emissive(m);
+                let eimg = if e != [0.0; 3] {
+                    intern(m.emissive_image)
+                } else {
+                    None
+                };
+                (m.base_color, e, eimg)
+            } else {
+                (
+                    model::fold_emissive(m.base_color, m.emissive),
+                    [0.0; 3],
+                    None,
+                )
             };
+            key.base_color = [
+                eff[0].to_bits(),
+                eff[1].to_bits(),
+                eff[2].to_bits(),
+                eff[3].to_bits(),
+            ];
+            key.class = AlphaClass::from_alpha_mode(&m.alpha_mode);
+            key.cutoff = m.alpha_cutoff.to_bits();
+            key.double_sided = m.double_sided;
+            key.image = image;
+            key.emissive = [
+                emissive[0].to_bits(),
+                emissive[1].to_bits(),
+                emissive[2].to_bits(),
+            ];
+            key.emissive_image = emissive_image;
             mats.push(intern_material(
                 key,
                 &m.name,
@@ -574,6 +674,7 @@ mod tests {
             cutoff: 0.5,
             image: None,
             double_sided: false,
+            ..Default::default()
         }
     }
 
@@ -714,6 +815,7 @@ mod tests {
             }],
             1,
             Some(&cache),
+            Default::default(),
         )
         .unwrap();
         assert_eq!(model.total_tris(), 1);
@@ -743,6 +845,7 @@ mod tests {
             std::slice::from_ref(&placement),
             1,
             Some(&cache),
+            Default::default(),
         )
         .unwrap();
         assert_eq!(model.primitives.len(), 1);
@@ -782,6 +885,7 @@ mod tests {
             }],
             1,
             Some(&cache),
+            Default::default(),
         )
         .unwrap();
         let (mn, mx) = model.bounds();
@@ -811,6 +915,7 @@ mod tests {
             }],
             1,
             Some(&cache),
+            Default::default(),
         )
         .unwrap();
         assert!((signed_volume(&plain) - 1.0).abs() < 1e-4);
@@ -824,6 +929,7 @@ mod tests {
             }],
             1,
             Some(&cache),
+            Default::default(),
         )
         .unwrap();
         assert!(
@@ -884,13 +990,29 @@ mod tests {
             glb_hash: Some(h.to_string()),
             ..Default::default()
         };
-        let plain = assemble(&dummy_client(), &ent, &[mk("hplain")], 1, Some(&cache)).unwrap();
+        let plain = assemble(
+            &dummy_client(),
+            &ent,
+            &[mk("hplain")],
+            1,
+            Some(&cache),
+            Default::default(),
+        )
+        .unwrap();
         let uv = plain.primitives[0].uvs[0];
         assert!(
             (uv[0] - 0.25).abs() < 1e-6 && (uv[1] - 0.5).abs() < 1e-6,
             "{uv:?}"
         );
-        let baked = assemble(&dummy_client(), &ent, &[mk("hxform")], 1, Some(&cache)).unwrap();
+        let baked = assemble(
+            &dummy_client(),
+            &ent,
+            &[mk("hxform")],
+            1,
+            Some(&cache),
+            Default::default(),
+        )
+        .unwrap();
         let uv = baked.primitives[0].uvs[0];
         assert!(
             (uv[0] - 0.6).abs() < 1e-5 && (uv[1] - 1.7).abs() < 1e-5,
@@ -923,6 +1045,7 @@ mod tests {
             ],
             1,
             Some(&cache),
+            Default::default(),
         )
         .unwrap();
         assert_eq!(model.images.len(), 1);
@@ -930,6 +1053,251 @@ mod tests {
         assert_eq!(model.materials[0].name, "matA");
         assert_eq!(model.primitives.len(), 2);
         assert!(model.primitives.iter().all(|p| p.material == 0));
+    }
+
+    #[test]
+    fn raw_materials_lane_keeps_source_truth_default_lane_normalizes() {
+        let base_png = tiny_png(4);
+        let mr_png = tiny_png(5);
+        let nrm_png = tiny_png(6);
+        let src = emit_glb(&LodModel {
+            root_name: "truth".to_string(),
+            primitives: vec![LodPrimitive {
+                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                normals: vec![[0.0, 0.0, 1.0]; 3],
+                uvs: vec![[0.25, 0.5], [1.0, 0.0], [0.0, 1.0]],
+                indices: vec![0, 1, 2],
+                material: 0,
+                ..Default::default()
+            }],
+            materials: vec![LodMaterial {
+                name: "Purple".to_string(),
+                base_color: [0.1854, 0.0007, 0.6921, 1.0],
+                image: Some(0),
+                double_sided: true,
+                roughness: 0.9,
+                mr_image: Some(1),
+                normal_image: Some(2),
+                emissive: [0.25, 0.5, 0.75],
+                emissive_strength: 2.0,
+                ..base_material()
+            }],
+            images: [&base_png, &mr_png, &nrm_png]
+                .iter()
+                .map(|b| LodImage {
+                    bytes: b.to_vec(),
+                    mime: "image/png".to_string(),
+                })
+                .collect(),
+            log: Vec::new(),
+        })
+        .unwrap();
+        let (mut json, bin) = chunks(&src);
+        json["materials"][0]["pbrMetallicRoughness"]
+            .as_object_mut()
+            .unwrap()
+            .remove("metallicFactor");
+        let src = rebuild(&json, &bin);
+
+        let cache = temp_cache("rawmat");
+        stage(&cache, "htruth", &src);
+        let ent = entity(&[("truth.glb", "htruth")]);
+        let place = Placement {
+            glb_hash: Some("htruth".to_string()),
+            ..Default::default()
+        };
+
+        let raw = assemble(
+            &dummy_client(),
+            &ent,
+            std::slice::from_ref(&place),
+            1,
+            Some(&cache),
+            model::MatLane {
+                raw_materials: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let m = &raw.materials[0];
+        assert_eq!(m.metallic, 1.0);
+        assert_eq!(m.roughness, 0.9);
+        assert_eq!(m.base_color, [0.1854, 0.0007, 0.6921, 1.0]);
+        assert_eq!(m.emissive, [0.25, 0.5, 0.75]);
+        assert_eq!(m.emissive_strength, 2.0);
+        assert!(m.double_sided);
+        assert!(m.mr_image.is_some());
+        assert!(m.normal_image.is_some());
+        assert_eq!(raw.images.len(), 3);
+
+        let glb = emit_glb(&raw).unwrap();
+        let (json, _) = chunks(&glb);
+        let mj = &json["materials"][0];
+        assert_eq!(
+            mj["pbrMetallicRoughness"]["metallicFactor"],
+            serde_json::json!(1.0)
+        );
+        assert!(mj["pbrMetallicRoughness"]
+            .get("metallicRoughnessTexture")
+            .is_some());
+        assert!(mj.get("normalTexture").is_some());
+        assert_eq!(mj["doubleSided"], serde_json::json!(true));
+        assert_eq!(
+            mj["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"],
+            serde_json::json!(2.0)
+        );
+
+        let plain = assemble(
+            &dummy_client(),
+            &ent,
+            std::slice::from_ref(&place),
+            1,
+            Some(&cache),
+            Default::default(),
+        )
+        .unwrap();
+        let m = &plain.materials[0];
+        assert_eq!(m.metallic, 0.0);
+        assert_eq!(m.roughness, 1.0);
+        assert_eq!(m.mr_image, None);
+        assert_eq!(m.normal_image, None);
+        assert_eq!(m.emissive_strength, 1.0);
+        assert_eq!(
+            m.base_color,
+            model::fold_emissive([0.1854, 0.0007, 0.6921, 1.0], [0.25, 0.5, 0.75])
+        );
+        assert_eq!(plain.images.len(), 1);
+    }
+
+    fn mr_test_glb() -> Vec<u8> {
+        let base_png = tiny_png(7);
+        let mut img = image::RgbaImage::new(4, 4);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([0, 90, 204, 255]);
+        }
+        let mut cur = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut cur, image::ImageFormat::Png).unwrap();
+        let mr_png = cur.into_inner();
+
+        emit_glb(&LodModel {
+            root_name: "met".to_string(),
+            primitives: vec![LodPrimitive {
+                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                normals: vec![[0.0, 0.0, 1.0]; 3],
+                uvs: vec![[0.25, 0.5], [1.0, 0.0], [0.0, 1.0]],
+                indices: vec![0, 1, 2],
+                material: 0,
+                ..Default::default()
+            }],
+            materials: vec![LodMaterial {
+                name: "Gold".to_string(),
+                image: Some(0),
+                metallic: 1.0,
+                roughness: 0.25,
+                mr_image: Some(1),
+                ..base_material()
+            }],
+            images: [&base_png, &mr_png]
+                .iter()
+                .map(|b| LodImage {
+                    bytes: b.to_vec(),
+                    mime: "image/png".to_string(),
+                })
+                .collect(),
+            log: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn assemble_lane(cache: &Path, hash: &str, lane: model::MatLane) -> LodModel {
+        let ent = entity(&[("met.glb", hash)]);
+        let place = Placement {
+            glb_hash: Some(hash.to_string()),
+            ..Default::default()
+        };
+        assemble(
+            &dummy_client(),
+            &ent,
+            std::slice::from_ref(&place),
+            1,
+            Some(cache),
+            lane,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn fidelity_lane_carries_usable_mr_texture_per_texel() {
+        let cache = temp_cache("mrcarry");
+        stage(&cache, "hmet", &mr_test_glb());
+
+        let fid = assemble_lane(
+            &cache,
+            "hmet",
+            model::MatLane {
+                fidelity: true,
+                ..Default::default()
+            },
+        );
+        let m = &fid.materials[0];
+        assert_eq!(m.metallic, 1.0);
+        assert_eq!(m.roughness, 0.25);
+        assert!(m.mr_image.is_some());
+        assert!(model::is_metal(m));
+        assert_eq!(fid.images.len(), 2);
+
+        let plain = assemble_lane(&cache, "hmet", Default::default());
+        assert_eq!(plain.materials[0].metallic, 0.0);
+        assert_eq!(plain.materials[0].roughness, 1.0);
+        assert_eq!(plain.materials[0].mr_image, None);
+        assert_eq!(plain.images.len(), 1);
+    }
+
+    #[test]
+    fn fidelity_lane_folds_mismatched_mr_texture_into_effective_metallic() {
+        let (mut json, bin) = chunks(&mr_test_glb());
+        json["materials"][0]["pbrMetallicRoughness"]["metallicRoughnessTexture"]["texCoord"] =
+            serde_json::json!(1);
+        let src = rebuild(&json, &bin);
+        let cache = temp_cache("mrfold");
+        stage(&cache, "hmet", &src);
+
+        let fid = assemble_lane(
+            &cache,
+            "hmet",
+            model::MatLane {
+                fidelity: true,
+                ..Default::default()
+            },
+        );
+        let m = &fid.materials[0];
+        assert!((m.metallic - 0.8).abs() < 1e-3, "{}", m.metallic);
+        assert_eq!(m.roughness, 0.25);
+        assert_eq!(m.mr_image, None);
+        assert_eq!(fid.images.len(), 1);
+    }
+
+    #[test]
+    fn fidelity_lane_folds_mr_texture_with_foreign_transform() {
+        let (mut json, bin) = chunks(&mr_test_glb());
+        json["materials"][0]["pbrMetallicRoughness"]["metallicRoughnessTexture"]["extensions"] =
+            serde_json::json!({"KHR_texture_transform": {"scale": [2.0, 2.0]}});
+        let src = rebuild(&json, &bin);
+        let cache = temp_cache("mrxf");
+        stage(&cache, "hmet", &src);
+
+        let fid = assemble_lane(
+            &cache,
+            "hmet",
+            model::MatLane {
+                fidelity: true,
+                ..Default::default()
+            },
+        );
+        let m = &fid.materials[0];
+        assert!((m.metallic - 0.8).abs() < 1e-3, "{}", m.metallic);
+        assert_eq!(m.mr_image, None);
+        assert_eq!(fid.images.len(), 1);
     }
 
     #[test]
@@ -953,6 +1321,7 @@ mod tests {
             &[mk("ha"), mk("hb")],
             1,
             Some(&cache),
+            Default::default(),
         )
         .unwrap();
         assert_eq!(model.materials.len(), 2);
@@ -980,6 +1349,7 @@ mod tests {
             &[mk(0.0), mk(10.0), mk(20.0)],
             1,
             Some(&cache),
+            Default::default(),
         )
         .unwrap();
         assert_eq!(model.total_tris(), 3);
@@ -1001,6 +1371,7 @@ mod tests {
             }],
             1,
             None,
+            Default::default(),
         )
         .unwrap_err();
         let msg = format!("{err:#}");
@@ -1037,6 +1408,7 @@ mod tests {
             ],
             1,
             Some(&cache),
+            Default::default(),
         )
         .unwrap();
         assert_eq!(model.total_tris(), 1);
@@ -1082,6 +1454,7 @@ mod tests {
             }],
             1,
             Some(&cache),
+            Default::default(),
         )
         .unwrap();
         assert_eq!(model.total_tris(), 1);
@@ -1103,6 +1476,7 @@ mod tests {
             }],
             1,
             Some(&cache),
+            Default::default(),
         )
         .unwrap();
         let out = emit_glb(&model).unwrap();

@@ -8,10 +8,27 @@ pub enum AlphaClass {
     Blend,
 }
 
+pub fn fold_emissive(base: [f64; 4], emissive: [f64; 3]) -> [f64; 4] {
+    [
+        (base[0] + emissive[0]).min(1.0),
+        (base[1] + emissive[1]).min(1.0),
+        (base[2] + emissive[2]).min(1.0),
+        base[3],
+    ]
+}
+
+pub fn scaled_emissive(m: &crate::scene::Material) -> [f64; 3] {
+    [
+        (m.emissive[0] * m.emissive_strength).clamp(0.0, 1.0),
+        (m.emissive[1] * m.emissive_strength).clamp(0.0, 1.0),
+        (m.emissive[2] * m.emissive_strength).clamp(0.0, 1.0),
+    ]
+}
+
 impl AlphaClass {
     pub fn from_alpha_mode(mode: &str) -> AlphaClass {
         match mode {
-            "MASK" => AlphaClass::Mask,
+            "MASK" => AlphaClass::Blend,
             "BLEND" => AlphaClass::Blend,
             _ => AlphaClass::Opaque,
         }
@@ -40,6 +57,46 @@ pub struct LodMaterial {
     pub cutoff: f64,
     pub image: Option<usize>,
     pub double_sided: bool,
+    pub emissive: [f64; 3],
+    pub emissive_image: Option<usize>,
+    pub metallic: f64,
+    pub roughness: f64,
+    pub mr_image: Option<usize>,
+    pub normal_image: Option<usize>,
+    pub emissive_strength: f64,
+}
+
+impl Default for LodMaterial {
+    fn default() -> Self {
+        LodMaterial {
+            name: String::new(),
+            class: AlphaClass::Opaque,
+            base_color: [1.0, 1.0, 1.0, 1.0],
+            cutoff: 0.5,
+            image: None,
+            double_sided: false,
+            emissive: [0.0; 3],
+            emissive_image: None,
+            metallic: 0.0,
+            roughness: 1.0,
+            mr_image: None,
+            normal_image: None,
+            emissive_strength: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct MatLane {
+    pub emissive_channel: bool,
+    pub raw_materials: bool,
+    pub fidelity: bool,
+}
+
+pub const METAL_MIN_METALLIC: f64 = 0.5;
+
+pub fn is_metal(m: &LodMaterial) -> bool {
+    m.class == AlphaClass::Opaque && (m.metallic >= METAL_MIN_METALLIC || m.mr_image.is_some())
 }
 
 #[derive(Clone, Debug, Default)]
@@ -359,11 +416,7 @@ fn walk(
                 if fallback.is_none() {
                     model.materials.push(LodMaterial {
                         name: "default".to_string(),
-                        class: AlphaClass::Opaque,
-                        base_color: [1.0, 1.0, 1.0, 1.0],
-                        cutoff: 0.5,
-                        image: None,
-                        double_sided: false,
+                        ..Default::default()
                     });
                     *fallback = Some(model.materials.len() - 1);
                 }
@@ -385,6 +438,14 @@ fn walk(
 }
 
 pub fn from_glb_bytes(bytes: &[u8], root_name: &str) -> Result<LodModel> {
+    from_glb_bytes_with(bytes, root_name, false)
+}
+
+pub fn from_glb_bytes_with(
+    bytes: &[u8],
+    root_name: &str,
+    emissive_channel: bool,
+) -> Result<LodModel> {
     let scene = crate::gltf::parse(bytes, ".glb", None, false, true)?;
     let mut model = LodModel {
         root_name: root_name.to_string(),
@@ -393,7 +454,7 @@ pub fn from_glb_bytes(bytes: &[u8], root_name: &str) -> Result<LodModel> {
     let mut by_hash: HashMap<String, usize> = HashMap::new();
     let mut image_slot: Vec<Option<Option<usize>>> = vec![None; scene.images.len()];
     for m in &scene.materials {
-        let image = match m.base_color_image {
+        let mut intern = |tr: Option<crate::scene::TexRef>| match tr {
             Some(tr) if tr.image < scene.images.len() => {
                 if image_slot[tr.image].is_none() {
                     image_slot[tr.image] =
@@ -403,13 +464,32 @@ pub fn from_glb_bytes(bytes: &[u8], root_name: &str) -> Result<LodModel> {
             }
             _ => None,
         };
+        let image = intern(m.base_color_image);
+        let (base_color, emissive, emissive_image) = if emissive_channel {
+            let e = scaled_emissive(m);
+            let eimg = if e != [0.0; 3] {
+                intern(m.emissive_image)
+            } else {
+                None
+            };
+            (m.base_color, e, eimg)
+        } else {
+            (fold_emissive(m.base_color, m.emissive), [0.0; 3], None)
+        };
+        let mr_image = intern(m.metallic_roughness_image);
         model.materials.push(LodMaterial {
             name: m.name.clone(),
             class: AlphaClass::from_alpha_mode(&m.alpha_mode),
-            base_color: m.base_color,
+            base_color,
             cutoff: m.alpha_cutoff,
             image,
             double_sided: m.double_sided,
+            emissive,
+            emissive_image,
+            metallic: m.metallic,
+            roughness: m.roughness,
+            mr_image,
+            ..Default::default()
         });
     }
     let scene_mat_count = scene.materials.len();
@@ -435,7 +515,7 @@ mod tests {
     #[test]
     fn alpha_mode_mapping() {
         assert_eq!(AlphaClass::from_alpha_mode("OPAQUE"), AlphaClass::Opaque);
-        assert_eq!(AlphaClass::from_alpha_mode("MASK"), AlphaClass::Mask);
+        assert_eq!(AlphaClass::from_alpha_mode("MASK"), AlphaClass::Blend);
         assert_eq!(AlphaClass::from_alpha_mode("BLEND"), AlphaClass::Blend);
         assert_eq!(AlphaClass::from_alpha_mode(""), AlphaClass::Opaque);
         assert_eq!(AlphaClass::from_alpha_mode("mask"), AlphaClass::Opaque);

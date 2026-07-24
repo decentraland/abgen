@@ -38,6 +38,7 @@ using System.Text;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
 using Debug = UnityEngine.Debug;
 
 public static class AbVisualCompare
@@ -55,6 +56,7 @@ public static class AbVisualCompare
     static string s_platform;
     static float[] s_azimuths;
     static int s_size;
+    static UnityEngine.Object[] s_shaderAssets;
 
     static void L(string s)
     {
@@ -118,8 +120,9 @@ public static class AbVisualCompare
         if (!Path.IsPathRooted(shaderPath)) shaderPath = Path.Combine(root, shaderPath);
         AssetBundle shaderAb = AssetBundle.LoadFromFile(shaderPath);
         if (shaderAb == null) throw new Exception("shader bundle failed to load: " + shaderPath);
-        UnityEngine.Object[] shaderAssets = shaderAb.LoadAllAssets();
-        L("shader bundle loaded, assets=" + shaderAssets.Length);
+        s_shaderAssets = shaderAb.LoadAllAssets();
+        L("shader bundle loaded, assets=" + s_shaderAssets.Length +
+          " shaders=[" + string.Join(",", s_shaderAssets.OfType<Shader>().Select(sh => sh.name)) + "]");
 
         string jobsPath = Env("AB_JOBS", "jobs.txt");
         if (!Path.IsPathRooted(jobsPath)) jobsPath = Path.Combine(root, jobsPath);
@@ -133,7 +136,11 @@ public static class AbVisualCompare
             else { label = parts[0]; kind = "glb"; bundlePath = parts[1]; depsDir = parts[2]; }
             L("JOB " + label + " kind=" + kind + " " + bundlePath);
             var sw = Stopwatch.StartNew();
-            try { RenderJob(label, kind, bundlePath, depsDir, outDir); }
+            try
+            {
+                if (kind == "rawglb") RenderRawGlb(label, bundlePath, outDir);
+                else RenderJob(label, kind, bundlePath, depsDir, outDir);
+            }
             catch (Exception e)
             {
                 L("JOB FAIL " + label + ": " + e.Message);
@@ -141,7 +148,40 @@ public static class AbVisualCompare
             }
             L("TIME " + label + " kind=" + kind + " ms=" + sw.ElapsedMilliseconds);
         }
+        try { RenderEnvProbe(outDir); }
+        catch (Exception e) { L("envprobe FAIL: " + e.Message); }
         L("=== run end");
+    }
+
+    static void RenderEnvProbe(string outDir)
+    {
+        Shader lit = Shader.Find("Universal Render Pipeline/Lit");
+        if (lit == null) { L("envprobe skipped: URP/Lit not found"); return; }
+        var chrome = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        var diffuse = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        Material mc = null, md = null;
+        try
+        {
+            chrome.transform.position = new Vector3(-0.7f, 0f, 0f);
+            diffuse.transform.position = new Vector3(0.7f, 0f, 0f);
+            mc = new Material(lit) { color = Color.white };
+            mc.SetFloat("_Metallic", 1f);
+            mc.SetFloat("_Smoothness", 0.95f);
+            md = new Material(lit) { color = new Color(0.5f, 0.5f, 0.5f) };
+            md.SetFloat("_Metallic", 0f);
+            md.SetFloat("_Smoothness", 0.5f);
+            chrome.GetComponent<Renderer>().sharedMaterial = mc;
+            diffuse.GetComponent<Renderer>().sharedMaterial = md;
+            var b = new Bounds(Vector3.zero, new Vector3(2.8f, 1.4f, 1.4f));
+            Shoot("envprobe", b, outDir, new float[] { 35f }, new[] { "-a0" });
+        }
+        finally
+        {
+            UnityEngine.Object.DestroyImmediate(chrome);
+            UnityEngine.Object.DestroyImmediate(diffuse);
+            if (mc != null) UnityEngine.Object.DestroyImmediate(mc);
+            if (md != null) UnityEngine.Object.DestroyImmediate(md);
+        }
     }
 
     // ---------- inventory ----------
@@ -234,6 +274,7 @@ public static class AbVisualCompare
     static void RenderJob(string label, string kind, string bundlePath, string depsDir, string outDir)
     {
         var loaded = new List<AssetBundle>();
+        var createdTex = new List<UnityEngine.Object>();
         GameObject rootGo = null;
         var inv = new Inv { label = label, kind = kind, bundle = bundlePath };
         try
@@ -362,6 +403,9 @@ public static class AbVisualCompare
                 if (prefab == null) continue;
                 GameObject inst = UnityEngine.Object.Instantiate(prefab, rootGo.transform);
                 inst.name = prefab.name;
+                inst.SetActive(true);
+                foreach (Transform tr in inst.GetComponentsInChildren<Transform>(true))
+                    tr.gameObject.SetActive(true);
                 instances.Add(inst);
             }
             inv.instantiated = instances.Count;
@@ -377,12 +421,104 @@ public static class AbVisualCompare
                     inv.materials++;
                     if (m == null || m.shader == null || m.shader.name == "Hidden/InternalErrorShader") inv.errorShader++;
                 }
-            L(label + " renderers=" + rends.Length + " materials=" + inv.materials + " errorShader=" + inv.errorShader);
+            int activeRends = rends.Count(r => r.enabled && r.gameObject.activeInHierarchy);
+            L(label + " renderers=" + rends.Length + " active=" + activeRends + " materials=" + inv.materials + " errorShader=" + inv.errorShader);
+
+            long triTotal = 0, vertTotal = 0;
+            foreach (var mf in rootGo.GetComponentsInChildren<MeshFilter>(true))
+            {
+                Mesh gm = mf.sharedMesh; if (gm == null) continue;
+                uint idx = 0; for (int s = 0; s < gm.subMeshCount; s++) idx += gm.GetIndexCount(s);
+                triTotal += idx / 3; vertTotal += gm.vertexCount;
+            }
+            foreach (var smr in rootGo.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+            {
+                Mesh gm = smr.sharedMesh; if (gm == null) continue;
+                uint idx = 0; for (int s = 0; s < gm.subMeshCount; s++) idx += gm.GetIndexCount(s);
+                triTotal += idx / 3; vertTotal += gm.vertexCount;
+            }
+            L(label + " geometry tris=" + triTotal + " verts=" + vertTotal);
+
             if (rends.Length == 0)
             {
                 L(label + " no renderers -> inventory only, skip render");
                 return;
             }
+
+            string omat = Environment.GetEnvironmentVariable("AB_OVERRIDE_MAT");
+            if (omat == "1" || omat == "tex")
+            {
+                Shader lit = Shader.Find("Universal Render Pipeline/Lit");
+                if (lit != null)
+                {
+                    bool textured = omat == "tex";
+                    var dumped = new HashSet<Texture>();
+                    foreach (Renderer r in rends)
+                    {
+                        var orig = r.sharedMaterials;
+                        var mats = new Material[orig.Length];
+                        for (int mi = 0; mi < mats.Length; mi++)
+                        {
+                            var lm = new Material(lit) { color = new Color(0.72f, 0.72f, 0.74f) };
+                            if (textured)
+                            {
+                                Texture bt = FindBaseTexture(orig[mi]);
+                                if (bt != null)
+                                {
+                                    lm.SetTexture("_BaseMap", bt);
+                                    lm.color = Color.white;
+                                    string on = orig[mi] != null ? orig[mi].name.ToLowerInvariant() : "";
+                                    if (on.Contains("texturebakeresult") && (on.Contains("transparent") || on.Contains("cutout")))
+                                    {
+                                        lm.SetFloat("_Surface", 1f);
+                                        lm.SetFloat("_SrcBlend", 5f);
+                                        lm.SetFloat("_DstBlend", 10f);
+                                        lm.SetFloat("_ZWrite", 0f);
+                                        lm.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
+                                        lm.renderQueue = 3000;
+                                    }
+                                    var bt2 = bt as Texture2D;
+                                    if (bt2 != null && dumped.Add(bt))
+                                    {
+                                        string tp = Path.Combine(outDir, label + "-basemap-" + dumped.Count + ".png");
+                                        try { BlitTexToPng(bt2, tp); L(label + " dumped basemap '" + bt2.name + "' -> " + Path.GetFileName(tp)); }
+                                        catch (Exception te) { L(label + " basemap dump failed: " + te.Message); }
+                                    }
+                                }
+                                if (orig[mi] != null && orig[mi].HasProperty("_EmissionMap"))
+                                {
+                                    Texture et = orig[mi].GetTexture("_EmissionMap");
+                                    if (et != null)
+                                    {
+                                        Color ec = orig[mi].HasProperty("_EmissionColor") ? orig[mi].GetColor("_EmissionColor") : Color.white;
+                                        lm.SetTexture("_EmissionMap", et);
+                                        lm.SetColor("_EmissionColor", ec);
+                                        lm.EnableKeyword("_EMISSION");
+                                        lm.globalIlluminationFlags = MaterialGlobalIlluminationFlags.None;
+                                        L(label + " emission map carried onto override mat " + mi + " color=" + ec);
+                                    }
+                                }
+                                if (orig[mi] != null && orig[mi].HasProperty("_Metallic") && orig[mi].HasProperty("_Smoothness"))
+                                {
+                                    float met = orig[mi].GetFloat("_Metallic");
+                                    float smo = orig[mi].GetFloat("_Smoothness");
+                                    if (met != 0f || smo != 0f)
+                                    {
+                                        lm.SetFloat("_Metallic", met);
+                                        lm.SetFloat("_Smoothness", smo);
+                                        L(label + " metallic floats carried onto override mat " + mi + " m=" + met + " s=" + smo);
+                                    }
+                                }
+                            }
+                            mats[mi] = lm;
+                        }
+                        r.sharedMaterials = mats;
+                    }
+                    L(label + " material override -> URP Lit" + (textured ? " +baseMap (textures visible)" : " (geometry-visible)"));
+                }
+                else L(label + " material override requested but URP/Lit shader not found");
+            }
+            else RealShaderBind(label, rootGo, rends, createdTex);
 
             Bounds b = rends[0].bounds;
             foreach (Renderer r in rends) b.Encapsulate(r.bounds);
@@ -391,6 +527,51 @@ public static class AbVisualCompare
 
             string[] suffixes = Enumerable.Range(0, s_azimuths.Length).Select(i => "-a" + i).ToArray();
             Shoot(label, b, outDir, s_azimuths, suffixes);
+
+            if (Env("AB_ABLATE", "") == "1" && omat != "1" && omat != "tex")
+            {
+                var mats = new List<Material>();
+                var seenM = new HashSet<Material>();
+                foreach (Renderer r in rends)
+                    foreach (Material m in r.sharedMaterials)
+                        if (m != null && seenM.Add(m)) mats.Add(m);
+
+                var savedTex = new List<KeyValuePair<Material, KeyValuePair<string, Texture>>>();
+                foreach (Material m in mats)
+                    foreach (string prop in new[] { "_EmissionMap", "_MetallicGlossMap" })
+                        if (m.HasProperty(prop) && m.GetTexture(prop) != null)
+                        {
+                            savedTex.Add(new KeyValuePair<Material, KeyValuePair<string, Texture>>(
+                                m, new KeyValuePair<string, Texture>(prop, m.GetTexture(prop))));
+                            m.SetTexture(prop, null);
+                        }
+                if (savedTex.Count > 0)
+                {
+                    Shoot(label, b, outDir, new float[] { s_azimuths[0] }, new[] { "-abl-planes" });
+                    foreach (var kv in savedTex) kv.Key.SetTexture(kv.Value.Key, kv.Value.Value);
+                }
+
+                var savedFl = new List<KeyValuePair<Material, Vector2>>();
+                foreach (Material m in mats)
+                    if (m.HasProperty("_Metallic") && m.HasProperty("_Smoothness") &&
+                        (m.GetFloat("_Metallic") != 0f || m.GetFloat("_Smoothness") != 0f))
+                    {
+                        savedFl.Add(new KeyValuePair<Material, Vector2>(
+                            m, new Vector2(m.GetFloat("_Metallic"), m.GetFloat("_Smoothness"))));
+                        m.SetFloat("_Metallic", 0f);
+                        m.SetFloat("_Smoothness", 0f);
+                    }
+                if (savedFl.Count > 0)
+                {
+                    Shoot(label, b, outDir, new float[] { s_azimuths[0] }, new[] { "-abl-floats" });
+                    foreach (var kv in savedFl)
+                    {
+                        kv.Key.SetFloat("_Metallic", kv.Value.x);
+                        kv.Key.SetFloat("_Smoothness", kv.Value.y);
+                    }
+                }
+                L(label + " ablation: planes=" + savedTex.Count + " floats=" + savedFl.Count);
+            }
 
             if (kind == "animated")
             {
@@ -421,6 +602,130 @@ public static class AbVisualCompare
             if (rootGo != null) UnityEngine.Object.DestroyImmediate(rootGo);
             foreach (AssetBundle abx in loaded)
                 if (abx != null) abx.Unload(true);
+            foreach (UnityEngine.Object o in createdTex)
+                if (o != null) UnityEngine.Object.DestroyImmediate(o);
+        }
+    }
+
+    static void RealShaderBind(string label, GameObject rootGo, Renderer[] rends, List<UnityEngine.Object> created)
+    {
+        Shader texarr = null;
+        if (s_shaderAssets != null)
+            texarr = s_shaderAssets.OfType<Shader>().FirstOrDefault(sh => sh.name == "DCL/Scene_TexArray");
+        var seen = new HashSet<Material>();
+        int pptr = 0, post = 0, unresolved = 0, rebound = 0;
+        bool placed = false;
+        Vector3 rootPos = Vector3.zero;
+        foreach (Renderer r in rends)
+            foreach (Material m in r.sharedMaterials)
+            {
+                if (m == null || !seen.Add(m)) continue;
+                bool broken = m.shader == null || m.shader.name == "Hidden/InternalErrorShader";
+                if (broken && texarr != null) { m.shader = texarr; post++; broken = false; }
+                else if (!broken) pptr++;
+                if (broken)
+                {
+                    unresolved++;
+                    L(label + " mat '" + m.name + "' shader UNRESOLVED");
+                    continue;
+                }
+                if (m.shader.name == "DCL/Scene_TexArray" && m.HasProperty("_BaseMapArr"))
+                {
+                    if (m.GetTexture("_BaseMapArr") == null)
+                    {
+                        var bt = (m.HasProperty("_BaseMap") ? m.GetTexture("_BaseMap") : null) as Texture2D;
+                        if (bt != null)
+                        {
+                            var arr = new Texture2DArray(bt.width, bt.height, 1, bt.format, bt.mipmapCount > 1);
+                            Graphics.CopyTexture(bt, 0, arr, 0);
+                            m.SetTexture("_BaseMapArr", arr);
+                            m.SetInteger("_BaseMapArr_ID", 0);
+                            created.Add(arr);
+                            rebound++;
+                        }
+                    }
+                    if (!placed && m.HasProperty("_PlaneClipping"))
+                    {
+                        Vector4 pc = m.GetVector("_PlaneClipping");
+                        if (pc.y > pc.x)
+                        {
+                            rootPos = new Vector3(pc.x + 0.05f, 0f, pc.z + 0.05f);
+                            rootGo.transform.position = rootPos;
+                            placed = true;
+                        }
+                    }
+                }
+                L(label + " mat '" + m.name + "' shader='" + m.shader.name + "'" +
+                  " kw=[" + string.Join(",", m.shaderKeywords) + "]" +
+                  " metallic=" + (m.HasProperty("_Metallic") ? F(m.GetFloat("_Metallic")) : "-") +
+                  " smooth=" + (m.HasProperty("_Smoothness") ? F(m.GetFloat("_Smoothness")) : "-") +
+                  " planeClip=" + (m.HasProperty("_PlaneClipping") ? m.GetVector("_PlaneClipping").ToString("F2") : "-"));
+            }
+        L(label + " real-shader bind: pptr=" + pptr + " postassign=" + post +
+          " unresolved=" + unresolved + " texarrayRebind=" + rebound +
+          " rootAt=" + rootPos.ToString("F2"));
+    }
+
+    static void RenderRawGlb(string label, string assetPath, string outDir)
+    {
+        var inv = new Inv { label = label, kind = "rawglb", bundle = assetPath };
+        GameObject rootGo = null;
+        try
+        {
+            GameObject prefab = AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
+            if (prefab == null)
+            {
+                AssetDatabase.ImportAsset(assetPath, ImportAssetOptions.ForceSynchronousImport);
+                prefab = AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
+            }
+            if (prefab == null) throw new Exception("glb import produced no GameObject: " + assetPath);
+
+            rootGo = new GameObject("ABVIS_ROOT");
+            GameObject inst = UnityEngine.Object.Instantiate(prefab, rootGo.transform);
+            inst.name = prefab.name;
+            inst.SetActive(true);
+            foreach (Transform tr in inst.GetComponentsInChildren<Transform>(true))
+                tr.gameObject.SetActive(true);
+            inv.instantiated = 1;
+
+            Renderer[] rends = rootGo.GetComponentsInChildren<Renderer>(true);
+            inv.renderers = rends.Length;
+            foreach (Renderer r in rends)
+                foreach (Material m in r.sharedMaterials)
+                {
+                    inv.materials++;
+                    if (m == null || m.shader == null || m.shader.name == "Hidden/InternalErrorShader") inv.errorShader++;
+                }
+
+            long triTotal = 0;
+            foreach (var mf in rootGo.GetComponentsInChildren<MeshFilter>(true))
+            {
+                Mesh gm = mf.sharedMesh; if (gm == null) continue;
+                uint idx = 0; for (int s = 0; s < gm.subMeshCount; s++) idx += gm.GetIndexCount(s);
+                triTotal += idx / 3; inv.vertexTotal += gm.vertexCount;
+            }
+            L(label + " rawglb renderers=" + rends.Length + " materials=" + inv.materials +
+              " errorShader=" + inv.errorShader + " tris=" + triTotal + " verts=" + inv.vertexTotal);
+            if (rends.Length == 0) throw new Exception("no renderers in imported glb");
+
+            Bounds b = rends[0].bounds;
+            foreach (Renderer r in rends) b.Encapsulate(r.bounds);
+            inv.hasBounds = true; inv.boundsCenter = b.center; inv.boundsExtents = b.extents;
+            L(label + " bounds c=" + b.center.ToString("F2") + " e=" + b.extents.ToString("F2"));
+
+            string[] suffixes = Enumerable.Range(0, s_azimuths.Length).Select(i => "-a" + i).ToArray();
+            Shoot(label, b, outDir, s_azimuths, suffixes);
+        }
+        catch (Exception e)
+        {
+            inv.error = e.Message;
+            throw;
+        }
+        finally
+        {
+            try { inv.Write(Path.Combine(outDir, label + ".inventory.json")); }
+            catch (Exception we) { L(label + " inventory write FAILED: " + we.Message); }
+            if (rootGo != null) UnityEngine.Object.DestroyImmediate(rootGo);
         }
     }
 
@@ -478,6 +783,40 @@ public static class AbVisualCompare
         return n;
     }
 
+    static Texture FindBaseTexture(Material m)
+    {
+        if (m == null) return null;
+        if (m.mainTexture != null) return m.mainTexture;
+        Shader sh = m.shader;
+        if (sh == null) return null;
+        int pc = UnityEditor.ShaderUtil.GetPropertyCount(sh);
+        for (int pi = 0; pi < pc; pi++)
+        {
+            if (UnityEditor.ShaderUtil.GetPropertyType(sh, pi) == UnityEditor.ShaderUtil.ShaderPropertyType.TexEnv)
+            {
+                Texture t = m.GetTexture(UnityEditor.ShaderUtil.GetPropertyName(sh, pi));
+                if (t is Texture2D) return t;
+            }
+        }
+        return null;
+    }
+
+    static int ReadBack(RenderTexture rt, Texture2D tex)
+    {
+        RenderTexture prev = RenderTexture.active;
+        RenderTexture.active = rt;
+        tex.ReadPixels(new Rect(0, 0, tex.width, tex.height), 0, 0);
+        tex.Apply();
+        RenderTexture.active = prev;
+        Color32[] scan = tex.GetPixels32();
+        if (scan.Length == 0) return 0;
+        Color32 bg = scan[0];
+        int nc = 0;
+        for (int p = 0; p < scan.Length; p++)
+            if (scan[p].r != bg.r || scan[p].g != bg.g || scan[p].b != bg.b) nc++;
+        return nc;
+    }
+
     static void BlitTexToPng(Texture2D t, string path)
     {
         RenderTexture rt = RenderTexture.GetTemporary(t.width, t.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
@@ -504,16 +843,30 @@ public static class AbVisualCompare
     {
         var camGo = new GameObject("ABVIS_CAM");
         var lightGo = new GameObject("ABVIS_LIGHT");
+        var volGo = new GameObject("ABVIS_VOLUME");
         RenderTexture rt = null;
         Texture2D tex = null;
+        Material skyMat = null;
+        Cubemap skyCube = null;
+        VolumeProfile volProfile = null;
         AmbientMode oldAmb = RenderSettings.ambientMode;
         Color oldAmbColor = RenderSettings.ambientLight;
+        Color oldAmbSky = RenderSettings.ambientSkyColor;
+        Color oldAmbEq = RenderSettings.ambientEquatorColor;
+        Color oldAmbGnd = RenderSettings.ambientGroundColor;
+        Material oldSkybox = RenderSettings.skybox;
+        DefaultReflectionMode oldRefl = RenderSettings.defaultReflectionMode;
+        Texture oldCustomRefl = RenderSettings.customReflectionTexture;
         try
         {
             Camera cam = camGo.AddComponent<Camera>();
             cam.clearFlags = CameraClearFlags.SolidColor;
             cam.backgroundColor = new Color(0.15f, 0.15f, 0.18f, 1f);
             cam.fieldOfView = 50f;
+            cam.cullingMask = ~0;
+            cam.allowHDR = true;
+            var camData = cam.GetUniversalAdditionalCameraData();
+            if (camData != null) camData.renderPostProcessing = true;
 
             Light light = lightGo.AddComponent<Light>();
             light.type = LightType.Directional;
@@ -522,8 +875,34 @@ public static class AbVisualCompare
             light.shadows = LightShadows.None; // deterministic
             lightGo.transform.rotation = Quaternion.Euler(45f, -30f, 0f);
 
-            RenderSettings.ambientMode = AmbientMode.Flat;
-            RenderSettings.ambientLight = new Color(0.35f, 0.35f, 0.35f, 1f);
+            skyMat = new Material(Shader.Find("Skybox/Procedural"));
+            RenderSettings.skybox = skyMat;
+            RenderSettings.ambientMode = AmbientMode.Skybox;
+            DynamicGI.UpdateEnvironment();
+            var shp = RenderSettings.ambientProbe;
+            float shMag = Mathf.Abs(shp[0, 0]) + Mathf.Abs(shp[1, 0]) + Mathf.Abs(shp[2, 0]);
+            if (shMag < 1e-3f)
+            {
+                RenderSettings.ambientMode = AmbientMode.Trilight;
+                RenderSettings.ambientSkyColor = new Color(0.52f, 0.62f, 0.78f);
+                RenderSettings.ambientEquatorColor = new Color(0.42f, 0.43f, 0.47f);
+                RenderSettings.ambientGroundColor = new Color(0.24f, 0.22f, 0.21f);
+            }
+            skyCube = BuildSkyCubemap(-lightGo.transform.forward);
+            RenderSettings.defaultReflectionMode = DefaultReflectionMode.Custom;
+            RenderSettings.customReflectionTexture = skyCube;
+
+            volProfile = ScriptableObject.CreateInstance<VolumeProfile>();
+            var tm = volProfile.Add<Tonemapping>(true);
+            tm.mode.Override(TonemappingMode.ACES);
+            var vol = volGo.AddComponent<Volume>();
+            vol.isGlobal = true;
+            vol.priority = 100f;
+            vol.sharedProfile = volProfile;
+            Texture defRefl = ReflectionProbe.defaultTexture;
+            L(label + " env=skybox+aces hdr=" + cam.allowHDR + " postfx=" + (camData != null && camData.renderPostProcessing) +
+              " ambientSH=" + F(shMag) + " ambientMode=" + RenderSettings.ambientMode +
+              " defaultRefl=" + (defRefl != null ? defRefl.name + "#" + defRefl.width : "NULL"));
 
             float radius = Mathf.Max(b.extents.magnitude, 0.5f);
             float dist = radius * 2.0f;
@@ -539,36 +918,88 @@ public static class AbVisualCompare
                 camGo.transform.position = b.center - dir * dist;
                 camGo.transform.LookAt(b.center);
 
-                bool rendered = false;
+                string path = "none";
+                int nonClear = 0;
                 var req = new RenderPipeline.StandardRequest { destination = rt };
                 if (RenderPipeline.SupportsRenderRequest(cam, req))
                 {
                     RenderPipeline.SubmitRenderRequest(cam, req);
-                    rendered = true;
+                    nonClear = ReadBack(rt, tex);
+                    path = "request";
                 }
-                if (!rendered)
+                if (nonClear == 0)
                 {
                     cam.targetTexture = rt;
                     cam.Render();
                     cam.targetTexture = null;
+                    nonClear = ReadBack(rt, tex);
+                    path = "camRender";
                 }
-
-                RenderTexture.active = rt;
-                tex.ReadPixels(new Rect(0, 0, s_size, s_size), 0, 0);
-                tex.Apply();
-                RenderTexture.active = null;
                 File.WriteAllBytes(Path.Combine(outDir, label + suffixes[i] + ".png"), tex.EncodeToPNG());
-                L(label + " wrote " + suffixes[i]);
+                L(label + " wrote " + suffixes[i] + " path=" + path + " nonclear=" + nonClear);
             }
         }
         finally
         {
             RenderSettings.ambientMode = oldAmb;
             RenderSettings.ambientLight = oldAmbColor;
+            RenderSettings.ambientSkyColor = oldAmbSky;
+            RenderSettings.ambientEquatorColor = oldAmbEq;
+            RenderSettings.ambientGroundColor = oldAmbGnd;
+            RenderSettings.skybox = oldSkybox;
+            RenderSettings.defaultReflectionMode = oldRefl;
+            RenderSettings.customReflectionTexture = oldCustomRefl;
             if (tex != null) UnityEngine.Object.DestroyImmediate(tex);
             if (rt != null) { rt.Release(); UnityEngine.Object.DestroyImmediate(rt); }
             UnityEngine.Object.DestroyImmediate(camGo);
             UnityEngine.Object.DestroyImmediate(lightGo);
+            UnityEngine.Object.DestroyImmediate(volGo);
+            if (volProfile != null) UnityEngine.Object.DestroyImmediate(volProfile);
+            if (skyMat != null) UnityEngine.Object.DestroyImmediate(skyMat);
+            if (skyCube != null) UnityEngine.Object.DestroyImmediate(skyCube);
         }
+    }
+
+    static Cubemap BuildSkyCubemap(Vector3 sunDir)
+    {
+        const int N = 64;
+        var cube = new Cubemap(N, TextureFormat.RGBAHalf, true) { name = "abvis-sky" };
+        Color zen = new Color(0.35f, 0.52f, 0.85f);
+        Color hor = new Color(0.78f, 0.82f, 0.90f);
+        Color gnd = new Color(0.24f, 0.22f, 0.21f);
+        Color sun = new Color(3.5f, 3.2f, 2.8f);
+        sunDir.Normalize();
+        var px = new Color[N * N];
+        for (int f = 0; f < 6; f++)
+        {
+            for (int y = 0; y < N; y++)
+            {
+                float v = 2f * (y + 0.5f) / N - 1f;
+                for (int x = 0; x < N; x++)
+                {
+                    float u = 2f * (x + 0.5f) / N - 1f;
+                    Vector3 d;
+                    switch (f)
+                    {
+                        case 0: d = new Vector3(1f, -v, -u); break;
+                        case 1: d = new Vector3(-1f, -v, u); break;
+                        case 2: d = new Vector3(u, 1f, v); break;
+                        case 3: d = new Vector3(u, -1f, -v); break;
+                        case 4: d = new Vector3(u, -v, 1f); break;
+                        default: d = new Vector3(-u, -v, -1f); break;
+                    }
+                    d.Normalize();
+                    Color c = d.y >= 0f
+                        ? Color.Lerp(hor, zen, Mathf.Pow(d.y, 0.6f))
+                        : Color.Lerp(hor, gnd, Mathf.Pow(-d.y, 0.5f));
+                    c += sun * Mathf.Pow(Mathf.Max(0f, Vector3.Dot(d, sunDir)), 48f);
+                    c.a = 1f;
+                    px[y * N + x] = c;
+                }
+            }
+            cube.SetPixels(px, (CubemapFace)f);
+        }
+        cube.Apply(true, false);
+        return cube;
     }
 }

@@ -159,9 +159,7 @@ pub fn simplify_model(
             tris_after: total,
             ratios_run,
             aggressive_final: sloppy,
-            passthrough: false,
-            unsimplified: false,
-            rescued_classes: Vec::new(),
+            ..Default::default()
         },
     ))
 }
@@ -270,6 +268,7 @@ mod tests {
                 cutoff: 0.5,
                 image: None,
                 double_sided: false,
+                ..Default::default()
             }],
             images: Vec::new(),
             log: Vec::new(),

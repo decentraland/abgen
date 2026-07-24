@@ -6,7 +6,7 @@ use crate::lodgen::model::{AlphaClass, LodImage, LodModel, LodPrimitive};
 
 use super::pack::expand_axis;
 use super::tile::{Bucket, Tile, UvMap};
-use super::{JPEG_QUALITY, NATIVE_SOLID_DIM};
+use super::{JPEG_QUALITY, LOSSLESS_OPAQUE_MIN_BUDGET, NATIVE_SOLID_DIM};
 
 pub(super) fn compose(
     tiles: &[Tile],
@@ -14,11 +14,13 @@ pub(super) fn compose(
     rects: &[(u32, u32, u32, u32)],
     canvas: u32,
     padding: u32,
+    premul: bool,
+    srgb: bool,
 ) -> Vec<u8> {
     let s = canvas as usize;
     let mut out = vec![0u8; s * s * 4];
     for ((t, crop), &(x, y, w, h)) in tiles.iter().zip(crops.iter()).zip(rects.iter()) {
-        let px = t.render_cropped(*crop, w, h);
+        let px = t.render_cropped(*crop, w, h, premul, srgb);
         let x0 = x.saturating_sub(padding) as usize;
         let y0 = y.saturating_sub(padding) as usize;
         let x1 = (x + w + padding).min(canvas) as usize;
@@ -120,7 +122,12 @@ fn fill_background(rgba: &mut [u8], size: u32) {
     }
 }
 
-pub(super) fn encode_atlas(class: AlphaClass, mut rgba: Vec<u8>, canvas: u32) -> Result<LodImage> {
+pub(super) fn encode_atlas(
+    class: AlphaClass,
+    mut rgba: Vec<u8>,
+    canvas: u32,
+    budget: u32,
+) -> Result<LodImage> {
     if class == AlphaClass::Opaque {
         fill_background(&mut rgba, canvas);
         let mut rgb = Vec::with_capacity(canvas as usize * canvas as usize * 3);
@@ -130,6 +137,13 @@ pub(super) fn encode_atlas(class: AlphaClass, mut rgba: Vec<u8>, canvas: u32) ->
         let img = image::RgbImage::from_raw(canvas, canvas, rgb)
             .ok_or_else(|| anyhow!("atlas rgb buffer"))?;
         let mut cur = std::io::Cursor::new(Vec::new());
+        if budget >= LOSSLESS_OPAQUE_MIN_BUDGET {
+            img.write_to(&mut cur, image::ImageFormat::Png)?;
+            return Ok(LodImage {
+                bytes: cur.into_inner(),
+                mime: "image/png".to_string(),
+            });
+        }
         let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cur, JPEG_QUALITY);
         img.write_with_encoder(enc)?;
         Ok(LodImage {

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>bisect: running</title>
+<h1>Tint bisection — bc7_test_* golden entries under this browser's WGSL compiler</h1>
+<p>Runs the same golden word-streams the native wgpu tests use, compares
+against CPU references computed in-module, reports the first diverging
+entry. Title flips to the verdict.</p>
+<pre id="log"></pre>
+<script type="module">
+import init, { gpu_bisect } from './gpu/abgen_wasm_gpu.js';
+
+const logEl = document.getElementById('log');
+const log = (s) => { logEl.textContent += s + '\n'; };
+
+try {
+  log(`webgpu=${!!navigator.gpu} crossOriginIsolated=${typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated}`);
+  await init();
+  const t0 = performance.now();
+  const report = JSON.parse(await gpu_bisect());
+  log(`adapter: ${report.adapter}`);
+  log(`bisect ran in ${((performance.now() - t0) / 1000).toFixed(1)}s\n`);
+  let firstFail = null;
+  for (const r of report.results) {
+    const line = r.pass
+      ? `PASS  ${r.entry} (${r.cases} cases)`
+      : `FAIL  ${r.entry} (${r.cases} cases)` + (r.first_diff
+        ? ` first diff: case ${r.first_diff.case_index} byte ${r.first_diff.byte_offset} got=0x${(r.first_diff.got_word >>> 0).toString(16).padStart(8, '0')} want=0x${(r.first_diff.want_word >>> 0).toString(16).padStart(8, '0')}`
+        : '');
+    log(line);
+    if (!r.pass && !firstFail) firstFail = r.entry;
+  }
+  document.title = firstFail ? `bisect: FIRST-FAIL ${firstFail}` : 'bisect: ALL-PASS';
+  log(firstFail ? `\nFIRST DIVERGING ENTRY: ${firstFail}` : '\nALL ENTRIES PASS under this compiler');
+} catch (e) {
+  document.title = 'bisect: FATAL';
+  log('FATAL: ' + ((e && e.stack) || e));
+}
+</script>

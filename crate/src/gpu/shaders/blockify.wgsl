@@ -257,13 +257,17 @@ fn blockify_halve(@builtin(global_invocation_id) giv: vec3<u32>) {
     }
     let sbase = it.src_px_lo * 4u;
     let d = (it.dst_px_lo + np) * 4u;
+    // job.pad is 0u at runtime but the compiler cannot prove it: xor-laundering
+    // each partial sum through the integer domain pins the corelib's sequential
+    // accumulation order against reassociation (srgb levels carry non-exact
+    // linear values; fast/relaxed math may otherwise regroup the add tree).
     for (var ch = 0u; ch < 4u; ch = ch + 1u) {
         var acc = 0.0;
         for (var dy = 0u; dy < fh; dy = dy + 1u) {
             for (var dx = 0u; dx < fw; dx = dx + 1u) {
                 let y = ny * fh + dy;
                 let x = nx * fw + dx;
-                acc = acc + pyr[sbase + (y * w + x) * 4u + ch];
+                acc = bitcast<f32>(bitcast<u32>(acc + pyr[sbase + (y * w + x) * 4u + ch]) ^ job.pad);
             }
         }
         pyr[d + ch] = acc * inv;

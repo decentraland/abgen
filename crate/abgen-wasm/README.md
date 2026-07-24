@@ -10,15 +10,15 @@ manifest. Nothing leaves the browser.
 ## Run it
 
 ```bash
-bash wasm-poc/build.sh          # build site/wasm/abgen_poc.wasm (gitignored artifact)
-bash wasm-poc/serve.sh          # http://127.0.0.1:5189/wasm/
+bash abgen-wasm/build.sh          # build site/wasm/abgen_wasm.wasm (gitignored artifact)
+bash abgen-wasm/serve.sh          # http://127.0.0.1:5189/wasm/
 ```
 
-`site/wasm/abgen_poc.wasm` (~4.3 MB) is never committed — `build.sh`
+`site/wasm/abgen_wasm.wasm` (~4.3 MB) is never committed — `build.sh`
 regenerates it from the tree. The module is a plain cargo package at
-`wasm-poc/` with its own committed `Cargo.lock`, excluded from the parent
+`abgen-wasm/` with its own committed `Cargo.lock`, excluded from the parent
 workspace so the default workspace build/check/test never needs a wasm
-toolchain. The toolchain is pinned in `wasm-poc/toolchain/flake.nix`
+toolchain. The toolchain is pinned in `abgen-wasm/toolchain/flake.nix`
 (rust 1.97.0 + wasm32 target); no wasm-bindgen — the module speaks a
 hand-rolled C ABI (`poc_init` / `poc_alloc` / `poc_convert`, events stream
 back through the imported `env.host_emit`).
@@ -78,15 +78,22 @@ bundles.
   flag raises the module floor to engines with wasm SIMD (Chrome 91+,
   Firefox 89+, Safari 16.4+, Node 16.4+ — older engines reject the module
   at validation).
-- WebGPU encode is a documented follow-up, deliberately descoped: the
-  module is a bindgen-free cdylib with a synchronous `poc_convert`, while
-  browser WebGPU buffer readback is async-only, and wgpu's browser backend
-  requires wasm-bindgen glue. Doing it honestly means a resumable convert —
-  a dedicated texture-encode job phase that awaits GPU readbacks between
-  module calls (a natural fit over the worker-pool job protocol), reusing
-  the native GPU lane's bit-exact WGSL kernels and its per-device
-  self-qualification contract. Until then the native CUDA/wgpu lane is the
-  GPU story.
+- WebGPU encode is wired via a bridge that keeps `poc_convert` synchronous:
+  a separate wasm-bindgen module (`crate/wasm-gpu`, the native GPU lane's
+  bit-exact WGSL kernels behind `abgen::gpu`'s wasm32 API) runs in its own
+  worker, and convert workers block on a SharedArrayBuffer + `Atomics.wait`
+  handshake (`bc7_pure::set_encode_hook` → `host_encode_bc7` import →
+  `site/wasm/gpu-worker.js`, which stays async via `Atomics.waitAsync` for
+  GPU readback). Needs crossOriginIsolated (site/server.py sends COOP/COEP);
+  anything missing degrades to the CPU-SIMD path with a note. The native
+  per-device self-qualification contract carries over: `gpu_init` refuses
+  any adapter whose output is not bit-identical to the in-module CPU oracle
+  across the native qualification matrix. Status: Chrome's WGSL compiler
+  (Tint→MSL) is NOT currently bit-exact on Apple Metal — the same kernels
+  qualify under native wgpu (Naga) on the same GPU — so the lane arms only
+  on adapters that pass; hardening the WGSL against Tint codegen is the
+  open follow-up. `site/wasm/gputest.html` is the end-to-end harness (runs
+  CPU-forced vs GPU-enabled and byte-compares every bundle).
 
 Formerly a gap, now real: libjpeg error recovery uses actual setjmp/longjmp
 via wasi-libc's `libsetjmp.a` (the LLVM Wasm-SjLj transform over wasm
@@ -94,7 +101,7 @@ exception handling, legacy `try`/`catch` encoding — Chrome 95+, Firefox
 100+, Safari 15.2+, Node 17+). A malformed JPEG now fails per-image exactly
 like native instead of trapping the module; the EH compile flags are scoped
 to the libjpeg9c build (`third_party/libjpeg9c/build.rs`), and the final
-link adds `libsetjmp.a` in `wasm-poc/build.rs`. crnlib's bundled `jpgd`
+link adds `libsetjmp.a` in `abgen-wasm/build.rs`. crnlib's bundled `jpgd`
 file loader is never called — unchanged.
 
 ## wasm C/C++ port notes
@@ -103,22 +110,22 @@ file loader is never called — unchanged.
   devShell pins `CC/CXX/AR_wasm32_unknown_unknown` and appends
   `--target=wasm32-unknown-wasi` via `CFLAGS`/`CXXFLAGS` (env flags land
   last, overriding cc-rs's `--target=wasm32-unknown-unknown`).
-- `wasm-poc/build.rs` links wasi-libc's `libc.a` plus `libc++.a`/`libc++abi.a`
+- `abgen-wasm/build.rs` links wasi-libc's `libc.a` plus `libc++.a`/`libc++abi.a`
   into the final cdylib; the resulting `wasi_snapshot_preview1` imports
   (stdio/env/prestat) are stubbed in `site/wasm/worker.js` — `fd_prestat_get`
   must return EBADF(8) so libc's preopen scan terminates.
 - `poc_init` calls `__wasm_call_ctors` explicitly (reactor model); without
   that reference wasm-ld wraps every export in command-model ctor/dtor calls
   and the first export invocation traps in `__funcs_on_exit`.
-- Headless verification: `wasm-poc/test/make-fixtures.py` + `node
-  wasm-poc/test/headless.mjs <out> windows '' <fixture.glb>` (single
+- Headless verification: `abgen-wasm/test/make-fixtures.py` + `node
+  abgen-wasm/test/headless.mjs <out> windows '' <fixture.glb>` (single
   instance) or `headless-pool.mjs` (the same page pool over a
   worker_threads shim, `--workers=N`); full cross-target gate:
-  `bash wasm-poc/test/parity.sh`.
+  `bash abgen-wasm/test/parity.sh`.
 
 ## Cross-target byte gate
 
-`bash wasm-poc/test/parity.sh` rebuilds the wasm module and the native
+`bash abgen-wasm/test/parity.sh` rebuilds the wasm module and the native
 `abgen`/`abgen-lod` binaries from the same tree, regenerates the fixtures,
 converts every one on both sides (native under `ABGEN_JPEG_GLB_9C=1`, per
 the decoder rule above), and sha256-compares each produced artifact across

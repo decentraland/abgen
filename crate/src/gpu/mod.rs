@@ -25,6 +25,8 @@ use qualify::QualStatus;
 #[cfg(target_arch = "wasm32")]
 pub use wgpu::{init_gpu, Gpu};
 #[cfg(target_arch = "wasm32")]
+pub use wgpu_bc7::bisect;
+#[cfg(target_arch = "wasm32")]
 pub use wgpu_bc7::{build_engine, encode_bc7_mip_chain_on, Engine};
 
 #[cfg(target_arch = "wasm32")]

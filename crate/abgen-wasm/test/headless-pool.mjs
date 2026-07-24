@@ -6,7 +6,7 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
-import { runConvert } from '../../site/wasm/pool.js';
+import { runConvert } from '../../../site/wasm/pool.js';
 
 let lod = 1, workers = 0;
 const positional = [];
@@ -24,7 +24,7 @@ if (!outDir || !platform || paths.length === 0) {
 mkdirSync(outDir, { recursive: true });
 
 const shim = fileURLToPath(new URL('./worker-shim.mjs', import.meta.url));
-const workerJs = fileURLToPath(new URL('../../site/wasm/worker.js', import.meta.url));
+const workerJs = fileURLToPath(new URL('../../../site/wasm/worker.js', import.meta.url));
 const spawn = () => {
   const w = new Worker(shim, { workerData: { workerJs } });
   const like = {
@@ -47,7 +47,7 @@ const files = paths.map((p) => {
     data: buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
   };
 });
-const wasmBytes = readFileSync(new URL('../../site/wasm/abgen_poc.wasm', import.meta.url));
+const wasmBytes = readFileSync(new URL('../../../site/wasm/abgen_wasm.wasm', import.meta.url));
 
 const t0 = performance.now();
 let exit = 0;

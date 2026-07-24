@@ -58,31 +58,35 @@ const OPT_MODE4_3_OFF: u32 = 3840u;
 const OPT_MODE4_2_OFF: u32 = 4096u;
 const OPT_TABLES_WORDS: u32 = 4352u;
 
-const G_WEIGHTS2 = array<u32, 4>(
+// Tables below are var<private>, not const: runtime-indexed module-scope
+// const arrays are inlined per-use and context-dependently miscompile to 0
+// under Chrome's WGSL compiler on Metal (same bug family as the note at the
+// rounding fences); private address space lowers to memory and is immune.
+var<private> G_WEIGHTS2 = array<u32, 4>(
     0u, 21u, 43u, 64u,
 );
 
-const G_WEIGHTS3 = array<u32, 8>(
+var<private> G_WEIGHTS3 = array<u32, 8>(
     0u, 9u, 18u, 27u, 37u, 46u, 55u, 64u,
 );
 
-const G_WEIGHTS4 = array<u32, 16>(
+var<private> G_WEIGHTS4 = array<u32, 16>(
     0u, 4u, 9u, 13u, 17u, 21u, 26u, 30u, 34u, 38u, 43u, 47u, 51u, 55u, 60u, 64u,
 );
 
-const G_WEIGHTS2X_BITS = array<u32, 16>(
+var<private> G_WEIGHTS2X_BITS = array<u32, 16>(
     0x00000000u, 0x00000000u, 0x3f800000u, 0x00000000u, 0x3ddc7ffeu, 0x3e61c001u, 0x3ee71fffu, 0x3ea80000u,
     0x3ee71fffu, 0x3e61c001u, 0x3ddc7ffeu, 0x3f2c0000u, 0x3f800000u, 0x00000000u, 0x00000000u, 0x3f800000u,
 );
 
-const G_WEIGHTS3X_BITS = array<u32, 32>(
+var<private> G_WEIGHTS3X_BITS = array<u32, 32>(
     0x00000000u, 0x00000000u, 0x3f800000u, 0x00000000u, 0x3ca1ff2eu, 0x3df78034u, 0x3f3d0ff9u, 0x3e100000u,
     0x3da2003bu, 0x3e4effe3u, 0x3f044007u, 0x3e900000u, 0x3e364021u, 0x3e79bfdfu, 0x3eab2010u, 0x3ed80000u,
     0x3eab2010u, 0x3e79bfdfu, 0x3e364021u, 0x3f140000u, 0x3f044007u, 0x3e4effe3u, 0x3da2003bu, 0x3f380000u,
     0x3f3d0ff9u, 0x3df78034u, 0x3ca1ff2eu, 0x3f5c0000u, 0x3f800000u, 0x00000000u, 0x00000000u, 0x3f800000u,
 );
 
-const G_WEIGHTS4X_BITS = array<u32, 64>(
+var<private> G_WEIGHTS4X_BITS = array<u32, 64>(
     0x00000000u, 0x00000000u, 0x3f800000u, 0x00000000u, 0x3b7ffbceu, 0x3d700043u, 0x3f60fffcu, 0x3d800000u,
     0x3ca1ff2eu, 0x3df78034u, 0x3f3d0ff9u, 0x3e100000u, 0x3d29003fu, 0x3e25bff0u, 0x3f229004u, 0x3e500000u,
     0x3d908030u, 0x3e47bfe8u, 0x3f0a1006u, 0x3e880000u, 0x3ddc7ffeu, 0x3e61c001u, 0x3ee71fffu, 0x3ea80000u,
@@ -227,56 +231,56 @@ var<private> G_PARTITION3: array<u32, 1024> = array<u32, 1024>(
     0u, 1u, 1u, 1u, 2u, 0u, 1u, 1u, 2u, 2u, 0u, 1u, 2u, 2u, 2u, 0u,
 );
 
-const G_ANCHOR_2ND = array<i32, 64>(
+var<private> G_ANCHOR_2ND = array<i32, 64>(
     15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
     15, 2, 8, 2, 2, 8, 8, 15, 2, 8, 2, 2, 8, 8, 2, 2,
     15, 15, 6, 8, 2, 8, 15, 15, 2, 8, 2, 2, 2, 15, 15, 6,
     6, 2, 6, 8, 15, 15, 2, 2, 15, 15, 15, 15, 15, 2, 2, 15,
 );
 
-const G_ANCHOR_3RD_1 = array<i32, 64>(
+var<private> G_ANCHOR_3RD_1 = array<i32, 64>(
     3, 3, 15, 15, 8, 3, 15, 15, 8, 8, 6, 6, 6, 5, 3, 3,
     3, 3, 8, 15, 3, 3, 6, 10, 5, 8, 8, 6, 8, 5, 15, 15,
     8, 15, 3, 5, 6, 10, 8, 15, 15, 3, 15, 5, 15, 15, 15, 15,
     3, 15, 5, 5, 5, 8, 5, 10, 5, 10, 8, 13, 15, 12, 3, 3,
 );
 
-const G_ANCHOR_3RD_2 = array<i32, 64>(
+var<private> G_ANCHOR_3RD_2 = array<i32, 64>(
     15, 8, 8, 3, 15, 15, 3, 8, 15, 15, 15, 15, 15, 15, 15, 8,
     15, 8, 15, 3, 15, 8, 15, 8, 3, 15, 6, 10, 15, 15, 10, 8,
     15, 3, 15, 10, 10, 8, 9, 10, 6, 15, 8, 15, 3, 6, 6, 8,
     15, 3, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 3, 15, 15, 8,
 );
 
-const G_NUM_SUBSETS = array<u32, 8>(
+var<private> G_NUM_SUBSETS = array<u32, 8>(
     3u, 2u, 3u, 2u, 1u, 1u, 1u, 2u,
 );
 
-const G_PARTITION_BITS = array<u32, 8>(
+var<private> G_PARTITION_BITS = array<u32, 8>(
     4u, 6u, 6u, 6u, 0u, 0u, 0u, 6u,
 );
 
-const G_COLOR_INDEX_BITCOUNT = array<u32, 8>(
+var<private> G_COLOR_INDEX_BITCOUNT = array<u32, 8>(
     3u, 3u, 2u, 2u, 2u, 2u, 4u, 2u,
 );
 
-const G_ALPHA_INDEX_BITCOUNT = array<i32, 8>(
+var<private> G_ALPHA_INDEX_BITCOUNT = array<i32, 8>(
     0, 0, 0, 0, 3, 2, 4, 2,
 );
 
-const G_MODE_HAS_P_BITS = array<i32, 8>(
+var<private> G_MODE_HAS_P_BITS = array<i32, 8>(
     1, 1, 0, 1, 0, 0, 1, 1,
 );
 
-const G_MODE_HAS_SHARED_P_BITS = array<i32, 8>(
+var<private> G_MODE_HAS_SHARED_P_BITS = array<i32, 8>(
     0, 1, 0, 0, 0, 0, 0, 0,
 );
 
-const G_COLOR_PRECISION_TABLE = array<u32, 8>(
+var<private> G_COLOR_PRECISION_TABLE = array<u32, 8>(
     4u, 6u, 5u, 7u, 5u, 7u, 7u, 5u,
 );
 
-const G_ALPHA_PRECISION_TABLE = array<u32, 8>(
+var<private> G_ALPHA_PRECISION_TABLE = array<u32, 8>(
     0u, 0u, 0u, 0u, 6u, 8u, 7u, 5u,
 );
 
@@ -711,7 +715,7 @@ var<private> SUBSET_IDX3_TOTAL: array<u32, 192> = array<u32, 192>(
     8u, 12u, 2u, 2u, 12u, 2u, 2u, 2u, 2u, 12u, 2u, 2u, 12u, 4u, 6u, 6u,
 );
 
-const TREE_FEATURE = array<i32, 127>(
+var<private> TREE_FEATURE = array<i32, 127>(
     1, 2, 7, 6, 2, 9, 6, 4, 4, 3, 9, 3, 1, 2, 2, 3,
     9, 2, 5, -1, 8, 4, 4, 9, 3, 6, 7, 3, 0, 3, 3, -1,
     -1, 9, -1, 2, 6, 9, 3, 0, -1, 3, 1, -1, -1, -1, -1, -1,
@@ -722,7 +726,7 @@ const TREE_FEATURE = array<i32, 127>(
     -1, -1, -1, -1, -1, -1, 9, -1, -1, -1, -1, -1, 6, -1, -1,
 );
 
-const TREE_THRESHOLD = array<i32, 127>(
+var<private> TREE_THRESHOLD = array<i32, 127>(
     0, 0, 254, 0, 31, 203, 251, 0, 0, 0, 235, 0, 3, 0, 8, 0,
     233, 1, 0, 0, 72, 0, 0, 207, 5, 254, 254, 51, 12186, 1, 12, 0,
     0, 176, 0, 0, 123, 225, 4, 87, 0, 1, 6, 0, 0, 0, 0, 0,
@@ -733,7 +737,7 @@ const TREE_THRESHOLD = array<i32, 127>(
     0, 0, 0, 0, 0, 0, 114, 0, 0, 0, 0, 0, 0, 0, 0,
 );
 
-const TREE_LEFT = array<i32, 127>(
+var<private> TREE_LEFT = array<i32, 127>(
     1, 7, 3, 21, 5, 9, 19, 15, 23, 17, 11, 13, 53, 49, 29, 33,
     77, 61, 35, 4, 27, 37, 43, 25, 55, 67, 31, 57, 79, 51, 45, 6,
     5, 105, 6, 41, 103, 39, 115, 81, 5, 89, 47, 6, 7, 3, 6, 6,
@@ -744,7 +748,7 @@ const TREE_LEFT = array<i32, 127>(
     6, 1, 6, 5, 4, 1, 121, 6, 6, 6, 1, 5, 125, 5, 5,
 );
 
-const TREE_RIGHT = array<i32, 127>(
+var<private> TREE_RIGHT = array<i32, 127>(
     2, 8, 4, 22, 6, 10, 20, 16, 24, 18, 12, 14, 54, 50, 30, 34,
     78, 62, 36, 6623, 28, 38, 44, 26, 56, 68, 32, 58, 80, 52, 46, 9914,
     8047, 106, 3998, 42, 104, 40, 116, 82, 5000, 90, 48, 9997, 9245, 7947, 6619, 4218,
@@ -1082,56 +1086,65 @@ const YR_BITS: u32 = 0x3e59b3d0u;
 const YG_BITS: u32 = 0x3f371759u;
 const YB_BITS: u32 = 0x3d93dd98u;
 
-fn fone() -> f32 {
-    return bitcast<f32>(job.fone);
-}
-
-fn fzero() -> f32 {
-    return (fone() - 1.0) * fone();
-}
-
-fn pmul(a: f32, b: f32) -> f32 {
-    return ((a * b) - fzero()) * fone();
-}
-
-// padd/psub/pval: NVIDIA's Vulkan compiler was observed REASSOCIATING plain add/sub chains
-// ((A+B)+C -> A+(B+C)) AND mul chains ((w*dl)*dl -> w*(dl*dl)) when intermediates are
-// unobserved — beyond the FMA contraction pmul defeats. Any add/sub whose result feeds
-// another add/sub must go through *fone (a mul is a hard boundary for add-trees), and any
-// non-exact product whose result feeds another mul must go through -fzero (a sub is a hard
-// boundary for mul-trees; *fone cannot pin mul grouping because exact 1.0 floats freely).
-// fzero = (fone - 1.0) * fone is runtime +0.0 the compiler cannot fold; x - (+0.0) is an
-// exact identity for every x including -0.0, and contracting either multiply into the sub
-// (fma(a, b, -0)) is still a single correct rounding. fzero's trailing *fone is REQUIRED:
-// a bare fone - 1.0 joins the consumer's add-tree and reassociates as (x - fone) + 1.0,
-// which quantizes x near 1.0 (observed 3-ULP corruption in lsq iz terms). Exact-integer
-// chains (products and sums < 2^24) are immune to regrouping and stay plain.
-fn padd(a: f32, b: f32) -> f32 {
-    return (a + b) * fone();
-}
-
-fn psub(a: f32, b: f32) -> f32 {
-    return (a - b) * fone();
+// pmul/padd/psub/pval: rounding fences. Compilers may reassociate plain
+// add/sub chains ((A+B)+C -> A+(B+C)) and mul chains ((w*dl)*dl -> w*(dl*dl))
+// and contract mul+add into fma — NVIDIA's Vulkan compiler was observed doing
+// the former, and Metal under Chrome/Dawn's `math_mode(relaxed)` (Tint-shaped
+// MSL) was observed penetrating the previous ARITHMETIC fences (*fone /
+// -fzero): multiplying by an opaque 1.0 pins nothing once the optimizer is
+// licensed to regroup the exact mul chain and re-expose a contractible
+// mul+add (1-ULP drift in vecmath/lsq/dist golden tests under Tint, bit-exact
+// under Naga — same GPU, same Metal). The only fence float optimizations
+// cannot cross is a round trip through the INTEGER domain: bitcast to u32,
+// xor with a runtime-opaque zero, bitcast back. zmask() == 0u at runtime
+// (job.fone holds the bits of 1.0f), so the launder is bit-identity for every
+// value including -0.0 and NaN payloads, but the compiler cannot prove it and
+// integer xor participates in no float rewrite. Each fence therefore
+// materializes exactly one correct rounding of its operation.
+// Exact-integer chains (products and sums < 2^24) are immune to regrouping
+// and stay plain.
+fn zmask() -> u32 {
+    return job.fone ^ 0x3f800000u;
 }
 
 fn pval(x: f32) -> f32 {
-    return x - fzero();
+    return bitcast<f32>(bitcast<u32>(x) ^ zmask());
+}
+
+fn pmul(a: f32, b: f32) -> f32 {
+    return pval(a * b);
+}
+
+fn padd(a: f32, b: f32) -> f32 {
+    return pval(a + b);
+}
+
+fn psub(a: f32, b: f32) -> f32 {
+    return pval(a - b);
+}
+
+fn pval3(v: vec3<f32>) -> vec3<f32> {
+    return bitcast<vec3<f32>>(bitcast<vec3<u32>>(v) ^ vec3<u32>(zmask()));
+}
+
+fn pval4(v: vec4<f32>) -> vec4<f32> {
+    return bitcast<vec4<f32>>(bitcast<vec4<u32>>(v) ^ vec4<u32>(zmask()));
 }
 
 fn pmul3(a: f32, b: vec3<f32>) -> vec3<f32> {
-    return ((a * b) - vec3<f32>(fzero())) * fone();
+    return pval3(a * b);
 }
 
 fn pmul4(a: f32, b: vec4<f32>) -> vec4<f32> {
-    return ((a * b) - vec4<f32>(fzero())) * fone();
+    return pval4(a * b);
 }
 
 fn padd3(a: vec3<f32>, b: vec3<f32>) -> vec3<f32> {
-    return (a + b) * fone();
+    return pval3(a + b);
 }
 
 fn padd4(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
-    return (a + b) * fone();
+    return pval4(a + b);
 }
 
 // recip_exact / sqrt_exact: correctly-rounded 1.0/x and sqrt(x) in integer mantissa math
@@ -2636,7 +2649,7 @@ const PCA_SEED_B_BITS: u32 = 0x3f333333u;
 const CCC_EPS_BITS: u32 = 0x2edbe6ffu;
 
 fn psub4(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
-    return (a - b) * fone();
+    return pval4(a - b);
 }
 
 fn div_exact(a: f32, b: f32) -> f32 {
@@ -3451,6 +3464,85 @@ fn make_est_params(mode: u32) -> CCParams {
     return p;
 }
 
+// Tint workaround: dynamic loads from small function-space scalar arrays
+// (register-promoted after loop unrolling) miscompile to literal 0 under
+// Chrome's WGSL compiler on Metal (bisected via the est_debug entry: constant
+// reads and stores are sound, every runtime-indexed load returns 0; the
+// 64-scalar px array is memory-backed and unaffected). Subset indices are
+// 0..15, so pack them 4-bit into a vec2<u32> using constant-index reads only,
+// and extract lanes with shift/mask + select — no dynamic array or
+// vector-component indexing anywhere on this path.
+fn pack_idx16(idxs: ptr<function, array<i32, 16>>) -> vec2<u32> {
+    let lo = (u32((*idxs)[0]) & 15u)
+        | ((u32((*idxs)[1]) & 15u) << 4u)
+        | ((u32((*idxs)[2]) & 15u) << 8u)
+        | ((u32((*idxs)[3]) & 15u) << 12u)
+        | ((u32((*idxs)[4]) & 15u) << 16u)
+        | ((u32((*idxs)[5]) & 15u) << 20u)
+        | ((u32((*idxs)[6]) & 15u) << 24u)
+        | ((u32((*idxs)[7]) & 15u) << 28u);
+    let hi = (u32((*idxs)[8]) & 15u)
+        | ((u32((*idxs)[9]) & 15u) << 4u)
+        | ((u32((*idxs)[10]) & 15u) << 8u)
+        | ((u32((*idxs)[11]) & 15u) << 12u)
+        | ((u32((*idxs)[12]) & 15u) << 16u)
+        | ((u32((*idxs)[13]) & 15u) << 20u)
+        | ((u32((*idxs)[14]) & 15u) << 24u)
+        | ((u32((*idxs)[15]) & 15u) << 28u);
+    return vec2<u32>(lo, hi);
+}
+
+fn idx16_at(packed: vec2<u32>, k: u32) -> u32 {
+    let half = select(packed.x, packed.y, k >= 8u);
+    return (half >> ((k & 7u) * 4u)) & 15u;
+}
+
+// vec4 lane access with constant components only (same Tint bug class as the
+// pack_idx16 note: dynamic vec components miscompile in promoted contexts).
+fn lane_get_i32(v: vec4<i32>, lane: u32) -> i32 {
+    return select(
+        select(v.x, v.y, lane == 1u),
+        select(v.z, v.w, lane == 3u),
+        lane >= 2u,
+    );
+}
+
+fn lane_get_u32(v: vec4<u32>, lane: u32) -> u32 {
+    return select(
+        select(v.x, v.y, lane == 1u),
+        select(v.z, v.w, lane == 3u),
+        lane >= 2u,
+    );
+}
+
+fn lane_set_u32(v: vec4<u32>, lane: u32, val: u32) -> vec4<u32> {
+    var r = v;
+    if (lane == 0u) {
+        r.x = val;
+    } else if (lane == 1u) {
+        r.y = val;
+    } else if (lane == 2u) {
+        r.z = val;
+    } else {
+        r.w = val;
+    }
+    return r;
+}
+
+fn lane_set_i32(v: vec4<i32>, lane: u32, val: i32) -> vec4<i32> {
+    var r = v;
+    if (lane == 0u) {
+        r.x = val;
+    } else if (lane == 1u) {
+        r.y = val;
+    } else if (lane == 2u) {
+        r.z = val;
+    } else {
+        r.w = val;
+    }
+    return r;
+}
+
 fn ccc_est_idx(
     mode: u32,
     w: vec4<u32>,
@@ -3458,10 +3550,11 @@ fn ccc_est_idx(
     num: u32,
     px: ptr<function, array<vec4<i32>, 16>>,
 ) -> vec2<u32> {
+    let pk = pack_idx16(idxs);
     var lo = vec3<f32>(255.0, 255.0, 255.0);
     var hi = vec3<f32>(0.0, 0.0, 0.0);
     for (var k = 0u; k < num; k = k + 1u) {
-        let c = vec3<f32>((*px)[u32((*idxs)[k])].xyz);
+        let c = vec3<f32>((*px)[idx16_at(pk, k)].xyz);
         lo = min(lo, c);
         hi = max(hi, c);
     }
@@ -3477,7 +3570,7 @@ fn ccc_est_idx(
     let wf = vec3<f32>(f32(w.x), f32(w.y), f32(w.z));
     var total_errf = 0.0;
     for (var k = 0u; k < num; k = k + 1u) {
-        let c = vec3<f32>((*px)[u32((*idxs)[k])].xyz);
+        let c = vec3<f32>((*px)[idx16_at(pk, k)].xyz);
         let d = dir.x * c.x + dir.y * c.y + dir.z * c.z;
         let s = fsaturate(pmul(floor(pmul(d - low, scale) + 0.5), inv_n));
         let it = padd3(lo, pmul3(s, dir));
@@ -3498,10 +3591,11 @@ fn ccc_est_mode7_idx(
     num: u32,
     px: ptr<function, array<vec4<i32>, 16>>,
 ) -> vec2<u32> {
+    let pk = pack_idx16(idxs);
     var lo = vec4<f32>(255.0, 255.0, 255.0, 255.0);
     var hi = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     for (var k = 0u; k < num; k = k + 1u) {
-        let c = vec4<f32>((*px)[u32((*idxs)[k])]);
+        let c = vec4<f32>((*px)[idx16_at(pk, k)]);
         lo = min(lo, c);
         hi = max(hi, c);
     }
@@ -3519,7 +3613,7 @@ fn ccc_est_mode7_idx(
     }
     var total_errf = 0.0;
     for (var k = 0u; k < num; k = k + 1u) {
-        let c = vec4<f32>((*px)[u32((*idxs)[k])]);
+        let c = vec4<f32>((*px)[idx16_at(pk, k)]);
         let d = dir.x * c.x + dir.y * c.y + dir.z * c.z + dir.w * c.w;
         let s = fsaturate(pmul(floor(pmul(d - low, scale) + 0.5), inv_n));
         let it = padd4(lo, pmul4(s, dir));
@@ -3621,6 +3715,9 @@ fn est_list_range(
     sols: ptr<function, array<Solution, 8>>,
     num_solutions: ptr<function, i32>,
 ) -> i32 {
+    // Force sols to memory (Tint note at the fences): the insert path below
+    // indexes it at runtime.
+    (*sols)[zmask()] = (*sols)[zmask()];
     let p = make_est_params(mode);
     var i_at = 0;
     for (var part = part_lo; part < part_hi; part = part + 1u) {
@@ -3680,7 +3777,9 @@ fn est_list_take(
     num_solutions: i32,
     max_solutions_in: i32,
 ) -> SolutionList {
+    (*sols)[zmask()] = (*sols)[zmask()];
     var lst: SolutionList;
+    lst.sols[zmask()] = lst.sols[zmask()];
     var take = num_solutions;
     if (take > max_solutions_in) {
         take = max_solutions_in;
@@ -3787,8 +3886,12 @@ fn est_list_group2(
         max_solutions = i32(SOL_CAP);
     }
     var gsols: array<Solution, 32>;
-    var gnum: array<i32, 4>;
-    var giat: array<i32, 4>;
+    // gnum/giat as vec4 lanes with constant-component access: 4-element scalar
+    // arrays indexed by the runtime lane variable are register-promoted and
+    // their dynamic loads miscompile to 0 under Chrome's WGSL compiler in the
+    // plan-kernel inlining context (see the Tint note at the rounding fences).
+    var gnum = vec4<i32>(0);
+    var giat = vec4<i32>(0);
     let first_end = min(total_partitions, BC7E_2SUBSET_CHECKERBOARD_PARTITION_INDEX + 1u);
     for (var lane = 0u; lane < nlanes; lane = lane + 1u) {
         var lpx: array<vec4<i32>, 16>;
@@ -3797,18 +3900,19 @@ fn est_list_group2(
         }
         var sols: array<Solution, 8>;
         var num = 0;
-        giat[lane] = est_list_range(
+        let iat = est_list_range(
             mode, false, 2u, max_solutions, 0u, first_end, &lpx, &sols, &num,
         );
+        giat = lane_set_i32(giat, lane, iat);
         for (var i = 0u; i < SOL_CAP; i = i + 1u) {
             gsols[lane * 8u + i] = sols[i];
         }
-        gnum[lane] = num;
+        gnum = lane_set_i32(gnum, lane, num);
     }
     if (total_partitions > first_end) {
         var all_done = true;
         for (var lane = 0u; lane < nlanes; lane = lane + 1u) {
-            if (giat[lane] < EST_THRESH) {
+            if (lane_get_i32(giat, lane) < EST_THRESH) {
                 all_done = false;
             }
         }
@@ -3822,7 +3926,7 @@ fn est_list_group2(
                 for (var i = 0u; i < SOL_CAP; i = i + 1u) {
                     sols[i] = gsols[lane * 8u + i];
                 }
-                var num = gnum[lane];
+                var num = lane_get_i32(gnum, lane);
                 _ = est_list_range(
                     mode, false, 2u, max_solutions,
                     first_end, total_partitions, &lpx, &sols, &num,
@@ -3830,7 +3934,7 @@ fn est_list_group2(
                 for (var i = 0u; i < SOL_CAP; i = i + 1u) {
                     gsols[lane * 8u + i] = sols[i];
                 }
-                gnum[lane] = num;
+                gnum = lane_set_i32(gnum, lane, num);
             }
         }
     }
@@ -3839,7 +3943,7 @@ fn est_list_group2(
         for (var i = 0u; i < SOL_CAP; i = i + 1u) {
             sols[i] = gsols[lane * 8u + i];
         }
-        (*out_lists)[lane] = est_list_take(&sols, gnum[lane], max_solutions_in);
+        (*out_lists)[lane] = est_list_take(&sols, lane_get_i32(gnum, lane), max_solutions_in);
     }
 }
 
@@ -4115,8 +4219,10 @@ fn bc7_test_modetree(@builtin(global_invocation_id) giv: vec3<u32>) {
 struct OptResults {
     mode: u32,
     partn: u32,
-    selectors: array<i32, 16>,
-    alpha_selectors: array<i32, 16>,
+    // 48 not 16: see the Tint note at the rounding fences (register-promoted
+    // small scalar arrays miscompile dynamic loads; >=48 stays memory-backed).
+    selectors: array<i32, 48>,
+    alpha_selectors: array<i32, 48>,
     low: array<vec4<i32>, 3>,
     high: array<vec4<i32>, 3>,
     pbits: array<vec2<u32>, 3>,
@@ -4126,46 +4232,137 @@ struct OptResults {
 
 const MODE4_SCALE_BITS: u32 = 0x3e7cfcfdu;
 
+// 8-way select tree over the per-mode metadata constants: in the solid-lane
+// inlining context (bc7_test_solid / the compress-kernel solid path) even
+// var<private> 8-element scalar arrays indexed by the runtime mode read back 0
+// under Chrome's WGSL compiler (G_COLOR_PRECISION_TABLE[best_mode] and
+// get_color_index_size both returned 0 while G_NUM_SUBSETS survived in the
+// same function -- see the Tint note at the rounding fences). Select trees
+// over literals are the proven-immune form (sel16_at).
+fn mode_tab8u(
+    m: u32,
+    t0: u32, t1: u32, t2: u32, t3: u32,
+    t4: u32, t5: u32, t6: u32, t7: u32,
+) -> u32 {
+    let a = select(t0, t1, (m & 1u) == 1u);
+    let b = select(t2, t3, (m & 1u) == 1u);
+    let c = select(t4, t5, (m & 1u) == 1u);
+    let d = select(t6, t7, (m & 1u) == 1u);
+    return select(select(a, b, (m & 2u) == 2u), select(c, d, (m & 2u) == 2u), (m & 4u) == 4u);
+}
+
+// Mirrors G_NUM_SUBSETS / G_PARTITION_BITS / G_COLOR_INDEX_BITCOUNT /
+// G_ALPHA_INDEX_BITCOUNT / G_MODE_HAS_P_BITS / G_MODE_HAS_SHARED_P_BITS /
+// G_COLOR_PRECISION_TABLE / G_ALPHA_PRECISION_TABLE for the encode context.
+fn mode_num_subsets(m: u32) -> u32 {
+    return mode_tab8u(m, 3u, 2u, 3u, 2u, 1u, 1u, 1u, 2u);
+}
+
+fn mode_partition_bits(m: u32) -> u32 {
+    return mode_tab8u(m, 4u, 6u, 6u, 6u, 0u, 0u, 0u, 6u);
+}
+
+fn mode_has_pbits(m: u32) -> bool {
+    return mode_tab8u(m, 1u, 1u, 0u, 1u, 0u, 0u, 1u, 1u) != 0u;
+}
+
+fn mode_has_shared_pbits(m: u32) -> bool {
+    return mode_tab8u(m, 0u, 1u, 0u, 0u, 0u, 0u, 0u, 0u) != 0u;
+}
+
+fn mode_color_precision(m: u32) -> u32 {
+    return mode_tab8u(m, 4u, 6u, 5u, 7u, 5u, 7u, 7u, 5u);
+}
+
+fn mode_alpha_precision(m: u32) -> u32 {
+    return mode_tab8u(m, 0u, 0u, 0u, 0u, 6u, 8u, 7u, 5u);
+}
+
 fn get_color_index_size(mode: u32, index_selector: u32) -> u32 {
-    return G_COLOR_INDEX_BITCOUNT[mode] + index_selector;
+    return mode_tab8u(mode, 3u, 3u, 2u, 2u, 2u, 2u, 4u, 2u) + index_selector;
 }
 
 fn get_alpha_index_size(mode: u32, index_selector: u32) -> u32 {
-    return u32(G_ALPHA_INDEX_BITCOUNT[mode] - i32(index_selector));
+    return mode_tab8u(mode, 0u, 0u, 0u, 0u, 3u, 2u, 4u, 2u) - index_selector;
 }
 
 fn mode_has_separate_alpha_selectors(mode: u32) -> bool {
     return mode == 4u || mode == 5u;
 }
 
-fn block_or_byte(blk: ptr<function, vec4<u32>>, byte_idx: u32, v: u32) {
-    (*blk)[byte_idx >> 2u] = (*blk)[byte_idx >> 2u] | ((v & 0xffu) << ((byte_idx & 3u) * 8u));
+// Four named scalar fields, constant accesses only: both the dynamic vec4
+// component form ([i], runtime i) AND constant .z/.w component writes through
+// this pointer miscompile under Chrome's WGSL compiler in the encode-kernel
+// inlining context (writes past word 1 were silently dropped; see the Tint
+// note at the rounding fences). Named scalar struct fields are immune.
+struct BlockBits {
+    b0: u32,
+    b1: u32,
+    b2: u32,
+    b3: u32,
 }
 
+fn block_or_byte(blk: ptr<function, BlockBits>, byte_idx: u32, v: u32) {
+    let w = (v & 0xffu) << ((byte_idx & 3u) * 8u);
+    let i = byte_idx >> 2u;
+    if (i == 0u) {
+        (*blk).b0 = (*blk).b0 | w;
+    } else if (i == 1u) {
+        (*blk).b1 = (*blk).b1 | w;
+    } else if (i == 2u) {
+        (*blk).b2 = (*blk).b2 | w;
+    } else {
+        (*blk).b3 = (*blk).b3 | w;
+    }
+}
+
+// Takes/returns the bit offset BY VALUE: with a ptr<function, u32> cursor the
+// `*cur_ofs += n` write-backs were silently dropped for the call sites inlined
+// inside loops when the caller's mode is compile-time constant (bc7_test_solid
+// / the compress-kernel solid path: every post-rotation field landed at the
+// stale offset 8). Same Tint family as the BlockBits note above -- writes
+// through function-space pointers vanish in promoted contexts.
 fn set_block_bits(
-    blk: ptr<function, vec4<u32>>,
+    blk: ptr<function, BlockBits>,
     val: u32,
     num_bits: u32,
-    cur_ofs: ptr<function, u32>,
-) {
+    cur_ofs: u32,
+) -> u32 {
     var v = val;
     var nb = num_bits;
+    var ofs = cur_ofs;
     while (nb != 0u) {
-        let n = min(8u - (*cur_ofs & 7u), nb);
-        block_or_byte(blk, *cur_ofs >> 3u, v << (*cur_ofs & 7u));
+        let n = min(8u - (ofs & 7u), nb);
+        block_or_byte(blk, ofs >> 3u, v << (ofs & 7u));
         v = v >> n;
         nb = nb - n;
-        *cur_ofs = *cur_ofs + n;
+        ofs = ofs + n;
     }
+    return ofs;
+}
+
+// 16-way select tree over constant-index reads: runtime-indexed loads from
+// 16-element scalar arrays miscompile in promoted contexts (Tint note at the
+// rounding fences); the anchor reads below carry a runtime index.
+fn sel16_at(p: ptr<function, array<i32, 48>>, j: u32) -> i32 {
+    let a = select(select((*p)[0], (*p)[1], (j & 1u) == 1u),
+                   select((*p)[2], (*p)[3], (j & 1u) == 1u), (j & 2u) == 2u);
+    let b = select(select((*p)[4], (*p)[5], (j & 1u) == 1u),
+                   select((*p)[6], (*p)[7], (j & 1u) == 1u), (j & 2u) == 2u);
+    let c = select(select((*p)[8], (*p)[9], (j & 1u) == 1u),
+                   select((*p)[10], (*p)[11], (j & 1u) == 1u), (j & 2u) == 2u);
+    let d = select(select((*p)[12], (*p)[13], (j & 1u) == 1u),
+                   select((*p)[14], (*p)[15], (j & 1u) == 1u), (j & 2u) == 2u);
+    return select(select(a, b, (j & 4u) == 4u), select(c, d, (j & 4u) == 4u), (j & 8u) == 8u);
 }
 
 fn encode_bc7_block_bits(res: ptr<function, OptResults>) -> vec4<u32> {
     let best_mode = (*res).mode;
-    let total_subsets = G_NUM_SUBSETS[best_mode];
-    let total_partitions = 1u << G_PARTITION_BITS[best_mode];
-    var color_selectors: array<i32, 16>;
-    var alpha_selectors: array<i32, 16>;
-    var part: array<u32, 16>;
+    let total_subsets = mode_num_subsets(best_mode);
+    let total_partitions = 1u << mode_partition_bits(best_mode);
+    var color_selectors: array<i32, 48>;
+    var alpha_selectors: array<i32, 48>;
+    var part: array<u32, 48>;
     for (var i = 0u; i < 16u; i = i + 1u) {
         color_selectors[i] = (*res).selectors[i];
         alpha_selectors[i] = (*res).alpha_selectors[i];
@@ -4180,6 +4377,11 @@ fn encode_bc7_block_bits(res: ptr<function, OptResults>) -> vec4<u32> {
     var low: array<vec4<i32>, 3>;
     var high: array<vec4<i32>, 3>;
     var pbits: array<vec2<u32>, 3>;
+    // Runtime-opaque self-writes force these to memory: the subset loops below
+    // index them at runtime (Tint note at the rounding fences).
+    low[zmask()] = low[zmask()];
+    high[zmask()] = high[zmask()];
+    pbits[zmask()] = pbits[zmask()];
     for (var k = 0u; k < 3u; k = k + 1u) {
         low[k] = (*res).low[k];
         high[k] = (*res).high[k];
@@ -4197,10 +4399,16 @@ fn encode_bc7_block_bits(res: ptr<function, OptResults>) -> vec4<u32> {
                 anchor_index = u32(G_ANCHOR_2ND[(*res).partn]);
             }
         }
-        anchor[k] = i32(anchor_index);
+        if (k == 0u) {
+            anchor.x = i32(anchor_index);
+        } else if (k == 1u) {
+            anchor.y = i32(anchor_index);
+        } else {
+            anchor.z = i32(anchor_index);
+        }
         let color_index_bits = get_color_index_size(best_mode, (*res).index_selector);
         let num_color_indices = i32(1u << color_index_bits);
-        if ((color_selectors[anchor_index] & (num_color_indices >> 1u)) != 0) {
+        if ((sel16_at(&color_selectors, anchor_index) & (num_color_indices >> 1u)) != 0) {
             for (var i = 0u; i < 16u; i = i + 1u) {
                 if (part[i] == k) {
                     color_selectors[i] = (num_color_indices - 1) - color_selectors[i];
@@ -4217,7 +4425,7 @@ fn encode_bc7_block_bits(res: ptr<function, OptResults>) -> vec4<u32> {
                 low[k] = high[k];
                 high[k] = t;
             }
-            if (G_MODE_HAS_SHARED_P_BITS[best_mode] == 0) {
+            if (!mode_has_shared_pbits(best_mode)) {
                 let t = pbits[k].x;
                 pbits[k].x = pbits[k].y;
                 pbits[k].y = t;
@@ -4226,7 +4434,7 @@ fn encode_bc7_block_bits(res: ptr<function, OptResults>) -> vec4<u32> {
         if (mode_has_separate_alpha_selectors(best_mode)) {
             let alpha_index_bits = get_alpha_index_size(best_mode, (*res).index_selector);
             let num_alpha_indices = i32(1u << alpha_index_bits);
-            if ((alpha_selectors[anchor_index] & (num_alpha_indices >> 1u)) != 0) {
+            if ((sel16_at(&alpha_selectors, anchor_index) & (num_alpha_indices >> 1u)) != 0) {
                 for (var i = 0u; i < 16u; i = i + 1u) {
                     if (part[i] == k) {
                         alpha_selectors[i] = (num_alpha_indices - 1) - alpha_selectors[i];
@@ -4238,37 +4446,41 @@ fn encode_bc7_block_bits(res: ptr<function, OptResults>) -> vec4<u32> {
             }
         }
     }
-    var block = vec4<u32>(0u);
+    var block = BlockBits(0u, 0u, 0u, 0u);
     var cur = 0u;
-    set_block_bits(&block, 1u << best_mode, best_mode + 1u, &cur);
+    cur = set_block_bits(&block, 1u << best_mode, best_mode + 1u, cur);
     if (best_mode == 4u || best_mode == 5u) {
-        set_block_bits(&block, (*res).rotation, 2u, &cur);
+        cur = set_block_bits(&block, (*res).rotation, 2u, cur);
     }
     if (best_mode == 4u) {
-        set_block_bits(&block, (*res).index_selector, 1u, &cur);
+        cur = set_block_bits(&block, (*res).index_selector, 1u, cur);
     }
     if (total_partitions > 1u) {
-        set_block_bits(&block, (*res).partn, select(4u, 6u, total_partitions == 64u), &cur);
+        cur = set_block_bits(&block, (*res).partn, select(4u, 6u, total_partitions == 64u), cur);
     }
     let total_comps = select(3u, 4u, best_mode >= 4u);
     for (var comp = 0u; comp < total_comps; comp = comp + 1u) {
         for (var subset = 0u; subset < total_subsets; subset = subset + 1u) {
-            var prec = G_COLOR_PRECISION_TABLE[best_mode];
+            var prec = mode_color_precision(best_mode);
             if (comp == 3u) {
-                prec = G_ALPHA_PRECISION_TABLE[best_mode];
+                prec = mode_alpha_precision(best_mode);
             }
-            set_block_bits(&block, bitcast<u32>(low[subset][comp]), prec, &cur);
-            set_block_bits(&block, bitcast<u32>(high[subset][comp]), prec, &cur);
+            cur = set_block_bits(&block, bitcast<u32>(lane_get_i32(low[subset], comp)), prec, cur);
+            cur = set_block_bits(&block, bitcast<u32>(lane_get_i32(high[subset], comp)), prec, cur);
         }
     }
-    if (G_MODE_HAS_P_BITS[best_mode] != 0) {
+    if (mode_has_pbits(best_mode)) {
         for (var subset = 0u; subset < total_subsets; subset = subset + 1u) {
-            set_block_bits(&block, pbits[subset].x, 1u, &cur);
-            if (G_MODE_HAS_SHARED_P_BITS[best_mode] == 0) {
-                set_block_bits(&block, pbits[subset].y, 1u, &cur);
+            cur = set_block_bits(&block, pbits[subset].x, 1u, cur);
+            if (!mode_has_shared_pbits(best_mode)) {
+                cur = set_block_bits(&block, pbits[subset].y, 1u, cur);
             }
         }
     }
+    // sel16_at, not [idx]: in the solid-lane inlining context the direct
+    // constant-trip-count loop reads of these 48-wide locals returned 0 (the
+    // endpoint words packed fine, every selector packed as 0). Same family as
+    // the sel16_at anchor reads above.
     for (var idx = 0; idx < 16; idx = idx + 1) {
         var n = get_color_index_size(best_mode, (*res).index_selector);
         if ((*res).index_selector != 0u) {
@@ -4277,11 +4489,11 @@ fn encode_bc7_block_bits(res: ptr<function, OptResults>) -> vec4<u32> {
         if (idx == anchor.x || idx == anchor.y || idx == anchor.z) {
             n = n - 1u;
         }
-        var val = color_selectors[idx];
+        var val = sel16_at(&color_selectors, u32(idx));
         if ((*res).index_selector != 0u) {
-            val = alpha_selectors[idx];
+            val = sel16_at(&alpha_selectors, u32(idx));
         }
-        set_block_bits(&block, bitcast<u32>(val), n, &cur);
+        cur = set_block_bits(&block, bitcast<u32>(val), n, cur);
     }
     if (mode_has_separate_alpha_selectors(best_mode)) {
         for (var idx = 0; idx < 16; idx = idx + 1) {
@@ -4292,14 +4504,14 @@ fn encode_bc7_block_bits(res: ptr<function, OptResults>) -> vec4<u32> {
             if (idx == anchor.x || idx == anchor.y || idx == anchor.z) {
                 n = n - 1u;
             }
-            var val = alpha_selectors[idx];
+            var val = sel16_at(&alpha_selectors, u32(idx));
             if ((*res).index_selector != 0u) {
-                val = color_selectors[idx];
+                val = sel16_at(&color_selectors, u32(idx));
             }
-            set_block_bits(&block, bitcast<u32>(val), n, &cur);
+            cur = set_block_bits(&block, bitcast<u32>(val), n, cur);
         }
     }
-    return block;
+    return vec4<u32>(block.b0, block.b1, block.b2, block.b3);
 }
 
 fn or64_shl(acc: vec2<u32>, v: u32, s: u32) -> vec2<u32> {
@@ -4962,6 +5174,7 @@ fn run_mode_list(
     opt: ptr<function, OptResults>,
     px: ptr<function, array<vec4<i32>, 16>>,
 ) {
+    (*sols).sols[zmask()] = (*sols).sols[zmask()];
     let ns = (*sols).len;
     var iters = ns;
     if (rerun && ns > 2u) {
@@ -5276,7 +5489,8 @@ fn bc7_plan_alpha(@builtin(global_invocation_id) giv: vec3<u32>) {
         n = GROUP_WIDTH;
     }
     var apx: array<vec4<i32>, 64>;
-    var alpha_idx: array<u32, 4>;
+    // alpha_idx as vec4 lanes; lists touched: see the Tint note at the fences.
+    var alpha_idx = vec4<u32>(0u);
     var alpha_n = 0u;
     for (var k = 0u; k < n; k = k + 1u) {
         var px: array<vec4<i32>, 16>;
@@ -5297,15 +5511,16 @@ fn bc7_plan_alpha(@builtin(global_invocation_id) giv: vec3<u32>) {
             for (var i = 0u; i < 16u; i = i + 1u) {
                 apx[alpha_n * 16u + i] = px[i];
             }
-            alpha_idx[alpha_n] = k;
+            alpha_idx = lane_set_u32(alpha_idx, alpha_n, k);
             alpha_n = alpha_n + 1u;
         }
     }
     if (alpha_n != 0u && params.use_mode7 != 0u) {
         var lists: array<SolutionList, 4>;
+        lists[zmask()] = lists[zmask()];
         est_list_group2(7u, i32(params.al_max_mode7), alpha_n, &apx, &lists);
         for (var k = 0u; k < alpha_n; k = k + 1u) {
-            write_plan_sol_list((start + alpha_idx[k]) * PLAN_STRIDE + 85u, lists[k]);
+            write_plan_sol_list((start + lane_get_u32(alpha_idx, k)) * PLAN_STRIDE + 85u, lists[k]);
         }
     }
 }
@@ -5314,7 +5529,7 @@ fn gather_opaque(
     start: u32,
     n: u32,
     opx: ptr<function, array<vec4<i32>, 64>>,
-    opaque_idx: ptr<function, array<u32, 4>>,
+    opaque_idx: ptr<function, vec4<u32>>,
 ) -> u32 {
     var opaque_n = 0u;
     for (var k = 0u; k < n; k = k + 1u) {
@@ -5325,7 +5540,7 @@ fn gather_opaque(
             for (var i = 0u; i < 16u; i = i + 1u) {
                 (*opx)[opaque_n * 16u + i] = px[i];
             }
-            (*opaque_idx)[opaque_n] = k;
+            *opaque_idx = lane_set_u32(*opaque_idx, opaque_n, k);
             opaque_n = opaque_n + 1u;
         }
     }
@@ -5344,7 +5559,8 @@ fn bc7_plan_opaque13(@builtin(global_invocation_id) giv: vec3<u32>) {
         n = GROUP_WIDTH;
     }
     var opx: array<vec4<i32>, 64>;
-    var opaque_idx: array<u32, 4>;
+    // opaque_idx as vec4 lanes; lists touched: see the Tint note at the fences.
+    var opaque_idx = vec4<u32>(0u);
     let opaque_n = gather_opaque(start, n, &opx, &opaque_idx);
     if (opaque_n == 0u || (params.use_mode[1] == 0u && params.use_mode[3] == 0u)) {
         return;
@@ -5355,14 +5571,15 @@ fn bc7_plan_opaque13(@builtin(global_invocation_id) giv: vec3<u32>) {
             for (var i = 0u; i < 16u; i = i + 1u) {
                 px[i] = opx[k * 16u + i];
             }
-            let base = (start + opaque_idx[k]) * PLAN_STRIDE;
+            let base = (start + lane_get_u32(opaque_idx, k)) * PLAN_STRIDE;
             out_words[base + 5u] = estimate_partition(1u, &px);
         }
     } else {
         var lists: array<SolutionList, 4>;
+        lists[zmask()] = lists[zmask()];
         est_list_group2(1u, i32(params.op_max_mode13), opaque_n, &opx, &lists);
         for (var k = 0u; k < opaque_n; k = k + 1u) {
-            let base = (start + opaque_idx[k]) * PLAN_STRIDE;
+            let base = (start + lane_get_u32(opaque_idx, k)) * PLAN_STRIDE;
             out_words[base + 7u] = 1u;
             write_plan_sol_list(base + 10u, lists[k]);
         }
@@ -5381,14 +5598,15 @@ fn bc7_plan_opaque02(@builtin(global_invocation_id) giv: vec3<u32>) {
         n = GROUP_WIDTH;
     }
     var opx: array<vec4<i32>, 64>;
-    var opaque_idx: array<u32, 4>;
+    // opaque_idx as vec4 lanes; lists touched: see the Tint note at the fences.
+    var opaque_idx = vec4<u32>(0u);
     let opaque_n = gather_opaque(start, n, &opx, &opaque_idx);
     for (var k = 0u; k < opaque_n; k = k + 1u) {
         var px: array<vec4<i32>, 16>;
         for (var i = 0u; i < 16u; i = i + 1u) {
             px[i] = opx[k * 16u + i];
         }
-        let base = (start + opaque_idx[k]) * PLAN_STRIDE;
+        let base = (start + lane_get_u32(opaque_idx, k)) * PLAN_STRIDE;
         if (params.use_mode[0] != 0u) {
             if (params.op_max_mode0 == 1u) {
                 out_words[base + 4u] = estimate_partition(0u, &px);

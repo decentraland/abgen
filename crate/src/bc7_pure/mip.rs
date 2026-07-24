@@ -274,6 +274,12 @@ pub fn encode_bc7_mip_chain_with_profile(
             return r;
         }
     }
+    #[cfg(target_arch = "wasm32")]
+    if let Some(r) = super::wasm_hook::try_encode(
+        rgba, width, height, mip_count, flip, srgb, perceptual, profile,
+    ) {
+        return r;
+    }
     let w = width as usize;
     let h = height as usize;
     assert_eq!(rgba.len(), w * h * 4);

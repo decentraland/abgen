@@ -76,6 +76,8 @@ pub fn self_gate_bundle_with(
     let mut materials: Vec<(String, i64, i64, i64)> = Vec::new();
     let mut renderer_mat_pids: HashSet<i64> = HashSet::new();
     let mut textures: Vec<(String, i64, i64, i64, i64)> = Vec::new();
+    let mut mat_metal: Vec<(String, i64, Vec<String>, f64, f64, f64)> = Vec::new();
+    let mut tex_colorspace: HashMap<i64, i64> = HashMap::new();
     let mut mesh_extent = [0.0f64; 3];
     let mut mesh_count = 0usize;
     let mut deps: Vec<String> = Vec::new();
@@ -134,6 +136,54 @@ pub fn self_gate_bundle_with(
                         .and_then(|p| p.get("m_PathID"))
                         .and_then(|x| x.as_i64())
                         .unwrap_or(-1);
+                    let keywords: Vec<String> = v
+                        .get("m_ValidKeywords")
+                        .and_then(|k| k.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|s| s.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let mgm = v
+                        .get("m_SavedProperties")
+                        .and_then(|p| p.get("m_TexEnvs"))
+                        .and_then(|t| t.as_array())
+                        .and_then(|arr| {
+                            arr.iter().find_map(|e| {
+                                let pair = e.as_array()?;
+                                if pair.first()?.as_str()? == "_MetallicGlossMap" {
+                                    pair.get(1)?.get("m_Texture")?.get("m_PathID")?.as_i64()
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .unwrap_or(0);
+                    let flt = |n: &str| {
+                        v.get("m_SavedProperties")
+                            .and_then(|p| p.get("m_Floats"))
+                            .and_then(|f| f.as_array())
+                            .and_then(|arr| {
+                                arr.iter().find_map(|e| {
+                                    let pair = e.as_array()?;
+                                    if pair.first()?.as_str()? == n {
+                                        pair.get(1)?.as_f64()
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                            .unwrap_or(f64::NAN)
+                    };
+                    mat_metal.push((
+                        name.clone(),
+                        mgm,
+                        keywords,
+                        flt("_Metallic"),
+                        flt("_Smoothness"),
+                        flt("_SmoothnessTextureChannel"),
+                    ));
                     materials.push((name, fid, pid, obj.path_id));
                 }
                 23 | 137 => {
@@ -156,6 +206,7 @@ pub fn self_gate_bundle_with(
                 }
                 28 => {
                     let get = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(-1);
+                    tex_colorspace.insert(obj.path_id, get("m_ColorSpace"));
                     textures.push((
                         name,
                         get("m_TextureFormat"),
@@ -306,6 +357,44 @@ pub fn self_gate_bundle_with(
         "texture-uniform-size",
         tex_sizes.len() <= 1,
         format!("{} distinct size(s): {tex_sizes:?}", tex_sizes.len()),
+    );
+    for (name, mgm, keywords, met, smooth, stc) in &mat_metal {
+        if *mgm == 0 {
+            continue;
+        }
+        let has_kw = keywords.iter().any(|k| k == "_METALLICSPECGLOSSMAP");
+        push_check(
+            &mut checks,
+            format!("metal-gloss-map[{name}]"),
+            has_kw && *met == 1.0 && *smooth == 1.0 && *stc == 0.0,
+            format!(
+                "keyword={has_kw} _Metallic={met} _Smoothness={smooth} \
+                 _SmoothnessTextureChannel={stc}"
+            ),
+        );
+        let cs = tex_colorspace.get(mgm).copied();
+        push_check(
+            &mut checks,
+            format!("metal-gloss-map-linear[{name}]"),
+            cs == Some(0),
+            format!("m_ColorSpace={cs:?} want Some(0)"),
+        );
+    }
+    let stray: Vec<&String> = mat_metal
+        .iter()
+        .filter(|(_, mgm, kw, _, _, _)| {
+            *mgm == 0 && kw.iter().any(|k| k == "_METALLICSPECGLOSSMAP")
+        })
+        .map(|(n, _, _, _, _, _)| n)
+        .collect();
+    push_check(
+        &mut checks,
+        "metal-gloss-keyword-hygiene",
+        stray.is_empty(),
+        format!(
+            "{} material(s) with _METALLICSPECGLOSSMAP but no bound map: {stray:?}",
+            stray.len()
+        ),
     );
     match &metadata {
         Some(m) => {

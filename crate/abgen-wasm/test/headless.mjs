@@ -1,4 +1,4 @@
-// Headless driver for site/wasm/abgen_poc.wasm — same protocol as
+// Headless driver for site/wasm/abgen_wasm.wasm — same protocol as
 // site/wasm/worker.js, run under node for CI-style verification.
 // usage: node headless.mjs <out_dir> <platform> <entity|''>
 //        [--lod=0|1] [--crop=0|1] [--tri-cap=N] <file...>
@@ -110,10 +110,19 @@ const blob = new Uint8Array(total);
 let off = 0;
 for (const p of parts) { blob.set(p, off); off += p.byteLength; }
 
-const wasmBytes = readFileSync(new URL('../../site/wasm/abgen_poc.wasm', import.meta.url));
+const wasmBytes = readFileSync(new URL('../../../site/wasm/abgen_wasm.wasm', import.meta.url));
+const wbindgenPlaceholder = new Proxy({}, {
+  get: (_, k) => (() => { throw new Error(`wasm-bindgen placeholder called: ${String(k)}`); }),
+});
 const { instance } = await WebAssembly.instantiate(wasmBytes, {
-  env: { host_emit: hostEmit },
+  // host_encode_bc7: no WebGPU bridge headless — 0 routes encodes to CPU.
+  env: { host_emit: hostEmit, host_encode_bc7: () => 0 },
   wasi_snapshot_preview1: wasi,
+  __wbindgen_placeholder__: wbindgenPlaceholder,
+  __wbindgen_externref_xform__: {
+    __wbindgen_externref_table_grow: () => -1,
+    __wbindgen_externref_table_set_null: () => {},
+  },
 });
 exports = instance.exports;
 exports.poc_init();

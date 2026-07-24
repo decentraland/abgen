@@ -3,7 +3,7 @@ use anyhow::{bail, Result};
 use super::tile::Tile;
 use super::{
     AtlasMode, GROW_TRIES, MAX_PACK_TRIES, MIN_TILE_DIM, NATIVE_MIN_CANVAS, NATIVE_SOLID_DIM,
-    SHRINK_STEP, TARGET_OCCUPANCY,
+    SHRINK_STEP, TARGET_OCCUPANCY, TILE_FLOOR_DIV,
 };
 
 struct SkyNode {
@@ -191,6 +191,7 @@ fn pack_single(
 pub(super) fn pack_bucket(
     tiles: &mut [Tile],
     crops: &mut [Option<[u32; 4]>],
+    weights: &[f64],
     mode: AtlasMode,
     max_pot: u32,
     padding: u32,
@@ -221,13 +222,35 @@ pub(super) fn pack_bucket(
             }
         })
         .collect();
+    let wsum: f64 = tiles
+        .iter()
+        .zip(weights.iter())
+        .filter(|(t, _)| !t.is_solid())
+        .map(|(_, w)| *w)
+        .sum();
+    let area_weighted = mode == AtlasMode::Native && wsum > 0.0;
+    let floor_dim = (canvas / TILE_FLOOR_DIV).max(MIN_TILE_DIM);
     let dims_at = |scale: f64| -> Vec<(u32, u32)> {
         tiles
             .iter()
             .zip(natives.iter())
-            .map(|(t, &(nw, nh))| {
+            .zip(weights.iter())
+            .map(|((t, &(nw, nh)), &wt)| {
                 if mode != AtlasMode::FullBleed && t.is_solid() {
                     return (nw, nh);
+                }
+                if area_weighted {
+                    let target = wt / wsum
+                        * TARGET_OCCUPANCY
+                        * (canvas as f64 * canvas as f64)
+                        * scale
+                        * scale;
+                    let ar = nw as f64 / nh as f64;
+                    let tw = (target * ar).sqrt().round() as u32;
+                    let th = (target / ar).sqrt().round() as u32;
+                    let lo =
+                        ((floor_dim as f64 * scale).round() as u32).clamp(MIN_TILE_DIM, floor_dim);
+                    return (tw.max(lo).min(nw), th.max(lo).min(nh));
                 }
                 let (bw, bh) = match mode {
                     AtlasMode::FullBleed => (t.src_w, t.src_h),
@@ -265,9 +288,13 @@ pub(super) fn pack_bucket(
         .iter()
         .map(|&(w, h)| (w + 2 * padding) as f64 * (h + 2 * padding) as f64)
         .sum();
-    let mut scale = (TARGET_OCCUPANCY * canvas as f64 * canvas as f64 / padded_area)
-        .sqrt()
-        .min(1.0);
+    let mut scale = if area_weighted {
+        1.0
+    } else {
+        (TARGET_OCCUPANCY * canvas as f64 * canvas as f64 / padded_area)
+            .sqrt()
+            .min(1.0)
+    };
     let mut fitted: Option<(Vec<(u32, u32)>, Vec<(u32, u32)>, f64)> = None;
     for _ in 0..MAX_PACK_TRIES {
         let dims = dims_at(scale);
