@@ -34,7 +34,6 @@ h1 .x{color:var(--accent)}
   padding:8px 10px;display:flex;flex-direction:column;gap:5px}
 .stage.live{border-color:var(--accent)}
 .sno{font-size:10px;font-weight:700;letter-spacing:.2em;text-transform:uppercase;color:var(--accent)}
-.sup{font-size:11px;line-height:1.45;color:var(--dim)}
 .sstat{font-size:11px;line-height:1.5;color:var(--faint);margin-top:auto}
 .sstat b{color:var(--ink);font-weight:700}
 .sarrow{align-self:center;color:var(--faint);padding:0 5px;font-size:13px;flex:0 0 auto}
@@ -97,18 +96,13 @@ main{display:grid;grid-template-columns:minmax(340px,4fr) minmax(420px,6fr);gap:
 #sum{margin-top:10px;font-size:11px;color:var(--dim);letter-spacing:.04em}
 #sum b{color:var(--ink)}
 
-#caveats{margin:0 18px 40px;border:1px solid var(--line);border-radius:3px;background:var(--panel);
-  padding:12px 14px;font-size:11px;color:var(--faint);line-height:1.8}
-#caveats b{color:var(--dim);letter-spacing:.18em;text-transform:uppercase;font-size:10px}
-#caveats span{color:var(--warnc)}
 </style>
 </head>
 <body>
 <header>
   <div class="masthead">
     <h1>ABGEN<span class="x">·</span>WASM LAB</h1>
-    <span class="gen">the abgen converter core compiled to wasm32 — glTF → Unity asset bundle, entirely in this tab</span>
-    <span class="gen"><b>nothing is uploaded; files never leave the browser</b></span>
+    <span class="gen">glTF → Unity asset bundle</span>
     <span class="gen"><a href="../index.html">← parity lightbox</a></span>
   </div>
 </header>
@@ -116,25 +110,21 @@ main{display:grid;grid-template-columns:minmax(340px,4fr) minmax(420px,6fr);gap:
 <div id="proc">
   <div class="stage" id="st0">
     <div class="sno">01 · Upload</div>
-    <div class="sup">glb / gltf / textures, or a zip of a scene, wearable or emote</div>
     <div class="sstat" id="ss0">waiting for files</div>
   </div>
   <div class="sarrow">→</div>
   <div class="stage" id="st1">
     <div class="sno">02 · Parse</div>
-    <div class="sup">GLB container → accessors → RH→LH handedness, winding, tangents, skinning</div>
     <div class="sstat" id="ss1">—</div>
   </div>
   <div class="sarrow">→</div>
   <div class="stage" id="st2">
     <div class="sno">03 · Encode</div>
-    <div class="sup">linear-space mips, alpha bleed, BC7 / DXT / crunched-CRN compression (CPU, one file per worker)</div>
     <div class="sstat" id="ss2">—</div>
   </div>
   <div class="sarrow">→</div>
   <div class="stage" id="st3">
     <div class="sno">04 · Serialize</div>
-    <div class="sup">SerializedFile type trees → UnityFS container, 128 KiB LZ4HC blocks</div>
     <div class="sstat" id="ss3">—</div>
   </div>
 </div>
@@ -142,7 +132,7 @@ main{display:grid;grid-template-columns:minmax(340px,4fr) minmax(420px,6fr);gap:
 <main>
   <div class="panel">
     <p class="ptitle">Input<span class="x">·</span>entity</p>
-    <div id="drop">drop <b>.glb</b> / <b>.gltf</b> / textures / <b>.zip</b> here<br>or click to pick files</div>
+    <div id="drop">drop <b>.glb</b> / <b>.gltf</b> / <b>.zip</b> — or click</div>
     <input id="pick" type="file" multiple style="display:none">
     <table id="filetable"></table>
     <div class="controls">
@@ -156,8 +146,8 @@ main{display:grid;grid-template-columns:minmax(340px,4fr) minmax(420px,6fr);gap:
       <div class="grp" id="etgrp">
         <button data-v="" class="on">auto</button><button data-v="wearable">wearable</button><button data-v="emote">emote</button><button data-v="scene">scene</button>
       </div>
-      <span class="chip on" id="magenta" title="missing textures become a magenta placeholder instead of failing the build">tolerate missing refs</span>
-      <span class="chip on" id="lodchip" title="also bake a LOD1 bundle: merge + ISS placements + texture atlas + DCL/Scene_TexArray binding + self-gate (the module also does parcel crop and meshopt tri-cap decimation; this page bakes with those off)">bake lod1</span>
+      <span class="chip on" id="magenta">tolerate missing refs</span>
+      <span class="chip on" id="lodchip">bake lod1</span>
     </div>
     <button id="convert" disabled>convert</button>
     <button id="reset">clear</button>
@@ -171,22 +161,6 @@ main{display:grid;grid-template-columns:minmax(340px,4fr) minmax(420px,6fr);gap:
   </div>
 </main>
 
-<div id="caveats">
-  <b>the real codecs, compiled to wasm</b> — IJG libjpeg 9c, crnlib (crunched DXT5 normal maps) and the
-  draco decoder are statically linked into this module via a wasi-libc/libc++ toolchain. Bundles built here are
-  byte-identical to the native binary from the same tree under the libjpeg-9c GLB decode profile (the byte gate
-  pins ABGEN_JPEG_GLB_9C=1; the native production default decodes GLB JPEGs with turbojpeg, the closer match to
-  the Unity oracle): every byte-path transcendental routes through one shared libm, and the gate (12 fixtures
-  across windows/mac/webgl — LOD1 bakes with meshopt decimation, parcel crop and ISS placements on windows/mac,
-  plus a corrupt-JPEG recovery pair) passes with zero diffs. Files convert one per worker on a pool; a
-  malformed image fails only its own file through real setjmp recovery, exactly like native, and a worker that
-  traps anyway is terminated and respawned so the rest of the run completes. Remaining gaps vs the native
-  fleet:
-  <span>encode is CPU (SIMD128 in the BC7 partition estimator, startup-qualified byte-equal to scalar) —
-  native uses AVX-512 or a bit-exact CUDA/wgpu GPU lane; WebGPU here is a documented follow-up</span> ·
-  <span>gltfpack decimation and placements acquisition via the Node manifest-builder stay native-only</span>.
-  Every produced bundle is a real UnityFS archive, structurally validated (E0–E9) before download.
-</div>
 
 <script type="module" src="app.js"></script>
 </body>
