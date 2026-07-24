@@ -118,6 +118,7 @@ pub struct Material {
     pub occlusion_strength: f64,
     pub double_sided: bool,
     pub tex_transforms: std::collections::BTreeMap<String, TexTransform>,
+    pub tex_uv_channels: std::collections::BTreeMap<String, i64>,
     pub uses_uv_channel_select: bool,
     pub uses_spec_gloss: bool,
     pub spec_gloss_image: Option<TexRef>,
@@ -125,6 +126,7 @@ pub struct Material {
     pub glossiness_factor: f64,
     pub specular_color_image: Option<TexRef>,
     pub uses_emissive_strength: bool,
+    pub emissive_strength: f64,
 }
 
 #[derive(Clone, Debug, Default)]

@@ -32,9 +32,9 @@ USAGE:
             [--catalyst URL]
   abgen-lod assemble (--scene <entityId|X,Y> | --entity-json FILE) -o out.glb
             [--catalyst URL] [--iss FILE|auto|off] [--cache DIR] [--level 1]
-            [--no-crop] [--no-atlas] [--max-size 256] [--padding 0] [--atlas-fixed]
-            [--atlas-adaptive]
-  abgen-lod atlas -i in.glb -o out.glb [--max-size 256] [--padding 0]
+            [--no-crop] [--no-atlas] [--raw-materials] [--max-size 256]
+            [--padding 2] [--atlas-fixed] [--atlas-adaptive]
+  abgen-lod atlas -i in.glb -o out.glb [--max-size 256] [--padding 2]
             [--atlas-fixed] [--atlas-adaptive] [--crop-base X,Y --crop-parcels 'x,y;x,y;...']
   abgen-lod simplify -i in.glb -o out.glb [--ratio 0.1] [--tri-cap N]
             [--simplifier meshopt|gltfpack] [--gltfpack PATH]
@@ -42,11 +42,12 @@ USAGE:
   abgen-lod generate --scene <pointer|entityId> --out DIR
             [--platform windows|mac|linux[,windows|mac|linux...]]
             [--level 0,1] [--ratio 0.1] [--tri-cap N|auto|off] [--atlas-max 256]
-            [--atlas-fixed] [--atlas-adaptive] [--no-crop] [--catalyst URL]
-            [--iss FILE|auto|off]
+            [--atlas-fixed] [--atlas-adaptive] [--bake-order pre|post]
+            [--no-crop] [--catalyst URL] [--iss FILE|auto|off]
             [--workdir DIR] [--cache DIR] [--simplifier meshopt|gltfpack]
             [--gltfpack PATH]
-            [--allow-unsimplified] [--keep-glb] [--gpu]
+            [--allow-unsimplified] [--keep-glb] [--no-uv-reclamp] [--emissive]
+            [--fidelity] [--gpu]
 
 bundle: stages <src.glb> as {entityIdLower}_{level}.glb and builds
   {out}/{entityIdLower}/LOD/{level}/{entityIdLower}_{level}_{platform} (+.br).
@@ -80,7 +81,13 @@ assemble: resolves placements like `placements`, fetches every referenced GLB
   not dropped; the +-0.05 margin exists only in the _PlaneClipping shader
   vector; disable with --no-crop), atlases it into per-alpha-class
   TextureBakeResult materials
-  (disable with --no-atlas) and writes it to -o.
+  (disable with --no-atlas) and writes it to -o. --raw-materials (requires
+  --no-atlas) keeps SOURCE material truth in the emitted glb instead of the
+  LOD normalization: explicit source metallicFactor/roughnessFactor (spec
+  default 1.0 written as 1.0, never forced to 0), metallicRoughnessTexture,
+  normalTexture, doubleSided, and the UNfolded baseColorFactor with the raw
+  emissiveFactor/emissiveTexture (+KHR_materials_emissive_strength) — the
+  ground-truth reference lane for material-fidelity comparisons.
 atlas: re-runs only the atlas stage on an existing merged GLB: dedupe +
   skyline-pack tiles into one square power-of-two atlas per alpha class
   (opaque JPEG, mask/transparent PNG after alpha bleed), merge each class
@@ -103,14 +110,15 @@ simplify: decimates a GLB. --simplifier picks the backend (default from
   topology-preserving pass with a loose error bound so the count target
   dominates, a sloppy (topology-ignoring) retry when that stops early
   above target, then orphan-vertex compaction; a capped result still over
-  budget is a hard error. gltfpack shells out (-si <ratio> -sp -noq;
-  binary resolved --gltfpack > ABGEN_GLTFPACK > PATH): --tri-cap N re-runs
-  up to 3 times with the ratio rescaled by target/actual*0.9 (-sa on the
-  final attempt); if the cap is still unreached at gltfpack's default -se
-  error bound it binary-searches a relaxed -se (aggressive) for the
-  largest result under the cap, else it fills back toward [0.8*cap, cap]
-  when the input was above the cap. In both backends inputs already
-  satisfying ratio>=1 + cap pass through untouched.
+  budget is a hard error. gltfpack shells out (-si <ratio> -noq;
+  binary resolved --gltfpack > ABGEN_GLTFPACK > PATH): --tri-cap N: when
+  the plain quality pass stays over the cap, the ladder re-runs at the
+  budget-true ratio (cap/source) escalating the error limit
+  (-sp -se 0.03|0.1|0.3|1.0) and stops at the mildest rung that fits; -sa
+  is a genuine last resort. A fit below 0.8*cap fills back toward the cap
+  by bisecting -se on the quality path (ratio without -sa on a plain fit;
+  -sa bisection only when the fit itself was -sa). In both backends inputs
+  already satisfying ratio>=1 + cap pass through untouched.
   --allow-unsimplified copies the input through verbatim (loud warning)
   when the simplifier is unavailable or fails.
 generate/placements/assemble run without node: scenes lacking an ISS
@@ -132,10 +140,16 @@ generate: the full sync chain: resolve scene -> placements (iss|embedded
   --tri-cap auto: cap = 500 x parcels, the production budget, so the final
   mesh is min(source, 500 x parcels) tris. Scenes at or under the cap pass
   through bit-identically (without resolving gltfpack); larger scenes are
-  decimated into [0.8*cap, cap] (hard error if the cap is unreachable).
+  decimated with the -se escalation ladder into [0.8*cap, cap] (hard error
+  if the cap is unreachable).
   --tri-cap N overrides the cap; --tri-cap off restores the legacy
   ratio-only lane (pass-through at or under 500 x parcels, else an
-  uncapped ratio decimation). --simplifier picks the decimation backend
+  uncapped ratio decimation). --bake-order post reorders the chain to
+  production's ordering: assemble -> crop -> raw multi-material GLB ->
+  simplify -> re-ingest -> atlas -> bundle, so atlas UVs are baked onto the
+  final decimated triangles and simplification can never smear them across
+  atlas tiles; the default pre keeps the atlas-then-simplify chain.
+  --simplifier picks the decimation backend
   exactly as in `simplify` above (default from ABGEN_SIMPLIFIER, else
   meshopt). Every capped run adds a tri-cap self-gate
   check (tris_after <= cap); an --allow-unsimplified verbatim copy passes
@@ -160,7 +174,32 @@ generate: the full sync chain: resolve scene -> placements (iss|embedded
   /lods-unity/manifests/{sceneId}_InitialSceneState.json and an
   iss-descriptor self-gate check re-parses it. Every run ends with a
   structural self-gate; any FAIL exits nonzero. --keep-glb keeps the
-  intermediate merged GLBs in the workdir.
+  intermediate merged GLBs in the workdir. --emissive (default off) carries
+  glTF emission through instead of folding emissiveFactor into the base
+  colour: a second atlas per alpha class is baked with the same packed rects
+  (emissive texel x factor in linear light, black for non-glowing sources)
+  and bound as _EmissionMap with _EmissionColor white in the bundle, so
+  glowing materials glow in the client; scenes with no glowing material
+  emit no emission atlas. --fidelity (default off; off is byte-identical to
+  the production-parity bake) restores source material state production
+  normalizes away. Transparent class: double-sided glass gets its back
+  faces (source doubleSided OR per alpha class -> _Cull 0) together with
+  glTF BLEND depth semantics (_ZWrite 0 - the pair ships as one change),
+  the forced 0.8 base alpha becomes the data-true per-texel atlas alpha,
+  and the constant spec sheen is killed (_SpecColor 0.05,
+  _SpecularHighlights/_EnvironmentReflections 0). The opaque class keeps
+  production culling: ~95% of source opaque materials are doubleSided
+  (exporter default), so restoring them would flip the whole class. Metal
+  class: opaque materials with effective metallic >= 0.5 or a usable MR
+  texture split into a 4th merged material carrying _Metallic/_Smoothness
+  floats; when a source MR texture rides the same UV set and transform as
+  _BaseMap it is carried per-texel into a metal-rough atlas plane on the
+  base rects, repacked from glTF ORM to Unity layout (metallic = B x
+  metallicFactor in R, smoothness = 1 - G x roughnessFactor in A, linear
+  BC7) and bound as _MetallicGlossMap with the _METALLICSPECGLOSSMAP
+  keyword and _Metallic/_Smoothness pinned to 1; factor-only metals keep
+  the keyword-free float path and scenes without a usable MR texture emit
+  no MR plane.
 
 --help/-h prints this help; --version/-V prints the version."
 }
@@ -353,6 +392,7 @@ fn cmd_bundle(argv: &[String]) -> Result<i32> {
             base: base_parcel,
             timestamp,
             vertical_override: vertical_clip,
+            fidelity: false,
         }),
         ..Default::default()
     };
@@ -499,8 +539,9 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
     let mut level: u32 = 1;
     let mut no_crop = false;
     let mut no_atlas = false;
+    let mut raw_materials = false;
     let mut max_size: u32 = 256;
-    let mut padding: u32 = 0;
+    let mut padding: u32 = 2;
     let mut atlas_fixed = false;
     let mut atlas_adaptive = false;
 
@@ -550,6 +591,9 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
             "--no-atlas" => {
                 no_atlas = true;
             }
+            "--raw-materials" => {
+                raw_materials = true;
+            }
             "--max-size" => {
                 max_size = need(i)?.parse().context("--max-size")?;
                 i += 1;
@@ -570,6 +614,9 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
         i += 1;
     }
     let out = out.ok_or_else(|| anyhow!("assemble needs -o <out.glb>"))?;
+    if raw_materials && !no_atlas {
+        bail!("--raw-materials requires --no-atlas: the atlased lane would re-normalize the materials it claims to preserve");
+    }
 
     let client = CatalystClient::from_args(&catalyst, None);
     let ent = match &entity_json {
@@ -597,7 +644,17 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
     if let Some(dir) = cache_dir {
         std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
     }
-    let mut model = assemble::assemble(&client, &ent, &list, level, cache_dir)?;
+    let mut model = assemble::assemble(
+        &client,
+        &ent,
+        &list,
+        level,
+        cache_dir,
+        abgen::lodgen::model::MatLane {
+            raw_materials,
+            ..Default::default()
+        },
+    )?;
     if !no_crop {
         let (base, parcels) = abgen::lodgen::scene_geometry(&ent)?;
         let rects = abgen::lodgen::crop::crop_rects_rh(base, &parcels);
@@ -614,7 +671,7 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
         } else {
             abgen::lodgen::atlas::AtlasMode::Native
         };
-        abgen::lodgen::atlas::atlas_with(&model, max_size, padding, mode)?
+        abgen::lodgen::atlas::atlas_with(&model, max_size, padding, mode, false)?
     };
     for line in &model.log {
         eprintln!("{line}");
@@ -683,7 +740,7 @@ fn cmd_atlas(argv: &[String]) -> Result<i32> {
     let mut input: Option<String> = None;
     let mut out: Option<String> = None;
     let mut max_size: u32 = 256;
-    let mut padding: u32 = 0;
+    let mut padding: u32 = 2;
     let mut atlas_fixed = false;
     let mut atlas_adaptive = false;
     let mut crop_base: Option<String> = None;
@@ -760,7 +817,7 @@ fn cmd_atlas(argv: &[String]) -> Result<i32> {
     } else {
         abgen::lodgen::atlas::AtlasMode::Native
     };
-    let atlased = abgen::lodgen::atlas::atlas_with(&model, max_size, padding, mode)?;
+    let atlased = abgen::lodgen::atlas::atlas_with(&model, max_size, padding, mode, false)?;
     for line in atlased.log.iter().filter(|l| l.starts_with("atlas:")) {
         println!("{line}");
     }
@@ -971,6 +1028,14 @@ fn cmd_generate(argv: &[String]) -> Result<i32> {
             "--atlas-adaptive" => {
                 params.atlas_adaptive = true;
             }
+            "--bake-order" => {
+                match need(i)?.as_str() {
+                    "pre" => params.bake_after_simplify = false,
+                    "post" => params.bake_after_simplify = true,
+                    other => bail!("--bake-order must be pre|post, got {other:?}"),
+                }
+                i += 1;
+            }
             "--no-crop" => {
                 params.crop = false;
             }
@@ -1008,6 +1073,15 @@ fn cmd_generate(argv: &[String]) -> Result<i32> {
             }
             "--keep-glb" => {
                 params.keep_glb = true;
+            }
+            "--no-uv-reclamp" => {
+                params.uv_reclamp = false;
+            }
+            "--emissive" => {
+                params.emissive_channel = true;
+            }
+            "--fidelity" => {
+                params.fidelity = true;
             }
             "--gpu" => {
                 gpu_flag = true;

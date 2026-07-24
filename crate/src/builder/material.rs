@@ -5,6 +5,7 @@ pub(super) fn shader_pptr() -> Value {
 }
 
 const LOD_SPEC_COLOR: f64 = 0.199_999_958_276_748_66;
+pub(super) const FIDELITY_SPEC_COLOR: f64 = 0.05;
 
 fn lod_tex_env(slot: &str, pptr: (i64, i64), scale: (f64, f64), offset: (f64, f64)) -> Value {
     arr![
@@ -44,7 +45,8 @@ pub(super) fn build_lod_material_tree(
     let transparent = lname.contains("-transparent");
     let masked = !transparent && lname.contains("-cutout");
 
-    let valid: Vec<Value> = if masked {
+    let mgm_pid = tex_pid.get("_MetallicGlossMap").copied().unwrap_or((0, 0));
+    let mut valid: Vec<Value> = if masked {
         vec![
             Value::Str("_ALPHATEST_ON".into()),
             Value::Str("_SURFACE_TYPE_TRANSPARENT".into()),
@@ -57,6 +59,9 @@ pub(super) fn build_lod_material_tree(
     } else {
         Vec::new()
     };
+    if mgm_pid != (0, 0) {
+        valid.push(Value::Str("_METALLICSPECGLOSSMAP".into()));
+    }
     t.insert("m_ValidKeywords", Value::Array(valid));
     t.insert("m_InvalidKeywords", Value::Array(Vec::new()));
     t.insert("m_LightmapFlags", 4i64);
@@ -87,18 +92,20 @@ pub(super) fn build_lod_material_tree(
         Some(x) => ((x.scale[0], x.scale[1]), (x.offset[0], x.offset[1])),
         None => ((1.0, 1.0), (0.0, 0.0)),
     };
+    let emis_pid = tex_pid.get("_EmissionMap").copied().unwrap_or((0, 0));
     let tex_envs: Vec<Value> = vec![
         lod_tex_env("_BaseMap", base_pid, base_scale, base_offset),
         lod_tex_env("_BaseMapArr", (0, 0), (1.0, 1.0), (0.0, 0.0)),
         lod_tex_env("_BumpMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
-        lod_tex_env("_EmissionMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
+        lod_tex_env("_EmissionMap", emis_pid, (1.0, 1.0), (0.0, 0.0)),
         lod_tex_env("_MainTex", (0, 0), (1.0, 1.0), (0.0, 0.0)),
-        lod_tex_env("_MetallicGlossMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
+        lod_tex_env("_MetallicGlossMap", mgm_pid, (1.0, 1.0), (0.0, 0.0)),
         lod_tex_env("_OcclusionMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
         lod_tex_env("_ParallaxMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
         lod_tex_env("_SpecGlossMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
     ];
 
+    let fid_blend = transparent && lod.fidelity;
     let alpha_clip = if masked { 1.0 } else { 0.0 };
     let alpha_to_mask = if masked { 1.0 } else { 0.0 };
     // Upstream hard-codes _Cutoff 0.5 in its cutout branch; the glTF
@@ -128,44 +135,60 @@ pub(super) fn build_lod_material_tree(
         ("_DetailNormalMapScale", 1.0),
         ("_DstBlend", dst_blend),
         ("_DstBlendAlpha", 0.0),
-        ("_EnvironmentReflections", 1.0),
+        ("_EnvironmentReflections", if fid_blend { 0.0 } else { 1.0 }),
         ("_GlossMapScale", 1.0),
         ("_Glossiness", 0.0),
         ("_GlossyReflections", 1.0),
-        ("_Metallic", 0.0),
+        ("_Metallic", if lod.fidelity { m.metallic } else { 0.0 }),
         ("_Mode", 0.0),
         ("_OcclusionStrength", 1.0),
         ("_Parallax", 0.02),
         ("_QueueOffset", 0.0),
         ("_ReceiveShadows", 1.0),
-        ("_Smoothness", 0.0),
+        (
+            "_Smoothness",
+            if lod.fidelity {
+                (1.0 - m.roughness).clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+        ),
         ("_SmoothnessTextureChannel", 0.0),
-        ("_SpecularHighlights", 1.0),
+        ("_SpecularHighlights", if fid_blend { 0.0 } else { 1.0 }),
         ("_SrcBlend", 1.0),
         ("_SrcBlendAlpha", 1.0),
         ("_Surface", surface),
         ("_UVSec", 0.0),
         ("_WorkflowMode", 1.0),
         ("_XRMotionVectorsPass", 1.0),
-        ("_ZWrite", 1.0),
+        ("_ZWrite", if fid_blend { 0.0 } else { 1.0 }),
     ];
     let floats_v: Vec<Value> = floats.into_iter().map(|(n, v)| arr![n, v]).collect();
 
     // Upstream forces alpha 0.8 on transparent materials (mat.color write);
     // it serializes as the f32 0.8 widened to double.
     let mut lod_base_color = materials::base_color_verbatim(m.base_color);
-    if transparent {
+    if transparent && !lod.fidelity {
         lod_base_color[3] = 0.8_f32 as f64;
     }
+    let emission_color = if emis_pid != (0, 0) {
+        [1.0, 1.0, 1.0, 1.0]
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    };
     let colors: Vec<Value> = vec![
         lod_color("_BaseColor", lod_base_color),
         lod_color("_Color", [1.0, 1.0, 1.0, 1.0]),
-        lod_color("_EmissionColor", [0.0, 0.0, 0.0, 1.0]),
+        lod_color("_EmissionColor", emission_color),
         lod_color("_PlaneClipping", lod.plane_clipping),
-        lod_color(
-            "_SpecColor",
-            [LOD_SPEC_COLOR, LOD_SPEC_COLOR, LOD_SPEC_COLOR, 1.0],
-        ),
+        lod_color("_SpecColor", {
+            let sc = if fid_blend {
+                FIDELITY_SPEC_COLOR
+            } else {
+                LOD_SPEC_COLOR
+            };
+            [sc, sc, sc, 1.0]
+        }),
         lod_color("_VerticalClipping", lod.vertical_clipping),
     ];
 

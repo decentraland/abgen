@@ -3,6 +3,7 @@ pub struct SimplifyReport {
     pub tris_before: usize,
     pub tris_after: usize,
     pub ratios_run: Vec<f64>,
+    pub se_run: Vec<f64>,
     pub aggressive_final: bool,
     pub passthrough: bool,
     pub unsimplified: bool,
@@ -12,10 +13,15 @@ pub struct SimplifyReport {
 impl SimplifyReport {
     pub fn summary(&self) -> String {
         format!(
-            "tris {} -> {} (ratios {:?}{}{}{}{})",
+            "tris {} -> {} (ratios {:?}{}{}{}{}{})",
             self.tris_before,
             self.tris_after,
             self.ratios_run,
+            if self.se_run.is_empty() {
+                String::new()
+            } else {
+                format!(", -sp -se {:?}", self.se_run)
+            },
             if self.aggressive_final { ", -sa" } else { "" },
             if self.passthrough {
                 ", passthrough"

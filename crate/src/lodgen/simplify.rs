@@ -1,13 +1,33 @@
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use super::model::LodModel;
+use super::model::{AlphaClass, LodMaterial, LodModel};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RescueGranularity {
+    Material,
+    AlphaClass,
+}
+
+fn rescue_key(mat: &LodMaterial, granularity: RescueGranularity) -> String {
+    match granularity {
+        RescueGranularity::Material => mat.name.clone(),
+        RescueGranularity::AlphaClass => match mat.class {
+            AlphaClass::Opaque if super::model::is_metal(mat) => "alpha:metal".to_string(),
+            AlphaClass::Opaque => "alpha:opaque".to_string(),
+            AlphaClass::Mask => "alpha:mask".to_string(),
+            AlphaClass::Blend => "alpha:blend".to_string(),
+        },
+    }
+}
 
 pub const CLASS_SURVIVAL_MIN_TRIS: usize = 200;
 pub const CLASS_RESCUE_ERROR_LIMIT: f64 = 0.001;
+pub const LADDER_ERROR_RUNGS: [f64; 4] = [0.03, 0.1, 0.3, 1.0];
+const GLTFPACK_DEFAULT_SE: f64 = 0.01;
 
 pub const GLTFPACK_NIX_RECIPE: &str =
     "nix-shell -p meshoptimizer --run 'gltfpack -i <in.glb> -o <out.glb> -si 0.1 -noq'";
@@ -197,8 +217,16 @@ pub fn resolve_gltfpack(flag: Option<&Path>) -> Result<PathBuf> {
     resolve_from(flag, env.as_deref(), path_var.as_deref())
 }
 
-fn simplify_args(ratio: f64, aggressive: bool, error_limit: Option<f64>) -> Vec<String> {
+fn simplify_args(
+    ratio: f64,
+    aggressive: bool,
+    permissive: bool,
+    error_limit: Option<f64>,
+) -> Vec<String> {
     let mut args = vec!["-si".to_string(), format!("{ratio}")];
+    if permissive {
+        args.push("-sp".to_string());
+    }
     if let Some(e) = error_limit {
         args.push("-se".to_string());
         args.push(format!("{e}"));
@@ -216,11 +244,12 @@ fn run_gltfpack(
     output: &Path,
     ratio: f64,
     aggressive: bool,
+    permissive: bool,
     error_limit: Option<f64>,
 ) -> Result<()> {
     let mut cmd = Command::new(gltfpack);
     cmd.arg("-i").arg(input).arg("-o").arg(output);
-    cmd.args(simplify_args(ratio, aggressive, error_limit));
+    cmd.args(simplify_args(ratio, aggressive, permissive, error_limit));
     let out = run_with_deadline(
         cmd,
         subproc_deadline(),
@@ -250,62 +279,93 @@ fn glb_tris(path: &Path) -> Result<usize> {
 
 fn glb_model(path: &Path) -> Result<LodModel> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    super::model::from_glb_bytes(&bytes, "simplify-check")
+    super::model::from_glb_bytes_with(&bytes, "simplify-check", true)
         .with_context(|| format!("reparse {}", path.display()))
 }
 
-fn tris_by_material(model: &LodModel) -> HashMap<String, usize> {
+fn tris_by_key(model: &LodModel, granularity: RescueGranularity) -> HashMap<String, usize> {
     let mut counts = HashMap::new();
     for prim in &model.primitives {
         if let Some(mat) = model.materials.get(prim.material) {
-            *counts.entry(mat.name.clone()).or_insert(0) += prim.indices.len() / 3;
+            *counts.entry(rescue_key(mat, granularity)).or_insert(0) += prim.indices.len() / 3;
         }
     }
     counts
 }
 
-fn class_submodel(model: &LodModel, mat_idx: usize) -> LodModel {
-    let mat = &model.materials[mat_idx];
+fn class_submodel(model: &LodModel, key: &str, granularity: RescueGranularity) -> LodModel {
     let mut sub = LodModel {
         root_name: format!("{}-rescue", model.root_name),
-        materials: vec![super::model::LodMaterial {
-            image: None,
-            ..mat.clone()
-        }],
         ..Default::default()
     };
-    if let Some(img) = mat.image {
-        sub.images.push(model.images[img].clone());
-        sub.materials[0].image = Some(0);
-    }
+    let mut mat_map: HashMap<usize, usize> = HashMap::new();
+    let mut img_map: HashMap<usize, usize> = HashMap::new();
     for prim in &model.primitives {
-        if prim.material == mat_idx {
-            let mut p = prim.clone();
-            p.material = 0;
-            sub.primitives.push(p);
+        let Some(mat) = model.materials.get(prim.material) else {
+            continue;
+        };
+        if rescue_key(mat, granularity) != key {
+            continue;
         }
+        let sub_mi = *mat_map.entry(prim.material).or_insert_with(|| {
+            let mut m = LodMaterial {
+                image: None,
+                emissive_image: None,
+                mr_image: None,
+                ..mat.clone()
+            };
+            let slots = [
+                (&mut m.image, mat.image),
+                (&mut m.emissive_image, mat.emissive_image),
+                (&mut m.mr_image, mat.mr_image),
+            ];
+            for (slot, src) in slots {
+                if let Some(img) = src {
+                    let si = *img_map.entry(img).or_insert_with(|| {
+                        sub.images.push(model.images[img].clone());
+                        sub.images.len() - 1
+                    });
+                    *slot = Some(si);
+                }
+            }
+            sub.materials.push(m);
+            sub.materials.len() - 1
+        });
+        let mut p = prim.clone();
+        p.material = sub_mi;
+        sub.primitives.push(p);
     }
     sub
 }
 
-fn merge_class(out_model: &mut LodModel, source: &LodModel, mat_idx: usize, geometry: &LodModel) {
-    let mat = &source.materials[mat_idx];
-    let merged_mat = match out_model.materials.iter().position(|m| m.name == mat.name) {
-        Some(i) => i,
-        None => {
-            let mut m = super::model::LodMaterial {
-                image: None,
-                ..mat.clone()
-            };
-            if let Some(img) = mat.image {
-                out_model.images.push(source.images[img].clone());
-                m.image = Some(out_model.images.len() - 1);
+fn merge_model(out_model: &mut LodModel, rescued: &LodModel) {
+    for prim in &rescued.primitives {
+        let mat = &rescued.materials[prim.material];
+        let merged_mat = match out_model.materials.iter().position(|m| m.name == mat.name) {
+            Some(i) => i,
+            None => {
+                let mut m = LodMaterial {
+                    image: None,
+                    emissive_image: None,
+                    mr_image: None,
+                    ..mat.clone()
+                };
+                if let Some(img) = mat.image {
+                    out_model.images.push(rescued.images[img].clone());
+                    m.image = Some(out_model.images.len() - 1);
+                }
+                if let Some(img) = mat.emissive_image {
+                    out_model.images.push(rescued.images[img].clone());
+                    m.emissive_image = Some(out_model.images.len() - 1);
+                }
+                if let Some(img) = mat.mr_image {
+                    out_model.images.push(rescued.images[img].clone());
+                    m.mr_image = Some(out_model.images.len() - 1);
+                }
+                out_model.materials.push(m);
+                out_model.materials.len() - 1
             }
-            out_model.materials.push(m);
-            out_model.materials.len() - 1
-        }
-    };
-    for prim in &geometry.primitives {
+        };
         let mut p = prim.clone();
         p.material = merged_mat;
         out_model.primitives.push(p);
@@ -317,20 +377,25 @@ fn rescue_lost_classes(
     output: &Path,
     ratio: f64,
     gltfpack: &Path,
+    granularity: RescueGranularity,
     report: &mut SimplifyReport,
 ) -> Result<()> {
     let in_model = glb_model(input)?;
-    let in_tris = tris_by_material(&in_model);
+    let in_tris = tris_by_key(&in_model, granularity);
     let mut out_model = glb_model(output)?;
-    let out_tris = tris_by_material(&out_model);
+    let out_tris = tris_by_key(&out_model, granularity);
     let mut changed = false;
-    for mat_idx in 0..in_model.materials.len() {
-        let name = in_model.materials[mat_idx].name.clone();
-        let before = in_tris.get(&name).copied().unwrap_or(0);
-        if before < CLASS_SURVIVAL_MIN_TRIS || out_tris.get(&name).copied().unwrap_or(0) > 0 {
+    let mut seen: HashSet<String> = HashSet::new();
+    for mat in &in_model.materials {
+        let key = rescue_key(mat, granularity);
+        if !seen.insert(key.clone()) {
             continue;
         }
-        let sub = class_submodel(&in_model, mat_idx);
+        let before = in_tris.get(&key).copied().unwrap_or(0);
+        if before < CLASS_SURVIVAL_MIN_TRIS || out_tris.get(&key).copied().unwrap_or(0) > 0 {
+            continue;
+        }
+        let sub = class_submodel(&in_model, &key, granularity);
         let sub_in = output.with_extension("rescue-in.glb");
         let sub_out = output.with_extension("rescue-out.glb");
         std::fs::write(&sub_in, super::emit::emit_glb(&sub)?)
@@ -341,6 +406,7 @@ fn rescue_lost_classes(
             &sub_out,
             ratio,
             false,
+            false,
             Some(CLASS_RESCUE_ERROR_LIMIT),
         )?;
         let rescued = glb_model(&sub_out)?;
@@ -348,24 +414,19 @@ fn rescue_lost_classes(
         let _ = std::fs::remove_file(&sub_out);
         if rescued.total_tris() > 0 {
             eprintln!(
-                "simplify: class {name:?} vanished at ratio {ratio} ({before} source tris); \
+                "simplify: class {key:?} vanished at ratio {ratio} ({before} source tris); \
                  rescued alone with -se {CLASS_RESCUE_ERROR_LIMIT} ({} tris)",
                 rescued.total_tris()
             );
-            merge_class(&mut out_model, &in_model, mat_idx, &rescued);
+            merge_model(&mut out_model, &rescued);
         } else {
             eprintln!(
-                "simplify: class {name:?} vanished at ratio {ratio} ({before} source tris) and \
+                "simplify: class {key:?} vanished at ratio {ratio} ({before} source tris) and \
                  the -se {CLASS_RESCUE_ERROR_LIMIT} retry also emptied it; merging it verbatim"
             );
-            merge_class(
-                &mut out_model,
-                &in_model,
-                mat_idx,
-                &class_submodel(&in_model, mat_idx),
-            );
+            merge_model(&mut out_model, &sub);
         }
-        report.rescued_classes.push(name);
+        report.rescued_classes.push(key);
         changed = true;
     }
     if changed {
@@ -414,6 +475,24 @@ pub fn simplify(
     tri_cap: Option<u64>,
     gltfpack: &Path,
 ) -> Result<SimplifyReport> {
+    simplify_with(
+        input,
+        output,
+        ratio,
+        tri_cap,
+        gltfpack,
+        RescueGranularity::Material,
+    )
+}
+
+pub fn simplify_with(
+    input: &Path,
+    output: &Path,
+    ratio: f64,
+    tri_cap: Option<u64>,
+    gltfpack: &Path,
+    granularity: RescueGranularity,
+) -> Result<SimplifyReport> {
     let tris_before = glb_tris(input)?;
     let under_cap = |tris: usize| tri_cap.is_none_or(|c| tris as u64 <= c);
     if ratio >= 1.0 && under_cap(tris_before) {
@@ -429,92 +508,112 @@ pub fn simplify(
         tris_before,
         ..Default::default()
     };
-    let mut current = ratio.clamp(1e-3, 1.0);
-    let mut tris_after = tris_before;
-    for attempt in 0..4 {
-        let aggressive = attempt == 3;
-        run_gltfpack(gltfpack, input, output, current, aggressive, None)?;
-        report.ratios_run.push(current);
-        report.aggressive_final = aggressive;
-        tris_after = glb_tris(output)?;
-        if under_cap(tris_after) || aggressive {
-            break;
-        }
-        current = if attempt == 2 {
-            rescale_ratio(1.0, tris_before as u64, tri_cap.unwrap_or(1))
-        } else {
-            rescale_ratio(current, tris_after as u64, tri_cap.unwrap_or(1))
-        };
+    let current = ratio.clamp(1e-3, 1.0);
+    run_gltfpack(gltfpack, input, output, current, false, false, None)?;
+    report.ratios_run.push(current);
+    let mut tris_after = glb_tris(output)?;
+    enum Fit {
+        Plain,
+        Rung(usize),
+        Sa,
     }
-    let mut error_relaxed = false;
-    if let Some(cap) = tri_cap {
-        if tris_after as u64 > cap {
-            error_relaxed = true;
-            let ratio_sa = rescale_ratio(1.0, tris_before as u64, cap.max(1));
-            let (mut lo, mut hi) = (0.01f64, 1.0f64);
-            let mut best: Option<(usize, Vec<u8>)> = None;
-            for _ in 0..6 {
-                let se = (lo + hi) / 2.0;
-                run_gltfpack(gltfpack, input, output, ratio_sa, true, Some(se))?;
-                report.ratios_run.push(ratio_sa);
-                report.aggressive_final = true;
-                let t = glb_tris(output)?;
-                if t as u64 <= cap {
-                    hi = se;
-                    if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
-                        best = Some((t, std::fs::read(output)?));
-                    }
-                } else {
-                    lo = se;
-                }
+    let mut fit = Fit::Plain;
+    if !under_cap(tris_after) {
+        let cap = tri_cap.unwrap_or(1);
+        let r = (cap as f64 / tris_before.max(1) as f64).clamp(1e-3, 1.0);
+        let mut fitted = false;
+        for (i, &se) in LADDER_ERROR_RUNGS.iter().enumerate() {
+            run_gltfpack(gltfpack, input, output, r, false, true, Some(se))?;
+            report.ratios_run.push(r);
+            report.se_run.push(se);
+            tris_after = glb_tris(output)?;
+            if under_cap(tris_after) {
+                fit = Fit::Rung(i);
+                fitted = true;
+                break;
             }
-            match best {
-                Some((t, bytes)) => {
-                    std::fs::write(output, &bytes)?;
-                    tris_after = t;
-                }
-                None => bail!(
-                    "tri cap {cap} not reached after {} gltfpack attempts (final {} tris, ratios {:?})",
-                    report.ratios_run.len(),
+        }
+        if !fitted {
+            run_gltfpack(gltfpack, input, output, r, true, false, None)?;
+            report.ratios_run.push(r);
+            report.aggressive_final = true;
+            tris_after = glb_tris(output)?;
+            fit = Fit::Sa;
+            if !under_cap(tris_after) {
+                bail!(
+                    "tri cap {cap} not reached after the -se ladder and -sa (final {} tris, ratios {:?}, se rungs {:?})",
                     tris_after,
-                    report.ratios_run
-                ),
+                    report.ratios_run,
+                    report.se_run
+                );
             }
         }
     }
-    if let Some(cap) = tri_cap.filter(|_| !error_relaxed) {
+    if let Some(cap) = tri_cap {
         let floor = (cap as f64 * 0.8) as usize;
         if tris_after > 0
             && (tris_before as u64) > cap
             && (tris_after as u64) <= cap
             && tris_after < floor
         {
-            let mut lo_ratio = report.ratios_run.last().copied().unwrap_or(current);
-            let mut hi_ratio: Option<f64> = None;
             let mut best = std::fs::read(output)?;
-            for _ in 0..6 {
-                if tris_after >= floor {
-                    break;
+            match fit {
+                Fit::Rung(i) => {
+                    let r = (cap as f64 / tris_before.max(1) as f64).clamp(1e-3, 1.0);
+                    let mut hi_se = LADDER_ERROR_RUNGS[i];
+                    let mut lo_se = if i == 0 {
+                        GLTFPACK_DEFAULT_SE
+                    } else {
+                        LADDER_ERROR_RUNGS[i - 1]
+                    };
+                    for _ in 0..6 {
+                        if tris_after >= floor || hi_se - lo_se < 1e-4 {
+                            break;
+                        }
+                        let cand = (lo_se + hi_se) / 2.0;
+                        run_gltfpack(gltfpack, input, output, r, false, true, Some(cand))?;
+                        let t = glb_tris(output)?;
+                        if t as u64 > cap {
+                            lo_se = cand;
+                        } else {
+                            hi_se = cand;
+                            if t > tris_after {
+                                tris_after = t;
+                                best = std::fs::read(output)?;
+                                report.se_run.push(cand);
+                            }
+                        }
+                    }
                 }
-                let cand = match hi_ratio {
-                    None => (cap as f64 * 0.9 / tris_before as f64)
-                        .max(lo_ratio * 2.0)
-                        .clamp(1e-3, 1.0),
-                    Some(h) => (lo_ratio + h) / 2.0,
-                };
-                if (cand - lo_ratio).abs() < 1e-6 {
-                    break;
-                }
-                run_gltfpack(gltfpack, input, output, cand, true, None)?;
-                let t = glb_tris(output)?;
-                if t as u64 > cap {
-                    hi_ratio = Some(cand);
-                } else {
-                    lo_ratio = cand;
-                    if t > tris_after {
-                        tris_after = t;
-                        best = std::fs::read(output)?;
-                        report.ratios_run.push(cand);
+                Fit::Plain | Fit::Sa => {
+                    let aggressive = matches!(fit, Fit::Sa);
+                    let mut lo_ratio = report.ratios_run.last().copied().unwrap_or(current);
+                    let mut hi_ratio: Option<f64> = None;
+                    for _ in 0..6 {
+                        if tris_after >= floor {
+                            break;
+                        }
+                        let cand = match hi_ratio {
+                            None => (cap as f64 * 0.9 / tris_before as f64)
+                                .max(lo_ratio * 2.0)
+                                .clamp(1e-3, 1.0),
+                            Some(h) => (lo_ratio + h) / 2.0,
+                        };
+                        if (cand - lo_ratio).abs() < 1e-6 {
+                            break;
+                        }
+                        run_gltfpack(gltfpack, input, output, cand, aggressive, false, None)?;
+                        let t = glb_tris(output)?;
+                        if t as u64 > cap {
+                            hi_ratio = Some(cand);
+                        } else {
+                            lo_ratio = cand;
+                            if t > tris_after {
+                                tris_after = t;
+                                best = std::fs::read(output)?;
+                                report.ratios_run.push(cand);
+                            }
+                        }
                     }
                 }
             }
@@ -523,7 +622,7 @@ pub fn simplify(
     }
     report.tris_after = tris_after;
     let ratio_run = report.ratios_run.last().copied().unwrap_or(current);
-    rescue_lost_classes(input, output, ratio_run, gltfpack, &mut report)?;
+    rescue_lost_classes(input, output, ratio_run, gltfpack, granularity, &mut report)?;
     Ok(report)
 }
 
@@ -590,6 +689,7 @@ mod tests {
             cutoff: 0.5,
             image: None,
             double_sided: false,
+            ..Default::default()
         }
     }
 
@@ -707,6 +807,25 @@ mod tests {
     }
 
     #[test]
+    fn metal_material_gets_its_own_rescue_class() {
+        let mut m = material("gold", AlphaClass::Opaque);
+        m.metallic = 1.0;
+        assert_eq!(rescue_key(&m, RescueGranularity::AlphaClass), "alpha:metal");
+        assert_eq!(rescue_key(&m, RescueGranularity::Material), "gold");
+        let plain = material("wall", AlphaClass::Opaque);
+        assert_eq!(
+            rescue_key(&plain, RescueGranularity::AlphaClass),
+            "alpha:opaque"
+        );
+        let mut blend = material("glass", AlphaClass::Blend);
+        blend.metallic = 1.0;
+        assert_eq!(
+            rescue_key(&blend, RescueGranularity::AlphaClass),
+            "alpha:blend"
+        );
+    }
+
+    #[test]
     fn rescale_ratio_scales_by_target_over_actual() {
         let r = rescale_ratio(0.1, 1000, 500);
         assert!((r - 0.045).abs() < 1e-12, "{r}");
@@ -813,22 +932,31 @@ mod tests {
     }
 
     #[test]
-    fn simplify_args_are_feature_preserving() {
-        assert_eq!(simplify_args(0.1, false, None), vec!["-si", "0.1", "-noq"]);
-        assert_eq!(
-            simplify_args(0.25, true, None),
-            vec!["-si", "0.25", "-sa", "-noq"]
-        );
-        assert_eq!(
-            simplify_args(0.1, false, Some(CLASS_RESCUE_ERROR_LIMIT)),
-            vec!["-si", "0.1", "-se", "0.001", "-noq"]
-        );
-        for lever in ["-sp", "-sa"] {
+    fn simplify_args_ladder_shapes() {
+        for lever in ["-sp", "-sa", "-se"] {
             assert!(
-                !simplify_args(0.1, false, None).iter().any(|a| a == lever),
+                !simplify_args(0.1, false, false, None)
+                    .iter()
+                    .any(|a| a == lever),
                 "{lever} must not be in the default invocation"
             );
         }
+        assert_eq!(
+            simplify_args(0.1, false, false, None),
+            vec!["-si", "0.1", "-noq"]
+        );
+        assert_eq!(
+            simplify_args(0.156, false, true, Some(0.03)),
+            vec!["-si", "0.156", "-sp", "-se", "0.03", "-noq"]
+        );
+        assert_eq!(
+            simplify_args(0.25, true, false, None),
+            vec!["-si", "0.25", "-sa", "-noq"]
+        );
+        assert_eq!(
+            simplify_args(0.1, false, false, Some(CLASS_RESCUE_ERROR_LIMIT)),
+            vec!["-si", "0.1", "-se", "0.001", "-noq"]
+        );
     }
 
     #[test]
@@ -897,13 +1025,190 @@ mod tests {
         std::fs::write(&output, emit_glb(&lost).unwrap()).unwrap();
 
         let mut report = SimplifyReport::default();
-        rescue_lost_classes(&input, &output, 0.1, &bin, &mut report).unwrap();
+        rescue_lost_classes(
+            &input,
+            &output,
+            0.1,
+            &bin,
+            RescueGranularity::Material,
+            &mut report,
+        )
+        .unwrap();
         assert_eq!(report.rescued_classes, vec!["bl".to_string()]);
         let out = glb_model(&output).unwrap();
-        let by_mat = tris_by_material(&out);
+        let by_mat = tris_by_key(&out, RescueGranularity::Material);
         assert_eq!(by_mat.get("op").copied().unwrap_or(0), 128);
         assert!(by_mat.get("bl").copied().unwrap_or(0) > 0, "{by_mat:?}");
         assert_eq!(report.tris_after, out.total_tris());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn alpha_granularity_rescues_lost_class_not_lost_materials() {
+        let Ok(bin) = resolve_gltfpack(None) else {
+            eprintln!("SKIP: gltfpack not resolvable ({GLTFPACK_NIX_RECIPE})");
+            return;
+        };
+        let dir = temp_dir("alpharescue");
+        let materials = vec![
+            material("op-big", AlphaClass::Opaque),
+            material("bl", AlphaClass::Blend),
+            material("op-small", AlphaClass::Opaque),
+        ];
+        let full = LodModel {
+            root_name: "alpharescue".to_string(),
+            primitives: vec![
+                grid_primitive(32),
+                scattered_quads(1, 150, 0.5),
+                scattered_quads(2, 150, 0.5),
+            ],
+            materials: materials.clone(),
+            images: Vec::new(),
+            log: Vec::new(),
+        };
+        let lost = LodModel {
+            root_name: "alpharescue".to_string(),
+            primitives: vec![grid_primitive(8)],
+            materials,
+            images: Vec::new(),
+            log: Vec::new(),
+        };
+        let input = dir.join("in.glb");
+        let output = dir.join("out.glb");
+        std::fs::write(&input, emit_glb(&full).unwrap()).unwrap();
+        std::fs::write(&output, emit_glb(&lost).unwrap()).unwrap();
+
+        let mut report = SimplifyReport::default();
+        rescue_lost_classes(
+            &input,
+            &output,
+            0.1,
+            &bin,
+            RescueGranularity::AlphaClass,
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!(report.rescued_classes, vec!["alpha:blend".to_string()]);
+        let out = glb_model(&output).unwrap();
+        let by_mat = tris_by_key(&out, RescueGranularity::Material);
+        assert_eq!(by_mat.get("op-big").copied().unwrap_or(0), 128);
+        assert_eq!(by_mat.get("op-small").copied().unwrap_or(0), 0);
+        assert!(by_mat.get("bl").copied().unwrap_or(0) > 0, "{by_mat:?}");
+        assert_eq!(report.tris_after, out.total_tris());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn strip_uv_cards(material: usize, count: u32, size: f32) -> LodPrimitive {
+        let mut prim = LodPrimitive {
+            material,
+            ..Default::default()
+        };
+        for k in 0..count {
+            let x = (k % 12) as f32 * 0.8;
+            let z = (k / 12) as f32 * 0.8;
+            let u0 = k as f32 / count as f32;
+            let u1 = (k + 1) as f32 / count as f32;
+            let base = prim.positions.len() as u32;
+            for (dx, dy, u, v) in [
+                (0.0, 0.0, u0, 0.0),
+                (size, 0.0, u1, 0.0),
+                (0.0, size, u0, 1.0),
+                (size, size, u1, 1.0),
+            ] {
+                prim.positions.push([x + dx, 1.0 + dy, z]);
+                prim.normals.push([0.0, 0.0, 1.0]);
+                prim.uvs.push([u, v]);
+            }
+            prim.indices.extend_from_slice(&[
+                base,
+                base + 2,
+                base + 1,
+                base + 1,
+                base + 2,
+                base + 3,
+            ]);
+        }
+        prim
+    }
+
+    fn leaf_stats(model: &LodModel) -> (usize, f32) {
+        let mut tris = 0usize;
+        let mut max_span = 0f32;
+        for prim in &model.primitives {
+            let Some(mat) = model.materials.get(prim.material) else {
+                continue;
+            };
+            if mat.name != "leaf" {
+                continue;
+            }
+            for t in prim.indices.chunks_exact(3) {
+                tris += 1;
+                let us: Vec<f32> = t.iter().map(|&i| prim.uvs[i as usize][0]).collect();
+                let span = us.iter().cloned().fold(f32::MIN, f32::max)
+                    - us.iter().cloned().fold(f32::MAX, f32::min);
+                max_span = max_span.max(span);
+            }
+        }
+        (tris, max_span)
+    }
+
+    #[test]
+    fn capped_ladder_keeps_cutout_foliage_present_and_unsmeared() {
+        let Ok(bin) = resolve_gltfpack(None) else {
+            eprintln!("SKIP: gltfpack not resolvable ({GLTFPACK_NIX_RECIPE})");
+            return;
+        };
+        let dir = temp_dir("foliage");
+        let cards = 150u32;
+        let full = LodModel {
+            root_name: "foliage".to_string(),
+            primitives: vec![grid_primitive(48), strip_uv_cards(1, cards, 0.5)],
+            materials: vec![
+                material("op", AlphaClass::Opaque),
+                material("leaf", AlphaClass::Blend),
+            ],
+            images: Vec::new(),
+            log: Vec::new(),
+        };
+        let input = dir.join("in.glb");
+        let output = dir.join("out.glb");
+        std::fs::write(&input, emit_glb(&full).unwrap()).unwrap();
+
+        let report = simplify_with(
+            &input,
+            &output,
+            1.0,
+            Some(600),
+            &bin,
+            RescueGranularity::Material,
+        )
+        .unwrap();
+        let out = glb_model(&output).unwrap();
+        let (leaf_tris, max_span) = leaf_stats(&out);
+        assert!(leaf_tris > 0, "cutout foliage deleted: {report:?}");
+        let strip = 1.0 / cards as f32;
+        assert!(
+            max_span <= 2.5 * strip,
+            "foliage uvs smeared across cards: span {max_span} vs strip {strip} ({report:?})"
+        );
+        assert!(
+            !report.aggressive_final,
+            "quality ladder fell through to -sa: {report:?}"
+        );
+
+        let sa_out = dir.join("sa.glb");
+        let r = 600.0 / full.total_tris() as f64;
+        run_gltfpack(&bin, &input, &sa_out, r, true, false, None).unwrap();
+        let sa = glb_model(&sa_out).unwrap();
+        let (sa_tris, sa_span) = leaf_stats(&sa);
+        assert!(
+            leaf_tris >= sa_tris,
+            "ladder kept less foliage than -sa: {leaf_tris} vs {sa_tris}"
+        );
+        assert!(
+            max_span <= sa_span.max(2.5 * strip),
+            "ladder smeared more than -sa: {max_span} vs {sa_span}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

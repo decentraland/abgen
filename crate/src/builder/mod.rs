@@ -530,6 +530,7 @@ pub struct LodBuildParams {
     pub root_position: [f64; 3],
     pub main_asset: String,
     pub timestamp: Option<i64>,
+    pub fidelity: bool,
 }
 
 pub struct BuildOpts<'a> {

@@ -1,3 +1,5 @@
+use crate::bc7_pure::{linear_to_srgb_u8, srgb_to_linear_u8};
+
 const C: usize = 4;
 
 #[inline]
@@ -23,19 +25,18 @@ struct AxisPlan {
     taps: Vec<Vec<(usize, f64)>>,
 }
 
-fn axis_plan(n: usize, m: usize, b: f64, c: f64) -> AxisPlan {
+fn bspline_plan(n: usize, m: usize) -> AxisPlan {
     let ratio = n as f64 / m as f64;
-    let scalew = if ratio > 1.0 { ratio } else { 1.0 };
     let support = 2.0;
     let mut taps = Vec::with_capacity(m);
     for d in 0..m {
         let center = (d as f64 + 0.5) * ratio - 0.5;
-        let lo = (center - support * scalew).floor() as i64;
-        let hi = (center + support * scalew).ceil() as i64;
+        let lo = (center - support).floor() as i64;
+        let hi = (center + support).ceil() as i64;
         let mut row = Vec::with_capacity((hi - lo + 1) as usize);
         let mut p = lo;
         while p <= hi {
-            let w = cubic_bc((center - p as f64) / scalew, b, c);
+            let w = cubic_bc(center - p as f64, 1.0, 0.0);
             if w != 0.0 {
                 let pc = p.clamp(0, n as i64 - 1) as usize;
                 row.push((pc, w));
@@ -47,41 +48,46 @@ fn axis_plan(n: usize, m: usize, b: f64, c: f64) -> AxisPlan {
     AxisPlan { taps }
 }
 
-const MITCHELL_B: f64 = 1.0 / 3.0;
-const MITCHELL_C: f64 = 1.0 / 3.0;
-const BSPLINE_B: f64 = 1.0;
-const BSPLINE_C: f64 = 0.0;
+fn area_plan(n: usize, m: usize) -> AxisPlan {
+    let ratio = n as f64 / m as f64;
+    let mut taps = Vec::with_capacity(m);
+    for d in 0..m {
+        let lo = d as f64 * ratio;
+        let hi = ((d + 1) as f64 * ratio).min(n as f64);
+        let first = lo.floor() as usize;
+        let last = (hi.ceil() as usize).min(n) - 1;
+        let mut row = Vec::with_capacity(last - first + 1);
+        for p in first..=last {
+            let w = ((p + 1) as f64).min(hi) - (p as f64).max(lo);
+            if w > 0.0 {
+                row.push((p, w));
+            }
+        }
+        taps.push(row);
+    }
+    AxisPlan { taps }
+}
 
 fn plan_for_axis(n: usize, m: usize) -> AxisPlan {
     if m < n {
-        axis_plan(n, m, MITCHELL_B, MITCHELL_C)
+        area_plan(n, m)
     } else {
-        axis_plan(n, m, BSPLINE_B, BSPLINE_C)
+        bspline_plan(n, m)
     }
 }
 
-pub fn box_downscale_rgba(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
-    debug_assert_eq!(src.len(), sw * sh * C);
-    if (sw, sh) == (dw, dh) {
-        return src.to_vec();
-    }
-
+fn resample_axes(work: &[f64], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f64> {
     let hplan = if dw == sw {
         None
     } else {
         Some(plan_for_axis(sw, dw))
     };
-    let inter_w = dw;
-    let mut inter = vec![0f64; sh * inter_w * C];
+    let mut inter = vec![0f64; sh * dw * C];
     match &hplan {
-        None => {
-            for i in 0..sh * sw * C {
-                inter[i] = src[i] as f64;
-            }
-        }
+        None => inter.copy_from_slice(work),
         Some(plan) => {
             let src_rs = sw * C;
-            let dst_rs = inter_w * C;
+            let dst_rs = dw * C;
             for y in 0..sh {
                 let srow = y * src_rs;
                 let drow = y * dst_rs;
@@ -91,7 +97,7 @@ pub fn box_downscale_rgba(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize
                     for &(sx, w) in taps {
                         let o = srow + sx * C;
                         for ch in 0..C {
-                            acc[ch] += w * src[o + ch] as f64;
+                            acc[ch] += w * work[o + ch];
                         }
                         wsum += w;
                     }
@@ -109,36 +115,96 @@ pub fn box_downscale_rgba(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize
     } else {
         Some(plan_for_axis(sh, dh))
     };
-    let mut out = vec![0u8; dh * dw * C];
-    let inter_rs = inter_w * C;
-    let out_rs = dw * C;
-    let finish = |v: f64| -> u8 { v.round().clamp(0.0, 255.0) as u8 };
-    match &vplan {
-        None => {
-            for i in 0..dh * dw * C {
-                out[i] = finish(inter[i]);
-            }
-        }
-        Some(plan) => {
-            for (y, taps) in plan.taps.iter().enumerate() {
-                let drow = y * out_rs;
-                for x in 0..inter_w {
-                    let mut acc = [0f64; C];
-                    let mut wsum = 0f64;
-                    for &(sy, w) in taps {
-                        let o = sy * inter_rs + x * C;
-                        for ch in 0..C {
-                            acc[ch] += w * inter[o + ch];
-                        }
-                        wsum += w;
-                    }
-                    let o = drow + x * C;
-                    for ch in 0..C {
-                        out[o + ch] = finish(acc[ch] / wsum);
-                    }
+    let Some(plan) = &vplan else {
+        return inter;
+    };
+    let mut out = vec![0f64; dh * dw * C];
+    let inter_rs = dw * C;
+    for (y, taps) in plan.taps.iter().enumerate() {
+        let drow = y * inter_rs;
+        for x in 0..dw {
+            let mut acc = [0f64; C];
+            let mut wsum = 0f64;
+            for &(sy, w) in taps {
+                let o = sy * inter_rs + x * C;
+                for ch in 0..C {
+                    acc[ch] += w * inter[o + ch];
                 }
+                wsum += w;
+            }
+            let o = drow + x * C;
+            for ch in 0..C {
+                out[o + ch] = acc[ch] / wsum;
             }
         }
+    }
+    out
+}
+
+pub fn box_downscale_rgba(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+    srgb: bool,
+) -> Vec<u8> {
+    debug_assert_eq!(src.len(), sw * sh * C);
+    if (sw, sh) == (dw, dh) {
+        return src.to_vec();
+    }
+
+    let mut work = vec![0f64; sh * sw * C];
+    for (i, &v) in src.iter().enumerate() {
+        work[i] = if srgb && i % C != 3 {
+            srgb_to_linear_u8(v) as f64
+        } else {
+            v as f64
+        };
+    }
+    let fin = resample_axes(&work, sw, sh, dw, dh);
+
+    let mut out = vec![0u8; dh * dw * C];
+    for (i, &v) in fin.iter().enumerate() {
+        out[i] = if srgb && i % C != 3 {
+            linear_to_srgb_u8(v as f32)
+        } else {
+            v.round().clamp(0.0, 255.0) as u8
+        };
+    }
+    out
+}
+
+const PREMUL_ALPHA_EPS: f64 = 1e-8;
+
+pub fn premul_downscale_rgba(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
+    debug_assert_eq!(src.len(), sw * sh * C);
+    if (sw, sh) == (dw, dh) {
+        return src.to_vec();
+    }
+
+    let mut work = vec![0f64; sh * sw * C];
+    for (px, wp) in src.chunks_exact(C).zip(work.chunks_exact_mut(C)) {
+        let a = px[3] as f64 / 255.0;
+        for ch in 0..3 {
+            wp[ch] = srgb_to_linear_u8(px[ch]) as f64 * a;
+        }
+        wp[3] = a;
+    }
+    let fin = resample_axes(&work, sw, sh, dw, dh);
+
+    let mut out = vec![0u8; dh * dw * C];
+    for (px, fp) in out.chunks_exact_mut(C).zip(fin.chunks_exact(C)) {
+        let a = fp[3];
+        for ch in 0..3 {
+            let lin = if a > PREMUL_ALPHA_EPS {
+                (fp[ch] / a).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            px[ch] = linear_to_srgb_u8(lin as f32);
+        }
+        px[3] = (a.clamp(0.0, 1.0) * 255.0).round() as u8;
     }
     out
 }
@@ -147,57 +213,45 @@ pub fn box_downscale_rgba(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize
 mod tests {
     use super::*;
 
-    fn impulse_col(n_src: usize, n_dst: usize, pos: usize) -> Vec<u8> {
-        let mut src = vec![0u8; 2 * n_src * C];
-        for x in 0..2 {
-            let o = (pos * 2 + x) * C;
-            src[o] = 255;
-            src[o + 1] = 255;
-            src[o + 2] = 255;
-            src[o + 3] = 255;
-        }
+    #[test]
+    fn linear_domain_average() {
+        let src = [
+            255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255,
+        ];
+        let out = box_downscale_rgba(&src, 2, 2, 1, 1, true);
+        assert_eq!(&out[..3], &[188, 188, 188]);
+        assert_eq!(out[3], 128);
+    }
 
-        for y in 0..n_src {
-            for x in 0..2 {
-                src[(y * 2 + x) * C + 3] = 255;
+    #[test]
+    fn byte_domain_average_when_not_srgb() {
+        let src = [
+            255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255,
+        ];
+        let out = box_downscale_rgba(&src, 2, 2, 1, 1, false);
+        assert_eq!(out, [128, 128, 128, 128]);
+    }
+
+    #[test]
+    fn area_weights_exact() {
+        let mut src = vec![0u8; 3 * C];
+        for (y, v) in [30u8, 90, 150].into_iter().enumerate() {
+            for ch in 0..3 {
+                src[y * C + ch] = v;
             }
+            src[y * C + 3] = 255;
         }
-        let out = box_downscale_rgba(&src, 2, n_src, 2, n_dst);
-
-        (0..n_dst).map(|y| out[(y * 2) * C]).collect()
+        let out = box_downscale_rgba(&src, 1, 3, 1, 2, false);
+        assert_eq!(out[0], 50);
+        assert_eq!(out[C], 130);
+        assert_eq!(out[3], 255);
+        assert_eq!(out[C + 3], 255);
     }
 
-    #[test]
-    fn downscale_impulse_matches_unity() {
-        let col = impulse_col(300, 256, 150);
-        assert_eq!(col[127], 22);
-        assert_eq!(col[128], 192);
-        assert_eq!(col[129], 5);
-
-        let col0 = impulse_col(300, 256, 0);
-        assert_eq!(col0[0], 211);
-        assert_eq!(col0[1], 5);
-
-        let col9 = impulse_col(300, 256, 299);
-        assert_eq!(col9[254], 5);
-        assert_eq!(col9[255], 211);
-    }
-
-    #[test]
-    fn upscale_impulse_matches_unity() {
-        let col = impulse_col(200, 256, 100);
-        assert_eq!(col[126], 2);
-        assert_eq!(col[127], 58);
-        assert_eq!(col[128], 167);
-        assert_eq!(col[129], 94);
-        assert_eq!(col[130], 7);
-    }
-
-    #[test]
-    fn step_edge_byte_domain() {
+    fn step_col(edge: usize) -> Vec<u8> {
         let mut src = vec![0u8; 2 * 300 * C];
         for y in 0..300 {
-            let v = if y < 150 { 0 } else { 255 };
+            let v = if y < edge { 0 } else { 255 };
             for x in 0..2 {
                 let o = (y * 2 + x) * C;
                 src[o] = v;
@@ -206,18 +260,96 @@ mod tests {
                 src[o + 3] = 255;
             }
         }
-        let out = box_downscale_rgba(&src, 2, 300, 2, 256);
-        let col: Vec<u8> = (0..256).map(|y| out[(y * 2) * C]).collect();
-        assert_eq!(col[127], 19);
-        assert_eq!(col[128], 236);
-        assert_eq!(col[126], 0);
+        let out = box_downscale_rgba(&src, 2, 300, 2, 256, true);
+        (0..256).map(|y| out[(y * 2) * C]).collect()
+    }
+
+    #[test]
+    fn step_edge_linear_no_overshoot() {
+        let col = step_col(151);
+        assert_eq!(col[127], 0);
+        assert_eq!(col[128], 107);
         assert_eq!(col[129], 255);
+        assert!(col.windows(2).all(|w| w[1] >= w[0]));
+
+        let aligned = step_col(150);
+        assert_eq!(aligned[127], 0);
+        assert_eq!(aligned[128], 255);
+    }
+
+    #[test]
+    fn upscale_bspline_byte_domain_unchanged() {
+        let n_src = 200;
+        let mut src = vec![0u8; 2 * n_src * C];
+        for x in 0..2 {
+            let o = (100 * 2 + x) * C;
+            src[o] = 255;
+            src[o + 1] = 255;
+            src[o + 2] = 255;
+        }
+        for y in 0..n_src {
+            for x in 0..2 {
+                src[(y * 2 + x) * C + 3] = 255;
+            }
+        }
+        let out = box_downscale_rgba(&src, 2, n_src, 2, 256, false);
+        let col: Vec<u8> = (0..256).map(|y| out[(y * 2) * C]).collect();
+        assert_eq!(col[126], 2);
+        assert_eq!(col[127], 58);
+        assert_eq!(col[128], 167);
+        assert_eq!(col[129], 94);
+        assert_eq!(col[130], 7);
     }
 
     #[test]
     fn identity_passthrough() {
         let src = vec![7u8; 4 * 4 * C];
-        let out = box_downscale_rgba(&src, 4, 4, 4, 4);
+        let out = box_downscale_rgba(&src, 4, 4, 4, 4, true);
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn premul_edge_no_rgb_drag() {
+        let (sw, sh) = (8usize, 8usize);
+        let mut src = vec![0u8; sw * sh * C];
+        for y in 0..sh {
+            for x in 0..sw {
+                let o = (y * sw + x) * C;
+                if x < 3 {
+                    src[o] = 255;
+                    src[o + 3] = 255;
+                } else {
+                    src[o + 1] = 255;
+                }
+            }
+        }
+        let premul = premul_downscale_rgba(&src, sw, sh, 4, 4);
+        for px in premul.chunks_exact(C) {
+            if px[3] > 0 {
+                assert_eq!(px[0], 255, "visible red thinned: {px:?}");
+                assert_eq!(px[1], 0, "hidden green dragged in: {px:?}");
+            } else {
+                assert_eq!(&px[0..3], &[0, 0, 0], "uncovered texel not zeroed: {px:?}");
+            }
+        }
+        let straight = box_downscale_rgba(&src, sw, sh, 4, 4, true);
+        let dragged = straight.chunks_exact(C).any(|px| px[3] > 0 && px[1] > 0);
+        assert!(dragged, "straight filter no longer drags; fixture stale");
+    }
+
+    #[test]
+    fn premul_matches_straight_when_fully_opaque() {
+        let (sw, sh) = (7usize, 5usize);
+        let mut src = vec![0u8; sw * sh * C];
+        for (i, px) in src.chunks_exact_mut(C).enumerate() {
+            px[0] = (i * 37 % 256) as u8;
+            px[1] = (i * 101 % 256) as u8;
+            px[2] = (i * 197 % 256) as u8;
+            px[3] = 255;
+        }
+        assert_eq!(
+            premul_downscale_rgba(&src, sw, sh, 3, 2),
+            box_downscale_rgba(&src, sw, sh, 3, 2, true)
+        );
     }
 }

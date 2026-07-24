@@ -169,10 +169,18 @@ pub fn emit_glb(model: &LodModel) -> Result<Vec<u8>> {
     }
 
     let mut mats_json: Vec<Value> = Vec::new();
+    let mut uses_strength_ext = false;
     for (mi, m) in model.materials.iter().enumerate() {
-        if let Some(i) = m.image {
-            if i >= model.images.len() {
-                bail!("emit_glb: material {mi} references missing image {i}");
+        for (slot, img) in [
+            ("image", m.image),
+            ("emissive image", m.emissive_image),
+            ("metallic-roughness image", m.mr_image),
+            ("normal image", m.normal_image),
+        ] {
+            if let Some(i) = img {
+                if i >= model.images.len() {
+                    bail!("emit_glb: material {mi} references missing {slot} {i}");
+                }
             }
         }
         let mut pbr = Map::new();
@@ -180,8 +188,11 @@ pub fn emit_glb(model: &LodModel) -> Result<Vec<u8>> {
         if let Some(i) = m.image {
             pbr.insert("baseColorTexture".to_string(), json!({"index": i}));
         }
-        pbr.insert("metallicFactor".to_string(), json!(0.0));
-        pbr.insert("roughnessFactor".to_string(), json!(1.0));
+        pbr.insert("metallicFactor".to_string(), json!(m.metallic));
+        if let Some(i) = m.mr_image {
+            pbr.insert("metallicRoughnessTexture".to_string(), json!({"index": i}));
+        }
+        pbr.insert("roughnessFactor".to_string(), json!(m.roughness));
         let mut mat = Map::new();
         if m.class == AlphaClass::Mask {
             mat.insert("alphaCutoff".to_string(), json!(m.cutoff));
@@ -189,6 +200,23 @@ pub fn emit_glb(model: &LodModel) -> Result<Vec<u8>> {
         mat.insert("alphaMode".to_string(), json!(m.class.gltf_name()));
         if m.double_sided {
             mat.insert("doubleSided".to_string(), json!(true));
+        }
+        if m.emissive != [0.0; 3] {
+            mat.insert("emissiveFactor".to_string(), json!(m.emissive));
+            if m.emissive_strength != 1.0 {
+                uses_strength_ext = true;
+                mat.insert(
+                    "extensions".to_string(),
+                    json!({"KHR_materials_emissive_strength":
+                        {"emissiveStrength": m.emissive_strength}}),
+                );
+            }
+        }
+        if let Some(i) = m.emissive_image {
+            mat.insert("emissiveTexture".to_string(), json!({"index": i}));
+        }
+        if let Some(i) = m.normal_image {
+            mat.insert("normalTexture".to_string(), json!({"index": i}));
         }
         mat.insert("name".to_string(), json!(m.name));
         mat.insert("pbrMetallicRoughness".to_string(), Value::Object(pbr));
@@ -203,6 +231,12 @@ pub fn emit_glb(model: &LodModel) -> Result<Vec<u8>> {
         "asset".to_string(),
         json!({"generator": "abgen-lodgen", "version": "2.0"}),
     );
+    if uses_strength_ext {
+        root.insert(
+            "extensionsUsed".to_string(),
+            json!(["KHR_materials_emissive_strength"]),
+        );
+    }
     root.insert("bufferViews".to_string(), Value::Array(views));
     root.insert("buffers".to_string(), json!([{"byteLength": bin.len()}]));
     if !images_json.is_empty() {
@@ -305,14 +339,16 @@ mod tests {
                     cutoff: 0.5,
                     image: Some(0),
                     double_sided: false,
+                    ..Default::default()
                 },
                 LodMaterial {
                     name: "matB".to_string(),
-                    class: AlphaClass::Mask,
+                    class: AlphaClass::Blend,
                     base_color: [1.0, 0.5, 0.25, 0.8],
-                    cutoff: 0.7,
+                    cutoff: 0.5,
                     image: None,
                     double_sided: true,
+                    ..Default::default()
                 },
             ],
             images: vec![LodImage {
@@ -341,6 +377,7 @@ mod tests {
                 cutoff: 0.5,
                 image: None,
                 double_sided: false,
+                ..Default::default()
             }],
             images: Vec::new(),
             log: Vec::new(),
@@ -460,6 +497,7 @@ mod tests {
                 cutoff: 0.5,
                 image: None,
                 double_sided: false,
+                ..Default::default()
             }],
             images: Vec::new(),
             log: Vec::new(),
@@ -619,5 +657,140 @@ mod tests {
         let a = emit_glb(&sample_model()).unwrap();
         let b = emit_glb(&sample_model()).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn emissive_round_trip_vs_fold() {
+        let mut model = sample_model();
+        model.materials[0].emissive = [0.25, 0.5, 0.75];
+        model.materials[0].emissive_image = Some(0);
+        let glb = emit_glb(&model).unwrap();
+
+        let on = from_glb_bytes_with(&glb, "sample_root", true).unwrap();
+        assert_eq!(on.materials[0].emissive, [0.25, 0.5, 0.75]);
+        assert_eq!(on.materials[0].emissive_image, Some(0));
+        assert_eq!(on.materials[0].base_color, model.materials[0].base_color);
+        assert_eq!(on.materials[1].emissive, [0.0; 3]);
+        assert_eq!(on.materials[1].emissive_image, None);
+
+        let off = from_glb_bytes(&glb, "sample_root").unwrap();
+        assert_eq!(
+            off.materials[0].base_color,
+            fold_emissive(model.materials[0].base_color, [0.25, 0.5, 0.75])
+        );
+        assert_eq!(off.materials[0].emissive, [0.0; 3]);
+        assert_eq!(off.materials[0].emissive_image, None);
+
+        let plain = emit_glb(&sample_model()).unwrap();
+        let (json, _) = chunks(&plain);
+        for m in json["materials"].as_array().unwrap() {
+            assert!(m.get("emissiveFactor").is_none(), "{m}");
+            assert!(m.get("emissiveTexture").is_none(), "{m}");
+        }
+    }
+
+    #[test]
+    fn raw_material_truth_emits_and_default_lane_is_normalized() {
+        let mut model = sample_model();
+        model.materials[0].metallic = 1.0;
+        model.materials[0].roughness = 0.9;
+        model.materials[0].mr_image = Some(0);
+        model.materials[0].normal_image = Some(0);
+        model.materials[0].emissive = [0.25, 0.5, 0.75];
+        model.materials[0].emissive_strength = 2.0;
+        let glb = emit_glb(&model).unwrap();
+        let (json, _) = chunks(&glb);
+        let m0 = &json["materials"][0];
+        let pbr = &m0["pbrMetallicRoughness"];
+        assert_eq!(pbr["metallicFactor"], serde_json::json!(1.0));
+        assert_eq!(pbr["roughnessFactor"], serde_json::json!(0.9));
+        assert_eq!(pbr["metallicRoughnessTexture"]["index"], 0);
+        assert_eq!(m0["normalTexture"]["index"], 0);
+        assert_eq!(m0["emissiveFactor"], serde_json::json!([0.25, 0.5, 0.75]));
+        assert_eq!(
+            m0["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"],
+            serde_json::json!(2.0)
+        );
+        assert_eq!(
+            json["extensionsUsed"],
+            serde_json::json!(["KHR_materials_emissive_strength"])
+        );
+
+        let m1 = &json["materials"][1];
+        assert_eq!(
+            m1["pbrMetallicRoughness"]["metallicFactor"],
+            serde_json::json!(0.0)
+        );
+        assert_eq!(
+            m1["pbrMetallicRoughness"]["roughnessFactor"],
+            serde_json::json!(1.0)
+        );
+        assert!(m1.get("normalTexture").is_none());
+        assert!(m1.get("extensions").is_none());
+        let (plain_json, _) = chunks(&emit_glb(&sample_model()).unwrap());
+        assert!(plain_json.get("extensionsUsed").is_none());
+        for m in plain_json["materials"].as_array().unwrap() {
+            assert_eq!(
+                m["pbrMetallicRoughness"]["metallicFactor"],
+                serde_json::json!(0.0)
+            );
+            assert_eq!(
+                m["pbrMetallicRoughness"]["roughnessFactor"],
+                serde_json::json!(1.0)
+            );
+            assert!(m["pbrMetallicRoughness"]
+                .get("metallicRoughnessTexture")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn metallic_roughness_round_trip_through_raw_glb() {
+        let mut model = sample_model();
+        model.materials[0].metallic = 0.8;
+        model.materials[0].roughness = 0.3;
+        let glb = emit_glb(&model).unwrap();
+        let back = from_glb_bytes(&glb, "sample_root").unwrap();
+        assert_eq!(back.materials[0].metallic, 0.8);
+        assert_eq!(back.materials[0].roughness, 0.3);
+        assert_eq!(back.materials[1].metallic, 0.0);
+        assert_eq!(back.materials[1].roughness, 1.0);
+    }
+
+    #[test]
+    fn mr_texture_round_trips_through_raw_glb() {
+        let mut model = sample_model();
+        model.materials[0].metallic = 0.9;
+        model.materials[0].roughness = 0.3;
+        model.materials[0].mr_image = Some(0);
+        let glb = emit_glb(&model).unwrap();
+        let (json, _) = chunks(&glb);
+        assert!(json["materials"][0]["pbrMetallicRoughness"]
+            .get("metallicRoughnessTexture")
+            .is_some());
+
+        let back = from_glb_bytes(&glb, "sample_root").unwrap();
+        assert_eq!(back.materials[0].mr_image, Some(0));
+        assert_eq!(back.materials[0].metallic, 0.9);
+        assert_eq!(back.materials[0].roughness, 0.3);
+        assert_eq!(back.materials[1].mr_image, None);
+        let again = emit_glb(&back).unwrap();
+        let (json2, _) = chunks(&again);
+        assert!(json2["materials"][0]["pbrMetallicRoughness"]
+            .get("metallicRoughnessTexture")
+            .is_some());
+    }
+
+    #[test]
+    fn emissive_strength_multiplied_and_clamped() {
+        let mut model = sample_model();
+        model.materials[0].emissive = [0.5, 0.2, 1.0];
+        let glb = emit_glb(&model).unwrap();
+        let (mut json, bin) = chunks(&glb);
+        json["materials"][0]["extensions"] =
+            serde_json::json!({"KHR_materials_emissive_strength": {"emissiveStrength": 3.0}});
+        let patched = rebuild(&json, &bin);
+        let on = from_glb_bytes_with(&patched, "sample_root", true).unwrap();
+        assert_eq!(on.materials[0].emissive, [1.0, 0.2f64 * 3.0, 1.0]);
     }
 }
