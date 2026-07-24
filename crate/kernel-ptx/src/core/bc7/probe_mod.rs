@@ -591,6 +591,25 @@ pub mod probe {
         sol_list(&out[0])
     }
 
+    /// Multi-lane form of `estimate_partition_list`: the 2-subset checkerboard
+    /// early-out couples lanes (the scan past partition 34 stops only when ALL
+    /// lanes are done), so a group of blocks estimated together can produce
+    /// different lists than each block alone. Mirrors of the grouped plan
+    /// passes must use this, not the single-lane probe.
+    pub fn estimate_partition_list_lanes(
+        mode: usize,
+        cp: &super::Params,
+        max_solutions: i32,
+        lanes_px: &[&[[i32; 4]; 16]],
+    ) -> Vec<SolList> {
+        let cols: Vec<[super::ColorI; 16]> =
+            lanes_px.iter().map(|px| colors_from(px)).collect();
+        let lanes: Vec<&[super::ColorI; 16]> = cols.iter().collect();
+        let mut out = vec![super::SolutionList::new(); lanes_px.len()];
+        super::estimate_partition_list_group(mode, &lanes, cp, max_solutions, &mut out);
+        out.iter().map(sol_list).collect()
+    }
+
     pub struct PlanOut {
         pub part0: u32,
         pub part13: u32,

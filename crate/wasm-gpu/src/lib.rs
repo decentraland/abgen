@@ -68,9 +68,30 @@ async fn qualify(g: &Gpu, eng: &Engine) -> Result<(), String> {
                     .await
                     .map_err(|e| format!("qualification encode failed: {e:#}"))?;
                     if got != want || got_mips != want_mips {
+                        let diff = got
+                            .iter()
+                            .zip(want.iter())
+                            .position(|(a, b)| a != b)
+                            .unwrap_or(got.len().min(want.len()));
+                        let ctx = |v: &[u8]| {
+                            v.iter()
+                                .skip(diff & !15)
+                                .take(16)
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>()
+                        };
                         return Err(format!(
                             "not bit-exact vs CPU oracle at {w}x{h} srgb={srgb} \
-                             perceptual={perceptual} profile={profile:?}"
+                             perceptual={perceptual} profile={profile:?}: first diff \
+                             byte {diff} (block {} byte-in-block {}; lens {}/{} mips {got_mips}/{want_mips}) \
+                             got[{}..]={} want={}",
+                            diff / 16,
+                            diff % 16,
+                            got.len(),
+                            want.len(),
+                            diff & !15,
+                            ctx(&got),
+                            ctx(&want),
                         ));
                     }
                 }
@@ -92,6 +113,64 @@ pub async fn gpu_init() -> Result<String, JsValue> {
     let summary = g.adapter_summary();
     STATE.with(|s| *s.borrow_mut() = Some(Rc::new((g, eng))));
     Ok(summary)
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Run the Tint bisection harness (abgen::gpu::bisect): the native wgpu_bc7
+/// golden test drivers replayed against this browser's WGSL compiler, one
+/// result per `bc7_test_*` entry. Deliberately does NOT require qualification
+/// to have passed — bisect exists precisely to localize a qualification
+/// failure. Reuses the gpu_init device when armed, otherwise acquires its own.
+#[wasm_bindgen]
+pub async fn gpu_bisect() -> Result<String, JsValue> {
+    let state = STATE.with(|s| s.borrow().clone());
+    let owned: Option<Gpu> = if state.is_some() {
+        None
+    } else {
+        Some(init_gpu().await.map_err(|e| JsValue::from_str(&e))?)
+    };
+    let g: &Gpu = match &state {
+        Some(st) => &st.0,
+        None => owned.as_ref().unwrap(),
+    };
+    let results = abgen::gpu::bisect::run_bisect(g).await;
+    let mut json = String::from("{\"adapter\":\"");
+    json.push_str(&json_escape(&g.adapter_summary()));
+    json.push_str("\",\"results\":[");
+    for (i, r) in results.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            "{{\"entry\":\"{}\",\"cases\":{},\"pass\":{}",
+            json_escape(&r.entry),
+            r.cases,
+            r.pass
+        ));
+        if let Some(d) = &r.first_diff {
+            json.push_str(&format!(
+                ",\"first_diff\":{{\"byte_offset\":{},\"got_word\":{},\"want_word\":{},\"case_index\":{}}}",
+                d.byte_offset, d.got_word, d.want_word, d.case_index
+            ));
+        } else {
+            json.push_str(",\"first_diff\":null");
+        }
+        json.push('}');
+    }
+    json.push_str("]}");
+    Ok(json)
 }
 
 #[wasm_bindgen]
