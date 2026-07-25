@@ -74,6 +74,8 @@ pub mod unity;
 
 pub mod builder;
 pub mod bundle;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod bvwebgpu;
 
 pub mod compress;
 pub mod lods;

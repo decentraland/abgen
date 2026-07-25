@@ -26,7 +26,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn space_lane_serve<F>(
+pub(super) async fn space_lane_serve<F>(
     state: &AppState,
     lane: Option<&'static str>,
     dst: std::path::PathBuf,

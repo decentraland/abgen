@@ -107,6 +107,9 @@ chrono = "0.4"
 tracing = "0.1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy_mikktspace = "=1.0.0"
+ddsfile = "=0.5.2"
+gltf-json = { version = "=1.4.1", features = ["names", "extras", "extensions", "KHR_lights_punctual", "KHR_materials_transmission", "KHR_materials_ior", "KHR_materials_volume", "KHR_materials_unlit", "KHR_materials_emissive_strength", "KHR_texture_transform"] }
 image = "0.25"
 ureq = "3"
 memmap2 = "0.9"

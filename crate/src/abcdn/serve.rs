@@ -14,6 +14,8 @@ use super::state::AppState;
 fn binary_content_type(etag_source: &str) -> &'static str {
     if etag_source.ends_with(".manifest") {
         "text/cache-manifest"
+    } else if etag_source.ends_with(".pack") || etag_source.ends_with(".pack.br") {
+        "application/octet-stream"
     } else {
         "application/wasm"
     }

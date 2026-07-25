@@ -8,6 +8,7 @@ use super::resolver;
 use super::serve;
 use super::state::AppState;
 
+mod bvpk;
 mod dispatch;
 mod entities;
 mod fresh;
@@ -15,6 +16,7 @@ mod jit;
 mod status;
 mod upstream;
 
+use bvpk::*;
 use dispatch::*;
 #[cfg(test)]
 use entities::*;
@@ -28,5 +30,7 @@ pub use dispatch::dispatch;
 pub use entities::{post_entities_active, post_entities_versions};
 pub use status::{get_build_progress, health, livez, metrics, ping, readyz};
 
+#[cfg(test)]
+mod bvpk_tests;
 #[cfg(test)]
 mod tests;
