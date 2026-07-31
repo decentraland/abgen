@@ -349,6 +349,14 @@ mod tests {
         // Production-length names pass through verbatim.
         let short = binary_path(root, "bafkScene", "Qmhash_windows").unwrap();
         assert_eq!(short, Path::new("/out/bafkScene/windows/Qmhash_windows"));
+
+        // The windows lane stores original-case names while clients request
+        // Unity-lowercased ones; the collapse must map both to one file.
+        let mixed = format!("b64-{}_windows", "QzpcVXNlcnNc".repeat(20));
+        assert_eq!(
+            binary_path(root, &long_entity, &mixed).unwrap(),
+            binary_path(root, &long_entity, &mixed.to_lowercase()).unwrap()
+        );
     }
 
     #[test]
