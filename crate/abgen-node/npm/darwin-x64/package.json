@@ -1,0 +1,27 @@
+{
+  "name": "@dcl/abgen-node-darwin-x64",
+  "version": "0.15.0",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "abgen-node.darwin-x64.node",
+  "files": [
+    "abgen-node.darwin-x64.node"
+  ],
+  "description": "Decentraland asset-bundle conversion in-process for Node (Rust + napi-rs) — the same abgen core the server and the Unity plugin run",
+  "license": "AGPL-3.0-or-later",
+  "engines": {
+    "node": ">= 18"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/decentraland/abgen.git"
+  }
+}
