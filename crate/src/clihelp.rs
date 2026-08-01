@@ -2,7 +2,7 @@ pub fn version_line(bin: &str) -> String {
     format!(
         "{bin} {} ({})",
         env!("CARGO_PKG_VERSION"),
-        option_env!("ABGEN_GIT_COMMIT").unwrap_or("unknown")
+        option_env!("ABGEN_BUILD_ID").unwrap_or("unknown")
     )
 }
 

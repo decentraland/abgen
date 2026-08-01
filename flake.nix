@@ -8,12 +8,52 @@
 
   outputs = { self, nixpkgs, crane }:
     let
+      lib = nixpkgs.lib;
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
 
-      perSystem = nixpkgs.lib.genAttrs systems (system:
+      sourceDateEpoch = "315532800";
+
+      buildFileset = lib.fileset.unions [
+        ./Cargo.toml
+        ./Cargo.lock
+        ./rust-toolchain.toml
+        ./crate
+        ./template
+      ];
+
+      buildSource = lib.fileset.toSource {
+        root = ./.;
+        fileset = lib.fileset.traceVal buildFileset;
+      };
+
+      buildId = builtins.substring 0 12 (builtins.hashString "sha256"
+        (builtins.concatStringsSep "\n" [
+          (baseNameOf (builtins.unsafeDiscardStringContext buildSource.outPath))
+          (builtins.hashFile "sha256" ./rust-toolchain.toml)
+          (builtins.hashFile "sha256" ./flake.lock)
+          (builtins.hashFile "sha256" ./flake.nix)
+        ]));
+
+      buildEnv = {
+        ABGEN_BUILD_ID = buildId;
+        SOURCE_DATE_EPOCH = sourceDateEpoch;
+      };
+
+      rustChannel = (builtins.fromTOML
+        (builtins.readFile ./rust-toolchain.toml)).toolchain.channel;
+
+      perSystem = lib.genAttrs systems (system:
         let
           pkgs = import nixpkgs { inherit system; };
           craneLib = crane.mkLib pkgs;
+
+          _toolchainMatches = lib.assertMsg (pkgs.rustc.version == rustChannel) ''
+            toolchain mismatch: rust-toolchain.toml pins ${rustChannel} but this
+            nixpkgs ships rustc ${pkgs.rustc.version}. The rustup legs would build
+            with one compiler and the nix legs with the other. Move flake.lock and
+            rust-toolchain.toml together, or pick the nixpkgs rev that carries the
+            version you want.
+          '';
 
           nativeDeps = with pkgs; [
             cargo
@@ -28,28 +68,31 @@
           sharedLibExt = pkgs.stdenv.hostPlatform.extensions.sharedLibrary;
 
           crateVersion = (builtins.fromTOML (builtins.readFile ./crate/Cargo.toml)).package.version;
-          gitCommit = if self ? rev then builtins.substring 0 12 self.rev else "unknown";
 
           commonArgs = {
             pname = "abgen";
             version = crateVersion;
-            src = self;
+            src = buildSource;
             nativeBuildInputs = with pkgs; [ cmake pkg-config git ];
             doCheck = false;
+            env.SOURCE_DATE_EPOCH = sourceDateEpoch;
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
           abgenPkg = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
-            env.ABGEN_GIT_COMMIT = gitCommit;
-            cargoExtraArgs = "--bin abgen";
+            env = buildEnv;
+            cargoExtraArgs = "--locked --bin abgen";
           });
         in
+        assert _toolchainMatches;
         {
           devShells.default = pkgs.mkShell {
             nativeBuildInputs = nativeDeps;
 
             buildInputs = [ pkgs.libjpeg_turbo ];
+            ABGEN_BUILD_ID = buildId;
+            SOURCE_DATE_EPOCH = sourceDateEpoch;
             shellHook = ''
               export TURBOJPEG_LIB=${pkgs.libjpeg_turbo.out}/lib/libturbojpeg${sharedLibExt}
             '';
@@ -57,19 +100,32 @@
 
           packages.default = abgenPkg;
 
+          packages.buildId = buildId;
+
+          packages.abgen-native = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
+            pname = "abgen-native";
+            env = buildEnv;
+            buildPhaseCargoCommand = ''
+              cargoBuildLog=$(mktemp cargoBuildLogXXXX.json)
+              cargoWithProfile build --message-format json-render-diagnostics --locked --bin abgen >>"$cargoBuildLog"
+              cargoWithProfile build --message-format json-render-diagnostics --locked --package abgen-native >>"$cargoBuildLog"
+            '';
+          });
+
           packages.abgen-corpus = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
             pname = "abgen-corpus";
-            env.ABGEN_GIT_COMMIT = gitCommit;
-            cargoExtraArgs = "--bin abgen-corpus";
+            env = buildEnv;
+            cargoExtraArgs = "--locked --bin abgen-corpus";
           });
 
           packages.dockerImage =
             let
               runtimeData = pkgs.runCommand "abgen-runtime" { } ''
                 mkdir -p $out/opt/abgen
-                cp -r ${self}/template $out/opt/abgen/template
-                cp -r ${self}/crate/shader $out/opt/abgen/shader
+                cp -r ${buildSource}/template $out/opt/abgen/template
+                cp -r ${buildSource}/crate/shader $out/opt/abgen/shader
               '';
             in
             pkgs.dockerTools.buildLayeredImage {
@@ -105,7 +161,7 @@
             pkgs.rustPlatform.buildRustPackage {
               pname = "abgen-compare";
               version = crateVersion;
-              env.ABGEN_GIT_COMMIT = gitCommit;
+              env = buildEnv;
               src = self;
               cargoLock = {
                 lockFile = ./Cargo.lock;
