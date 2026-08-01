@@ -1,9 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// Decoder-only wasm build: no cmake, no cxx — compile the draco decoder
-// sources plus the plain-C bridge (cpp/decoder_api_c.cc) with the cc crate.
-// Skips encoder/io/tool/test translation units by filename.
 fn wasm_skip(path: &Path) -> bool {
     let p = path.to_string_lossy().replace('\\', "/");
     let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -125,6 +122,7 @@ fn main() {
             "-DBUILD_SHARED_LIBS=OFF",
             "-DCMAKE_BUILD_TYPE=Release",
             "-DDRACO_TESTS=OFF",
+            "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
             &format!("-DCMAKE_INSTALL_PREFIX={draco_build}/install"),
         ])
         .current_dir(&draco_build)

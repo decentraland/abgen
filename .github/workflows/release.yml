@@ -4,6 +4,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      record_hashes:
+        description: "Record artifact hashes instead of verifying them"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -12,10 +17,45 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
 
+  SOURCE_DATE_EPOCH: "315532800"
+
+  ABGEN_GIT_REV: ${{ github.sha }}
+
 jobs:
+  build-id:
+    name: build id
+    runs-on: ubuntu-24.04
+    outputs:
+      value: ${{ steps.eval.outputs.value }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - name: evaluate .#buildId
+        id: eval
+        run: |
+          set -eu
+          flags=(--extra-experimental-features nix-command
+                 --extra-experimental-features flakes)
+          # Evaluation only, no build: .#buildId is a content id over the
+          # filtered source tree, so it is a pure function of what will be
+          # compiled and is identical on every runner.
+          value="$(nix eval --raw "${flags[@]}" .#buildId)"
+          case "$value" in
+            *[!0-9a-f]*)
+              echo "buildId is not lowercase hex: $value" >&2; exit 1 ;;
+          esac
+          if [ "${#value}" -ne 12 ]; then
+            echo "buildId must be 12 chars, got ${#value}: $value" >&2; exit 1
+          fi
+          echo "ABGEN_BUILD_ID=$value"
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.target }}
+    needs: build-id
     runs-on: ${{ matrix.runner }}
+    env:
+      ABGEN_BUILD_ID: ${{ needs.build-id.outputs.value }}
     strategy:
       fail-fast: false
       matrix:
@@ -34,7 +74,6 @@ jobs:
             runner: ubuntu-24.04
             builder: rustup
             bin: abgen.exe
-            cargo_flags: --features rquickjs/bindgen
           - target: aarch64-apple-darwin
             runner: macos-15
             builder: rustup
@@ -54,7 +93,38 @@ jobs:
           git remote add origin "https://github.com/$GITHUB_REPOSITORY"
           git fetch -q --depth 1 origin "$GITHUB_SHA"
           git checkout -q FETCH_HEAD
-          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+          # SOURCE_DATE_EPOCH is pinned at the workflow level and nothing here
+          # derives it. ABGEN_BUILD_ID comes from the build-id job; an empty
+          # one would make crate/build.rs fall back to `git rev-parse` and put
+          # us straight back into per-commit binaries, so fail here instead of
+          # discovering it at hash-verify time.
+          test -n "${ABGEN_BUILD_ID:-}" \
+            || { echo "ABGEN_BUILD_ID is empty (build-id job output)" >&2; exit 1; }
+          echo "build id: $ABGEN_BUILD_ID  rev: $ABGEN_GIT_REV  epoch: $SOURCE_DATE_EPOCH"
+
+          # For the four rustup legs only; the nix legs exit below and never
+          # read them. They are how a rustup build gets what the nix sandbox
+          # gives for free: the sandbox already compiles at a fixed /build/source
+          # with a fixed $HOME, so flake.nix sets no remapping flags at all,
+          # while a runner build would otherwise bake /home/runner/work/... in.
+          # This mattered more when the native artifacts came from
+          # `nix develop --command cargo build`, which inherited this
+          # environment; all four are sandbox-built now.
+          # The rustup lane overwrites RUSTFLAGS below with target additions;
+          # a later GITHUB_ENV write wins.
+          #
+          # $HOME before $PWD, and the order is load-bearing: on a runner $PWD
+          # ($HOME/work/abgen/abgen) is nested inside $HOME, and gcc applies the
+          # LAST matching -ffile-prefix-map. Measured: with $PWD first, $HOME
+          # wins and the checkout maps to /home/work/... instead of /build.
+          # The $HOME map exists for vendored C compiled out of ~/.cargo — cxx's
+          # cxx.cc left the builder's real home in libabgen.a without it.
+          {
+            echo "RUSTFLAGS=--remap-path-prefix $PWD=/build --remap-path-prefix $HOME=/home"
+            echo "CFLAGS=-ffile-prefix-map=$HOME=/home -ffile-prefix-map=$PWD=/build"
+            echo "CXXFLAGS=-ffile-prefix-map=$HOME=/home -ffile-prefix-map=$PWD=/build"
+          } >> "$GITHUB_ENV"
 
           if [ "${{ matrix.builder }}" = "nix" ]; then
             exit 0
@@ -67,8 +137,8 @@ jobs:
               echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
               export PATH="$HOME/.cargo/bin:$PATH"
             fi
-            rustup toolchain install 1.97.1 --profile minimal --no-self-update
-            rustup default 1.97.1
+            rustup toolchain install 1.97.0 --profile minimal --no-self-update
+            rustup default 1.97.0
             rustup target add ${{ matrix.target }}
           ) > /tmp/rustup.log 2>&1 &
           rustup_pid=$!
@@ -89,6 +159,10 @@ jobs:
               echo "CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc-posix"
               echo "CXX_x86_64_pc_windows_gnu=x86_64-w64-mingw32-g++-posix"
               echo "AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar"
+              # Read by ci/stable-dlltool.sh, which -C dlltool= points at
+              # below. Named here so the wrapper and the rest of the lane's
+              # binutils cannot drift apart.
+              echo "ABGEN_REAL_DLLTOOL=x86_64-w64-mingw32-dlltool"
             } >> "$GITHUB_ENV"
           fi
 
@@ -122,14 +196,33 @@ jobs:
           rustflags="--remap-path-prefix $PWD=/build --remap-path-prefix $HOME=/home"
           if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
             rustflags="$rustflags -C link-arg=-Wl,--no-insert-timestamp"
+            # The one thing that made this lane nondeterministic. rustc builds
+            # the raw-dylib import libraries by shelling out to dlltool, into a
+            # per-invocation temp dir (deps/rustc<6 random chars>/), and
+            # binutils dlltool mangles that path into the _head_/_iname symbols
+            # it emits — so every cold build stamped fresh random names into
+            # every raw-dylib crate's rlib and, through the link, into all four
+            # artifacts. Measured on run 30637036957: 2,305,150 differing bytes
+            # in abgen.exe, every one in a COFF symbol or string table, every
+            # loadable byte identical. ci/stable-dlltool.sh gives dlltool a
+            # content-addressed output path instead; see its header, which also
+            # records why -C dlltool=llvm-dlltool is NOT the fix (reproducible,
+            # but leaves 40 IAT slots with no import descriptor under GNU ld).
+            #
+            # aarch64-pc-windows-gnullvm needs nothing: rustc's
+            # is_mingw_gnu_toolchain() is false for the llvm ABI, so that lane
+            # uses LLVM's in-process COFF import-library writer and never runs
+            # dlltool at all. This is the only lane that does.
+            rustflags="$rustflags -C dlltool=$PWD/ci/stable-dlltool.sh"
           fi
           if [ "${{ matrix.target }}" = "aarch64-pc-windows-gnullvm" ]; then
             rustflags="$rustflags -C target-feature=+crt-static -C link-arg=-Wl,--no-insert-timestamp"
           fi
           {
             echo "RUSTFLAGS=$rustflags"
-            echo "CFLAGS=-ffile-prefix-map=$PWD=/build"
-            echo "CXXFLAGS=-ffile-prefix-map=$PWD=/build"
+            # $HOME first — see the ordering note in the earlier flags step.
+            echo "CFLAGS=-ffile-prefix-map=$HOME=/home -ffile-prefix-map=$PWD=/build"
+            echo "CXXFLAGS=-ffile-prefix-map=$HOME=/home -ffile-prefix-map=$PWD=/build"
           } >> "$GITHUB_ENV"
 
       - if: matrix.builder == 'nix'
@@ -145,31 +238,149 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ matrix.target }}-1.97.1-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ matrix.target }}-1.97.1-
+          key: cargo-${{ matrix.target }}-1.97.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.target }}-1.97.0-
 
       - name: build
         run: |
           if [ "${{ matrix.builder }}" = "nix" ]; then
-            flags="--extra-experimental-features nix-command --extra-experimental-features flakes"
+            flags=(--extra-experimental-features nix-command
+                   --extra-experimental-features flakes)
             if [ -d /tmp/nix-deps-cache ]; then
-              nix copy $flags --from file:///tmp/nix-deps-cache --all --no-check-sigs || true
+              nix copy "${flags[@]}" --from file:///tmp/nix-deps-cache --all --no-check-sigs || true
             fi
-            nix build .#default --print-build-logs $flags
-            deps=$(nix build .#default.cargoArtifacts --print-out-paths --no-link $flags)
-            nix copy $flags --to file:///tmp/nix-deps-cache "$deps"
+            # All four artifacts, one sandboxed derivation. This used to be
+            # `nix build .#default` for abgen plus `nix develop --command cargo
+            # build` for the other three, and that split was the source of a
+            # whole class of bug: the sandboxed half could not see the runner
+            # environment and the devShell half inherited all of it, so one job
+            # ran on two clocks (SOURCE_DATE_EPOCH pinned inside, commit time
+            # outside) and only one of four artifacts was actually hermetic.
+            nix build .#abgen-native --print-build-logs "${flags[@]}"
+            deps=$(nix build .#abgen-native.cargoArtifacts --print-out-paths --no-link "${flags[@]}")
+            nix copy "${flags[@]}" --to file:///tmp/nix-deps-cache "$deps"
+
+            # crane's installFromCargoBuildLog puts executables in bin/ and
+            # cdylib/staticlib in lib/. Stage them where every later step
+            # already looks, so the gate, packaging and the hash manifest stay
+            # target-relative and identical across all six legs.
+            out="target/${{ matrix.target }}/release"
+            mkdir -p "$out"
+            install -m755 result/bin/abgen "$out/abgen"
+            install -m755 result/bin/abgen-host "$out/abgen-host"
+            install -m644 result/lib/libabgen.so "$out/libabgen.so"
+            install -m644 result/lib/libabgen.a "$out/libabgen.a"
           else
-            cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.cargo_flags }} --bin abgen
+            cargo build --release --locked --target ${{ matrix.target }} --bin abgen
+            cargo build --release --locked --target ${{ matrix.target }} -p abgen-native
           fi
+
+      - name: second build (record_hashes only)
+        if: ${{ inputs.record_hashes }}
+        run: |
+          set -eu
+          confirm="$RUNNER_TEMP/confirm"
+          rm -rf "$confirm"
+          mkdir -p "$confirm"
+
+          # The rebuild MUST use the same target directory as the first build.
+          # An earlier version built into $RUNNER_TEMP and remapped the path
+          # back; it reported every artifact nondeterministic (run 30621302143)
+          # for a reason no remap can reach: cc-rs hashes the absolute OUT_DIR
+          # into libabgen.a member NAMES, which is a filename it computes in
+          # Rust, not a path the compiler embeds, so -ffile-prefix-map has no
+          # effect on it. On Windows it is worse, because COFF symbol tables
+          # carry object-file names and all four artifacts move.
+          #
+          # What we are testing is determinism at a fixed path — same commit,
+          # same directory, built twice. Varying the path tests something else
+          # and answers a question we already have measured: the shipped three
+          # are path-independent, libabgen.a is not, and it is not shipped.
+          #
+          # Emptying target/ is what makes this an independent build rather
+          # than a cache read.
+          first="target/${{ matrix.target }}/release"
+          for f in "$first"/*; do
+            [ -f "$f" ] || continue
+            case "$(basename "$f")" in
+              abgen|abgen.exe|libabgen.so|libabgen.dylib|abgen.dll|libabgen.a|abgen-host|abgen-host.exe)
+                cp "$f" "$confirm/" ;;
+            esac
+          done
+
+          out="target/${{ matrix.target }}/release"
+          if [ "${{ matrix.builder }}" = "nix" ]; then
+            flags=(--extra-experimental-features nix-command
+                   --extra-experimental-features flakes)
+            # nix does the determinism check itself: --rebuild re-runs the
+            # derivation and fails if any byte of the output differs from the
+            # store path already built. That covers all four artifacts, so the
+            # confirm-dir comparison below is a formality on this lane and
+            # `--rebuild` is the step that can actually fail.
+            nix build .#abgen-native --rebuild --print-build-logs "${flags[@]}"
+            rm -rf target && mkdir -p "$out"
+            install -m755 result/bin/abgen "$out/abgen"
+            install -m755 result/bin/abgen-host "$out/abgen-host"
+            install -m644 result/lib/libabgen.so "$out/libabgen.so"
+            install -m644 result/lib/libabgen.a "$out/libabgen.a"
+          else
+            rm -rf target
+            cargo build --release --locked --target ${{ matrix.target }} --bin abgen
+            cargo build --release --locked --target ${{ matrix.target }} -p abgen-native
+          fi
+
+          # $confirm now holds build 1, target/ holds build 2 at the same path.
+          # verify-artifact-hashes.sh compares them and refuses to record on
+          # any disagreement.
+          ls -l "$confirm"
+          echo "ABGEN_CONFIRM_DIR=$confirm" >> "$GITHUB_ENV"
+
+      - name: verify artifact hashes
+        env:
+          ABGEN_RECORD_HASHES: ${{ inputs.record_hashes && '1' || '0' }}
+        run: |
+          set -eu
+          # One list for all six legs. The nix legs used to point at
+          # result/bin/abgen while their three siblings came from target/;
+          # both halves now land in target/, so nothing here is lane-specific.
+          artifacts=("target/${{ matrix.target }}/release/${{ matrix.bin || 'abgen' }}")
+          for f in libabgen.so libabgen.dylib abgen.dll libabgen.a abgen-host abgen-host.exe; do
+            src="target/${{ matrix.target }}/release/$f"
+            [ -f "$src" ] && artifacts+=("$src")
+          done
+          echo "artifacts: ${artifacts[*]}"
+          bash ci/verify-artifact-hashes.sh "${{ matrix.target }}" "${artifacts[@]}"
+
+      - name: upload recorded hashes
+        if: ${{ inputs.record_hashes }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hashes-${{ matrix.target }}
+          path: ci/artifact-hashes/${{ matrix.target }}.sha256
+          if-no-files-found: error
 
       - name: package, smoke test, publish
         env:
           GH_TOKEN: ${{ github.token }}
+          ABGEN_RELEASE: ${{ github.ref_name }}
         run: |
+          # mkdir before anything writes into it. GITHUB_REF_NAME is the branch
+          # on a workflow_dispatch, so on feat/embeddable-exports $dist contains
+          # a slash and names a path two levels deep. This used to be created as
+          # a side effect of `mkdir -p "$dist/shader"`; that line went away with
+          # the shipped assets, and five legs died on `cp: ... is not a
+          # directory`. Tags have no slash, so a real release would not have hit
+          # it — which is exactly why it needs to be explicit.
           dist="abgen-${GITHUB_REF_NAME:-dev}-${{ matrix.target }}"
-          mkdir -p "$dist/shader"
-          cp -R template "$dist/template"
-          cp crate/shader/scene_ignore_windows "$dist/shader/"
+          mkdir -p "$dist"
+          # No template/ or shader/ in the archive. Those bytes are compiled
+          # into the binary now, so shipping them again was ~1.5 MB of dead
+          # payload per archive — and worse than dead: ABGEN_ROOT is a hard
+          # error when unreadable, so a wrapper pointing at a directory that
+          # a partial extraction or a relocated binary left behind would abort
+          # where it used to fall through. Proven on real Windows: abgen.exe
+          # converted a live wearable with no template/ present anywhere and
+          # no ABGEN_ROOT set.
           cp LICENSE README.md "$dist/"
 
           if [ "${{ matrix.builder }}" = "nix" ]; then
@@ -180,11 +391,14 @@ jobs:
             done
             interp=$(readelf -l result/bin/abgen | sed -n 's/.*interpreter: \(.*\)]/\1/p')
             install -m755 "$interp" "$dist/lib/ld.so"
+            # Sets no ABGEN_ROOT / ABGEN_SHADER_BUNDLE: the assets are compiled
+            # in, and pointing those at a shipped directory would only create a
+            # way to fail. A user who genuinely wants to override still can —
+            # the binary reads both, and an unreadable one is a loud error
+            # rather than a silent fallback.
             cat > "$dist/abgen" <<'EOF'
           #!/bin/sh
           here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
-          export ABGEN_ROOT="${ABGEN_ROOT:-$here}"
-          export ABGEN_SHADER_BUNDLE="${ABGEN_SHADER_BUNDLE:-$here/shader/scene_ignore_windows}"
           exec "$here/lib/ld.so" --library-path "$here/lib" "$here/bin/abgen.bin" "$@"
           EOF
             chmod 755 "$dist/abgen"
@@ -197,10 +411,22 @@ jobs:
             fi
           fi
 
-          TAR=tar; command -v gtar >/dev/null && TAR=gtar
-          "$TAR" --sort=name --owner=0 --group=0 --numeric-owner \
-              --mtime="@${SOURCE_DATE_EPOCH}" -czf "$dist.tar.gz" "$dist"
+          # The rev is not in the binaries any more, so it ships next to them.
+          bash ci/write-build-info.sh "$dist" "${{ matrix.target }}"
+
+          bash ci/pack-archive.sh "$dist" "$dist.tar.gz" "$SOURCE_DATE_EPOCH"
+          # The sidecar is the only remaining answer to "which commit is this",
+          # so assert it survived packing rather than trusting that it did.
+          # Not piped into grep -q on purpose: the default shell here is
+          # `bash -eo pipefail`, and grep exiting early would SIGPIPE tar into
+          # a spurious 141.
+          members="$(tar -tzf "$dist.tar.gz")"
+          case "$members" in
+            *"/BUILD-INFO.txt"*) ;;
+            *) echo "BUILD-INFO.txt missing from $dist.tar.gz" >&2; exit 1 ;;
+          esac
           shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
+          bash ci/verify-reproducible.sh "$dist" "$dist.tar.gz" "$SOURCE_DATE_EPOCH"
 
           if ! echo "${{ matrix.target }}" | grep -q windows; then
             rm -rf /tmp/smoke && mkdir /tmp/smoke
@@ -219,13 +445,238 @@ jobs:
             )
           fi
 
+          nat="abgen-native-${GITHUB_REF_NAME:-dev}-${{ matrix.target }}"
+          mkdir -p "$nat/lib" "$nat/include"
+          cp crate/abgen-native/include/abgen.h "$nat/include/"
+          cp LICENSE "$nat/"
+          cp unity/README.md "$nat/README.md"
+          # No libabgen.a: it is 143 MB and would be ~35 MB of every asset for
+          # a need `cargo build -p abgen-native` already covers.
+          for f in libabgen.so libabgen.dylib abgen.dll; do
+            src="target/${{ matrix.target }}/release/$f"
+            [ -f "$src" ] && cp "$src" "$nat/lib/"
+          done
+          test -n "$(ls -A "$nat/lib")" || { echo "no native library built" >&2; exit 1; }
+
+          # Unlike abgen-host below, a library dlopen'd into Unity runs on the
+          # host process's glibc and cannot bundle its own, so the highest
+          # GLIBC_x.y in its verneed table is the oldest distribution it loads
+          # on. Gate the copy that actually ships, not a build-tree artifact.
+          # Linux legs only: .dylib and .dll have no verneed table.
+          if [ -f "$nat/lib/libabgen.so" ]; then
+            bash ci/check-glibc-floor.sh 2.34 "$nat/lib/libabgen.so"
+          fi
+          # abgen-host, and on the nix legs its own glibc with it.
+          #
+          # A nix-built ELF names its interpreter by absolute store path, so
+          # the helper only execs where that exact /nix/store path exists —
+          # the build machine. Measured on the sandboxed output: PT_INTERP is
+          # /nix/store/<hash>-glibc-2.42-67/lib/ld-linux-x86-64.so.2. Shipping
+          # it raw gives a helper that runs on the runner and nowhere else, and
+          # the native smoke below could never catch that, because it runs ON
+          # the runner.
+          #
+          # Bundling the loader fixes it in both directions at once: NixOS is
+          # fine because we pass the interpreter explicitly rather than relying
+          # on /lib64, ordinary distributions are fine because nothing touches
+          # their loader, and the host's own glibc version stops mattering —
+          # which is what libabgen.so, being dlopen'd into someone else's
+          # process, cannot do.
+          #
+          # The wrapper also hands the re-exec its real command. abgen-host
+          # re-execs itself to make RLIMIT_AS bind before mimalloc reserves
+          # arenas; under a loader current_exe() is the loader, so the naive
+          # form re-runs ld.so with abgen-host's arguments and dies on
+          # "unrecognized option '--max-memory-mb'" with the cap never applied.
+          if [ "${{ matrix.builder }}" = "nix" ]; then
+            hb="target/${{ matrix.target }}/release/abgen-host"
+            mkdir -p "$nat/bin" "$nat/host-lib"
+            install -m755 "$hb" "$nat/bin/abgen-host.bin"
+            for lib in $(ldd "$hb" | awk '$3 ~ /^\// {print $3}'); do
+              install -m644 "$lib" "$nat/host-lib/"
+            done
+            interp=$(readelf -lW "$hb" | sed -n 's/.*interpreter: \(.*\)]/\1/p')
+            install -m755 "$interp" "$nat/host-lib/ld.so"
+            cat > "$nat/abgen-host" <<'EOF'
+          #!/bin/sh
+          here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+          ABGEN_HOST_LOADER="$here/host-lib/ld.so"
+          ABGEN_HOST_LIBPATH="$here/host-lib"
+          ABGEN_HOST_BIN="$here/bin/abgen-host.bin"
+          export ABGEN_HOST_LOADER ABGEN_HOST_LIBPATH ABGEN_HOST_BIN
+          exec "$ABGEN_HOST_LOADER" --library-path "$ABGEN_HOST_LIBPATH" \
+               "$ABGEN_HOST_BIN" "$@"
+          EOF
+            chmod 755 "$nat/abgen-host"
+          else
+            for f in abgen-host abgen-host.exe; do
+              src="target/${{ matrix.target }}/release/$f"
+              [ -f "$src" ] && install -m755 "$src" "$nat/"
+            done
+          fi
+
+          bash ci/write-build-info.sh "$nat" "${{ matrix.target }}"
+
+          bash ci/pack-archive.sh "$nat" "$nat.tar.gz" "$SOURCE_DATE_EPOCH"
+          nat_members="$(tar -tzf "$nat.tar.gz")"
+          case "$nat_members" in
+            *"/BUILD-INFO.txt"*) ;;
+            *) echo "BUILD-INFO.txt missing from $nat.tar.gz" >&2; exit 1 ;;
+          esac
+          shasum -a 256 "$nat.tar.gz" > "$nat.tar.gz.sha256"
+          bash ci/verify-reproducible.sh "$nat" "$nat.tar.gz" "$SOURCE_DATE_EPOCH"
+
+          # The native archive shipped with nothing exercising it. Every
+          # non-Windows leg builds on its own architecture, so the helper can
+          # just be run; the Windows legs cross-compile from Linux and are
+          # covered by the windows CI job instead.
+          if ! echo "${{ matrix.target }}" | grep -q windows; then
+            rm -rf /tmp/natsmoke && mkdir /tmp/natsmoke
+            tar -xzf "$nat.tar.gz" -C /tmp/natsmoke
+            got=$("/tmp/natsmoke/$nat/abgen-host" --version)
+            test -n "$got" || { echo "abgen-host printed no version" >&2; exit 1; }
+            echo "native smoke: abgen-host $got"
+
+            # --version returns before apply_memory_limit, so the check above
+            # cannot see a broken re-exec. Drive the real path: an empty stdin
+            # makes the re-executed image fail reading its request, which is
+            # EXIT_PROTOCOL (64). Anything else — notably ld.so's exit 1 on
+            # "unrecognized option" — means the cap never bound.
+            set +e
+            "/tmp/natsmoke/$nat/abgen-host" --max-memory-mb 512 </dev/null
+            rc=$?
+            set -e
+            case "$(uname -s)" in
+              Darwin)
+                # Darwin enforces no per-process memory rlimit — setrlimit
+                # returns EINVAL at every size — so the helper refuses the flag
+                # rather than pretending, and exits EXIT_LIMIT. Asserting the
+                # refusal rather than skipping: a cap that silently did nothing
+                # is exactly what the refusal exists to prevent.
+                want=65; what="refusal" ;;
+              *)
+                # Linux re-execs to make RLIMIT_AS bind before mimalloc reserves
+                # its arenas, then fails reading the request from empty stdin,
+                # which is EXIT_PROTOCOL. Anything else — notably ld.so's exit 1
+                # on "unrecognized option" — means the cap never bound.
+                want=64; what="re-exec" ;;
+            esac
+            test "$rc" -eq "$want" || {
+              echo "abgen-host $what is broken: expected $want, got $rc" >&2; exit 1; }
+            echo "native smoke: --max-memory-mb $what ok"
+
+            # And prove the artifacts do not depend on this machine. A nix leg
+            # ships its own loader precisely so the archive works off NixOS;
+            # if anything still names a build-machine path as its interpreter,
+            # it runs here and nowhere else, and this smoke would not notice.
+            if [ "${{ matrix.builder }}" = "nix" ]; then
+              bad=$(readelf -lW "/tmp/natsmoke/$nat/bin/abgen-host.bin" \
+                    | sed -n 's/.*interpreter: \(.*\)]/\1/p')
+              case "$bad" in
+                /nix/store/*) ;;  # expected: the bundled loader handles it
+                *) echo "unexpected interpreter $bad" >&2; exit 1 ;;
+              esac
+              test -x "/tmp/natsmoke/$nat/host-lib/ld.so" \
+                || { echo "bundled loader missing from the archive" >&2; exit 1; }
+              echo "native smoke: bundled loader present"
+            fi
+          fi
+
           case "$GITHUB_REF" in refs/tags/v*) ;; *) exit 0 ;; esac
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
                  --title "abgen $GITHUB_REF_NAME" --notes-file .github/release-notes.md \
             || gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null
           gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
-            "$dist.tar.gz" "$dist.tar.gz.sha256"
+            "$dist.tar.gz" "$dist.tar.gz.sha256" \
+            "$nat.tar.gz" "$nat.tar.gz.sha256"
+
+  napi:
+    name: abgen-node ${{ matrix.target }}
+    needs: build-id
+    runs-on: ${{ matrix.runner }}
+    env:
+      ABGEN_BUILD_ID: ${{ needs.build-id.outputs.value }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu,  runner: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+          - { target: aarch64-apple-darwin,      runner: macos-15 }
+          - { target: x86_64-apple-darwin,       runner: macos-15-intel }
+          - { target: x86_64-pc-windows-msvc,    runner: windows-2025 }
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable @ 2026-07-08
+        with:
+          toolchain: "1.97.0"
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+      - name: install addon deps
+        working-directory: crate/abgen-node
+        run: npm i --no-audit --no-fund
+      - name: build the addon
+        working-directory: crate/abgen-node
+        run: npx napi build --platform --release --target ${{ matrix.target }}
+      - name: smoke the addon
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin'
+        working-directory: crate/abgen-node
+        run: node test/smoke.mjs
+      - name: glibc floor
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        working-directory: crate/abgen-node
+        run: bash ../../ci/check-glibc-floor.sh 2.34 ./*.node
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: napi-${{ matrix.target }}
+          path: crate/abgen-node/*.node
+          if-no-files-found: error
+
+  napi-publish:
+    name: publish @dcl/abgen-node
+    needs: [napi, build]
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+
+      - run: npm install -g npm@^11.5.1
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: crate/abgen-node/artifacts
+      - name: publish
+        working-directory: crate/abgen-node
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          npm i --no-audit --no-fund
+          # napi reads the version from this package.json, not from the tag, and
+          # prepublish propagates it to the per-platform manifests.
+          npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --ignore-scripts --allow-same-version
+          # `napi artifacts` writes into npm/<platform>/, which must already
+          # exist — those dirs are committed, from `napi create-npm-dir -t .`.
+          # index.js/index.d.ts are committed for the same reason: nothing here
+          # runs `napi build`, and they are the package's entry point.
+          npx napi artifacts --dir artifacts
+          ls -R ./npm
+          # `napi prepublish` publishes the per-platform packages and rewires
+          # optionalDependencies; it does NOT publish @dcl/abgen-node itself.
+          # It runs here as npm's prepublishOnly hook, which is the flow
+          # napi-rs's own scaffolded workflow uses. Calling prepublish alone
+          # would have pushed five platform packages and left the package
+          # sdk-commands actually depends on unpublished.
+          npm publish --access public
 
   publish:
     needs: build
@@ -234,13 +685,12 @@ jobs:
     permissions:
       contents: write
       id-token: write
+      attestations: write
     steps:
-      # No registry-url: it writes a placeholder-token .npmrc that breaks OIDC.
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: 24
 
-      # Trusted Publishing minimum; the runner's bundled npm is older.
       - run: npm install -g npm@^11.5.1
 
       - name: verify, checksums, npm
@@ -253,17 +703,38 @@ jobs:
           git fetch -q --depth 1 origin "$GITHUB_SHA"
           git checkout -q FETCH_HEAD
 
+          # Kept in separate directories: `dist` must hold the six runtime
+          # archives and nothing else, because npm/publish.sh reads it. The
+          # counts are asserted per set so neither can silently go missing —
+          # a single glob over both would let three of one and nine of the
+          # other still total twelve.
           gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --pattern 'abgen-*.tar.gz' --pattern 'abgen-*.tar.gz.sha256' -D dist
-          cd dist
-          test "$(ls ./*.tar.gz | wc -l)" -eq 6
-          sha256sum -c ./*.sha256
-          cat ./*.sha256 > SHA256SUMS.txt
+            --pattern 'abgen-v*.tar.gz' --pattern 'abgen-v*.tar.gz.sha256' -D dist
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'abgen-native-v*.tar.gz' --pattern 'abgen-native-v*.tar.gz.sha256' -D native
+
+          dist_archives=(dist/*.tar.gz)
+          native_archives=(native/*.tar.gz)
+          test "${#dist_archives[@]}" -eq 6
+          test "${#native_archives[@]}" -eq 6
+          (cd dist && sha256sum -c ./*.sha256)
+          (cd native && sha256sum -c ./*.sha256)
+
+          # One manifest covering everything the release ships. It used to list
+          # only the runtime archives while the native ones kept individual
+          # .sha256 assets, so a reader would take an incomplete file for the
+          # complete one.
+          cat dist/*.sha256 native/*.sha256 > SHA256SUMS.txt
+          test "$(wc -l < SHA256SUMS.txt)" -eq 12
           cat SHA256SUMS.txt
           gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber SHA256SUMS.txt
-          for f in ./*.sha256; do
+          for f in dist/*.sha256 native/*.sha256; do
             gh release delete-asset "$GITHUB_REF_NAME" "$(basename "$f")" --repo "$GITHUB_REPOSITORY" --yes
           done
-          cd ..
 
           bash npm/publish.sh "${GITHUB_REF_NAME#v}" dist
+
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: "dist/*.tar.gz,native/*.tar.gz"

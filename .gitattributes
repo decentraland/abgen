@@ -1,0 +1,12 @@
+# Files embedded with include_str! and compared byte-for-byte against
+# generated output. Git's autocrlf gives them \r\n on a Windows checkout while
+# serde_json emits \n, so the golden comparison fails there and only there.
+crate/src/lodgen/testdata/** text eol=lf
+
+# Embedded sources — executed rather than compared, but pinned for the same
+# reason: what the binary carries should not depend on the checkout platform.
+crate/src/lodgen/scenerun/prelude.js text eol=lf
+crate/src/gpu/shaders/*.wgsl text eol=lf
+
+# A CRLF shell script is not executable on Linux.
+*.sh text eol=lf

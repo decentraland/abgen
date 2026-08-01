@@ -1,10 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crate", "crate/dcl-contents"]
+members = ["crate", "crate/dcl-contents", "crate/abgen-native"]
 exclude = [
     "crate/third_party/draco_decoder",
     "crate/third_party/crunch",
     "crate/third_party/libjpeg9c",
     "crate/kernel-ptx",
     "crate/abgen-wasm",
+    "crate/abgen-node",
 ]

@@ -206,11 +206,12 @@ re-runs converge on the full asset set.
 3. What runs: each leg builds, packages, smoke-tests (`--version` + `/readyz`; windows
    legs are cross-built and not smoke-run), and uploads its archive with `--clobber`.
    The `publish` job re-downloads the published assets, verifies them against the
-   build-time hashes, uploads the aggregated `SHA256SUMS.txt`, and publishes the seven
-   npm packages (six platform binaries, then the `@dcl/abgen` connector) via npm
-   Trusted Publishing: no `NPM_TOKEN`, the job's OIDC token is exchanged for a
-   short-lived registry credential. Each package pins `decentraland/abgen` +
-   `release.yml` as its trusted publisher, so renaming this workflow file breaks
+   build-time hashes, uploads the aggregated `SHA256SUMS.txt`, and publishes seven npm
+   packages (six platform binaries, then the `@dcl/abgen` connector); `napi-publish`
+   publishes six more (five napi platform packages, then `@dcl/abgen-node`). Both go
+   via npm Trusted Publishing: no `NPM_TOKEN`, each job's OIDC token is exchanged for a
+   short-lived registry credential. All thirteen pin `decentraland/abgen` +
+   `release.yml` as their trusted publisher, so renaming this workflow file breaks
    publishing until every package's configuration is updated.
 4. Verify: exactly 7 assets on the release page (6 archives + `SHA256SUMS.txt`).
 5. Failed leg: re-run failed jobs from the Actions UI; everything converges.
