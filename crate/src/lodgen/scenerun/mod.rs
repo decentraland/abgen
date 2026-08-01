@@ -297,13 +297,20 @@ module.exports.onUpdate = async function () {
         (client, ent)
     }
 
+    /// Goldens are pinned to LF in .gitattributes. Normalising here too means
+    /// the comparison does not depend on the checkout honouring that — a CRLF
+    /// working copy failed this on Windows and nowhere else.
+    fn lf(s: &str) -> String {
+        s.replace("\r\n", "\n")
+    }
+
     fn assert_golden(coords: &str, pinned_entity: &str, golden: &str) {
         let (client, ent) = golden_scene(coords, pinned_entity);
         let full = run_scene_placements(&client, &ent)
             .unwrap()
             .unwrap_or_default();
         let got = serde_json::to_string_pretty(&full.placements).unwrap();
-        assert_eq!(got.trim(), golden.trim(), "{coords}");
+        assert_eq!(lf(&got).trim(), lf(golden).trim(), "{coords}");
     }
 
     #[test]
@@ -336,10 +343,8 @@ module.exports.onUpdate = async function () {
         )
         .unwrap();
         assert_eq!(
-            serde_json::to_string_pretty(&sdk7.placements)
-                .unwrap()
-                .trim(),
-            SDK7_GOLDEN_PLACEMENTS.trim()
+            lf(&serde_json::to_string_pretty(&sdk7.placements).unwrap()).trim(),
+            lf(SDK7_GOLDEN_PLACEMENTS).trim()
         );
         let mut content = HashMap::new();
         content.insert(
@@ -352,10 +357,8 @@ module.exports.onUpdate = async function () {
         )
         .unwrap();
         assert_eq!(
-            serde_json::to_string_pretty(&sdk6.placements)
-                .unwrap()
-                .trim(),
-            SDK6_GOLDEN_PLACEMENTS.trim()
+            lf(&serde_json::to_string_pretty(&sdk6.placements).unwrap()).trim(),
+            lf(SDK6_GOLDEN_PLACEMENTS).trim()
         );
         assert_eq!(sdk6.unresolved_src, 0);
     }

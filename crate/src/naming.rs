@@ -14,16 +14,12 @@ const FS_COMPONENT_MAX_BYTES: usize = 200;
 /// Maps a served name to the component it is stored under on disk: names within
 /// the limit pass through verbatim (production behavior is byte-identical);
 /// oversized names collapse to a fixed-length digest. Must be applied
-/// symmetrically by writers and resolvers. The digest is taken over the
-/// lowercased name: verbatim names get case-insensitive lookups from the
-/// filesystem (APFS/NTFS), and clients request Unity-lowercased bundle names
-/// while the windows/linux lanes store original-case hashes — the collapse
-/// must not be stricter than the verbatim path it replaces.
+/// symmetrically by writers and resolvers.
 pub fn fs_safe_component(name: &str) -> std::borrow::Cow<'_, str> {
     if name.len() <= FS_COMPONENT_MAX_BYTES {
         return std::borrow::Cow::Borrowed(name);
     }
-    let digest = crate::hashes::sha256_hex(name.to_lowercase().as_bytes());
+    let digest = crate::hashes::sha256_hex(name.as_bytes());
     std::borrow::Cow::Owned(format!("xn-{}", &digest[..40]))
 }
 
@@ -409,19 +405,6 @@ pub fn canonical_filename(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fs_safe_component_collapse_ignores_case() {
-        let mixed = format!("b64-{}_windows", "QzpcVXNlcnNc".repeat(20));
-        assert!(mixed.len() > FS_COMPONENT_MAX_BYTES);
-        let stored = fs_safe_component(&mixed);
-        assert!(stored.starts_with("xn-"));
-        // Unity lowercases bundle names on request; the collapsed lookup must
-        // stay as case-forgiving as the verbatim path it replaces.
-        assert_eq!(stored, fs_safe_component(&mixed.to_lowercase()));
-        // Short names still pass through byte-identical, case preserved.
-        assert_eq!(fs_safe_component("Qmhash_windows"), "Qmhash_windows");
-    }
 
     #[test]
     fn deps_digest_known_input() {

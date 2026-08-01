@@ -101,7 +101,7 @@ pub fn provenance(entity_id: &str) -> String {
         .take(8)
         .map(|b| format!("{b:02x}"))
         .collect();
-    format!("{inputs}+{}", env!("ABGEN_GIT_COMMIT"))
+    format!("{inputs}+{}", env!("ABGEN_BUILD_ID"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]

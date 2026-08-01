@@ -69,8 +69,6 @@ impl Default for LodOptions {
 }
 
 pub fn plane_clipping(parcels: &[(i32, i32)]) -> [f64; 4] {
-    // Empty parcels = "scene entity could not be resolved": the upstream
-    // converter zeroes the clipping planes in that state rather than failing.
     if parcels.is_empty() {
         return [0.0; 4];
     }
@@ -142,7 +140,14 @@ impl LodConversion {
 
 pub fn parse_lod_filename(locator: &str) -> Result<(String, u32, String)> {
     let no_query = locator.split(['?', '#']).next().unwrap_or(locator);
-    let file = no_query.rsplit('/').next().unwrap_or(no_query);
+    let file = if no_query.starts_with("http://") || no_query.starts_with("https://") {
+        no_query.rsplit('/').next().unwrap_or(no_query)
+    } else {
+        std::path::Path::new(no_query)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(no_query)
+    };
     let ext = naming::file_extension(file);
     let stem = match file.rfind('.') {
         Some(i) => &file[..i],
@@ -507,11 +512,9 @@ mod tests {
         assert!(ab_version_is_lod_era("v50"));
         assert!(ab_version_is_lod_era("V49"));
         assert!(ab_version_is_lod_era("49"));
-        // Legacy classic-LOD (v36) and webgl (v7) eras.
         assert!(!ab_version_is_lod_era("v36"));
         assert!(!ab_version_is_lod_era("v48"));
         assert!(!ab_version_is_lod_era("v7"));
-        // Missing/unparseable versions gate as legacy.
         assert!(!ab_version_is_lod_era(""));
         assert!(!ab_version_is_lod_era("v0-abgen"));
         assert!(!ab_version_is_lod_era("garbage"));
@@ -521,9 +524,6 @@ mod tests {
 
     #[test]
     fn unresolved_scene_zeroes_clipping_like_upstream() {
-        // Empty parcels is the "scene entity could not be resolved" state:
-        // the upstream converter converts anyway with zeroed clipping planes,
-        // zero scene height, and the prefab left at the origin.
         assert_eq!(plane_clipping(&[]), [0.0; 4]);
         assert_eq!(vertical_clipping(0), [0.0; 4]);
         assert_eq!(root_position((0, 0)), [0.0; 3]);
@@ -550,6 +550,21 @@ mod tests {
 
     #[test]
     fn rejects_bad_names() {
+        #[cfg(windows)]
+        {
+            let (sid, lvl, ext) =
+                parse_lod_filename(r"C:\Users\b\AppData\Local\Temp\t-1\bafkreiscene_1.glb")
+                    .unwrap();
+            assert_eq!(sid, "bafkreiscene");
+            assert_eq!(lvl, 1);
+            assert_eq!(ext, ".glb");
+        }
+        {
+            let native = std::path::Path::new("tmp").join("bafkreiscene_1.glb");
+            let (sid, lvl, _) = parse_lod_filename(native.to_str().unwrap()).unwrap();
+            assert_eq!(sid, "bafkreiscene");
+            assert_eq!(lvl, 1);
+        }
         assert!(parse_lod_filename("noLevel.glb").is_err());
         assert!(parse_lod_filename("scene_x.glb").is_err());
         assert!(parse_lod_filename("_3.glb").is_err());
