@@ -1,5 +1,4 @@
 use super::material::build_lod_material_tree;
-use super::templates::template_path;
 use super::texture::apply_png_gamma;
 use super::texture::encode_dxt5_mip_chain_real;
 use super::texture::encode_standalone_dxt5;
@@ -20,6 +19,31 @@ fn lowercased_lod_root_hashes_emit_metadata_textasset() {
     assert!(emits_metadata_textasset("bafkreifz6o7w_1", false));
     assert!(!emits_metadata_textasset("QmScene", false));
     assert!(emits_metadata_textasset("QmScene", true));
+}
+
+#[test]
+fn every_required_template_is_compiled_in() {
+    for f in REQUIRED_TEMPLATES {
+        let bytes = super::templates::embedded_template(f)
+            .unwrap_or_else(|| panic!("{f} is required but not compiled into this build"));
+        assert!(
+            bytes.starts_with(b"UnityFS"),
+            "{f}: embedded bytes are not a UnityFS bundle"
+        );
+    }
+    assert!(super::templates::embedded_template("not-a-template.bundle").is_none());
+}
+
+#[test]
+fn a_broken_abgen_root_is_an_error_not_a_fallback() {
+    let root = std::env::temp_dir().join(format!("abgen_no_templates_{}", std::process::id()));
+    let err = format!(
+        "{:#}",
+        super::templates::read_from_root(&root, "all-types.windows.bundle")
+            .expect_err("a broken ABGEN_ROOT must not fall back to the embedded copy")
+    );
+    assert!(err.contains("ABGEN_ROOT"), "{err}");
+    assert!(err.contains("all-types.windows.bundle"), "{err}");
 }
 
 #[test]
@@ -518,13 +542,6 @@ fn build_tiny_toggles(n_materials: usize, v38_compat: bool) -> BundleProbe {
 
 #[test]
 fn v38_compat_dcl_scene_default_material() {
-    if !template_path().exists() {
-        eprintln!(
-            "skipping: template bundle not found at {}",
-            template_path().display()
-        );
-        return;
-    }
     let off = build_tiny(1);
     assert_eq!(off.dcl_scene_materials, 0);
     assert_eq!(off.material_names, vec!["material_0".to_string()]);
@@ -576,14 +593,6 @@ fn build_tiny_force_dcl_scene(n_materials: usize) -> BundleProbe {
 
 #[test]
 fn force_default_material_emits_dcl_scene_without_v38() {
-    if !template_path().exists() {
-        eprintln!(
-            "skipping: template bundle not found at {}",
-            template_path().display()
-        );
-        return;
-    }
-
     let on = build_tiny_force_dcl_scene(1);
     assert_eq!(on.dcl_scene_materials, 1);
     assert_eq!(on.material_names.len(), 2);
@@ -602,14 +611,6 @@ fn force_default_material_emits_dcl_scene_without_v38() {
 
 #[test]
 fn external_bin_buffer_builds_real_geometry_or_fails() {
-    if !template_path().exists() {
-        eprintln!(
-            "skipping: template bundle not found at {}",
-            template_path().display()
-        );
-        return;
-    }
-
     let gltf = tiny_gltf_with_buffer(0, "{\"byteLength\":42,\"uri\":\"tri.bin\"}");
     let mut bin: Vec<u8> = Vec::new();
     for f in [0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0] {
@@ -663,14 +664,6 @@ fn count_anim_classes(data: &[u8]) -> (usize, usize, usize) {
 
 #[test]
 fn text_gltf_emote_emits_animator_and_controller() {
-    if !template_path().exists() {
-        eprintln!(
-            "skipping: template bundle not found at {}",
-            template_path().display()
-        );
-        return;
-    }
-
     let gltf = br#"{
             "asset": {"version": "2.0"},
             "scene": 0,
@@ -707,13 +700,6 @@ fn text_gltf_emote_emits_animator_and_controller() {
 
 #[test]
 fn build_bundle_multi_pair_matches_single_platform_builds() {
-    if !template_path().exists() {
-        eprintln!(
-            "skipping: template bundle not found at {}",
-            template_path().display()
-        );
-        return;
-    }
     let gltf = tiny_gltf(1);
     let opts = BuildOpts {
         source_file: Some("test.gltf"),
@@ -741,13 +727,6 @@ fn build_bundle_multi_pair_matches_single_platform_builds() {
 
 #[test]
 fn build_bundle_multi_non_shareable_targets_fall_back_to_full_builds() {
-    if !template_path().exists() {
-        eprintln!(
-            "skipping: template bundle not found at {}",
-            template_path().display()
-        );
-        return;
-    }
     let gltf = tiny_gltf(1);
     let opts = BuildOpts {
         source_file: Some("test.gltf"),
@@ -766,13 +745,6 @@ fn build_bundle_multi_non_shareable_targets_fall_back_to_full_builds() {
 
 #[test]
 fn build_bundle_multi_pair_standalone_texture_matches_singles() {
-    if !template_path().exists() {
-        eprintln!(
-            "skipping: template bundle not found at {}",
-            template_path().display()
-        );
-        return;
-    }
     let img = RgbaImage::from_fn(16, 16, |x, y| {
         image::Rgba([(x * 16) as u8, (y * 16) as u8, 128, 255])
     });
@@ -1026,7 +998,6 @@ fn lod_mat_base_color_alpha(tree: &Value) -> Option<f64> {
 
 #[test]
 fn lod_material_class_comes_from_name_suffix_like_upstream() {
-    // Opaque: no suffix — even with a BLEND alphaMode, upstream ignores it.
     let mut m = lod_test_material("TextureBakeResult-mat");
     m.alpha_mode = "BLEND".to_string();
     let t = lod_test_tree(&m);
@@ -1042,9 +1013,6 @@ fn lod_material_class_comes_from_name_suffix_like_upstream() {
     assert_eq!(lod_mat_float(&t, "_ZTestDepthEqualForOpaque"), None);
     assert_eq!(lod_mat_base_color_alpha(&t), Some(1.0));
 
-    // Cutout by name suffix; upstream hard-codes _Cutoff 0.5. Undeclared
-    // HDRP-named SetFloats (_AlphaCutoffEnable, ...) do not survive the
-    // Unity build, so they must not appear here either.
     let mut m = lod_test_material("TextureBakeResult-mat-cutout");
     m.alpha_cutoff = 0.7;
     let t = lod_test_tree(&m);
@@ -1067,10 +1035,6 @@ fn lod_material_class_comes_from_name_suffix_like_upstream() {
     assert_eq!(lod_mat_float(&t, "_ZWrite"), Some(1.0));
     assert_eq!(lod_mat_base_color_alpha(&t), Some(1.0));
 
-    // Transparent by name suffix — FORCED_TRANSPARENT state as built by a
-    // fresh Unity 6000.2.6f2 conversion: depth-writing transparency
-    // (_ZWrite 1, _DstBlendAlpha 0), base alpha forced to the f32 0.8, and
-    // none of the undeclared HDRP floats the upstream branch SetFloats.
     let t = lod_test_tree(&lod_test_material("TextureBakeResult-mat-transparent"));
     assert_eq!(
         lod_mat_keywords(&t),
@@ -1092,7 +1056,6 @@ fn lod_material_class_comes_from_name_suffix_like_upstream() {
     assert_eq!(lod_mat_float(&t, "_BlendMode"), None);
     assert_eq!(lod_mat_float(&t, "_ZTestDepthEqualForOpaque"), None);
     assert_eq!(lod_mat_base_color_alpha(&t), Some(0.8_f32 as f64));
-    // No RenderType override tag on the transparent class.
     assert_eq!(
         t.get("stringTagMap")
             .and_then(|v| v.as_array())
@@ -1100,22 +1063,18 @@ fn lod_material_class_comes_from_name_suffix_like_upstream() {
         Some(0)
     );
 
-    // Upstream checks -transparent first: both suffixes = transparent.
     let t = lod_test_tree(&lod_test_material("weird-transparent-cutout"));
     assert_eq!(
         t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()),
         Some(3000.0)
     );
 
-    // Suffix match is case-insensitive (OrdinalIgnoreCase upstream).
     let t = lod_test_tree(&lod_test_material("Foliage-CUTOUT"));
     assert_eq!(
         t.get("m_CustomRenderQueue").and_then(|v| v.as_f64()),
         Some(2450.0)
     );
 
-    // m_Floats must stay sorted by property name (Unity serializes the sheet
-    // sorted; the conditional inserts must not break the order).
     let t = lod_test_tree(&lod_test_material("TextureBakeResult-mat-transparent"));
     let floats = t
         .get("m_SavedProperties")

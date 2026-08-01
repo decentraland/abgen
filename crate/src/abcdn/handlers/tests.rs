@@ -796,10 +796,6 @@ async fn if_none_match_star_needs_an_existing_file() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shader_lane_materializes_vendored_and_strips_scene_id() {
     use axum::http::StatusCode;
-    if !crate::shader::vendored_path().exists() {
-        eprintln!("vendored shader bundle missing, skipping");
-        return;
-    }
     let dir = lane_temp_dir("shader");
     let state = mk_lane_state(&dir, None);
     let expect = crate::shader::bundle_bytes_verified().unwrap();
@@ -831,28 +827,20 @@ async fn shader_lane_materializes_vendored_and_strips_scene_id() {
     assert_eq!(lit.status(), StatusCode::NOT_FOUND);
     assert_eq!(reason_of(&lit).as_deref(), Some("shader-unavailable"));
 
-    if crate::shader::vendored_path_named("scene_ignore_mac").exists() {
-        let mac = lane_get(&state, "v41/bafkscene123/dcl/scene_ignore_mac").await;
-        assert_eq!(mac.status(), StatusCode::OK);
-        assert_eq!(
-            crate::hashes::sha256_hex(&body_bytes(mac).await),
-            crate::shader::vendored_sha("scene_ignore_mac").unwrap()
-        );
-        assert!(dir.join("dcl").join("scene_ignore_mac").is_file());
-        assert!(dir.join("scene_ignore_mac").is_file());
-    } else {
-        eprintln!("vendored shader bundle missing, skipping mac lane");
-    }
+    let mac = lane_get(&state, "v41/bafkscene123/dcl/scene_ignore_mac").await;
+    assert_eq!(mac.status(), StatusCode::OK);
+    assert_eq!(
+        crate::hashes::sha256_hex(&body_bytes(mac).await),
+        crate::shader::vendored_sha("scene_ignore_mac").unwrap()
+    );
+    assert!(dir.join("dcl").join("scene_ignore_mac").is_file());
+    assert!(dir.join("scene_ignore_mac").is_file());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shader_lane_mac_vendored_writes_back_to_space() {
     use axum::http::StatusCode;
-    if !crate::shader::vendored_path_named("scene_ignore_mac").exists() {
-        eprintln!("vendored shader bundle missing, skipping");
-        return;
-    }
     let dir = lane_temp_dir("shadermac");
     let (host, seen) = crate::live::stub::serve(vec![]);
     let state = mk_lane_state(&dir, Some(mk_stub_proxy(&host, false, "shadermac")));
@@ -1254,14 +1242,11 @@ async fn upstream_lane_serves_misses_and_skips_local_entities() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_bytes(resp).await, b"BUNDLE");
 
-    // Pure pass-through: nothing upstream-served is persisted locally.
     assert!(!dir.join("bafkup").exists());
 
-    // Local preview-server ids never go upstream.
     let resp = lane_get(&state, "manifest/b64-abc_windows.json").await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-    // Upstream misses are negative-cached: one upstream GET for two requests.
     let miss1 = lane_get(&state, "manifest/bafkmiss_windows.json").await;
     assert_eq!(miss1.status(), StatusCode::NOT_FOUND);
     assert_eq!(reason_of(&miss1).as_deref(), Some("upstream-miss"));
@@ -1294,8 +1279,6 @@ async fn upstream_runs_before_jit_build_lanes() {
     let proxy = mk_stub_proxy_catalyst(&spacehost, &format!("http://{cathost}"), false, "upfirst");
     let state = mk_lane_state_upstream_with_proxy(&dir, format!("http://{uphost}"), Some(proxy));
 
-    // An upstream hit is served without probing the entity with a local JIT
-    // build: the catalyst (entity resolver) must never be consulted.
     let resp = lane_get(&state, "manifest/bafkremote_windows.json").await;
     assert_eq!(resp.status(), StatusCode::OK);
     {
@@ -1306,8 +1289,6 @@ async fn upstream_runs_before_jit_build_lanes() {
         );
     }
 
-    // An upstream miss still falls through to the JIT build lane, which
-    // resolves the entity against the catalyst.
     let resp = lane_get(&state, "manifest/bafkmiss_windows.json").await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let cat = catseen.lock().unwrap().clone();
@@ -1323,9 +1304,6 @@ async fn registry_records_pass_through_upstream_versions() {
     use axum::extract::State;
     let dir = lane_temp_dir("regupstream");
 
-    // The catalyst resolves three entities: a remote emote the upstream
-    // registry knows, a remote wearable it does not, and the local corpus
-    // (b64-) preview scene.
     let resolved = serde_json::json!([
         {
             "id": "bafkremoteemote",
@@ -1358,8 +1336,6 @@ async fn registry_records_pass_through_upstream_versions() {
         resolved.to_string().into_bytes(),
     )]);
 
-    // The upstream registry answers with the versions the production CDN
-    // actually serves — deliberately different from this server's own (v41).
     let upstream_records = serde_json::json!([{
         "id": "bafkremoteemote",
         "pointers": ["urn:decentraland:test:emote:1"],
@@ -1422,17 +1398,13 @@ async fn registry_records_pass_through_upstream_versions() {
         recs.iter()
             .find(|r| r["pointers"].as_array().unwrap().iter().any(|v| v == p))
     };
-    // Remote emote: the upstream registry's record, verbatim.
     let emote = by_pointer("urn:decentraland:test:emote:1").expect("emote record");
     assert_eq!(emote["versions"]["assets"]["mac"]["version"], "v33");
     assert_eq!(emote["status"], "complete");
-    // Remote wearable unknown upstream: omitted, like the production registry.
     assert!(by_pointer("urn:decentraland:test:wearable:2").is_none());
-    // Local corpus entity: never asked upstream, keeps the JIT promise.
     let scene = by_pointer("0,0").expect("local scene record");
     assert_eq!(scene["versions"]["assets"]["mac"]["version"], "v41");
 
-    // Second request answers from the cache: still exactly one upstream POST.
     let _ = super::post_entities_versions(State(state.clone()), axum::Json(body)).await;
     let posts = rseen.lock().unwrap().clone();
     assert_eq!(
@@ -1443,6 +1415,5 @@ async fn registry_records_pass_through_upstream_versions() {
         1,
         "{posts:?}"
     );
-    // Only the remote URN pointers were forwarded — never the b64 scene's parcel.
     let _ = std::fs::remove_dir_all(&dir);
 }

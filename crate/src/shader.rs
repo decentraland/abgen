@@ -37,47 +37,66 @@ pub fn vendored_sha(name: &str) -> Option<&'static str> {
         .map(|(_, sha)| *sha)
 }
 
-pub fn vendored_path_named(name: &str) -> PathBuf {
-    if let Ok(p) = std::env::var("ABGEN_SHADER_BUNDLE") {
-        let p = PathBuf::from(p);
-        if name == VENDORED_FILE {
-            return p;
-        }
-        return match p.parent() {
-            Some(dir) => dir.join(name),
-            None => PathBuf::from(name),
-        };
-    }
-    let compiled = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("shader")
-        .join(name);
-    if compiled.is_file() {
-        return compiled;
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let bundled = dir.join("shader").join(name);
-            if bundled.is_file() {
-                return bundled;
-            }
-        }
-    }
-    compiled
+const EMBEDDED: [(&str, &[u8]); 2] = [
+    (
+        VENDORED_FILE,
+        include_bytes!("../shader/scene_ignore_windows"),
+    ),
+    (
+        "scene_ignore_mac",
+        include_bytes!("../shader/scene_ignore_mac"),
+    ),
+];
+
+fn embedded_bundle(name: &str) -> Option<&'static [u8]> {
+    EMBEDDED.iter().find(|(n, _)| *n == name).map(|(_, b)| *b)
 }
 
-pub fn vendored_path() -> PathBuf {
-    vendored_path_named(VENDORED_FILE)
+/// `ABGEN_SHADER_BUNDLE` names `scene_ignore_windows` itself; siblings such as
+/// `scene_ignore_mac` resolve from the same directory.
+fn override_path(name: &str) -> Option<PathBuf> {
+    let raw = std::env::var("ABGEN_SHADER_BUNDLE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let p = PathBuf::from(raw);
+    if name == VENDORED_FILE {
+        return Some(p);
+    }
+    Some(match p.parent() {
+        Some(dir) => dir.join(name),
+        None => PathBuf::from(name),
+    })
 }
 
-pub fn bundle_bytes_named(name: &str) -> Result<Vec<u8>> {
-    let p = vendored_path_named(name);
-    std::fs::read(&p).with_context(|| {
+/// Where the shader bundles are coming from, for logs and operator messages.
+pub fn bundle_source(name: &str) -> String {
+    match override_path(name) {
+        Some(p) => format!("{} (ABGEN_SHADER_BUNDLE)", p.display()),
+        None => "compiled into this build".to_string(),
+    }
+}
+
+/// Takes the override path rather than reading the env, so the no-fallback
+/// contract is testable without mutating process-wide state.
+fn read_override(p: &Path, name: &str) -> Result<Vec<u8>> {
+    std::fs::read(p).with_context(|| {
         format!(
-            "vendored shader bundle missing at {} — set ABGEN_SHADER_BUNDLE or \
-             restore shader/{name}",
+            "ABGEN_SHADER_BUNDLE is set but the vendored shader bundle {name} could not be \
+             read from {} — fix the path, or unset ABGEN_SHADER_BUNDLE to use the copy \
+             compiled into this build",
             p.display()
         )
     })
+}
+
+pub fn bundle_bytes_named(name: &str) -> Result<Vec<u8>> {
+    match override_path(name) {
+        Some(p) => read_override(&p, name),
+        None => embedded_bundle(name).map(<[u8]>::to_vec).ok_or_else(|| {
+            anyhow::anyhow!("no vendored shader named {name} is compiled into this build")
+        }),
+    }
 }
 
 pub fn bundle_bytes() -> Result<Vec<u8>> {
@@ -157,13 +176,33 @@ mod tests {
     }
 
     #[test]
+    fn every_vendored_bundle_is_embedded() {
+        for &(name, _) in VENDORED {
+            assert!(
+                embedded_bundle(name).is_some(),
+                "{name} is declared vendored but not compiled in"
+            );
+        }
+        assert_eq!(embedded_bundle("lit_ignore_windows"), None);
+    }
+
+    #[test]
+    fn a_broken_override_is_an_error_not_a_fallback() {
+        let missing = std::env::temp_dir()
+            .join(format!("abgen_no_shader_{}", std::process::id()))
+            .join(VENDORED_FILE);
+        let err = format!(
+            "{:#}",
+            read_override(&missing, VENDORED_FILE)
+                .expect_err("a broken override must not fall back to the embedded copy")
+        );
+        assert!(err.contains("ABGEN_SHADER_BUNDLE"), "{err}");
+        assert!(err.contains(VENDORED_FILE), "{err}");
+    }
+
+    #[test]
     fn vendored_bundles_match_identity() {
         for &(name, sha) in VENDORED {
-            let p = vendored_path_named(name);
-            if !p.exists() {
-                eprintln!("vendored shader bundle missing, skipping: {}", p.display());
-                continue;
-            }
             let data = bundle_bytes_verified_named(name).expect("verified read");
             assert_eq!(sha256_hex(&data), sha);
 
@@ -183,10 +222,6 @@ mod tests {
 
     #[test]
     fn emit_writes_versioned_layout() {
-        let p = vendored_path();
-        if !p.exists() {
-            return;
-        }
         let tmp = std::env::temp_dir().join(format!("abgen_shader_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let e = emit(&tmp, Some("v0-abgen"), true).expect("emit");

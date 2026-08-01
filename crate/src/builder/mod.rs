@@ -8,8 +8,10 @@ mod templates;
 mod tests;
 mod texture;
 
+pub use templates::require_templates;
 pub use templates::template_available;
-pub use templates::template_dir;
+pub use templates::template_identity;
+pub use templates::template_source;
 pub use templates::templates_missing;
 pub use templates::templates_missing_in;
 pub use templates::REQUIRED_TEMPLATES;

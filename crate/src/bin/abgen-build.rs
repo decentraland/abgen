@@ -31,13 +31,12 @@ fn main() {
 }
 
 fn template_preflight() {
-    let missing = abgen::builder::templates_missing();
-    if !missing.is_empty() {
+    if let Err(e) = abgen::builder::require_templates() {
         eprintln!(
-            "WARNING: missing bundle templates in {}: {} — set ABGEN_ROOT to the directory containing template/ (e.g. ABGEN_ROOT=/path/to/abgen)",
-            abgen::builder::template_dir().display(),
-            missing.join(", ")
+            "error: build templates unavailable ({}): {e:#}",
+            abgen::builder::template_source()
         );
+        std::process::exit(1);
     }
 }
 
