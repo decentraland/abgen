@@ -116,7 +116,7 @@ pub async fn health(State(state): State<AppState>) -> Response {
         "catalyst_url": state.catalyst_url,
         "ab_version": state.ab_version,
         "ab_date": state.ab_date,
-        "git_commit": option_env!("ABGEN_GIT_COMMIT").unwrap_or("unknown"),
+        "build_id": option_env!("ABGEN_BUILD_ID").unwrap_or("unknown"),
         "lod_jit": {
             "enabled": state.lod_jit.enabled,
             "simplifier": state.lod_jit.simplifier.name(),

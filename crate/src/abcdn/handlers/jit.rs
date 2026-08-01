@@ -861,8 +861,9 @@ pub(super) async fn shader_fallback(
                     ok
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::error!(
                         error = %format!("{e:#}"),
+                        source = %crate::shader::bundle_source(&name),
                         "vendored shader bundle unavailable — shader JIT lane cannot materialize"
                     );
                     false

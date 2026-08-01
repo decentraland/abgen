@@ -96,7 +96,7 @@ fn push_alpha_out(want: &mut Vec<u32>, out: &probe::AlphaOut) {
 
 #[test]
 fn wgpu_bc7_mode4_golden() {
-    let Some(g) = gpu_or_skip("wgpu_bc7_mode4_golden") else {
+    let Some(g) = qualified_gpu_or_skip("wgpu_bc7_mode4_golden") else {
         return;
     };
     let t = build_opt_tables();
@@ -452,7 +452,7 @@ fn wgpu_bc7_dbg_block() {
 
 #[test]
 fn wgpu_bc7_encode_blocks_golden() {
-    let Some(g) = gpu_or_skip("wgpu_bc7_encode_blocks_golden") else {
+    let Some(g) = qualified_gpu_or_skip("wgpu_bc7_encode_blocks_golden") else {
         return;
     };
     let t = build_opt_tables();
@@ -538,7 +538,7 @@ fn wgpu_bc7_encode_blocks_golden() {
 
 #[test]
 fn wgpu_bc7_mip_chain_qualification() {
-    if gpu_or_skip("wgpu_bc7_mip_chain_qualification").is_none() {
+    if qualified_gpu_or_skip("wgpu_bc7_mip_chain_qualification").is_none() {
         return;
     }
     let st = crate::gpu::qualify::qualify_backend_with(
@@ -557,7 +557,7 @@ fn wgpu_bc7_mip_chain_qualification() {
 
 #[test]
 fn wgpu_bc7_mip_chain_explicit_args_golden() {
-    if gpu_or_skip("wgpu_bc7_mip_chain_explicit_args_golden").is_none() {
+    if qualified_gpu_or_skip("wgpu_bc7_mip_chain_explicit_args_golden").is_none() {
         return;
     }
     for &(w, h) in &[(37u32, 53u32), (64, 64)] {

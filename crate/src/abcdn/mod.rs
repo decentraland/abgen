@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::routing::{get, post};
 use axum::Router;
 
@@ -32,7 +32,7 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
         version = %cfg.live_version,
         content_disk = ?cfg.content_disk,
         abgen_root = ?cfg.abgen_root,
-        git = option_env!("ABGEN_GIT_COMMIT").unwrap_or("unknown"),
+        build_id = option_env!("ABGEN_BUILD_ID").unwrap_or("unknown"),
         "abgen server config"
     );
 
@@ -112,33 +112,22 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
 
     let live_proxy = crate::live::Proxy::new(pcfg);
     let ab_date = live_proxy.date().to_string();
+    crate::builder::require_templates().with_context(|| {
+        format!(
+            "ab-cdn in-process converter needs the build templates ({})",
+            crate::builder::template_source()
+        )
+    })?;
     let live_template_ok = crate::builder::template_available();
     let templates_missing = crate::builder::templates_missing();
-    if live_template_ok {
-        tracing::info!(
-            turbojpeg = crate::live::Proxy::turbojpeg_available(),
-            template_dir = %crate::builder::template_dir().display(),
-            cache = %cfg.live_cache_dir,
-            version = %cfg.live_version,
-            build_date = %ab_date,
-            "ab-cdn in-process conversion active"
-        );
-    } else {
-        tracing::error!(
-            template_dir = %crate::builder::template_dir().display(),
-            abgen_root = ?cfg.abgen_root,
-            "ab-cdn in-process converter active but build template MISSING — \
-             every corpus miss will 500; set ABGEN_ROOT to the template root"
-        );
-    }
-    if !templates_missing.is_empty() {
-        tracing::error!(
-            missing = ?templates_missing,
-            template_dir = %crate::builder::template_dir().display(),
-            "ab-cdn required build templates MISSING — bundles built without \
-             them lose animation/skinned emission; /health reports degraded"
-        );
-    }
+    tracing::info!(
+        turbojpeg = crate::live::Proxy::turbojpeg_available(),
+        templates = %crate::builder::template_source(),
+        cache = %cfg.live_cache_dir,
+        version = %cfg.live_version,
+        build_date = %ab_date,
+        "ab-cdn in-process conversion active"
+    );
     let live_proxy = Some(live_proxy);
 
     let content_db = match &cfg.content_database_url {

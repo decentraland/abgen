@@ -1,0 +1,28 @@
+[package]
+name = "abgen-node"
+version = "0.15.0"
+edition = "2021"
+description = "Node native module (napi-rs) exposing abgen's conversion pipeline in-process."
+license = "AGPL-3.0-or-later"
+publish = false
+
+# Excluded from the root workspace, like abgen-wasm: this crate links against
+# the Node host's symbols, which are resolved by the loader at require() time
+# rather than at link time. Keeping it out means the plain
+# `cargo build --release` the release matrix runs is unaffected by it.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+abgen = { path = ".." }
+napi = { version = "2.16", default-features = false, features = ["napi8", "async", "tokio_rt"] }
+napi-derive = "2.16"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true

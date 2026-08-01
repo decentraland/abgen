@@ -286,8 +286,6 @@ impl Proxy {
     }
 
     fn bundle(&self, cid: &str, bundle_name: &str) -> Result<Vec<u8>> {
-        // The LRU cache key must match the on-disk dir name seeded at boot,
-        // so both derive from the storage-safe component.
         let safe_cid = naming::fs_safe_component(cid);
         let entity_dir = self.bundle_dir.join(&*safe_cid);
         let cache_path = entity_dir.join(&*naming::fs_safe_component(bundle_name));
@@ -891,8 +889,6 @@ impl Proxy {
 
         self.entities.lock().unwrap().remove(cid);
 
-        // A changed non-glb (texture/.bin) invalidates every glb bundle too:
-        // glbs inline their resolved dependencies at build time.
         let changed_lower: std::collections::HashSet<String> =
             changed.iter().map(|h| h.to_lowercase()).collect();
         let dep_changed = changed_lower.iter().any(|h| !glb_hashes.contains(h));
@@ -908,8 +904,6 @@ impl Proxy {
     }
 
     fn digest_path(&self, cid: &str) -> PathBuf {
-        // Hash the id: preview-server ids are arbitrary strings, not
-        // guaranteed to be filesystem-safe.
         let key = crate::hashes::sha256_hex(cid.as_bytes());
         self.digests_dir.join(format!("{}.json", &key[..32]))
     }
@@ -968,10 +962,6 @@ fn prune_stale_bundles(
         let Some(name) = name.to_str() else { continue };
         let raw = name.strip_suffix(".br").unwrap_or(name);
 
-        // Digest-collapsed storage names (xn-…) can't be parsed back to a
-        // hash; the corpus build records their source hash in the names
-        // index, so they prune exactly like verbatim names. Entries the
-        // index doesn't know are unmappable leftovers: sweep them.
         let h = if raw.starts_with("xn-") {
             match collapsed_names.get(raw) {
                 Some(h) => h.clone(),
@@ -998,16 +988,7 @@ fn build_id() -> String {
             buf.extend_from_slice(&b);
         }
     }
-    if let Ok(rd) = std::fs::read_dir(crate::builder::template_dir()) {
-        let mut files: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
-        files.sort();
-        for f in files {
-            if let Ok(b) = std::fs::read(&f) {
-                buf.extend_from_slice(f.to_string_lossy().as_bytes());
-                buf.extend_from_slice(&b);
-            }
-        }
-    }
+    buf.extend_from_slice(crate::builder::template_identity().as_bytes());
     crate::hashes::sha256_hex(&buf)
 }
 
@@ -1078,8 +1059,8 @@ impl Proxy {
                     template_root = %root,
                     abgen_root_env = %env_root,
                     "template_root differs from the ABGEN_ROOT env — builder templates \
-                     resolve from ABGEN_ROOT (or the crate dir); set ABGEN_ROOT at \
-                     process start"
+                     resolve from ABGEN_ROOT, or from the copy compiled into this \
+                     build when it is unset; set ABGEN_ROOT at process start"
                 );
             }
         }
@@ -1495,12 +1476,10 @@ mod tests {
             })
         };
 
-        // First pass seeds the digest store; everything counts as changed.
         let p1 = mk(b"GLB1", b"TEX1");
         let c1 = p1.refresh_entity_content("bafkreva", &corpus).unwrap();
         assert_eq!(c1.len(), 2);
 
-        // Simulate prior build outputs.
         let bundle_dir = p1.bundle_dir.join("bafkreva");
         std::fs::create_dir_all(&bundle_dir).unwrap();
         let glb_bundle = bundle_dir.join("qmglb_0123456789abcdef0123456789abcdef_windows");
@@ -1511,7 +1490,6 @@ mod tests {
         std::fs::create_dir_all(&corpus_entity).unwrap();
         std::fs::write(corpus_entity.join("windows.manifest.json"), b"{}").unwrap();
 
-        // Same bytes: nothing changes, nothing pruned.
         let p2 = mk(b"GLB1", b"TEX1");
         assert!(p2
             .refresh_entity_content("bafkreva", &corpus)
@@ -1521,8 +1499,6 @@ mod tests {
         assert!(tex_bundle.is_file());
         assert!(corpus_entity.is_dir());
 
-        // glb bytes changed under the same hash: its bundle and the corpus
-        // dir are pruned; the texture bundle survives.
         let p3 = mk(b"GLB2", b"TEX1");
         let c3 = p3.refresh_entity_content("bafkreva", &corpus).unwrap();
         assert_eq!(c3, vec!["qmglb".to_string()]);
@@ -1531,7 +1507,6 @@ mod tests {
         assert!(!corpus_entity.exists());
         assert_eq!(p3.content.fetch("qmglb").unwrap(), b"GLB2");
 
-        // Texture changed: dependency-capable, so glb bundles are pruned too.
         std::fs::write(&glb_bundle, b"AB").unwrap();
         std::fs::create_dir_all(&corpus_entity).unwrap();
         let p4 = mk(b"GLB2", b"TEX2");
@@ -1592,12 +1567,10 @@ mod prune_tests {
 
         prune_stale_bundles(&dir, &changed, false, &glbs, &index);
 
-        // indexed collapsed names prune exactly like verbatim ones (.br sidecars too)
         assert!(!dir.join("xn-changed").exists());
         assert!(!dir.join("xn-changed.br").exists());
         assert!(dir.join("xn-kept").exists());
         assert!(dir.join("xn-kept.br").exists());
-        // unmappable collapsed names are swept
         assert!(!dir.join("xn-unknown").exists());
         assert!(!dir.join("HASHA_mac").exists());
         assert!(dir.join("HASHB_mac").exists());

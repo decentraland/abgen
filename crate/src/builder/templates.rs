@@ -1,47 +1,102 @@
 use super::*;
+use std::borrow::Cow;
 
-fn abgen_root() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("ABGEN_ROOT") {
-        return std::path::PathBuf::from(p);
-    }
-    let compiled = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    if compiled.join("template").is_dir() {
-        return compiled;
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            if dir.join("template").is_dir() {
-                return dir.to_path_buf();
-            }
-        }
-    }
-    compiled
-}
-
-pub(super) fn template_path() -> PathBuf {
-    abgen_root()
-        .join("template")
-        .join("all-types.windows.bundle")
-}
-
-pub fn template_dir() -> PathBuf {
-    abgen_root().join("template")
-}
-
-pub fn template_available() -> bool {
-    template_path().is_file()
-}
+pub const ALL_TYPES_TEMPLATE: &str = "all-types.windows.bundle";
 
 pub const REQUIRED_TEMPLATES: [&str; 4] = [
-    "all-types.windows.bundle",
+    ALL_TYPES_TEMPLATE,
     "animated-types.windows.bundle",
     "emote-types.windows.bundle",
     "skinned-types.windows.bundle",
 ];
 
+const EMBEDDED: [(&str, &[u8]); 4] = [
+    (
+        ALL_TYPES_TEMPLATE,
+        include_bytes!("../../../template/all-types.windows.bundle"),
+    ),
+    (
+        "animated-types.windows.bundle",
+        include_bytes!("../../../template/animated-types.windows.bundle"),
+    ),
+    (
+        "emote-types.windows.bundle",
+        include_bytes!("../../../template/emote-types.windows.bundle"),
+    ),
+    (
+        "skinned-types.windows.bundle",
+        include_bytes!("../../../template/skinned-types.windows.bundle"),
+    ),
+];
+
+pub(super) fn embedded_template(file: &str) -> Option<&'static [u8]> {
+    EMBEDDED.iter().find(|(n, _)| *n == file).map(|(_, b)| *b)
+}
+
+/// `ABGEN_ROOT`, when set to something non-empty: the directory that contains
+/// `template/`. The documented escape hatch, and how a native host (Unity's C#
+/// layer handing over a `StreamingAssets` path) points abgen at its own copy.
+fn override_root() -> Option<PathBuf> {
+    std::env::var("ABGEN_ROOT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Where the templates are coming from, for logs and operator-facing messages.
+pub fn template_source() -> String {
+    match override_root() {
+        Some(root) => format!("{} (ABGEN_ROOT)", root.join("template").display()),
+        None => "compiled into this build".to_string(),
+    }
+}
+
+/// One template's bytes: the override's file if `ABGEN_ROOT` is set, otherwise
+/// the embedded copy. An unreadable override is an error, not a fall back —
+/// silently substituting the embedded copy would hide a mistyped override,
+/// which is the same class of bug as the missing-asset silence this replaced.
+/// Takes the root rather than reading the env, so the no-fallback contract is
+/// testable without mutating process-wide state.
+pub(super) fn read_from_root(root: &std::path::Path, file: &str) -> Result<Vec<u8>> {
+    let path = root.join("template").join(file);
+    std::fs::read(&path).with_context(|| {
+        format!(
+            "ABGEN_ROOT is set to {} but the build template {file} could not be read from \
+             {} — fix the path, or unset ABGEN_ROOT to use the copy compiled into this build",
+            root.display(),
+            path.display()
+        )
+    })
+}
+
+fn template_bytes(file: &str) -> Result<Cow<'static, [u8]>> {
+    match override_root() {
+        Some(root) => read_from_root(&root, file).map(Cow::Owned),
+        None => embedded_template(file)
+            .map(Cow::Borrowed)
+            .ok_or_else(|| anyhow!("no build template named {file} is compiled into this build")),
+    }
+}
+
+/// Can the primary template be obtained at all? False only when `ABGEN_ROOT`
+/// points somewhere broken.
+pub fn template_available() -> bool {
+    template_bytes(ALL_TYPES_TEMPLATE).is_ok()
+}
+
+/// Which required templates cannot be obtained. Empty unless `ABGEN_ROOT` is
+/// set to a directory that is missing some of them.
+pub fn templates_missing() -> Vec<String> {
+    REQUIRED_TEMPLATES
+        .iter()
+        .filter(|f| template_bytes(f).is_err())
+        .map(|f| f.to_string())
+        .collect()
+}
+
+/// Which required templates a *given* directory lacks. A pure check on a
+/// caller-supplied path — used to validate a candidate `ABGEN_ROOT`.
 pub fn templates_missing_in(dir: &std::path::Path) -> Vec<String> {
     REQUIRED_TEMPLATES
         .iter()
@@ -50,129 +105,100 @@ pub fn templates_missing_in(dir: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-pub fn templates_missing() -> Vec<String> {
-    templates_missing_in(&template_dir())
+/// Hard preflight: every required template must be obtainable. Callers that
+/// would otherwise report a zero-bundle success run this first.
+pub fn require_templates() -> Result<()> {
+    for f in REQUIRED_TEMPLATES {
+        template_bytes(f)?;
+    }
+    Ok(())
 }
 
-fn aux_types() -> &'static HashMap<String, (SerializedType, Value)> {
+/// Content identity of the template set actually in use — the embedded copy,
+/// or the override's files when `ABGEN_ROOT` is set. Feeds the build id, so a
+/// process pointed at different templates keys its caches differently.
+pub fn template_identity() -> String {
     use std::sync::OnceLock;
-    static CACHE: OnceLock<HashMap<String, (SerializedType, Value)>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        let mut out: HashMap<String, (SerializedType, Value)> = HashMap::new();
-
-        let harvest = |out: &mut HashMap<String, (SerializedType, Value)>,
-                       file: &str,
-                       mapping: &[(&str, &str)]| {
-            let bundle = match read_template_bundle(file) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::error!(
-                        template = file,
-                        error = %e,
-                        "aux template unavailable — animation/skinned emission \
-                         disabled for the types it provides"
-                    );
-                    return;
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let mut buf: Vec<u8> = Vec::new();
+            for f in REQUIRED_TEMPLATES {
+                buf.extend_from_slice(f.as_bytes());
+                match template_bytes(f) {
+                    Ok(b) => buf.extend_from_slice(&b),
+                    Err(_) => buf.extend_from_slice(b"<unavailable>"),
                 }
-            };
-            if let Some(sf) = bundle.serialized() {
-                for obj in &sf.objects {
-                    for (src, key) in mapping {
-                        if obj.type_name == *src && !out.contains_key(*key) {
-                            if let Ok(tree) = sf.read_typetree(obj) {
-                                let st = sf.types[obj.type_id as usize].clone();
-                                out.insert(key.to_string(), (st, tree));
-                            }
-                        }
+            }
+            crate::hashes::sha256_hex(&buf)
+        })
+        .clone()
+}
+
+fn harvest(
+    out: &mut HashMap<String, (SerializedType, Value)>,
+    file: &str,
+    mapping: &[(&str, &str)],
+) -> Result<()> {
+    let bundle = read_template_bundle(file)
+        .map_err(|e| anyhow!("aux build template {file} unavailable: {e}"))?;
+    if let Some(sf) = bundle.serialized() {
+        for obj in &sf.objects {
+            for (src, key) in mapping {
+                if obj.type_name == *src && !out.contains_key(*key) {
+                    if let Ok(tree) = sf.read_typetree(obj) {
+                        let st = sf.types[obj.type_id as usize].clone();
+                        out.insert(key.to_string(), (st, tree));
                     }
                 }
             }
-        };
-
-        harvest(
-            &mut out,
-            "animated-types.windows.bundle",
-            &[
-                ("Animation", "Animation"),
-                ("AnimationClip", "AnimationClip"),
-            ],
-        );
-        harvest(
-            &mut out,
-            "emote-types.windows.bundle",
-            &[
-                ("Animator", "Animator"),
-                ("AnimatorController", "AnimatorController"),
-                ("AnimationClip", "AnimationClip_mecanim"),
-            ],
-        );
-        harvest(
-            &mut out,
-            "skinned-types.windows.bundle",
-            &[("SkinnedMeshRenderer", "SkinnedMeshRenderer")],
-        );
-        out
-    })
+        }
+    }
+    Ok(())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn template_mmap() -> Result<&'static memmap2::Mmap> {
+fn build_aux_types() -> Result<HashMap<String, (SerializedType, Value)>> {
+    let mut out: HashMap<String, (SerializedType, Value)> = HashMap::new();
+    harvest(
+        &mut out,
+        "animated-types.windows.bundle",
+        &[
+            ("Animation", "Animation"),
+            ("AnimationClip", "AnimationClip"),
+        ],
+    )?;
+    harvest(
+        &mut out,
+        "emote-types.windows.bundle",
+        &[
+            ("Animator", "Animator"),
+            ("AnimatorController", "AnimatorController"),
+            ("AnimationClip", "AnimationClip_mecanim"),
+        ],
+    )?;
+    harvest(
+        &mut out,
+        "skinned-types.windows.bundle",
+        &[("SkinnedMeshRenderer", "SkinnedMeshRenderer")],
+    )?;
+    Ok(out)
+}
+
+fn aux_types() -> Result<&'static HashMap<String, (SerializedType, Value)>> {
     use std::sync::OnceLock;
-    static CACHE: OnceLock<Result<memmap2::Mmap, String>> = OnceLock::new();
-    let entry = CACHE.get_or_init(|| {
-        let path = template_path();
-        if !path.exists() {
-            return Err(format!("template bundle not found at {}", path.display()));
-        }
-        crate::local_store::mmap_file(&path).map_err(|e| e.to_string())
-    });
+    static CACHE: OnceLock<std::result::Result<HashMap<String, (SerializedType, Value)>, String>> =
+        OnceLock::new();
+    let entry = CACHE.get_or_init(|| build_aux_types().map_err(|e| format!("{e:#}")));
     entry.as_ref().map_err(|e| anyhow!("{e}"))
 }
 
-#[cfg(target_arch = "wasm32")]
-fn embedded_template(file: &str) -> Option<&'static [u8]> {
-    match file {
-        "all-types.windows.bundle" => {
-            Some(include_bytes!("../../../template/all-types.windows.bundle"))
-        }
-        "animated-types.windows.bundle" => Some(include_bytes!(
-            "../../../template/animated-types.windows.bundle"
-        )),
-        "emote-types.windows.bundle" => Some(include_bytes!(
-            "../../../template/emote-types.windows.bundle"
-        )),
-        "skinned-types.windows.bundle" => Some(include_bytes!(
-            "../../../template/skinned-types.windows.bundle"
-        )),
-        _ => None,
-    }
+fn template_all_bytes() -> Result<Cow<'static, [u8]>> {
+    template_bytes(ALL_TYPES_TEMPLATE)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn template_all_bytes() -> Result<&'static [u8]> {
-    Ok(&template_mmap()?[..])
-}
-
-#[cfg(target_arch = "wasm32")]
-fn template_all_bytes() -> Result<&'static [u8]> {
-    embedded_template("all-types.windows.bundle")
-        .ok_or_else(|| anyhow!("all-types template not embedded"))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 fn read_template_bundle(file: &str) -> std::result::Result<Bundle, String> {
-    let path = abgen_root().join("template").join(file);
-    if !path.exists() {
-        return Err(format!("missing at {}", path.display()));
-    }
-    Bundle::load(&path).map_err(|e| format!("{e:#}"))
-}
-
-#[cfg(target_arch = "wasm32")]
-fn read_template_bundle(file: &str) -> std::result::Result<Bundle, String> {
-    let bytes = embedded_template(file).ok_or_else(|| "not embedded".to_string())?;
-    let d = Bundle::decompress_bytes(bytes).map_err(|e| format!("{e:#}"))?;
-    Bundle::from_decompressed(&d).map_err(|e| format!("{e:#}"))
+    let bytes = template_bytes(file).map_err(|e| format!("{e:#}"))?;
+    Bundle::load_bytes(&bytes).map_err(|e| format!("{e:#}"))
 }
 
 pub(super) fn load_template() -> Result<(
@@ -191,7 +217,7 @@ pub(super) fn load_template() -> Result<(
     let entry = CACHE.get_or_init(|| {
         let load = || -> Result<Cached> {
             let mm = template_all_bytes()?;
-            let decompressed = Bundle::decompress_bytes(mm)?;
+            let decompressed = Bundle::decompress_bytes(&mm)?;
             let bundle = Bundle::from_decompressed(&decompressed)?;
             let mut proto: HashMap<String, SerializedType> = HashMap::new();
             let mut base: HashMap<String, Value> = HashMap::new();
@@ -211,7 +237,7 @@ pub(super) fn load_template() -> Result<(
                     }
                 }
             }
-            for (key, (st, tree)) in aux_types().iter() {
+            for (key, (st, tree)) in aux_types()?.iter() {
                 proto.entry(key.clone()).or_insert_with(|| st.clone());
                 base.entry(key.clone()).or_insert_with(|| tree.clone());
             }

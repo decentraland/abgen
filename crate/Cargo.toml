@@ -1,6 +1,6 @@
 [package]
 name = "abgen"
-version = "0.14.1"
+version = "0.15.0"
 edition = "2021"
 description = "Decentraland asset-bundle converter + ab-cdn-compatible JIT server — clean-room reimplementation of asset-bundle-converter."
 license = "AGPL-3.0-or-later"
@@ -85,6 +85,12 @@ path = "examples/atlasprobe.rs"
 [features]
 engine-v8 = ["dep:v8"]
 
+[build-dependencies]
+# Compiles compat/isoc23_shim.c on linux-gnu — see crate/build.rs. Already in
+# the lock file via crunch_ffi/libmimalloc-sys, so this adds an edge, not a
+# package.
+cc = "1"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip", "raw_value"] }
@@ -138,6 +144,13 @@ wasm-bindgen = "=0.2.121"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["console"] }
+
+[target.'cfg(all(target_os = "windows", target_arch = "aarch64", target_env = "gnu"))'.dependencies]
+# rquickjs-sys picks bindings by exact triple and ships none for gnullvm (msvc
+# and x86_64-gnu both have one), so they must be generated. A target dep rather
+# than a `--features` flag because abgen-native depends on abgen, not rquickjs,
+# and so cannot forward the flag.
+rquickjs = { version = "0.12", default-features = false, features = ["bindgen"] }
 
 [target.'cfg(all(not(target_os = "windows"), not(target_arch = "wasm32")))'.dependencies]
 mimalloc = { version = "0.1.52", default-features = false }

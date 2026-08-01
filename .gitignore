@@ -2,6 +2,7 @@
 /target
 /crate/target
 /crate/abgen-wasm/target/
+/crate/abgen-node/target/
 .cargo-home/
 
 # wasm lab build artifact — crate/abgen-wasm/build.sh regenerates it
@@ -48,3 +49,22 @@ npm/local/
 # wasm WebGPU module build artifacts — crate/abgen-wasm/build.sh regenerates
 /crate/wasm-gpu/target/
 /site/wasm/gpu/
+
+# Unity plugin binaries: built by unity/build.sh or pulled from a release.
+# The .meta files beside them are committed — the importer settings are source.
+unity/Packages/org.decentraland.abgen/Runtime/Plugins/**/*.dll
+unity/Packages/org.decentraland.abgen/Runtime/Plugins/**/*.dylib
+unity/Packages/org.decentraland.abgen/Runtime/Plugins/**/*.so
+
+# napi build outputs: the .node is per-platform and comes from the release
+# matrix, but index.js/index.d.ts ARE committed — napi-publish never runs
+# `napi build`, so nothing would generate the package's entry point.
+/crate/abgen-node/*.node
+/crate/abgen-node/node_modules/
+/crate/abgen-node/npm/**/*.node
+
+# Local release-process rehearsals (release.yml builds these in the runner).
+/abgen-v*/
+/abgen-v*.tar.gz*
+/abgen-native-v*/
+/abgen-native-v*.tar.gz*

@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable @ 2026-07-08
         with:
-          toolchain: "1.97.1"
+          toolchain: "1.97.0"
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -35,15 +35,67 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable @ 2026-07-08
         with:
-          toolchain: "1.97.1"
+          toolchain: "1.97.0"
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      # the toolchain is node-free: the crate must never spawn npm or node
       - name: forbid node spawns
         run: |
           ! grep -rn 'Command::new("npm\|Command::new("node' crate/src
-      # --test-threads=1: the lib tests share the ABGEN_ROOT env (lodgen vs emote-template race).
-      # --locked matches the Dockerfile build: a Cargo.toml edit without a
-      # regenerated Cargo.lock must fail at PR time, not at image-build time.
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: ABGEN_ROOT="$GITHUB_WORKSPACE" cargo test --locked --workspace --lib -- --test-threads=1
+      - run: ABGEN_ROOT="$GITHUB_WORKSPACE" cargo test --locked -p abgen-native --tests
+      - name: C ABI smoke test
+        run: ABGEN_ROOT="$GITHUB_WORKSPACE" crate/abgen-native/tests/run-smoke.sh
+
+      - name: glibc floor
+        run: bash ci/check-glibc-floor.sh 2.34 target/release/libabgen.so target/release/libabgen.a
+
+  windows:
+    name: windows lib tests
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable @ 2026-07-08
+        with:
+          toolchain: "1.97.0"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: lib tests
+        shell: pwsh
+        run: |
+          $env:ABGEN_ROOT = $env:GITHUB_WORKSPACE
+          cargo test --locked --workspace --lib -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p abgen-native --tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: native host smoke
+        shell: pwsh
+        run: |
+          cargo build --release -p abgen-native
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -NoProfile -ExecutionPolicy Bypass -File ci/abgen-smoke.ps1 -Tree $env:GITHUB_WORKSPACE
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  excluded-hosts:
+    name: excluded hosts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable @ 2026-07-08
+        with:
+          toolchain: "1.97.0"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: abgen-node (build + smoke)
+        run: |
+          cargo build --release --locked --manifest-path crate/abgen-node/Cargo.toml
+          node crate/abgen-node/test/smoke.mjs
+          # The addon is dlopen'd into node and so is bound by the host's
+          # glibc exactly like libabgen.so is by Unity's.
+          bash ci/check-glibc-floor.sh 2.34 \
+            crate/abgen-node/target/release/libabgen_node.so
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - name: abgen-wasm (wasm32)
+        run: |
+          cd crate/abgen-wasm
+          nix develop "path:$PWD/toolchain" --command \
+            env RUSTFLAGS='-C target-feature=+simd128' \
+            cargo check --locked --release --target wasm32-unknown-unknown

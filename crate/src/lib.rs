@@ -78,6 +78,9 @@ pub mod bundle;
 pub mod bvwebgpu;
 
 pub mod compress;
+/// The embeddable conversion export shared by the wasm bridge, the C-ABI
+/// cdylib (`crate/abgen-native`) and the node addon (`crate/abgen-node`).
+pub mod export;
 pub mod lods;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod regen;

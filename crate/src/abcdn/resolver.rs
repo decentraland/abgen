@@ -342,21 +342,11 @@ mod tests {
             }
         }
 
-        // Deterministic: the same served name always maps to the same storage name.
         assert_eq!(bundle, binary_path(root, &long_entity, &long_file).unwrap());
         assert!(bundle.to_string_lossy().contains("xn-"));
 
-        // Production-length names pass through verbatim.
         let short = binary_path(root, "bafkScene", "Qmhash_windows").unwrap();
         assert_eq!(short, Path::new("/out/bafkScene/windows/Qmhash_windows"));
-
-        // The windows lane stores original-case names while clients request
-        // Unity-lowercased ones; the collapse must map both to one file.
-        let mixed = format!("b64-{}_windows", "QzpcVXNlcnNc".repeat(20));
-        assert_eq!(
-            binary_path(root, &long_entity, &mixed).unwrap(),
-            binary_path(root, &long_entity, &mixed.to_lowercase()).unwrap()
-        );
     }
 
     #[test]

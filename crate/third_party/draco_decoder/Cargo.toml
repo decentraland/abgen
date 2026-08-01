@@ -58,12 +58,12 @@ version = "1.25"
 version = "1.0"
 
 [build-dependencies.cc]
-version = "1.2"
+version = "1.4"
 
 [target.'cfg(not(target_arch = "wasm32"))'.build-dependencies.cxx-build]
 version = "1.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies.tokio]
-version = "1.52.3"
+version = "1.53.1"
 features = ["full"]
 
