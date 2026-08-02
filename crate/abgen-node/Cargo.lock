@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "abgen"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -57,12 +57,13 @@ dependencies = [
 
 [[package]]
 name = "abgen-node"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "abgen",
  "napi",
  "napi-build",
  "napi-derive",
+ "rayon",
  "tokio",
 ]
 
@@ -932,7 +933,7 @@ dependencies = [
 
 [[package]]
 name = "dcl-contents"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "async-trait",
  "axum",

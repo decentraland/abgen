@@ -585,7 +585,7 @@ jobs:
           case "$GITHUB_REF" in refs/tags/v*) ;; *) exit 0 ;; esac
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-                 --title "abgen $GITHUB_REF_NAME" --notes-file .github/release-notes.md \
+                 --title "$GITHUB_REF_NAME" --notes-file .github/release-notes.md \
             || gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null
           gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
             "$dist.tar.gz" "$dist.tar.gz.sha256" \
@@ -595,6 +595,10 @@ jobs:
     name: abgen-node ${{ matrix.target }}
     needs: build-id
     runs-on: ${{ matrix.runner }}
+    # Alpine for musl: abgen links C++ (draco), so the target needs a real musl
+    # g++, not just rustup's std. This image is napi-rs's own, and carries a
+    # rustup and a node the Actions runner can execute.
+    container: ${{ matrix.container || '' }}
     env:
       ABGEN_BUILD_ID: ${{ needs.build-id.outputs.value }}
     strategy:
@@ -603,18 +607,28 @@ jobs:
         include:
           - { target: x86_64-unknown-linux-gnu,  runner: ubuntu-24.04 }
           - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+          - { target: x86_64-unknown-linux-musl, runner: ubuntu-24.04, container: 'ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine' }
           - { target: aarch64-apple-darwin,      runner: macos-15 }
           - { target: x86_64-apple-darwin,       runner: macos-15-intel }
           - { target: x86_64-pc-windows-msvc,    runner: windows-2025 }
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable @ 2026-07-08
+      - if: matrix.container == ''
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable @ 2026-07-08
         with:
           toolchain: "1.97.0"
           targets: ${{ matrix.target }}
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - if: matrix.container == ''
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: 24
+      - name: pin the toolchain inside the container
+        if: matrix.container != ''
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup target add ${{ matrix.target }} --toolchain 1.97.0
+          rustup default 1.97.0
       - name: install addon deps
         working-directory: crate/abgen-node
         run: npm i --no-audit --no-fund
@@ -622,7 +636,7 @@ jobs:
         working-directory: crate/abgen-node
         run: npx napi build --platform --release --target ${{ matrix.target }}
       - name: smoke the addon
-        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin'
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-unknown-linux-musl'
         working-directory: crate/abgen-node
         run: node test/smoke.mjs
       - name: glibc floor

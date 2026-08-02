@@ -104,6 +104,21 @@ section.ent{border-left:1px solid var(--line);margin:26px 0 0;content-visibility
 .cell .tag{position:absolute;left:0;top:0;font-size:9px;letter-spacing:.16em;padding:2px 6px;
   color:var(--dim);background:rgba(13,12,16,.78);text-transform:uppercase;z-index:2}
 .cell.heatcell{border-color:#552}
+/* A run that captured no pixels: the two image columns collapse to one
+   evidence column, because a square of "no shots" repeated 1600 times is
+   worse than no column at all. */
+.cell.eviden{aspect-ratio:auto;min-height:0;padding:9px 11px;display:flex;
+  flex-direction:column;gap:6px;justify-content:center;background:var(--panel2)}
+.eviden .ev{font-size:12px;line-height:1.5;color:var(--ink)}
+.eviden .evmeta{font-size:10px;letter-spacing:.06em;color:var(--faint);text-transform:uppercase}
+.eviden .evgo{font-size:10px;letter-spacing:.1em;color:var(--accent)}
+.nopix{display:inline-block;margin-left:6px;font-size:9px;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--faint);border:1px solid var(--line);
+  border-radius:2px;padding:0 5px;vertical-align:1px}
+#norender{display:none;margin:8px 12px 0;padding:9px 12px;border-radius:3px;
+  border:1px solid var(--line);border-left:3px solid var(--stub);
+  background:var(--panel);font-size:12px;line-height:1.6;color:var(--dim)}
+#norender b{color:var(--ink)}
 .cell .stat{position:absolute;right:0;bottom:0;font-size:9px;letter-spacing:.06em;padding:2px 6px;
   color:var(--ink);background:rgba(13,12,16,.82);z-index:2}
 .cell.ph{display:flex;align-items:center;justify-content:center;cursor:default;
@@ -232,6 +247,7 @@ section.ent{border-left:1px solid var(--line);margin:26px 0 0;content-visibility
   <div id="campbar" class="hide"></div>
   <div id="procbody"></div>
 </section>
+<div id="norender"></div>
 <div class="colcap" id="colcap">
   <span>bundle / verdict</span><span>upstream</span><span>ours</span>
 </div>
@@ -396,8 +412,14 @@ async function fetchRun(isPoll){
     }
     S.data=d;LBL=Object.assign({upstream:'upstream',ours:'ours'},d.labels||{});
     AZMAX=1;
-    for(const ent of d.entities||[])for(const r of ent.rows)
+    // A run is render-less when not one row retained a shot. Derived rather
+    // than declared: d.render being null is the generator's intent, this is
+    // what actually arrived, and it is what the columns must reflect.
+    S.renderless=true;
+    for(const ent of d.entities||[])for(const r of ent.rows){
       AZMAX=Math.max(AZMAX,(r.up||[]).length,(r.ours||[]).length);
+      if(r.up||r.ours)S.renderless=false;
+    }
     if(isPoll){
       PROC.clear();PROC_LRU.length=0;   // rows may have new bytes/images
       const y=scrollY;boot(d);scrollTo(0,y);
@@ -685,10 +707,20 @@ function syncToggles(){
   document.querySelectorAll('#kinds .chip[data-n]').forEach(x=>x.classList.toggle('on',x.dataset.n===S.kind));
   document.querySelectorAll('#tags .chip[data-t]').forEach(x=>x.classList.toggle('on',x.dataset.t===S.tag));
   document.querySelectorAll('#platgrp button').forEach(x=>x.classList.toggle('on',x.dataset.p===S.plat));
-  const ncols=S.heat?3:2;
+  const ncols=S.renderless?1:(S.heat?3:2);
   document.documentElement.style.setProperty('--ncols',ncols);
   const cap=document.getElementById('colcap');
-  cap.innerHTML=`<span>bundle / verdict</span><span>${LBL.upstream}</span><span>${LBL.ours}${S.zoom?' · zoomed':''}</span>${S.heat?'<span class="heatcap">red-diff ×8</span>':''}`;
+  cap.innerHTML=S.renderless
+    ? `<span>bundle / verdict</span><span>what was compared</span>`
+    : `<span>bundle / verdict</span><span>${LBL.upstream}</span><span>${LBL.ours}${S.zoom?' · zoomed':''}</span>${S.heat?'<span class="heatcap">red-diff ×8</span>':''}`;
+  const nr=document.getElementById('norender');
+  nr.style.display=S.renderless?'block':'none';
+  if(S.renderless)
+    nr.innerHTML=`<b>No pixels were compared in this run.</b> Nothing was rendered, so
+      every verdict here is structural — read from the bundle bytes with
+      objdump/texdump/matdump. A verdict of <b>imperceptible</b> means the structures
+      matched, <i>not</i> that the two look alike on screen; nothing checked how they
+      look. Click any card for the hierarchy, texture, material and byte diffs.`;
 }
 
 function render(){
@@ -753,20 +785,35 @@ function imgCell(r,src,label){
 }
 function phCell(r,txt){const div=document.createElement('div');div.className='cell ph';div.textContent=txt;return div;}
 
+/* What a structural row actually established, given there is no image to show. */
+function evidenceCell(r){
+  const div=document.createElement('div');div.className='cell eviden';
+  const what=r.detail||r.note||'no structural detail recorded';
+  const esc=t=>String(t).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'})[c]);
+  div.innerHTML=`<div class="evmeta">${esc(r.cat||'structural')} · ${esc(r.platform||'')}</div>
+    <div class="ev">${esc(what)}</div>
+    <div class="evgo">open the full diagnosis →</div>`;
+  return div;
+}
+
 function rowEl(r){
   const el=document.createElement('div');el.className='row';el._row=r;
   el.onclick=()=>location.href=detailUrl(r);
   const meta=document.createElement('div');meta.className='meta';
   const amp=r.ppm8!=null?`<div class="note">Δ>8: <b style="color:${r.ppm8<=200?'var(--identical)':'var(--visible)'}">${r.ppm8.toLocaleString()}ppm</b> · maxΔ ${r.maxd!=null?r.maxd:'?'}</div>`:'';
   meta.innerHTML=`<div class="pair"><a href="${detailUrl(r)}" style="color:inherit;text-decoration:none;border-bottom:1px dotted var(--accent)">${r.pair}</a> <span class="kindtag">${r.kind}</span> <span class="settag">${(r.tags||[]).concat(r.platform).join('·')}</span></div>
-    <div><span class="badge b-${r.label}">${r.label}</span>
+    <div><span class="badge b-${r.label}">${r.label}</span>${(r.ppm==null&&!r.up&&!r.ours)?'<span class="nopix" title="no pixels were compared for this pair">structure only</span>':''}
       <span class="note">${r.ppm!=null?r.ppm.toLocaleString()+'ppm · ':''}up ${r.upVersion||'?'}</span></div>
     ${amp}<div class="bundle">${r.bundle}</div>
-    <div class="note">${r.prov||''}</div>${r.note?`<div class="note">${r.note}</div>`:''}`;
+    <div class="note">${r.prov||''}</div>${(r.note&&!S.renderless)?`<div class="note">${r.note}</div>`:''}`;
   el.appendChild(meta);
+  if(S.renderless){
+    el.appendChild(evidenceCell(r));
+  }else{
   el.appendChild(r.up?imgCell(r,'up',LBL.upstream):phCell(r,r.label==='fail'?(r.note||'load fail'):`no ${LBL.upstream} shots retained`));
   el.appendChild(r.ours?imgCell(r,'ours',LBL.ours):phCell(r,r.label==='fail'?(r.note||'load fail'):`no ${LBL.ours} shots`));
-  if(S.heat){
+  }
+  if(S.heat&&!S.renderless){
     if(r.up&&r.ours){
       const div=document.createElement('div');div.className='cell heatcell';
       const c=document.createElement('canvas');c.className='c-heat';div.appendChild(c);
