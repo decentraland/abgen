@@ -2,7 +2,7 @@
   "name": "@dcl/abgen",
   "version": "0.0.0-dev",
   "description": "Decentraland asset-bundle converter + ab-cdn-compatible JIT server. Installs the prebuilt abgen binary for your platform.",
-  "license": "AGPL-3.0-or-later",
+  "license": "Apache-2.0 OR AGPL-3.0-or-later",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/decentraland/abgen.git"

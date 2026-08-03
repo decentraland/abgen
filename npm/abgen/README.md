@@ -40,5 +40,5 @@ time. `@dcl/sdk-commands` uses this to boot the asset-bundle preview sidecar.
 
 ## License
 
-AGPL-3.0-or-later. Full text and vendored third-party notices in the
+Apache-2.0 OR AGPL-3.0-or-later, at your option. Full texts and vendored third-party notices in the
 [repository](https://github.com/decentraland/abgen).
