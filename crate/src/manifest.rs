@@ -66,6 +66,10 @@ pub fn write_scene(
     exit_code: i32,
     date: &str,
 ) -> Result<PathBuf> {
+    crate::naming::ensure_writable_component(entity_id)?;
+    for fname in bundles.keys() {
+        crate::naming::ensure_writable_component(fname)?;
+    }
     let base = PathBuf::from(out_dir).join(entity_id);
     let pdir = base.join(platform);
     std::fs::create_dir_all(&pdir)?;
@@ -270,6 +274,48 @@ mod tests {
         assert_eq!(s.len(), "2026-05-20T12:00:00.000000+00:00".len());
         assert_eq!(&s[4..5], "-");
         assert_eq!(&s[10..11], "T");
+    }
+
+    #[test]
+    fn write_scene_refuses_oversized_names_before_writing() {
+        let tmp = std::env::temp_dir().join(format!("abgen_manifest_guard_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let long = format!("b64-{}", "Q".repeat(260));
+
+        let mut bundles = BTreeMap::new();
+        bundles.insert("a_windows".to_string(), b"x".to_vec());
+        let err = write_scene(
+            tmp.to_str().unwrap(),
+            &long,
+            "windows",
+            &bundles,
+            DEFAULT_AB_VERSION,
+            0,
+            TEST_DATE,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Refusing to write"), "{err}");
+
+        let mut bundles = BTreeMap::new();
+        bundles.insert("a_windows".to_string(), b"x".to_vec());
+        bundles.insert(format!("{long}_windows"), b"x".to_vec());
+        let err = write_scene(
+            tmp.to_str().unwrap(),
+            "entityY",
+            "windows",
+            &bundles,
+            DEFAULT_AB_VERSION,
+            0,
+            TEST_DATE,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Refusing to write"), "{err}");
+        assert!(
+            !tmp.exists(),
+            "all names are vetted before anything is written"
+        );
     }
 
     #[test]

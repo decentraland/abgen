@@ -60,6 +60,7 @@ impl LocalContentStore {
     }
 
     pub fn write(&self, cid: &str, bytes: &[u8]) -> Result<()> {
+        crate::naming::ensure_writable_component(cid).context("local content store")?;
         let path = self.path_for(cid);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
@@ -89,5 +90,26 @@ mod tests {
         let s = LocalContentStore::new("/nonexistent/abgen-local-store");
         let err = s.fetch("bafkrei000000").unwrap_err().to_string();
         assert!(err.contains("local content store"), "{err}");
+    }
+
+    #[test]
+    fn write_refuses_oversized_cid_loudly() {
+        let tmp = std::env::temp_dir().join(format!("abgen_store_guard_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let s = LocalContentStore::new(&tmp);
+
+        let cid = format!("b64-{}", "Q".repeat(260));
+        let msg = format!("{:#}", s.write(&cid, b"x").unwrap_err());
+        assert!(
+            msg.contains("Refusing to write") && msg.contains(&cid),
+            "{msg}"
+        );
+        assert!(msg.contains("local content store"), "{msg}");
+        assert!(!tmp.exists(), "refusal must happen before any write");
+
+        let ok_cid = format!("b64-{}", "Q".repeat(196));
+        s.write(&ok_cid, b"x").unwrap();
+        assert!(s.exists(&ok_cid));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

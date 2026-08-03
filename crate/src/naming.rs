@@ -19,8 +19,26 @@ pub fn fs_safe_component(name: &str) -> std::borrow::Cow<'_, str> {
     if name.len() <= FS_COMPONENT_MAX_BYTES {
         return std::borrow::Cow::Borrowed(name);
     }
-    let digest = crate::hashes::sha256_hex(name.as_bytes());
+    let digest = crate::hashes::sha256_hex(name.to_lowercase().as_bytes());
     std::borrow::Cow::Owned(format!("xn-{}", &digest[..40]))
+}
+
+/// NAME_MAX (255 bytes) minus headroom for atomic-write `.tmp.{pid}.{seq}` suffixes.
+pub const FS_WRITE_COMPONENT_MAX_BYTES: usize = 240;
+
+/// Refuses a component that must be stored verbatim but can never fit in NAME_MAX.
+/// Why: letting it through fails later, deep inside a conversion, with the OS's
+/// cryptic error (ENAMETOOLONG; "os error 3"/"123" on Windows) far from the cause —
+/// only unbounded dev-lane ids (b64- base64 of a local path) ever get this long.
+pub fn ensure_writable_component(name: &str) -> Result<()> {
+    if name.len() <= FS_WRITE_COMPONENT_MAX_BYTES {
+        return Ok(());
+    }
+    bail!(
+        "Refusing to write into a file whose name will be longer than 255 chars: \
+         this will cause problems on some platforms. Try to relocate the folder \
+         in a different path, or use smaller folder names. The failed name is: {name}"
+    );
 }
 
 const GLB_MAGIC: u32 = 0x46546C67;
@@ -405,6 +423,31 @@ pub fn canonical_filename(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_writable_component_boundary() {
+        let ok = "a".repeat(FS_WRITE_COMPONENT_MAX_BYTES);
+        assert!(ensure_writable_component(&ok).is_ok());
+        let over = "a".repeat(FS_WRITE_COMPONENT_MAX_BYTES + 1);
+        let err = ensure_writable_component(&over).unwrap_err().to_string();
+        assert!(
+            err.contains("Refusing to write") && err.contains(&over),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn fs_safe_component_collapse_ignores_case() {
+        let mixed = format!("b64-{}_windows", "QzpcVXNlcnNc".repeat(20));
+        assert!(mixed.len() > FS_COMPONENT_MAX_BYTES);
+        let stored = fs_safe_component(&mixed);
+        assert!(stored.starts_with("xn-"));
+        // Unity lowercases bundle names on request; the collapsed lookup must
+        // stay as case-forgiving as the verbatim path it replaces.
+        assert_eq!(stored, fs_safe_component(&mixed.to_lowercase()));
+        // Short names still pass through byte-identical, case preserved.
+        assert_eq!(fs_safe_component("Qmhash_windows"), "Qmhash_windows");
+    }
 
     #[test]
     fn deps_digest_known_input() {
