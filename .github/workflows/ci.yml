@@ -132,14 +132,25 @@ jobs:
         with:
           toolchain: "1.97.0"
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # Built through napi, not cargo, so index.js/index.d.ts are regenerated
+      # and can be compared against what is committed. Those two are generated
+      # files that are also the package's entry point, so a #[napi] export
+      # added without regenerating them compiles into the binary and is
+      # unreachable from JavaScript — which is exactly how setMaxThreads
+      # shipped missing in 0.15.1 and 0.15.2.
       - name: abgen-node (build + smoke)
+        working-directory: crate/abgen-node
         run: |
-          cargo build --release --locked --manifest-path crate/abgen-node/Cargo.toml
-          node crate/abgen-node/test/smoke.mjs
+          npm ci --no-audit --no-fund
+          npx napi build --platform --release -- --locked
+          git diff --exit-code -- index.js index.d.ts \
+            || { echo "index.js/index.d.ts are stale; run 'napi build --platform --release' and commit them" >&2; exit 1; }
+          node test/smoke.mjs
           # The addon is dlopen'd into node and so is bound by the host's
-          # glibc exactly like libabgen.so is by Unity's.
-          bash ci/check-glibc-floor.sh 2.34 \
-            crate/abgen-node/target/release/libabgen_node.so
+          # glibc exactly like libabgen.so is by Unity's. Paths are relative to
+          # crate/abgen-node now that the step runs there.
+          bash ../../ci/check-glibc-floor.sh 2.34 \
+            target/release/libabgen_node.so
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
       - name: abgen-wasm (wasm32)
         run: |
