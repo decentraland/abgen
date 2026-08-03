@@ -19,7 +19,7 @@ pub fn fs_safe_component(name: &str) -> std::borrow::Cow<'_, str> {
     if name.len() <= FS_COMPONENT_MAX_BYTES {
         return std::borrow::Cow::Borrowed(name);
     }
-    let digest = crate::hashes::sha256_hex(name.as_bytes());
+    let digest = crate::hashes::sha256_hex(name.to_lowercase().as_bytes());
     std::borrow::Cow::Owned(format!("xn-{}", &digest[..40]))
 }
 
