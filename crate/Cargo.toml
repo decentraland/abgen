@@ -149,10 +149,6 @@ rquickjs = { version = "0.12", default-features = false, features = ["std", "arr
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif", "tga"] }
 meshopt = "=0.6.2"
 wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "webgpu"] }
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-js-sys = "0.3"
-web-sys = { version = "0.3", features = ["console"] }
 
 [target.'cfg(all(target_os = "windows", target_arch = "aarch64", target_env = "gnu"))'.dependencies]
 # rquickjs-sys picks bindings by exact triple and ships none for gnullvm (msvc

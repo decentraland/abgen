@@ -21,7 +21,6 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "image",
- "js-sys",
  "libc",
  "libjpeg9c",
  "libm",
@@ -49,9 +48,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
  "wgpu",
 ]
 
