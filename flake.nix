@@ -13,13 +13,18 @@
 
       sourceDateEpoch = "315532800";
 
-      buildFileset = lib.fileset.unions [
-        ./Cargo.toml
-        ./Cargo.lock
-        ./rust-toolchain.toml
-        ./crate
-        ./template
-      ];
+      buildFileset = lib.fileset.difference
+        (lib.fileset.unions [
+          ./Cargo.toml
+          ./Cargo.lock
+          ./rust-toolchain.toml
+          ./crate
+          ./template
+        ])
+        # Per-platform npm scaffolding: adding or dropping one cannot change a
+        # single release binary, but it sits under crate/, so including it made
+        # every artifact hash churn on packaging edits alone.
+        ./crate/abgen-node/npm;
 
       buildSource = lib.fileset.toSource {
         root = ./.;

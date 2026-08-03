@@ -45,6 +45,10 @@ jobs:
     name: address sanitizer
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    # Measured at 21m (17.7m of it one suite). The default is six hours, and a
+    # nightly job that wedges on the CUDA or SIMD paths would burn all of it
+    # unattended, repeatedly.
+    timeout-minutes: 90
     env:
       # -D warnings from the top-level env would fail the build on lints the
       # instrumentation itself provokes, and the sanitizer flags have to reach
