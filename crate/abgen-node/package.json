@@ -1,6 +1,6 @@
 {
   "name": "@dcl/abgen-node",
-  "version": "0.15.0",
+  "version": "0.15.1",
   "description": "Decentraland asset-bundle conversion in-process for Node (Rust + napi-rs) \u2014 the same abgen core the server and the Unity plugin run",
   "license": "AGPL-3.0-or-later",
   "repository": {

@@ -1,6 +1,6 @@
 [package]
 name = "abgen-node"
-version = "0.15.0"
+version = "0.15.1"
 edition = "2021"
 description = "Node native module (napi-rs) exposing abgen's conversion pipeline in-process."
 license = "AGPL-3.0-or-later"
@@ -20,6 +20,7 @@ abgen = { path = ".." }
 napi = { version = "2.16", default-features = false, features = ["napi8", "async", "tokio_rt"] }
 napi-derive = "2.16"
 tokio = { version = "1", features = ["rt-multi-thread"] }
+rayon = "1"
 
 [build-dependencies]
 napi-build = "2"

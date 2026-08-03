@@ -18,6 +18,7 @@
 use abgen::export::{self, CollectingSink, HostInfo, InputBuilder};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use std::sync::Once;
 
 const HOST: HostInfo = HostInfo::new("v-abgen-node", "node://embedded");
 
@@ -82,6 +83,40 @@ pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+static POOL: Once = Once::new();
+
+/// Half the cores, because this host is the developer's own CLI.
+///
+/// The other two hosts want every core: the server converts as its whole job,
+/// and Unity calls `abgen_set_max_threads` itself. Here conversion runs inside
+/// `sdk-commands start`, so taking the machine for the duration interferes with
+/// the editing that preview exists to serve.
+fn default_pool() {
+    POOL.call_once(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads((cores / 2).max(1))
+            .build_global();
+    });
+}
+
+/// Overrides the pool size. Process-wide, effective once, and only before the
+/// first [`convert`] — after that the default is already installed and this
+/// returns false rather than pretending to have applied.
+#[napi]
+pub fn set_max_threads(threads: u32) -> bool {
+    let mut applied = false;
+    POOL.call_once(|| {
+        applied = rayon::ThreadPoolBuilder::new()
+            .num_threads((threads as usize).max(1))
+            .build_global()
+            .is_ok();
+    });
+    applied
+}
+
 /// Converts one entity on the blocking pool, not the libuv event loop:
 /// conversion is CPU-bound for seconds at a time.
 ///
@@ -108,6 +143,7 @@ pub async fn convert(options: AbgenConvertOptions) -> Result<AbgenConvertResult>
         builder = builder.content_entry(e.file, e.hash);
     }
     let request = builder.build();
+    default_pool();
 
     let collected = tokio::task::spawn_blocking(move || {
         let sink = CollectingSink::new();

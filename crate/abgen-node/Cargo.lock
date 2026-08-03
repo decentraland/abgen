@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "abgen"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -21,7 +21,6 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "image",
- "js-sys",
  "libc",
  "libjpeg9c",
  "libm",
@@ -49,20 +48,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
  "wgpu",
 ]
 
 [[package]]
 name = "abgen-node"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "abgen",
  "napi",
  "napi-build",
  "napi-derive",
+ "rayon",
  "tokio",
 ]
 
@@ -932,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "dcl-contents"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "async-trait",
  "axum",

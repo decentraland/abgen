@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # The sanitizer job is the only thing this triggers, and it is far too slow
+    # to sit in front of a PR.
+    - cron: "23 4 * * *"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -27,6 +32,49 @@ jobs:
           toolchain: "1.97.0"
           components: rustfmt
       - run: cargo fmt --all -- --check
+
+  # Aims at the 156 unsafe sites — the CUDA bindings, the FFI surface, and the
+  # hand-vectorized BC7 kernels — by running the existing suite with the memory
+  # model actually checked. It only sees inputs the tests already carry, which
+  # is the limitation to remember when reading a green run.
+  #
+  # miri is not an option here and will not become one: it cannot execute the
+  # C and C++ dependencies (draco, libjpeg, crunch), so it would refuse before
+  # reaching any of the code worth checking.
+  sanitizers:
+    name: address sanitizer
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # Measured at 21m (17.7m of it one suite). The default is six hours, and a
+    # nightly job that wedges on the CUDA or SIMD paths would burn all of it
+    # unattended, repeatedly.
+    timeout-minutes: 90
+    env:
+      # -D warnings from the top-level env would fail the build on lints the
+      # instrumentation itself provokes, and the sanitizer flags have to reach
+      # the C deps too or their allocations stay invisible.
+      RUSTFLAGS: -Zsanitizer=address
+      CFLAGS: -fsanitize=address -fno-omit-frame-pointer
+      CXXFLAGS: -fsanitize=address -fno-omit-frame-pointer
+      # detect_leaks stays off: rayon's pool and the CUDA runtime hold
+      # allocations for the process lifetime by design, and reporting those as
+      # leaks would bury a real finding.
+      ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable @ 2026-07-08
+        with:
+          # Sanitizers are nightly-only. This is the one place the pinned 1.97.0
+          # does not apply; nothing built here ships.
+          toolchain: nightly
+          components: rust-src
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # --target is load-bearing: without it the build scripts are instrumented
+      # too and run under a sanitizer they were never linked against.
+      - name: cargo test under ASan
+        run: |
+          ABGEN_ROOT="$GITHUB_WORKSPACE" cargo test --locked --workspace --lib \
+            --target x86_64-unknown-linux-gnu -- --test-threads=1
 
   check:
     name: clippy + test

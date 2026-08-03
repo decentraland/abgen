@@ -583,9 +583,14 @@ jobs:
           fi
 
           case "$GITHUB_REF" in refs/tags/v*) ;; *) exit 0 ;; esac
+          # Created as a DRAFT and published only once every asset is in
+          # place, because immutable releases freeze assets at publication:
+          # after that only the title and notes can change. Published here,
+          # the first target to finish would seal the release and the other
+          # five would fail to upload.
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-                 --title "abgen $GITHUB_REF_NAME" --notes-file .github/release-notes.md \
+            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft \
+                 --title "$GITHUB_REF_NAME" --notes-file .github/release-notes.md \
             || gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null
           gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
             "$dist.tar.gz" "$dist.tar.gz.sha256" \
@@ -738,3 +743,14 @@ jobs:
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: "dist/*.tar.gz,native/*.tar.gz"
+
+      # Last, and only once: this is the step that makes the release
+      # immutable. Everything that mutates assets — the per-target uploads,
+      # SHA256SUMS.txt, the delete-asset sweep — has to have finished.
+      - name: publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft \
+            --jq 'if .isDraft then error("release is still a draft") else "published" end'
