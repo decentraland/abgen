@@ -38,7 +38,7 @@ classifier is the spec). Setup details: [pipeline/README.md](pipeline/README.md)
 
 | Bin | What |
 |---|---|
-| `abgen` | ab-cdn-compatible HTTP server: serves a corpus dir + JIT-converts misses (feature `server`, on by default) |
+| `abgen` | ab-cdn-compatible HTTP server: serves a corpus dir + JIT-converts misses |
 | `abgen-build` | single-file local converter CLI (glb -> bundle, `--expect-hash` verify) |
 | `abgen-corpus` | batch corpus builder: manifest / `--entity-ids` (add `--fetch-missing` to pull content from a catalyst) / `--world <name>[,...]` (resolve + fetch + convert a world; upstream via `--worlds-url` or `ABGEN_WORLDS_URL`) / `--live-mode` / `--collection-urn` / `--from-reference`; full-corpus runbook in [docs/BATCH.md](docs/BATCH.md) |
 | `abgen-verify` | parity differ (ours vs reference bundles, ppm-bits, `--tolerant`) |
@@ -67,10 +67,12 @@ An explorer can point both its asset-bundle CDN base and its registry base at th
 `optimized-assets` client flag targets). The unsigned registry surface from the in-tree
 [`dcl-contents`](crate/dcl-contents) crate is always mounted (`POST /profiles`,
 `POST /profiles/metadata`, `GET /entities/status/{id}`, `GET /worlds/{world_name}/manifest`), sourced
-from a connected content DB (feature `content-db`) or proxied from `ABGEN_CATALYST_URL`. The
-signed/write registry extras (denylist, queues, admin, `flush-cache`) are NOT served - they belong to a
-catalyst or registry service, not this converter. Route-by-route parity, header semantics, and the
-DB-vs-proxy source selection: [docs/ROUTES.md](docs/ROUTES.md).
+from a connected content DB or proxied from `ABGEN_CATALYST_URL`. The signed/write registry routes
+(`/denylist*`, `/queues/*`, `/registry`, `/flush-cache`) **do** mount, but only when
+`CONTENT_PG_CONNECTION_STRING` is set in URL form - so a converter deployment that leaves it unset
+serves none of them. Setting it exposes admin surface: gate it with `API_ADMIN_TOKEN` and
+`DENYLIST_MODERATORS`, and do not put it on a public listener unauthenticated. Route-by-route parity,
+header semantics, and the DB-vs-proxy source selection: [docs/ROUTES.md](docs/ROUTES.md).
 ## Tests
 ```bash
 ABGEN_ROOT="$PWD" cargo test --workspace --lib -- --test-threads=1
@@ -151,7 +153,7 @@ restore it - it never fetches or re-downloads:
 | `ABGEN_CATALYST_URL` | `http://127.0.0.1:5141/content` | content server (standalone: `https://peer.decentraland.org/content`) |
 | `ABGEN_CONTENT_DISK` | unset | optional local content-store root (disk-first client) |
 | `ABGEN_CACHE_DIR` | `./abgen-serve-cache` | JIT conversion cache |
-| `ABGEN_VERSION` | `v41` | advertised AB version |
+| `ABGEN_VERSION` | `v49` | advertised AB version |
 | `ABGEN_MANIFEST_CONTENT_SERVER_URL` | `https://peer.decentraland.org/content` | `contentServerUrl` stamped into manifests |
 | `ABGEN_ROOT` | repo root | root containing `template/` |
 | `ABGEN_METRICS_BEARER_TOKEN` | unset | if set, `/metrics` requires this bearer token |
@@ -159,7 +161,7 @@ restore it - it never fetches or re-downloads:
 | `ABGEN_JIT_CONTENT_DIGEST` | `0` | freshness for content servers whose declared hashes are not content-addressed (the `@dcl/sdk-commands` preview server keys them by file path). Defaults to ON when `ABGEN_CATALYST_URL` points at a loopback host (a dev preview server), OFF otherwise; explicit values always win. When on, manifest requests re-download the entity's convertible content, sha256 it, and prune stale conversions when bytes changed under an unchanged hash. Changed non-glb files (textures/`.bin`) also invalidate every glb bundle of the entity. Debounced per entity via `ABGEN_REVALIDATE_DEBOUNCE_S` (default `2`) |
 | `ABGEN_UPSTREAM_AB_CDN` | unset | read-through to a production ab-cdn (e.g. `https://ab-cdn.decentraland.org`): manifest/bundle/LOD/ISS requests that 404 through every local and JIT lane are streamed from upstream without persisting anything locally. Lets a client point its whole optimized-assets base URL here (wearables/emotes keep working) while only local scene entities are built locally. Paths containing `b64-` preview ids are never proxied |
 | `RUST_LOG` | `abgen=info,tower_http=info` | tracing filter |
-| `CONTENT_PG_CONNECTION_STRING` (or `POSTGRES_*` parts) | unset | feature `content-db` only |
+| `CONTENT_PG_CONNECTION_STRING` (or `POSTGRES_*` parts) | unset | content DB; URL form also mounts the signed registry routes |
 ### S3 space cache (read-through + write-back)
 Enabled when `ABGEN_S3_BUCKET` is non-empty (or `ABGEN_USE_SPACE=1`):
 - credentials, first match wins: `ABGEN_S3_ACCESS_KEY`/`ABGEN_S3_SECRET_KEY`, `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, or the ECS container role (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `_FULL_URI`)
@@ -218,7 +220,7 @@ Parity posture and clean-room provenance are documented separately: [PARITY.md](
 ## Provenance
 This repository is a generated standalone export: the server crate maps to `crate/` with a small
 overlay; the pipeline/site/harness trees ship verbatim; the content component + unsigned registry
-surface ship as the shared `crate/dcl-contents` crate (feature `content-db`), copied verbatim from
+surface ship as the shared `crate/dcl-contents` crate, copied verbatim from
 the internal tree. Mechanical differences from the internal source: signed/denylist/queue registry
 routes deleted; the server bin is `abgen` and the local build CLI is `abgen-build`.
 ## License
