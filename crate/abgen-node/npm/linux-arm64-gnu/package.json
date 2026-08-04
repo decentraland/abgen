@@ -1,6 +1,6 @@
 {
   "name": "@dcl/abgen-node-linux-arm64-gnu",
-  "version": "0.15.3",
+  "version": "0.15.4",
   "os": [
     "linux"
   ],

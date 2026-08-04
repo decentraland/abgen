@@ -1,6 +1,6 @@
 {
   "name": "@dcl/abgen-node-darwin-arm64",
-  "version": "0.15.3",
+  "version": "0.15.4",
   "os": [
     "darwin"
   ],
