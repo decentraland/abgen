@@ -1,7 +1,7 @@
 # abgen
 Standalone Decentraland asset-bundle converter + ab-cdn-compatible JIT server, plus **abgen-compare**,
 a parity pipeline that measures output against the production CDN in a browser. The converter is a
-clean-room Rust reimplementation of the Unity
+clean-room Rust reimplementation of the legacy
 [asset-bundle-converter](https://github.com/decentraland/asset-bundle-converter): GLB/GLTF content from
 any catalyst content server in, Unity AssetBundles layout-compatible with the production
 `ab-cdn.decentraland.org` CDN out (byte-level parity posture in [PARITY.md](PARITY.md)). See
@@ -46,7 +46,7 @@ classifier is the spec). Setup details: [pipeline/README.md](pipeline/README.md)
 
 Plus `pipeline/abgen-compare` (Python >= 3.9, stdlib-only, run in place) and bundle-inspection examples
 (`texdump`, `matdump`, `objdump`, `crndump`, `texcmp`, `texpng`) under `target/release/examples/`.
-`scripts/lod-parity.sh` runs the same baked LOD GLB through the Unity converter (a sibling
+`scripts/lod-parity.sh` runs the same baked LOD GLB through the legacy converter (a sibling
 [asset-bundle-converter](https://github.com/decentraland/asset-bundle-converter) checkout + editor) and
 through `abgen-lod bundle`, then diffs the two bundles (`abgen-lod compare` + `matdump`); `--site`
 publishes the verdicts to the compare site's `/lod.html`.
@@ -172,11 +172,12 @@ Enabled when `ABGEN_S3_BUCKET` is non-empty (or `ABGEN_USE_SPACE=1`):
 - `ABGEN_WORLDS_CONTENT_URL` - worlds-content-server fallback for entity/content fetches that miss the primary source (default public worlds server; `0`/`off`/empty disables)
 
 ### Asset-reuse mode (upstream converter parity)
-ON by default — the ab-cdn deployment has run asset-reuse since v49. Scene glb/gltf bundles use
-the upstream converter's canonical naming and shared bucket layout (applies to the JIT server
-and `abgen-corpus`). Set `ABGEN_DEPS_DIGEST=0` to fall back to legacy `{hash}_{platform}` names
-and entity-scoped space keys — needed only for parity runs against pre-v49 reference trees
-(e.g. `--live-mode` sampling of v15–v41 vintages, whose manifests list non-digest names).
+ON by default, matching the ab-cdn deployment's asset-reuse naming from v49 onward: scene
+glb/gltf bundles use the upstream converter's canonical naming and shared bucket layout (applies
+to the JIT server and `abgen-corpus`). Set `ABGEN_DEPS_DIGEST=0` to fall back to legacy
+`{hash}_{platform}` names and entity-scoped space keys — needed only for parity runs against
+pre-v49 reference trees (e.g. `--live-mode` sampling of v15–v41 vintages, whose manifests list
+non-digest names).
 - glb/gltf bundles are named `{hash}_{depsdigest}_{platform}` — the digest is a 128-bit hash of
   the glb's resolved `(file, hash)` dependency pairs (`.bin` + textures), so a glb whose
   dependency set changes lands at a new name/key; textures stay `{hash}_{platform}`

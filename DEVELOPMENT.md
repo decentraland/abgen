@@ -10,10 +10,10 @@ The release pipeline (`.github/workflows/release.yml`) is plain shell on GitHub-
 runners; the only non-shell steps are Determinate Systems' sha-pinned nix installer on
 the linux legs and first-party actions/cache everywhere (rustup legs: cargo registry +
 target dirs; nix legs: a nix file store carrying the crane deps-derivation closure,
-moved with nix copy). Measured rationale: warm cargo caches cut the rustup legs 2-4x,
-and the nix cache only pays because the flake splits dependency compilation into its
-own crane derivation (keyed on manifests/lockfile, stable across source edits) -
-without the split, a store cache replayed nothing. Every target builds **once**: Linux via
+moved with nix copy). The flake splits dependency compilation into its own crane
+derivation, keyed on manifests/lockfile and stable across source edits, so source
+edits keep hitting the nix cache - a cache keyed on the full source would replay
+nothing on every edit. Warm cargo caches cut the rustup legs 2-4x. Every target builds **once**: Linux via
 `nix build` from the committed flake.lock (hermetic; reproduce locally with `nix build` -
 the archives bundle the loader + libs behind the `abgen` entry script and run on any
 Linux, including NixOS); Windows and macOS via the pinned rustup toolchain with
@@ -24,8 +24,9 @@ re-runs converge on the full asset set.
 2. Tag the merge commit and push the tag:
    `git tag vX.Y.Z <merge-sha> && git push origin vX.Y.Z`
    Don't pre-create the release in the web UI: the pipeline adopts an existing release
-   (that is how v0.11.0 first shipped assetless), but only a CI-created one carries the
-   notes from `.github/release-notes.md`.
+   rather than creating a new one, so a pre-created release ships with no assets
+   attached; only a CI-created release carries the notes from
+   `.github/release-notes.md`.
 3. What runs: each leg builds, packages, smoke-tests (`--version` + `/readyz`; windows
    legs are cross-built and not smoke-run), and uploads its archive with `--clobber`.
    The `publish` job re-downloads the published assets, verifies them against the

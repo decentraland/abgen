@@ -1,6 +1,6 @@
 # Parity posture
 
-Where `abgen`'s reproduction of the Unity asset-bundle-converter's output is byte-exact, where it is
+Where `abgen`'s reproduction of the legacy converter's output is byte-exact, where it is
 deterministic-but-configurable, and where it drops to render/visual equivalence.
 
 ## Byte parity: the deterministic profile
@@ -47,8 +47,8 @@ render-noise class, not a change in what a texture depicts.
 
 ## Wearables: render parity, not byte parity
 
-Wearable bundles can **no longer be byte-gated against upstream by anyone**: upstream purged the
-pre-2026 wearable asset-bundle payloads, and the remaining manifests have no payloads behind them.
+Wearable bundles **cannot be byte-gated against upstream by anyone**: upstream does not serve the
+wearable asset-bundle payloads, and the remaining manifests have no payloads behind them.
 Validated by **render/visual comparison** instead.
 
 ## The visual gate

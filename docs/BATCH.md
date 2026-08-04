@@ -22,7 +22,7 @@ no database required:
   ids, or skip ids entirely and pass names to `abgen-corpus --world`, which resolves and fetches
   by itself.
 
-For scale: the 2026-07-10 full-corpus run resolved 74,292 active entities (25,569 scenes +
+For scale, the full active-entity set is on the order of 74,292 entities (25,569 scenes +
 46,254 wearables + 662 emotes + 1,807 world scenes).
 
 ## 2. The local content store
@@ -79,18 +79,17 @@ GPU is the recommendation for full-corpus runs.
 
 ## 6. Disk budget
 
-The full two-platform corpus out_root measured 215 GB (2026-07-10 run, hardlink-deduped,
-585,712 bundle files per platform). The content store is additional and scales with how much
-content you mirror. Plan for both plus scratch headroom.
+The full two-platform corpus out_root measures roughly 215 GB (hardlink-deduped, 585,712 bundle
+files per platform). The content store is additional and scales with how much content you
+mirror. Plan for both plus scratch headroom.
 
 ## 7. Exit semantics and the known failure class
 
 A run prints `DONE built=N skipped=N errs=N total=N` and exits 1 whenever `errs > 0` (manifest
 and reconcile errors included) - a full-corpus run that converts everything convertible still
-exits 1. Known baseline: ~260 failures per platform (259 mac / 258 windows on the 2026-07-10
-full run), almost all the legacy `load gltf inputs` class - old entities whose glTF payloads
-don't parse. Treat that count as the expected floor, alert on growth, top off with
-`--skip-existing` re-runs.
+exits 1. Known baseline: ~260 failures per platform (259 mac / 258 windows), almost all the
+legacy `load gltf inputs` class - old entities whose glTF payloads don't parse. Treat that
+count as the expected floor, alert on growth, top off with `--skip-existing` re-runs.
 
 An alternative is warming through a running `abgen` server (its registry POSTs eager-build
 misses), but direct batch is the efficient route for a full corpus.
@@ -102,11 +101,10 @@ local content store):
 
 - Full corpus, 74,292 active entities x windows+mac (585,712 bundle files per platform):
   27.0 min total wall at `-j 32` as two phased single-platform passes (mac 781 s, windows
-  841 s; ~74% of outputs built fresh, the rest skipped as already present from an earlier
-  partial run).
-- After the fused-pass work landed, one fused `--platform windows,mac` cold pass over the same
-  id set measured 764 s (~12.7 min) wall; on an 8,054-id cold sample the fused pass measured
-  2.54x faster than the phased platform pair.
+  841 s; ~74% of outputs build fresh, the rest are skipped as already present).
+- The fused `--platform windows,mac` pass beats running windows and mac as separate passes: a
+  cold pass over the same id set measures 764 s (~12.7 min) wall, and on an 8,054-id cold
+  sample the fused pass measures 2.54x faster than the phased platform pair.
 
 No full-corpus CPU wall time has been measured; no CPU projections are published. Conversion is
 fast in practice: the live browser wasm demo converts an 88 kB wearable GLB to a validated UnityFS

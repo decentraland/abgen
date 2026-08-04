@@ -84,12 +84,12 @@ Per ~120-entity chunk on a 16-core Windows node, roughly:
 
 | phase    | cost   | notes                                                    |
 |----------|--------|----------------------------------------------------------|
-| fetch    | ~90 s  | local mirror + `--abcdn-sleep 0`; the remote CDN was ~12 min |
+| fetch    | ~90 s  | local mirror + `--abcdn-sleep 0`; fetching the same set directly from the remote CDN takes ~12 min |
 | render   | ~4 min | one Unity session, jobs serial on the GPU — the floor    |
-| classify | ~25 s  | pixel-diff fanned over all cores (was ~4 min single-threaded) |
+| classify | ~25 s  | pixel-diff fanned over all cores; single-threaded classify takes ~4 min |
 
 ≈ 6 min/chunk. The render is the floor; to go under it use the `--azimuths` / `--render-size`
 dials (fewer/smaller shots trade angle/detail for speed) or add a second node. `skip byte-
 identical from render` removes exact-byte matches from the GPU set for free — its payoff grows
-as abgen converges toward byte-parity (recent cohorts still differ at the byte level even when
-the render is imperceptible, so it currently skips little).
+as abgen converges toward byte-parity: cohorts that differ at the byte level despite an
+imperceptible render limit how many pairs the skip captures.
