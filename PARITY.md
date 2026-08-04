@@ -1,6 +1,6 @@
 # Parity posture
 
-Where `abgen`'s reproduction of the Unity asset-bundle-converter's output is byte-exact, where it is
+Where `abgen`'s reproduction of the legacy converter's output is byte-exact, where it is
 deterministic-but-configurable, and where it drops to render/visual equivalence.
 
 ## Byte parity: the deterministic profile
@@ -9,8 +9,9 @@ The deterministic profile's output is bit-identical across rebuilds and compile 
 gates:
 
 - **Native reproducibility.** With the deterministic profile selected, 32 representative bundles
-  reproduce bit-for-bit against a frozen baseline. Release binaries are additionally built twice from a
-  clean tree in CI and required bit-identical before publishing.
+  reproduce bit-for-bit against a frozen baseline. Release binaries carry a committed sha256 manifest
+  (`ci/artifact-hashes/`) that every later build re-verifies against, on other runners and at other
+  commits, and a tag refuses to publish if any artifact disagrees.
 - **Cross-target parity.** The native converter (with `ABGEN_JPEG_GLB_9C=1`) and the WebAssembly build
   agree on 56/56 measured bundle hashes. The wasm self-gate independently compares 26 windows/mac/webgl
   bundle hashes across 8 format fixtures (JPEG, crunched DXT5 normals, Draco, gamma,
@@ -46,8 +47,8 @@ render-noise class, not a change in what a texture depicts.
 
 ## Wearables: render parity, not byte parity
 
-Wearable bundles can **no longer be byte-gated against upstream by anyone**: upstream purged the
-pre-2026 wearable asset-bundle payloads, and the remaining manifests have no payloads behind them.
+Wearable bundles **cannot be byte-gated against upstream by anyone**: upstream does not serve the
+wearable asset-bundle payloads, and the remaining manifests have no payloads behind them.
 Validated by **render/visual comparison** instead.
 
 ## The visual gate

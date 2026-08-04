@@ -56,18 +56,17 @@ back through the imported `env.host_emit`).
 
 ## The decoder rule (native default vs the gate)
 
-Native GLB JPEG decode defaults to turbojpeg: measured against the Unity
-upstream oracle it is the closer decoder (worst mean channel delta 0.03 vs
+Native GLB JPEG decode defaults to turbojpeg: measured against the upstream
+oracle it is the closer decoder (worst mean channel delta 0.03 vs
 2.99 for IJG 9c), so the wasm port does **not** flip the native default.
 wasm has no dlopen and always decodes through the vendored libjpeg9c. The
 parity gate closes that gap by exporting `ABGEN_JPEG_GLB_9C=1` — the
 existing native escape in `src/gltf/scene_build.rs` — on every native
-invocation, so both sides decode identically inside the gate while the
-production profile (env unset) stays byte-identical to the pre-wasm-port
-tree. Transcendental call sites in the byte path (`acos`, `powf`,
-`sin/cos`, `log2`) go through `src/detmath.rs` (pure-Rust libm) on both
-targets unconditionally — proven byte-neutral vs glibc libm on 60/60 real
-bundles.
+invocation, so both sides decode identically inside the gate, while the
+production profile (env unset) is unaffected by the wasm port.
+Transcendental call sites in the byte path (`acos`, `powf`, `sin/cos`,
+`log2`) go through `src/detmath.rs` (pure-Rust libm) on both targets
+unconditionally - byte-neutral vs glibc libm on 60/60 real bundles.
 
 ## Remaining gaps vs the native fleet
 
@@ -89,20 +88,20 @@ bundles.
   per-device self-qualification contract carries over: `gpu_init` refuses
   any adapter whose output is not bit-identical to the in-module CPU oracle
   across the native qualification matrix. Status: Chrome's WGSL compiler
-  (Tint→MSL) is NOT currently bit-exact on Apple Metal — the same kernels
+  (Tint→MSL) is not bit-exact on Apple Metal — the same kernels
   qualify under native wgpu (Naga) on the same GPU — so the lane arms only
   on adapters that pass; hardening the WGSL against Tint codegen is the
   open follow-up. `site/wasm/gputest.html` is the end-to-end harness (runs
   CPU-forced vs GPU-enabled and byte-compares every bundle).
 
-Formerly a gap, now real: libjpeg error recovery uses actual setjmp/longjmp
-via wasi-libc's `libsetjmp.a` (the LLVM Wasm-SjLj transform over wasm
+Not a gap: libjpeg error recovery uses actual setjmp/longjmp via
+wasi-libc's `libsetjmp.a` (the LLVM Wasm-SjLj transform over wasm
 exception handling, legacy `try`/`catch` encoding — Chrome 95+, Firefox
-100+, Safari 15.2+, Node 17+). A malformed JPEG now fails per-image exactly
+100+, Safari 15.2+, Node 17+). A malformed JPEG fails per-image exactly
 like native instead of trapping the module; the EH compile flags are scoped
 to the libjpeg9c build (`third_party/libjpeg9c/build.rs`), and the final
 link adds `libsetjmp.a` in `abgen-wasm/build.rs`. crnlib's bundled `jpgd`
-file loader is never called — unchanged.
+file loader is never called.
 
 ## wasm C/C++ port notes
 

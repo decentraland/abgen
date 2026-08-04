@@ -20,4 +20,4 @@ non-zero `exitCode` in `manifest`, with `code` still 0.
 
 `platform` is `"windows"`, `"mac"`, `"linux"` or `"webgl"`.
 
-Prebuilt for linux x64/arm64, darwin x64/arm64 and win32 x64. Apache-2.0 OR AGPL-3.0-or-later, at your option.
+Prebuilt for linux x64/arm64, darwin x64/arm64 and win32 x64. Apache-2.0.

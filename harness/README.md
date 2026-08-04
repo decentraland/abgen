@@ -94,7 +94,7 @@ failure as above):
   per-platform builds (the bare `.../<ver>/<entity>/dcl` URL 404s);
 - <=v36-era: one flat `scene_ignore_windows` shared across platforms (byte-identical on mac
   manifests; only correct for bundles of that same vintage);
-- v49-era: no shader listed; the old root URL
+- v49-era: no shader listed; the root URL
   `https://ab-cdn.decentraland.org/dcl/scene_ignore_windows` 404s.
 
 Preference order:
@@ -154,8 +154,8 @@ One job per line; `#` comments and blank lines skipped:
 | `AB_ANIM_SIZE` | `512` | frame-series render size |
 
 Defaults reproduce the parity campaign (3 azimuths, elevation 28 deg, FOV 50, 2x-bounds-radius
-distance, 1024^2 stills, 16x512^2 frames); classifier thresholds (<=200 ppm etc.) were calibrated
-at those settings - change both sides at once or not at all.
+distance, 1024^2 stills, 16x512^2 frames); classifier thresholds (<=200 ppm etc.) assume these
+settings - change both sides at once or not at all.
 
 ### 2.4 Invocation
 

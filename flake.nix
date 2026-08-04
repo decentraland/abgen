@@ -21,10 +21,13 @@
           ./crate
           ./template
         ])
-        # Per-platform npm scaffolding: adding or dropping one cannot change a
-        # single release binary, but it sits under crate/, so including it made
-        # every artifact hash churn on packaging edits alone.
-        ./crate/abgen-node/npm;
+        # buildId is embedded in every binary. Neither npm scaffolding nor prose
+        # can change compiled output, so including them would move all six
+        # targets' artifact hashes on a packaging or typo edit.
+        (lib.fileset.unions [
+          ./crate/abgen-node/npm
+          (lib.fileset.fileFilter (file: file.hasExt "md") ./crate)
+        ]);
 
       buildSource = lib.fileset.toSource {
         root = ./.;

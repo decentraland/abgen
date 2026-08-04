@@ -6,9 +6,14 @@
 #include "crn_winhdr.h"
 #endif
 #ifndef _MSC_VER
-// llvm-mingw's UCRT headers ship sprintf_s/vsprintf_s as always-inline
-// overloads; defining them again is a redefinition error under clang
-#if !(defined(__MINGW32__) && defined(__clang__))
+// mingw's UCRT headers ship sprintf_s/vsprintf_s as always-inline overloads
+// (sec_api/stdio_s.h, inside #ifdef _UCRT), so defining them here as well is a
+// redefinition error. What decides it is the CRT rather than the compiler:
+// mingw-w64 >= 12 defaults MINGW_HAS_SECURE_API on, so a UCRT toolchain
+// collides whether it is GCC or clang. __clang__ is kept alongside _UCRT
+// because the llvm-mingw lane is known to need the guard and there is no
+// reason to narrow it to prove a point.
+#if !(defined(__MINGW32__) && (defined(__clang__) || defined(_UCRT)))
 int sprintf_s(char* buffer, size_t sizeOfBuffer, const char* format, ...) {
   if (!sizeOfBuffer)
     return 0;

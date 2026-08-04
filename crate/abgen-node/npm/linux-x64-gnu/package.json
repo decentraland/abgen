@@ -1,6 +1,6 @@
 {
   "name": "@dcl/abgen-node-linux-x64-gnu",
-  "version": "0.15.3",
+  "version": "0.15.4",
   "os": [
     "linux"
   ],
@@ -12,7 +12,7 @@
     "abgen-node.linux-x64-gnu.node"
   ],
   "description": "Decentraland asset-bundle conversion in-process for Node (Rust + napi-rs) — the same abgen core the server and the Unity plugin run",
-  "license": "Apache-2.0 OR AGPL-3.0-or-later",
+  "license": "Apache-2.0",
   "engines": {
     "node": ">= 18"
   },

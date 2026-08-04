@@ -1,7 +1,7 @@
 # abgen
 Standalone Decentraland asset-bundle converter + ab-cdn-compatible JIT server, plus **abgen-compare**,
 a parity pipeline that measures output against the production CDN in a browser. The converter is a
-clean-room Rust reimplementation of the Unity
+clean-room Rust reimplementation of the legacy
 [asset-bundle-converter](https://github.com/decentraland/asset-bundle-converter): GLB/GLTF content from
 any catalyst content server in, Unity AssetBundles layout-compatible with the production
 `ab-cdn.decentraland.org` CDN out (byte-level parity posture in [PARITY.md](PARITY.md)). See
@@ -38,7 +38,7 @@ classifier is the spec). Setup details: [pipeline/README.md](pipeline/README.md)
 
 | Bin | What |
 |---|---|
-| `abgen` | ab-cdn-compatible HTTP server: serves a corpus dir + JIT-converts misses (feature `server`, on by default) |
+| `abgen` | ab-cdn-compatible HTTP server: serves a corpus dir + JIT-converts misses |
 | `abgen-build` | single-file local converter CLI (glb -> bundle, `--expect-hash` verify) |
 | `abgen-corpus` | batch corpus builder: manifest / `--entity-ids` (add `--fetch-missing` to pull content from a catalyst) / `--world <name>[,...]` (resolve + fetch + convert a world; upstream via `--worlds-url` or `ABGEN_WORLDS_URL`) / `--live-mode` / `--collection-urn` / `--from-reference`; full-corpus runbook in [docs/BATCH.md](docs/BATCH.md) |
 | `abgen-verify` | parity differ (ours vs reference bundles, ppm-bits, `--tolerant`) |
@@ -46,7 +46,7 @@ classifier is the spec). Setup details: [pipeline/README.md](pipeline/README.md)
 
 Plus `pipeline/abgen-compare` (Python >= 3.9, stdlib-only, run in place) and bundle-inspection examples
 (`texdump`, `matdump`, `objdump`, `crndump`, `texcmp`, `texpng`) under `target/release/examples/`.
-`scripts/lod-parity.sh` runs the same baked LOD GLB through the Unity converter (a sibling
+`scripts/lod-parity.sh` runs the same baked LOD GLB through the legacy converter (a sibling
 [asset-bundle-converter](https://github.com/decentraland/asset-bundle-converter) checkout + editor) and
 through `abgen-lod bundle`, then diffs the two bundles (`abgen-lod compare` + `matdump`); `--site`
 publishes the verdicts to the compare site's `/lod.html`.
@@ -67,10 +67,12 @@ An explorer can point both its asset-bundle CDN base and its registry base at th
 `optimized-assets` client flag targets). The unsigned registry surface from the in-tree
 [`dcl-contents`](crate/dcl-contents) crate is always mounted (`POST /profiles`,
 `POST /profiles/metadata`, `GET /entities/status/{id}`, `GET /worlds/{world_name}/manifest`), sourced
-from a connected content DB (feature `content-db`) or proxied from `ABGEN_CATALYST_URL`. The
-signed/write registry extras (denylist, queues, admin, `flush-cache`) are NOT served - they belong to a
-catalyst or registry service, not this converter. Route-by-route parity, header semantics, and the
-DB-vs-proxy source selection: [docs/ROUTES.md](docs/ROUTES.md).
+from a connected content DB or proxied from `ABGEN_CATALYST_URL`. The signed/write registry routes
+(`/denylist*`, `/queues/*`, `/registry`, `/flush-cache`) **do** mount, but only when
+`CONTENT_PG_CONNECTION_STRING` is set in URL form - so a converter deployment that leaves it unset
+serves none of them. Setting it exposes admin surface: gate it with `API_ADMIN_TOKEN` and
+`DENYLIST_MODERATORS`, and do not put it on a public listener unauthenticated. Route-by-route parity,
+header semantics, and the DB-vs-proxy source selection: [docs/ROUTES.md](docs/ROUTES.md).
 ## Tests
 ```bash
 ABGEN_ROOT="$PWD" cargo test --workspace --lib -- --test-threads=1
@@ -151,7 +153,7 @@ restore it - it never fetches or re-downloads:
 | `ABGEN_CATALYST_URL` | `http://127.0.0.1:5141/content` | content server (standalone: `https://peer.decentraland.org/content`) |
 | `ABGEN_CONTENT_DISK` | unset | optional local content-store root (disk-first client) |
 | `ABGEN_CACHE_DIR` | `./abgen-serve-cache` | JIT conversion cache |
-| `ABGEN_VERSION` | `v41` | advertised AB version |
+| `ABGEN_VERSION` | `v49` | advertised AB version |
 | `ABGEN_MANIFEST_CONTENT_SERVER_URL` | `https://peer.decentraland.org/content` | `contentServerUrl` stamped into manifests |
 | `ABGEN_ROOT` | repo root | root containing `template/` |
 | `ABGEN_METRICS_BEARER_TOKEN` | unset | if set, `/metrics` requires this bearer token |
@@ -159,7 +161,7 @@ restore it - it never fetches or re-downloads:
 | `ABGEN_JIT_CONTENT_DIGEST` | `0` | freshness for content servers whose declared hashes are not content-addressed (the `@dcl/sdk-commands` preview server keys them by file path). Defaults to ON when `ABGEN_CATALYST_URL` points at a loopback host (a dev preview server), OFF otherwise; explicit values always win. When on, manifest requests re-download the entity's convertible content, sha256 it, and prune stale conversions when bytes changed under an unchanged hash. Changed non-glb files (textures/`.bin`) also invalidate every glb bundle of the entity. Debounced per entity via `ABGEN_REVALIDATE_DEBOUNCE_S` (default `2`) |
 | `ABGEN_UPSTREAM_AB_CDN` | unset | read-through to a production ab-cdn (e.g. `https://ab-cdn.decentraland.org`): manifest/bundle/LOD/ISS requests that 404 through every local and JIT lane are streamed from upstream without persisting anything locally. Lets a client point its whole optimized-assets base URL here (wearables/emotes keep working) while only local scene entities are built locally. Paths containing `b64-` preview ids are never proxied |
 | `RUST_LOG` | `abgen=info,tower_http=info` | tracing filter |
-| `CONTENT_PG_CONNECTION_STRING` (or `POSTGRES_*` parts) | unset | feature `content-db` only |
+| `CONTENT_PG_CONNECTION_STRING` (or `POSTGRES_*` parts) | unset | content DB; URL form also mounts the signed registry routes |
 ### S3 space cache (read-through + write-back)
 Enabled when `ABGEN_S3_BUCKET` is non-empty (or `ABGEN_USE_SPACE=1`):
 - credentials, first match wins: `ABGEN_S3_ACCESS_KEY`/`ABGEN_S3_SECRET_KEY`, `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, or the ECS container role (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `_FULL_URI`)
@@ -170,11 +172,12 @@ Enabled when `ABGEN_S3_BUCKET` is non-empty (or `ABGEN_USE_SPACE=1`):
 - `ABGEN_WORLDS_CONTENT_URL` - worlds-content-server fallback for entity/content fetches that miss the primary source (default public worlds server; `0`/`off`/empty disables)
 
 ### Asset-reuse mode (upstream converter parity)
-ON by default — the ab-cdn deployment has run asset-reuse since v49. Scene glb/gltf bundles use
-the upstream converter's canonical naming and shared bucket layout (applies to the JIT server
-and `abgen-corpus`). Set `ABGEN_DEPS_DIGEST=0` to fall back to legacy `{hash}_{platform}` names
-and entity-scoped space keys — needed only for parity runs against pre-v49 reference trees
-(e.g. `--live-mode` sampling of v15–v41 vintages, whose manifests list non-digest names).
+ON by default, matching the ab-cdn deployment's asset-reuse naming from v49 onward: scene
+glb/gltf bundles use the upstream converter's canonical naming and shared bucket layout (applies
+to the JIT server and `abgen-corpus`). Set `ABGEN_DEPS_DIGEST=0` to fall back to legacy
+`{hash}_{platform}` names and entity-scoped space keys — needed only for parity runs against
+pre-v49 reference trees (e.g. `--live-mode` sampling of v15–v41 vintages, whose manifests list
+non-digest names).
 - glb/gltf bundles are named `{hash}_{depsdigest}_{platform}` — the digest is a 128-bit hash of
   the glb's resolved `(file, hash)` dependency pairs (`.bin` + textures), so a glb whose
   dependency set changes lands at a new name/key; textures stay `{hash}_{platform}`
@@ -211,19 +214,19 @@ unprivileged user on `:5147` with `template/` and `shader/` baked in and `ABGEN_
 preset. The [`.github/workflows/image.yml`](.github/workflows/image.yml) workflow builds that image and
 pushes it to `ghcr.io/decentraland/abgen:<tag>` (and `:latest`) on every `v*` tag. The org
 services-pipeline that publishes the same service to quay (service-name `abgen`) is configured
-externally in the private `decentraland/definitions` repo, not in this tree.
+externally in the private `decentraland/definitions` repo, not in this tree. Cutting a release -
+tagging, what the pipeline does, and what to check afterwards: [DEVELOPMENT.md](DEVELOPMENT.md).
 
 Parity posture and clean-room provenance are documented separately: [PARITY.md](PARITY.md) and
 [PROVENANCE.md](PROVENANCE.md).
 ## Provenance
 This repository is a generated standalone export: the server crate maps to `crate/` with a small
 overlay; the pipeline/site/harness trees ship verbatim; the content component + unsigned registry
-surface ship as the shared `crate/dcl-contents` crate (feature `content-db`), copied verbatim from
+surface ship as the shared `crate/dcl-contents` crate, copied verbatim from
 the internal tree. Mechanical differences from the internal source: signed/denylist/queue registry
 routes deleted; the server bin is `abgen` and the local build CLI is `abgen-build`.
 ## License
-Dual-licensed: **Apache-2.0 OR AGPL-3.0-or-later**, at your option. Take either one; you do not
-have to satisfy both. Full texts in [LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-AGPL](LICENSE-AGPL).
-Contributions are accepted under the same dual terms. Vendored third-party licenses and
+**Apache-2.0** - full text in [LICENSE](LICENSE). Contributions are accepted under the same
+terms. Vendored third-party licenses and
 shader/template bundle provenance: [PROVENANCE.md](PROVENANCE.md). Note: the lib sets
 `#[global_allocator] mimalloc`; any downstream embedding the lib inherits it.

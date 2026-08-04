@@ -24,11 +24,8 @@ how_to_record() {
   echo "  what a real build produced, and every later build checks against it." >&2
 }
 
-# Recording writes what this build produced; determinism is established by
-# every build that verifies against it afterwards, on other runners and at
-# other times. That is stronger evidence than repeating the build once on the
-# same machine in the same minute, which is all a same-run second build can
-# show. A hash that was a fluke fails the very next build, loudly.
+# One-shot record, not a same-run double-build: every later independent build
+# re-verifying against this manifest is what actually proves reproducibility.
 if [ "${ABGEN_RECORD_HASHES:-0}" = "1" ]; then
   for f in "$@"; do
     [ -f "$f" ] || { echo "recording: $f does not exist" >&2; exit 1; }

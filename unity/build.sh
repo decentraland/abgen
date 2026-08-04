@@ -36,20 +36,6 @@ src="$root/target/$target/release/$built"
 mkdir -p "$dest"
 cp "$src" "$dest/"
 
-# abgen.dll links draco's C++ and so imports the MinGW runtime; without these
-# beside it Unity fails to load the plugin at all, with nothing naming the
-# cause. The release archive ships them, so a local build must too.
-if [[ "$target" == *-pc-windows-gnu ]]; then
-    for dll in libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
-        runtime=$(x86_64-w64-mingw32-g++-posix -print-file-name="$dll" 2>/dev/null || true)
-        if [ -n "$runtime" ] && [ -f "$runtime" ]; then
-            cp "$runtime" "$dest/"
-        else
-            echo "warning: $dll not found; the plugin will not load without it" >&2
-        fi
-    done
-fi
-
 if [[ "$target" == *-apple-darwin ]]; then
     codesign -f -s - "$dest/$built"
 fi
@@ -67,3 +53,16 @@ Linux)  if command -v ldd >/dev/null; then
             echo "link check: $(ldd "$dest/$built" | wc -l) shared dependencies"
         fi ;;
 esac
+
+# Windows resolves a DLL's imports through the standard search order, never the
+# directory the DLL sits in, so a MinGW runtime import cannot be satisfied by
+# shipping the runtime beside the plugin. It has to not be an import at all.
+if [[ "$target" == *-pc-windows-gnu ]] && command -v x86_64-w64-mingw32-objdump >/dev/null; then
+    if x86_64-w64-mingw32-objdump -p "$dest/$built" \
+        | sed -n 's/^\tDLL Name: //p' \
+        | grep -qiE '^(libstdc\+\+-6|libgcc_s_seh-1|libwinpthread-1)\.dll$'; then
+        echo "link check: FAILED - imports the MinGW runtime, Unity will not load it" >&2
+        exit 1
+    fi
+    echo "link check: self-contained (system DLLs only)"
+fi

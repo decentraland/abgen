@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
-# Assembles a local platform npm package (@dcl/abgen-<platform>) from the release build,
-# for consuming @dcl/abgen via file: links during development (e.g. from creator-hub).
-#
-#   scripts/npm-local-package.sh
-#
-# Output: npm/local/abgen-<os>-<arch>/ with the binary next to template/ + shader/,
-# the layout the exe-dir asset fallback expects (same as npm/publish.sh).
+# Assembles a local @dcl/abgen-<platform> npm package from the release build, for
+# `file:` links during development (e.g. creator-hub).
+# Output layout must match npm/publish.sh's exe-dir asset fallback expectations.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

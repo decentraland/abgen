@@ -33,21 +33,15 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  # Aims at the 156 unsafe sites — the CUDA bindings, the FFI surface, and the
-  # hand-vectorized BC7 kernels — by running the existing suite with the memory
-  # model actually checked. It only sees inputs the tests already carry, which
-  # is the limitation to remember when reading a green run.
-  #
-  # miri is not an option here and will not become one: it cannot execute the
-  # C and C++ dependencies (draco, libjpeg, crunch), so it would refuse before
-  # reaching any of the code worth checking.
+  # Runs the existing test suite under ASan to check the unsafe FFI/CUDA/SIMD
+  # code; only sees inputs the tests already exercise. miri is not an
+  # alternative: it can't execute the C/C++ deps (draco, libjpeg, crunch).
   sanitizers:
     name: address sanitizer
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    # Measured at 21m (17.7m of it one suite). The default is six hours, and a
-    # nightly job that wedges on the CUDA or SIMD paths would burn all of it
-    # unattended, repeatedly.
+    # Bounds a nightly job that could otherwise wedge on the CUDA or SIMD
+    # paths and burn the default six-hour timeout unattended.
     timeout-minutes: 90
     env:
       # -D warnings from the top-level env would fail the build on lints the
@@ -133,11 +127,10 @@ jobs:
           toolchain: "1.97.0"
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # Built through napi, not cargo, so index.js/index.d.ts are regenerated
-      # and can be compared against what is committed. Those two are generated
-      # files that are also the package's entry point, so a #[napi] export
-      # added without regenerating them compiles into the binary and is
-      # unreachable from JavaScript — which is exactly how setMaxThreads
-      # shipped missing in 0.15.1 and 0.15.2.
+      # and diffed against what's committed. Those files are also the
+      # package's entry point, so a #[napi] export added without
+      # regenerating them compiles into the binary but stays unreachable
+      # from JavaScript.
       - name: abgen-node (build + smoke)
         working-directory: crate/abgen-node
         run: |

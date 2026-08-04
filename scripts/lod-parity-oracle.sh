@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Manual parity oracle between the npm scene-lod-entities-manifest-builder and
-# the embedded scene runtime; replaces the deleted in-tree npm spawn. Operator
-# local only, never CI. Before flipping any live JIT deployment, run this over
-# a wider batch of ISS-404 scenes — the two committed goldens are not a corpus.
+# the embedded scene runtime. Operator-run only, never CI. Before flipping any
+# live JIT deployment, run this over a wider batch of ISS-404 scenes — the two
+# committed goldens are not a corpus.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

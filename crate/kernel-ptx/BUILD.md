@@ -47,11 +47,9 @@ the exit code, never grep for PASS.
   byte-identity because `compress_group` couples lanes.
 - `Params`/`EndpointErr`/`OptTables` are `#[repr(C)]` (host->device raw-byte
   boundary); keep them repr(C).
-- crate/module renamed from the retired abgpugen name; PTX
-  regenerated (internal mangled symbols only; the eight `.visible .entry`
-  names are unchanged) and re-verified with gpu diff at the four recorded
-  seed/size combos; the harness then moved from a dedicated bin into
-  `abgen-verify gpu <diff|bench|corpus>`.
+- Internal PTX symbol names are Rust name-mangled and can change between
+  rebuilds; only the eight `.visible .entry` names below are the stable,
+  host-resolved contract.
 
 ## Contract
 

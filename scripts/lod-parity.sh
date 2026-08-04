@@ -40,9 +40,7 @@ DEFAULT_GLB="https://lod-unity-bucket-dev-0871c25.s3.us-east-1.amazonaws.com/lod
 ABC_REPO="${ABC_REPO:-$REPO/../asset-bundle-converter}"
 DEFAULT_UNITY="/Applications/Unity/Hub/Editor/6000.2.6f2/Unity.app/Contents/MacOS/Unity"
 UNITY_PATH="${UNITY_PATH:-$DEFAULT_UNITY}"
-# A stale/typo'd UNITY_PATH in the shell profile is common enough that
-# convert-lods.sh warns about it — fall back to the Hub default if the env
-# value doesn't point at an executable but the default does.
+# Fall back to the Hub default when UNITY_PATH is a stale/typo'd env value that isn't executable.
 if [ ! -x "$UNITY_PATH" ] && [ -x "$DEFAULT_UNITY" ]; then
   echo "WARN: UNITY_PATH=$UNITY_PATH is not executable; using $DEFAULT_UNITY" >&2
   UNITY_PATH="$DEFAULT_UNITY"
@@ -121,8 +119,7 @@ if [ -z "$UNITY_OUT" ]; then
   [ -x "$UNITY_PATH" ] || { echo "no Unity binary at $UNITY_PATH (--unity?)" >&2; exit 2; }
   mkdir -p "$UNITY_OUT"
 
-  # Same clean-state step as convert-lods.sh: stale .meta files from a prior
-  # run on a different importer chain break the first import.
+  # Must run before import: stale .meta files from a prior run on a different importer chain break the first import.
   rm -rf "$PROJECT_PATH/Assets/_DownloadedGLBs" "$PROJECT_PATH/Assets/_DownloadedGLBs.meta"
 
   LODS_ARG="$(IFS=';'; echo "${UNITY_URLS[*]}")"
@@ -197,9 +194,8 @@ if [ "$BUILD_SITE" = 1 ]; then
   RUN_ID="lod-parity-$(date +%Y%m%d-%H%M%S)"
   echo
   echo "== lodsite run dir ($RUN_ID)"
-  # ABGEN_LOD_REGISTRY_URL='': the v49 era gate consults the production
-  # registry, which knows nothing about these locally-built pairs — both
-  # sides here come from the current converter by construction.
+  # ABGEN_LOD_REGISTRY_URL must stay empty: the registry gate checks against
+  # production, which knows nothing about these locally-built pairs.
   ABGEN_LOD_PROD_BASE="file://$PROD_FLAT/" \
   ABGEN_LOD_CONTENT_URL="$CONTENT_URL/contents/" \
   ABGEN_LOD_REGISTRY_URL="" \
