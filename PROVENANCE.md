@@ -17,8 +17,9 @@ The Linux binaries are built by **Nix from the committed `flake.lock`** — a he
 derivation anyone can reproduce locally with `nix build`, which is a stronger guarantee than
 re-running the same build in CI; the archives bundle the loader and libraries behind the `abgen`
 entry script, so they run on any Linux with no host requirements. The Windows and macOS binaries
-are built with a pinned Rust toolchain, `--locked` against the committed `Cargo.lock`, and
-`SOURCE_DATE_EPOCH` from the tagged commit.
+are built with a pinned Rust toolchain, `--locked` against the committed `Cargo.lock`, and a fixed
+`SOURCE_DATE_EPOCH` — a constant, not the commit date, so the same source yields the same bytes at
+any tag.
 
 ## Vendored shader bundles
 

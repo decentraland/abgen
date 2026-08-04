@@ -6,15 +6,15 @@ your platform through an `optionalDependency`:
 
 | Platform | Package |
 |---|---|
-| Linux x64 (glibc >= 2.35) | `@dcl/abgen-linux-x64` |
-| Linux arm64 (glibc >= 2.35) | `@dcl/abgen-linux-arm64` |
+| Linux x64 (glibc >= 2.34) | `@dcl/abgen-linux-x64` |
+| Linux arm64 (glibc >= 2.34) | `@dcl/abgen-linux-arm64` |
 | Windows x64 | `@dcl/abgen-win32-x64` |
 | Windows arm64 | `@dcl/abgen-win32-arm64` |
 | macOS arm64 (Apple Silicon) | `@dcl/abgen-darwin-arm64` |
 | macOS x64 (Intel) | `@dcl/abgen-darwin-x64` |
 
-Each platform package carries the binary plus the `template/` and `shader/` runtime assets it
-resolves from its own directory - no configuration needed. The binaries are the same reproducible
+Each platform package carries just the binary: the `template/` and `shader/` runtime assets are
+compiled into it, so there is no configuration and nothing to place beside it. The binaries are the same reproducible
 artifacts attached to the GitHub release of the matching tag.
 
 ## Run the server

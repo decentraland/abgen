@@ -213,7 +213,8 @@ unprivileged user on `:5147` with `template/` and `shader/` baked in and `ABGEN_
 preset. The [`.github/workflows/image.yml`](.github/workflows/image.yml) workflow builds that image and
 pushes it to `ghcr.io/decentraland/abgen:<tag>` (and `:latest`) on every `v*` tag. The org
 services-pipeline that publishes the same service to quay (service-name `abgen`) is configured
-externally in the private `decentraland/definitions` repo, not in this tree.
+externally in the private `decentraland/definitions` repo, not in this tree. Cutting a release -
+tagging, what the pipeline does, and what to check afterwards: [DEVELOPMENT.md](DEVELOPMENT.md).
 
 Parity posture and clean-room provenance are documented separately: [PARITY.md](PARITY.md) and
 [PROVENANCE.md](PROVENANCE.md).
