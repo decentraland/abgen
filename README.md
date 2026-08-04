@@ -222,8 +222,7 @@ surface ship as the shared `crate/dcl-contents` crate (feature `content-db`), co
 the internal tree. Mechanical differences from the internal source: signed/denylist/queue registry
 routes deleted; the server bin is `abgen` and the local build CLI is `abgen-build`.
 ## License
-Dual-licensed: **Apache-2.0 OR AGPL-3.0-or-later**, at your option. Take either one; you do not
-have to satisfy both. Full texts in [LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-AGPL](LICENSE-AGPL).
-Contributions are accepted under the same dual terms. Vendored third-party licenses and
+**Apache-2.0** - full text in [LICENSE](LICENSE). Contributions are accepted under the same
+terms. Vendored third-party licenses and
 shader/template bundle provenance: [PROVENANCE.md](PROVENANCE.md). Note: the lib sets
 `#[global_allocator] mimalloc`; any downstream embedding the lib inherits it.

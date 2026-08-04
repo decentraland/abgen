@@ -3,7 +3,7 @@ name = "abgen-node"
 version = "0.15.4"
 edition = "2021"
 description = "Node native module (napi-rs) exposing abgen's conversion pipeline in-process."
-license = "Apache-2.0 OR AGPL-3.0-or-later"
+license = "Apache-2.0"
 publish = false
 
 # Excluded from the root workspace, like abgen-wasm: this crate links against

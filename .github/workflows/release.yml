@@ -413,8 +413,7 @@ jobs:
           # where it used to fall through. Proven on real Windows: abgen.exe
           # converted a live wearable with no template/ present anywhere and
           # no ABGEN_ROOT set.
-          # Both halves of the dual license, since either may be relied on.
-          cp LICENSE-APACHE LICENSE-AGPL README.md "$dist/"
+          cp LICENSE README.md "$dist/"
 
           if [ "${{ matrix.builder }}" = "nix" ]; then
             mkdir -p "$dist/bin" "$dist/lib"
@@ -476,7 +475,7 @@ jobs:
           nat="abgen-native-${GITHUB_REF_NAME:-dev}-${{ matrix.target }}"
           mkdir -p "$nat/lib" "$nat/include"
           cp crate/abgen-native/include/abgen.h "$nat/include/"
-          cp LICENSE-APACHE LICENSE-AGPL "$nat/"
+          cp LICENSE "$nat/"
           cp unity/README.md "$nat/README.md"
           # No libabgen.a: it is 143 MB and would be ~35 MB of every asset for
           # a need `cargo build -p abgen-native` already covers.

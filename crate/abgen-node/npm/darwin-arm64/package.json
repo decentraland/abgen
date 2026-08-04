@@ -12,7 +12,7 @@
     "abgen-node.darwin-arm64.node"
   ],
   "description": "Decentraland asset-bundle conversion in-process for Node (Rust + napi-rs) — the same abgen core the server and the Unity plugin run",
-  "license": "Apache-2.0 OR AGPL-3.0-or-later",
+  "license": "Apache-2.0",
   "engines": {
     "node": ">= 18"
   },

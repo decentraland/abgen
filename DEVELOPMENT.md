@@ -176,8 +176,7 @@ gate-passed output is promoted into the serving root, so rejected bundles are ne
 - compat: `ABGEN_V38_COMPAT`, `ABGEN_V38_TIMESTAMP`, `ABGEN_COLLECTION_MODE`, `ABGEN_REAL_TEXTURES`, `ABGEN_MAGENTA_MISSING`, `ABGEN_JPEG_TURBO_BOX`, `ABGEN_JPEG_GLB_9C`, `ABGEN_FAST_SERVE` (`live.rs::Proxy::new` sets some process-wide; not thread-safe before the first build)
 - debug/dev: `ABGEN_BC7_CACHE`, `ABGEN_BC7_SCALAR`, `ABGEN_BC7_NO512`, `ABGEN_BC7_CAPTURE`, `ABGEN_LZ4_DUMP`, `ABGEN_TEST_CRN_OURS`/`_REF`/`_DUMP`
 ## License
-Apache-2.0 OR AGPL-3.0-or-later, at your option - full texts in [LICENSE-APACHE](LICENSE-APACHE)
-and [LICENSE-AGPL](LICENSE-AGPL). Vendored third-party: crunch =
+Apache-2.0 - full text in [LICENSE](LICENSE). Vendored third-party: crunch =
 Zlib, draco_decoder = MIT/Apache-2.0, libjpeg9c = IJG. Shader/template bundles are generated
 Decentraland content artifacts (sha256-pinned; regenerable via `scripts/bootstrap-runtime.sh`). Note:
 the lib sets `#[global_allocator] mimalloc`; any downstream embedding the lib inherits it.
