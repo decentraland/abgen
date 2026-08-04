@@ -9,6 +9,14 @@ on:
         description: "Record artifact hashes instead of verifying them"
         type: boolean
         default: false
+      targets:
+        description: "Comma-separated target triples to build (empty = all). Iterating on one lane should not build six."
+        type: string
+        default: ""
+      skip_napi:
+        description: "Skip the @dcl/abgen-node matrix"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -27,6 +35,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       value: ${{ steps.eval.outputs.value }}
+      matrix: ${{ steps.matrix.outputs.value }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
@@ -50,6 +59,45 @@ jobs:
           echo "ABGEN_BUILD_ID=$value"
           echo "value=$value" >> "$GITHUB_OUTPUT"
 
+      # The full matrix is what a tag builds, always. `targets` only narrows a
+      # manual dispatch, so iterating on one lane costs one lane instead of six
+      # — it cannot narrow a tag, because a tag has no inputs.
+      - name: select targets
+        id: matrix
+        env:
+          WANT: ${{ inputs.targets }}
+          RECORDING: ${{ inputs.record_hashes }}
+        run: |
+          set -eu
+          # buildId is global: any source change moves every target's artifacts.
+          # Recording a filtered subset would leave the unbuilt targets' hashes
+          # describing a tree that no longer exists, and the next tag would fail
+          # the gate on them. Narrowing is for iteration, not for recording.
+          if [ -n "${WANT:-}" ] && [ "${RECORDING:-false}" = "true" ]; then
+            echo "record_hashes needs the full matrix; drop 'targets'" >&2
+            exit 1
+          fi
+          all='[
+            {"target":"x86_64-unknown-linux-gnu","runner":"ubuntu-24.04","builder":"nix"},
+            {"target":"aarch64-unknown-linux-gnu","runner":"ubuntu-24.04-arm","builder":"nix"},
+            {"target":"x86_64-pc-windows-gnu","runner":"ubuntu-24.04","builder":"rustup","bin":"abgen.exe"},
+            {"target":"aarch64-pc-windows-gnullvm","runner":"ubuntu-24.04","builder":"rustup","bin":"abgen.exe"},
+            {"target":"aarch64-apple-darwin","runner":"macos-15","builder":"rustup","bin":"abgen"},
+            {"target":"x86_64-apple-darwin","runner":"macos-15-intel","builder":"rustup","bin":"abgen"}
+          ]'
+          if [ -z "${WANT:-}" ]; then
+            out=$(echo "$all" | jq -c '{include: .}')
+          else
+            out=$(echo "$all" | jq -c --arg w "$WANT" \
+              '($w | split(",") | map(gsub("^\\s+|\\s+$";""))) as $want
+               | map(select(.target as $t | $want | index($t))) as $sel
+               | if ($sel | length) == 0
+                 then error("no target matched: \($w)")
+                 else {include: $sel} end')
+          fi
+          echo "$out" | jq .
+          echo "value=$out" >> "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.target }}
     needs: build-id
@@ -58,30 +106,7 @@ jobs:
       ABGEN_BUILD_ID: ${{ needs.build-id.outputs.value }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
-            builder: nix
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            builder: nix
-          - target: x86_64-pc-windows-gnu
-            runner: ubuntu-24.04
-            builder: rustup
-            bin: abgen.exe
-          - target: aarch64-pc-windows-gnullvm
-            runner: ubuntu-24.04
-            builder: rustup
-            bin: abgen.exe
-          - target: aarch64-apple-darwin
-            runner: macos-15
-            builder: rustup
-            bin: abgen
-          - target: x86_64-apple-darwin
-            runner: macos-15-intel
-            builder: rustup
-            bin: abgen
+      matrix: ${{ fromJSON(needs.build-id.outputs.matrix) }}
 
     steps:
       - if: matrix.builder == 'nix'
@@ -146,6 +171,39 @@ jobs:
           if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends g++-mingw-w64-x86-64-posix cmake
+
+            # A search directory holding ONLY libstdc++.a, so `-lstdc++` cannot
+            # resolve to an import library.
+            #
+            # Three build scripts emit `cargo:rustc-link-lib=stdc++` dylib-kind
+            # — link-cplusplus (via cxx via draco), meshopt, and crunch — and
+            # rustc renders that as `-Wl,-Bdynamic -lstdc++` at argv slot ~15,
+            # about fifty slots before any -C link-arg can reach. So nothing
+            # positional retracts it: -Bstatic wrapping lands at slot ~63,
+            # -static-libstdc++ exists only in the g++ driver and we link with
+            # gcc, and -static sets ld's initial mode which slot-14's
+            # -Wl,-Bdynamic then overrides. meshopt is worse still: it hardcodes
+            # .cpp_link_stdlib("stdc++"), so no CXXSTDLIB value can silence it.
+            #
+            # -L is the one lever that is not positional: "All -L options apply
+            # to all -l options, regardless of the order in which the options
+            # appear." ld searches directories in order and, within a directory,
+            # tries libstdc++.dll.a before libstdc++.a — so a directory
+            # containing only the archive forces the archive, for every emitter,
+            # including ones added later. Same trick as the aarch64-gnullvm lane
+            # below, which deletes libc++.dll.a for the same reason.
+            STDCXX_A="$(x86_64-w64-mingw32-g++-posix -print-file-name=libstdc++.a)"
+            case "$STDCXX_A" in
+              /*) ;;
+              *) echo "libstdc++.a unresolved: $STDCXX_A" >&2; exit 1 ;;
+            esac
+            # Its bytes end up inside abgen.dll, so it is a pinned build input:
+            # record the digest alongside the artifact hashes.
+            sha256sum "$STDCXX_A"
+            sudo mkdir -p /opt/mingw-static-cxx
+            sudo cp "$STDCXX_A" /opt/mingw-static-cxx/libstdc++.a
+            ls -1 /opt/mingw-static-cxx
+
             cat > /tmp/mingw-toolchain.cmake <<'EOF'
           set(CMAKE_SYSTEM_NAME Windows)
           set(CMAKE_SYSTEM_PROCESSOR x86_64)
@@ -196,6 +254,16 @@ jobs:
           rustflags="--remap-path-prefix $PWD=/build --remap-path-prefix $HOME=/home"
           if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
             rustflags="$rustflags -C link-arg=-Wl,--no-insert-timestamp"
+            # Self-contained abgen.dll: no MinGW runtime in the import table.
+            # +crt-static swaps the dynamic late-link args (-lgcc_s) for the
+            # static ones (-lgcc_eh -l:libpthread.a), which is what removes
+            # libgcc_s_seh-1 and libwinpthread-1; -static-libgcc is honoured by
+            # the gcc driver (unlike -static-libstdc++, which is g++-only and a
+            # no-op here); and the -L above is what forces libstdc++ to resolve
+            # to the archive. See the shadow-directory comment for why nothing
+            # positional can do that job.
+            rustflags="$rustflags -C target-feature=+crt-static -C link-arg=-static-libgcc"
+            rustflags="$rustflags -L native=/opt/mingw-static-cxx"
             # The one thing that made this lane nondeterministic. rustc builds
             # the raw-dylib import libraries by shelling out to dlltool, into a
             # per-invocation temp dir (deps/rustc<6 random chars>/), and
@@ -275,65 +343,25 @@ jobs:
             cargo build --release --locked --target ${{ matrix.target }} -p abgen-native
           fi
 
-      - name: second build (record_hashes only)
-        if: ${{ inputs.record_hashes }}
+      # An embedder cannot satisfy a MinGW runtime import by shipping the DLLs
+      # beside the library: Windows resolves a DLL's own imports through the
+      # standard search order, never the directory it sits in. So this is a
+      # gate, not a report. It also catches a new C++ dependency quietly
+      # reintroducing the import — three build scripts already emit -lstdc++,
+      # and a fourth would otherwise go unnoticed.
+      - name: windows self-containment
+        if: matrix.target == 'x86_64-pc-windows-gnu'
         run: |
           set -eu
-          confirm="$RUNNER_TEMP/confirm"
-          rm -rf "$confirm"
-          mkdir -p "$confirm"
-
-          # The rebuild MUST use the same target directory as the first build.
-          # An earlier version built into $RUNNER_TEMP and remapped the path
-          # back; it reported every artifact nondeterministic (run 30621302143)
-          # for a reason no remap can reach: cc-rs hashes the absolute OUT_DIR
-          # into libabgen.a member NAMES, which is a filename it computes in
-          # Rust, not a path the compiler embeds, so -ffile-prefix-map has no
-          # effect on it. On Windows it is worse, because COFF symbol tables
-          # carry object-file names and all four artifacts move.
-          #
-          # What we are testing is determinism at a fixed path — same commit,
-          # same directory, built twice. Varying the path tests something else
-          # and answers a question we already have measured: the shipped three
-          # are path-independent, libabgen.a is not, and it is not shipped.
-          #
-          # Emptying target/ is what makes this an independent build rather
-          # than a cache read.
-          first="target/${{ matrix.target }}/release"
-          for f in "$first"/*; do
-            [ -f "$f" ] || continue
-            case "$(basename "$f")" in
-              abgen|abgen.exe|libabgen.so|libabgen.dylib|abgen.dll|libabgen.a|abgen-host|abgen-host.exe)
-                cp "$f" "$confirm/" ;;
-            esac
-          done
-
-          out="target/${{ matrix.target }}/release"
-          if [ "${{ matrix.builder }}" = "nix" ]; then
-            flags=(--extra-experimental-features nix-command
-                   --extra-experimental-features flakes)
-            # nix does the determinism check itself: --rebuild re-runs the
-            # derivation and fails if any byte of the output differs from the
-            # store path already built. That covers all four artifacts, so the
-            # confirm-dir comparison below is a formality on this lane and
-            # `--rebuild` is the step that can actually fail.
-            nix build .#abgen-native --rebuild --print-build-logs "${flags[@]}"
-            rm -rf target && mkdir -p "$out"
-            install -m755 result/bin/abgen "$out/abgen"
-            install -m755 result/bin/abgen-host "$out/abgen-host"
-            install -m644 result/lib/libabgen.so "$out/libabgen.so"
-            install -m644 result/lib/libabgen.a "$out/libabgen.a"
-          else
-            rm -rf target
-            cargo build --release --locked --target ${{ matrix.target }} --bin abgen
-            cargo build --release --locked --target ${{ matrix.target }} -p abgen-native
+          imports=$(x86_64-w64-mingw32-objdump -p \
+            "target/${{ matrix.target }}/release/abgen.dll" \
+            | sed -n 's/^\tDLL Name: //p' | sort -u)
+          echo "abgen.dll imports:"; echo "$imports" | sed 's/^/  /'
+          if echo "$imports" | grep -qiE '^(libstdc\+\+-6|libgcc_s_seh-1|libwinpthread-1)\.dll$'; then
+            echo "abgen.dll imports the MinGW runtime; it is not self-contained" >&2
+            exit 1
           fi
-
-          # $confirm now holds build 1, target/ holds build 2 at the same path.
-          # verify-artifact-hashes.sh compares them and refuses to record on
-          # any disagreement.
-          ls -l "$confirm"
-          echo "ABGEN_CONFIRM_DIR=$confirm" >> "$GITHUB_ENV"
+          echo "abgen.dll is self-contained"
 
       - name: verify artifact hashes
         env:
@@ -381,7 +409,8 @@ jobs:
           # where it used to fall through. Proven on real Windows: abgen.exe
           # converted a live wearable with no template/ present anywhere and
           # no ABGEN_ROOT set.
-          cp LICENSE README.md "$dist/"
+          # Both halves of the dual license, since either may be relied on.
+          cp LICENSE-APACHE LICENSE-AGPL README.md "$dist/"
 
           if [ "${{ matrix.builder }}" = "nix" ]; then
             mkdir -p "$dist/bin" "$dist/lib"
@@ -448,7 +477,7 @@ jobs:
           nat="abgen-native-${GITHUB_REF_NAME:-dev}-${{ matrix.target }}"
           mkdir -p "$nat/lib" "$nat/include"
           cp crate/abgen-native/include/abgen.h "$nat/include/"
-          cp LICENSE "$nat/"
+          cp LICENSE-APACHE LICENSE-AGPL "$nat/"
           cp unity/README.md "$nat/README.md"
           # No libabgen.a: it is 143 MB and would be ~35 MB of every asset for
           # a need `cargo build -p abgen-native` already covers.
@@ -456,6 +485,15 @@ jobs:
             src="target/${{ matrix.target }}/release/$f"
             [ -f "$src" ] && cp "$src" "$nat/lib/"
           done
+          # abgen.dll links draco's C++, so it imports the MinGW runtime and is
+          # NOT self-contained: loading it in a host that lacks those DLLs fails
+          # at LoadLibrary with nothing naming the cause. The CLI archive already
+          # ships them next to the exe; an embedder needs them just as much.
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
+            for dll in libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
+              cp "$(x86_64-w64-mingw32-g++-posix -print-file-name=$dll)" "$nat/lib/"
+            done
+          fi
           test -n "$(ls -A "$nat/lib")" || { echo "no native library built" >&2; exit 1; }
 
           # Unlike abgen-host below, a library dlopen'd into Unity runs on the
@@ -582,6 +620,7 @@ jobs:
             fi
           fi
 
+
           case "$GITHUB_REF" in refs/tags/v*) ;; *) exit 0 ;; esac
           # Created as a DRAFT and published only once every asset is in
           # place, because immutable releases freeze assets at publication:
@@ -596,9 +635,24 @@ jobs:
             "$dist.tar.gz" "$dist.tar.gz.sha256" \
             "$nat.tar.gz" "$nat.tar.gz.sha256"
 
+      # Without this the archives exist only on a tagged release, so nothing
+      # can be tried before the tag is cut — which is how two release-blocking
+      # bugs reached a tag this week. Uploading per build makes a branch
+      # testable on a real machine before anything is published.
+      - name: upload archives for testing
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: archives-${{ matrix.target }}
+          path: |
+            abgen-*.tar.gz
+            abgen-native-*.tar.gz
+          if-no-files-found: ignore
+
   napi:
     name: abgen-node ${{ matrix.target }}
     needs: build-id
+    if: ${{ !inputs.skip_napi }}
     runs-on: ${{ matrix.runner }}
     env:
       ABGEN_BUILD_ID: ${{ needs.build-id.outputs.value }}

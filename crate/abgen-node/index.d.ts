@@ -53,6 +53,12 @@ export interface AbgenConvertResult {
 }
 export declare function version(): string
 /**
+ * Overrides the pool size. Process-wide, effective once, and only before the
+ * first [`convert`] — after that the default is already installed and this
+ * returns false rather than pretending to have applied.
+ */
+export declare function setMaxThreads(threads: number): boolean
+/**
  * Converts one entity on the blocking pool, not the libuv event loop:
  * conversion is CPU-bound for seconds at a time.
  *

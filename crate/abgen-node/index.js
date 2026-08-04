@@ -310,7 +310,8 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { version, convert } = nativeBinding
+const { version, setMaxThreads, convert } = nativeBinding
 
 module.exports.version = version
+module.exports.setMaxThreads = setMaxThreads
 module.exports.convert = convert

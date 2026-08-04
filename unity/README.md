@@ -15,7 +15,7 @@ unity/
   Packages/org.decentraland.abgen/
     package.json                        UPM manifest
     Runtime/
-      Abgen.asmdef
+      Decentraland.Abgen.asmdef
       NativeMethods.cs                  raw DllImports
       AbgenRequest.cs                   request-blob builder
       AbgenConverter.cs                 in-process API
@@ -27,6 +27,17 @@ unity/
 ```
 
 The `abgen-host` helper ships beside the library in the same release archive.
+
+On Windows the `Plugins/Windows/x86_64/` directory needs the MinGW runtime
+beside `abgen.dll` — `libstdc++-6.dll`, `libgcc_s_seh-1.dll` and
+`libwinpthread-1.dll`. The library links draco's C++, so it imports them; a
+host without them fails at `LoadLibrary` with nothing naming the cause. The
+`abgen-native-*-x86_64-pc-windows-gnu` archive ships all four in `lib/`.
+
+The managed assembly is `Decentraland.Abgen`, not `Abgen`, because
+`DllImport("abgen")` resolves `abgen.dll` and Windows filenames are
+case-insensitive: an `Abgen.dll` next to the native library is the same name,
+and the runtime can bind the managed assembly instead of the native one.
 
 ## Platform floor
 

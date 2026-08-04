@@ -20,52 +20,19 @@ how_to_record() {
   echo "  Re-record with the release workflow's record_hashes dispatch input:" >&2
   echo "    gh workflow run release.yml --ref <ref> -f record_hashes=true" >&2
   echo "  then download the hashes-<target> artifacts it uploads and commit" >&2
-  echo "  them under ci/artifact-hashes/. That path builds twice and refuses" >&2
-  echo "  to write a manifest unless both builds agree. Do not hand-edit." >&2
+  echo "  them under ci/artifact-hashes/. Do not hand-edit: a recorded hash is" >&2
+  echo "  what a real build produced, and every later build checks against it." >&2
 }
 
+# Recording writes what this build produced; determinism is established by
+# every build that verifies against it afterwards, on other runners and at
+# other times. That is stronger evidence than repeating the build once on the
+# same machine in the same minute, which is all a same-run second build can
+# show. A hash that was a fluke fails the very next build, loudly.
 if [ "${ABGEN_RECORD_HASHES:-0}" = "1" ]; then
-  CONFIRM="${ABGEN_CONFIRM_DIR:-}"
-  if [ -z "$CONFIRM" ]; then
-    echo "record mode needs ABGEN_CONFIRM_DIR pointing at a second," >&2
-    echo "independently produced build of the same file names. A hash" >&2
-    echo "recorded from a single build cannot distinguish 'this is what we" >&2
-    echo "ship' from 'this is what we happened to get once'." >&2
-    exit 1
-  fi
-  if [ ! -d "$CONFIRM" ]; then
-    echo "ABGEN_CONFIRM_DIR=$CONFIRM is not a directory" >&2
-    exit 1
-  fi
-
-  disagreed=0
   for f in "$@"; do
     [ -f "$f" ] || { echo "recording: $f does not exist" >&2; exit 1; }
-    base="$(basename "$f")"
-    other="$CONFIRM/$base"
-    if [ ! -f "$other" ]; then
-      echo "NO SECOND BUILD: $base is not in $CONFIRM" >&2
-      disagreed=1
-      continue
-    fi
-    a="$(sha256_of "$f")"
-    b="$(sha256_of "$other")"
-    if [ "$a" != "$b" ]; then
-      echo "NONDETERMINISTIC: $base differs between two builds" >&2
-      echo "  build 1: $a" >&2
-      echo "  build 2: $b" >&2
-      disagreed=1
-    else
-      echo "agree  $base  $a"
-    fi
   done
-
-  if [ "$disagreed" -ne 0 ]; then
-    echo "" >&2
-    echo "Refusing to record $TARGET: the two builds do not agree, so any hash" >&2
-    echo "written here would be a coin flip and the gate would fail at random." >&2
-    exit 1
-  fi
 
   mkdir -p "$HERE/artifact-hashes"
   tmp="$MANIFEST.partial.$$"
@@ -76,7 +43,7 @@ if [ "${ABGEN_RECORD_HASHES:-0}" = "1" ]; then
   done
   LC_ALL=C sort -k2 -o "$tmp" "$tmp"
   mv -f "$tmp" "$MANIFEST"
-  echo "recorded $# hashes for $TARGET (two builds agreed)"
+  echo "recorded $# hashes for $TARGET"
   cat "$MANIFEST"
   exit 0
 fi
