@@ -353,15 +353,19 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-gnu'
         run: |
           set -eu
-          imports=$(x86_64-w64-mingw32-objdump -p \
-            "target/${{ matrix.target }}/release/abgen.dll" \
-            | sed -n 's/^\tDLL Name: //p' | sort -u)
-          echo "abgen.dll imports:"; echo "$imports" | sed 's/^/  /'
-          if echo "$imports" | grep -qiE '^(libstdc\+\+-6|libgcc_s_seh-1|libwinpthread-1)\.dll$'; then
-            echo "abgen.dll imports the MinGW runtime; it is not self-contained" >&2
-            exit 1
-          fi
-          echo "abgen.dll is self-contained"
+          rc=0
+          for f in abgen.dll abgen.exe abgen-host.exe; do
+            imports=$(x86_64-w64-mingw32-objdump -p \
+              "target/${{ matrix.target }}/release/$f" \
+              | sed -n 's/^\tDLL Name: //p' | sort -u)
+            echo "$f imports:"; echo "$imports" | sed 's/^/  /'
+            if echo "$imports" | grep -qiE '^(libstdc\+\+-6|libgcc_s_seh-1|libwinpthread-1)\.dll$'; then
+              echo "$f imports the MinGW runtime; it is not self-contained" >&2
+              rc=1
+            fi
+          done
+          [ "$rc" -eq 0 ] || exit 1
+          echo "windows-gnu artifacts are self-contained"
 
       - name: verify artifact hashes
         env:
@@ -433,11 +437,6 @@ jobs:
             chmod 755 "$dist/abgen"
           else
             cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$dist/"
-            if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
-              for dll in libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
-                cp "$(x86_64-w64-mingw32-g++-posix -print-file-name=$dll)" "$dist/"
-              done
-            fi
           fi
 
           # The rev is not in the binaries any more, so it ships next to them.
@@ -485,15 +484,10 @@ jobs:
             src="target/${{ matrix.target }}/release/$f"
             [ -f "$src" ] && cp "$src" "$nat/lib/"
           done
-          # abgen.dll links draco's C++, so it imports the MinGW runtime and is
-          # NOT self-contained: loading it in a host that lacks those DLLs fails
-          # at LoadLibrary with nothing naming the cause. The CLI archive already
-          # ships them next to the exe; an embedder needs them just as much.
-          if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
-            for dll in libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
-              cp "$(x86_64-w64-mingw32-g++-posix -print-file-name=$dll)" "$nat/lib/"
-            done
-          fi
+          # No MinGW runtime beside it: the windows-gnu binaries link the C++
+          # runtime statically and import nothing but system DLLs, which the
+          # self-containment gate enforces. Shipping the DLLs anyway would
+          # document a dependency that no longer exists.
           test -n "$(ls -A "$nat/lib")" || { echo "no native library built" >&2; exit 1; }
 
           # Unlike abgen-host below, a library dlopen'd into Unity runs on the

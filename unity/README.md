@@ -28,11 +28,13 @@ unity/
 
 The `abgen-host` helper ships beside the library in the same release archive.
 
-On Windows the `Plugins/Windows/x86_64/` directory needs the MinGW runtime
-beside `abgen.dll` — `libstdc++-6.dll`, `libgcc_s_seh-1.dll` and
-`libwinpthread-1.dll`. The library links draco's C++, so it imports them; a
-host without them fails at `LoadLibrary` with nothing naming the cause. The
-`abgen-native-*-x86_64-pc-windows-gnu` archive ships all four in `lib/`.
+On Windows `abgen.dll` is self-contained: it links the MinGW C++ runtime
+statically and imports nothing but system DLLs, so it needs no
+`libstdc++-6.dll` or friends beside it. This matters for an embedder because
+Windows resolves a DLL's own imports through the standard search order rather
+than the directory the DLL sits in — a non-static build could not have been
+fixed by shipping the runtime alongside. A release-time gate fails the build
+if any of those imports comes back.
 
 The managed assembly is `Decentraland.Abgen`, not `Abgen`, because
 `DllImport("abgen")` resolves `abgen.dll` and Windows filenames are

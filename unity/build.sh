@@ -36,20 +36,6 @@ src="$root/target/$target/release/$built"
 mkdir -p "$dest"
 cp "$src" "$dest/"
 
-# abgen.dll links draco's C++ and so imports the MinGW runtime; without these
-# beside it Unity fails to load the plugin at all, with nothing naming the
-# cause. The release archive ships them, so a local build must too.
-if [[ "$target" == *-pc-windows-gnu ]]; then
-    for dll in libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
-        runtime=$(x86_64-w64-mingw32-g++-posix -print-file-name="$dll" 2>/dev/null || true)
-        if [ -n "$runtime" ] && [ -f "$runtime" ]; then
-            cp "$runtime" "$dest/"
-        else
-            echo "warning: $dll not found; the plugin will not load without it" >&2
-        fi
-    done
-fi
-
 if [[ "$target" == *-apple-darwin ]]; then
     codesign -f -s - "$dest/$built"
 fi
