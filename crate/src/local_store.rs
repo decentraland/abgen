@@ -21,6 +21,13 @@ impl LocalContentStore {
         Self { root: root.into() }
     }
 
+    /// Shards by the first two SHA-1 bytes of the cid; the filename is the cid itself,
+    /// collapsed by `fs_safe_component` when it cannot fit in NAME_MAX. Content ids are
+    /// unbounded input (the sdk-commands preview server derives them from absolute source
+    /// paths, and content-versioned ids append an mtime + machine-id tail), so the store
+    /// must stay valid for any id length. Reads and writes both resolve through here,
+    /// which keeps the collapse symmetric without a mapping file, and a collapsed name
+    /// can never collide with a verbatim one (verbatim names are short by definition).
     fn path_for(&self, cid: &str) -> PathBuf {
         use sha1::{Digest, Sha1};
         let digest = Sha1::digest(cid.as_bytes());
@@ -29,7 +36,9 @@ impl LocalContentStore {
             prefix.push(char::from_digit((b >> 4) as u32, 16).unwrap());
             prefix.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
         }
-        self.root.join(prefix).join(cid)
+        self.root
+            .join(prefix)
+            .join(&*crate::naming::fs_safe_component(cid))
     }
 
     pub fn fetch(&self, cid: &str) -> Result<Vec<u8>> {
@@ -60,7 +69,6 @@ impl LocalContentStore {
     }
 
     pub fn write(&self, cid: &str, bytes: &[u8]) -> Result<()> {
-        crate::naming::ensure_writable_component(cid).context("local content store")?;
         let path = self.path_for(cid);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
@@ -93,23 +101,34 @@ mod tests {
     }
 
     #[test]
-    fn write_refuses_oversized_cid_loudly() {
+    fn oversized_cid_is_collapsed_and_roundtrips() {
         let tmp = std::env::temp_dir().join(format!("abgen_store_guard_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let s = LocalContentStore::new(&tmp);
 
+        // Longer than any NAME_MAX: must be stored under a fixed-length collapsed name.
         let cid = format!("b64-{}", "Q".repeat(260));
-        let msg = format!("{:#}", s.write(&cid, b"x").unwrap_err());
-        assert!(
-            msg.contains("Refusing to write") && msg.contains(&cid),
-            "{msg}"
-        );
-        assert!(msg.contains("local content store"), "{msg}");
-        assert!(!tmp.exists(), "refusal must happen before any write");
+        s.write(&cid, b"payload").unwrap();
+        assert!(s.exists(&cid));
+        assert_eq!(s.fetch(&cid).unwrap(), b"payload");
 
+        let name = s.path_of(&cid);
+        let name = name.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("xn-"), "collapsed name, got {name}");
+        assert!(name.len() <= 46, "fixed-length name, got {} bytes", name.len());
+
+        // Distinct oversized cids must not share an entry.
+        let other = format!("b64-{}", "R".repeat(260));
+        assert_ne!(s.path_of(&cid), s.path_of(&other));
+
+        // Names within the limit keep production behavior: stored verbatim.
         let ok_cid = format!("b64-{}", "Q".repeat(196));
         s.write(&ok_cid, b"x").unwrap();
         assert!(s.exists(&ok_cid));
+        assert_eq!(
+            s.path_of(&ok_cid).file_name().unwrap().to_string_lossy(),
+            ok_cid
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
