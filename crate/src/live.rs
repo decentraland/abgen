@@ -46,6 +46,26 @@ fn is_convertible(file: &str) -> (bool, bool) {
     (is_glb, is_image)
 }
 
+/// File-level build workers per entity corpus build. Overridable via
+/// ABGEN_JIT_FILE_CONCURRENCY; the default is deliberately small — BC7 already
+/// spans every core, so workers only cover the single-threaded phases, and each
+/// in-flight file holds its decoded images in memory.
+fn corpus_file_jobs() -> usize {
+    static JOBS: OnceLock<usize> = OnceLock::new();
+    *JOBS.get_or_init(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        match std::env::var("ABGEN_JIT_FILE_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(n) if n > 0 => n,
+            _ => cores.min(4),
+        }
+    })
+}
+
 fn bounded_reserve<V>(map: &mut HashMap<String, V>, cap: usize, key: &str) {
     if map.len() >= cap && !map.contains_key(key) {
         if let Some(k) = map.keys().next().cloned() {
@@ -683,9 +703,7 @@ impl Proxy {
             .join(&*naming::fs_safe_component(cid))
             .join(platform);
         std::fs::create_dir_all(&pdir).with_context(|| format!("mkdir {}", pdir.display()))?;
-        let mut built: Vec<String> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
-        let mut tolerated: usize = 0;
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut collapsed_names: HashMap<String, String> = HashMap::new();
         let total = ctx
@@ -697,16 +715,29 @@ impl Proxy {
                 CONVERTIBLE_EXTS.iter().any(|e| lf.ends_with(e))
             })
             .count();
-        let mut processed: usize = 0;
         let _progress = ProgressGuard { proxy: self, cid };
+
+        // Pre-pass: resolve names, dedup, and skip space hits sequentially, so the
+        // parallel phase below is a pure per-file build list with no shared bookkeeping.
+        struct WorkItem {
+            order: usize,
+            file: String,
+            hash: String,
+            bundle_name: String,
+            bare_name: String,
+            is_image: bool,
+        }
+        let mut prebuilt: Vec<(usize, String)> = Vec::new();
+        let mut work: Vec<WorkItem> = Vec::new();
+        let mut order: usize = 0;
+        let mut done_pre: usize = 0;
         for c in &ctx.scene.content {
             let lf = c.file.to_lowercase();
             if !CONVERTIBLE_EXTS.iter().any(|e| lf.ends_with(e)) {
                 continue;
             }
-            self.progress_update(cid, processed, total, &c.file);
-            processed += 1;
-            let (is_glb, _) = is_convertible(&c.file);
+            order += 1;
+            let (is_glb, is_image) = is_convertible(&c.file);
             let case_hash = if platform == "mac" {
                 c.hash.to_lowercase()
             } else {
@@ -725,6 +756,7 @@ impl Proxy {
                             "no deps digest — glb omitted from manifest, exitCode will be non-zero"
                         );
                         failed.push(bare_name);
+                        done_pre += 1;
                         continue;
                     }
                 }
@@ -732,28 +764,60 @@ impl Proxy {
                 bare_name.clone()
             };
             if !seen.insert(bundle_name.clone()) {
+                done_pre += 1;
                 continue;
             }
             if self.space_probe_asset(&bundle_name) {
-                built.push(bundle_name);
+                prebuilt.push((order, bundle_name));
+                done_pre += 1;
                 continue;
             }
             let stored_name = naming::fs_safe_component(&bundle_name);
             if *stored_name != bundle_name {
                 collapsed_names.insert(stored_name.to_string(), c.hash.to_lowercase());
             }
+            work.push(WorkItem {
+                order,
+                file: c.file.clone(),
+                hash: c.hash.clone(),
+                bundle_name,
+                bare_name,
+                is_image,
+            });
+        }
+
+        // Parallel phase: N file-level workers. BC7 block encoding already spans every
+        // core via rayon's global pool during its bursts; these workers exist to overlap
+        // the single-threaded phases (fetch, GLB parse, BC5/DXT1, IO) of one file with
+        // another file's encode. Capped to bound peak decoded-image memory, not cores.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let jobs = corpus_file_jobs().min(work.len().max(1));
+        let built_m: Mutex<Vec<(usize, String)>> = Mutex::new(prebuilt);
+        let failed_m: Mutex<Vec<String>> = Mutex::new(failed);
+        let collapsed_m: Mutex<HashMap<String, String>> = Mutex::new(collapsed_names);
+        let tolerated_a = AtomicUsize::new(0);
+        let done = AtomicUsize::new(done_pre);
+        let next = AtomicUsize::new(0);
+        let hard_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+
+        let run_item = |it: &WorkItem| -> Result<()> {
+            self.progress_update(cid, done.load(Ordering::Relaxed), total, &it.file);
+            let stored_name = naming::fs_safe_component(&it.bundle_name);
             let dst = pdir.join(&*stored_name);
             let existed = dst.is_file();
-            match self.bundle(cid, &bundle_name) {
+            match self.bundle(cid, &it.bundle_name) {
                 Ok(bytes) => {
                     let tmp = crate::tmppath::tmp_sibling(&dst);
                     std::fs::write(&tmp, &bytes)
                         .with_context(|| format!("write {}", tmp.display()))?;
                     std::fs::rename(&tmp, &dst).ok();
-                    if bundle_name != bare_name {
-                        let stored_alias = naming::fs_safe_component(&bare_name);
-                        if *stored_alias != bare_name {
-                            collapsed_names.insert(stored_alias.to_string(), c.hash.to_lowercase());
+                    if it.bundle_name != it.bare_name {
+                        let stored_alias = naming::fs_safe_component(&it.bare_name);
+                        if *stored_alias != it.bare_name {
+                            collapsed_m
+                                .lock()
+                                .unwrap()
+                                .insert(stored_alias.to_string(), it.hash.to_lowercase());
                         }
                         let alias = pdir.join(&*stored_alias);
                         if !alias.exists() {
@@ -761,15 +825,17 @@ impl Proxy {
                         }
                     }
                     if !existed {
-                        self.space_put_bundle(cid, &bundle_name, &bytes);
+                        self.space_put_bundle(cid, &it.bundle_name, &bytes);
                     }
-                    built.push(bundle_name);
-                    let (_, is_image) = is_convertible(&c.file);
-                    if is_image {
-                        self.ensure_content(&c.hash).ok();
-                        if let Ok(raw) = self.content.fetch(&c.hash) {
+                    built_m
+                        .lock()
+                        .unwrap()
+                        .push((it.order, it.bundle_name.clone()));
+                    if it.is_image {
+                        self.ensure_content(&it.hash).ok();
+                        if let Ok(raw) = self.content.fetch(&it.hash) {
                             if !crate::builder::source_image_decodes(&raw) {
-                                tolerated += 1;
+                                tolerated_a.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -777,15 +843,55 @@ impl Proxy {
                 Err(e) => {
                     tracing::error!(
                         entity = %cid,
-                        bundle = %bundle_name,
-                        file = %c.file,
+                        bundle = %it.bundle_name,
+                        file = %it.file,
                         error = %format!("{e:#}"),
                         "jit build failed — omitted from manifest, exitCode will be non-zero"
                     );
-                    failed.push(bundle_name);
+                    failed_m.lock().unwrap().push(it.bundle_name.clone());
                 }
             }
+            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+            self.progress_update(cid, d, total, &it.file);
+            Ok(())
+        };
+
+        if jobs <= 1 {
+            for it in &work {
+                run_item(it)?;
+            }
+        } else {
+            std::thread::scope(|s| {
+                for _ in 0..jobs {
+                    s.spawn(|| loop {
+                        if hard_err.lock().unwrap().is_some() {
+                            break;
+                        }
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= work.len() {
+                            break;
+                        }
+                        if let Err(e) = run_item(&work[i]) {
+                            let mut g = hard_err.lock().unwrap();
+                            if g.is_none() {
+                                *g = Some(e);
+                            }
+                            break;
+                        }
+                    });
+                }
+            });
+            if let Some(e) = hard_err.into_inner().unwrap() {
+                return Err(e);
+            }
         }
+
+        let mut built_pairs = built_m.into_inner().unwrap();
+        built_pairs.sort_by_key(|p| p.0);
+        let built: Vec<String> = built_pairs.into_iter().map(|p| p.1).collect();
+        let failed = failed_m.into_inner().unwrap();
+        let tolerated = tolerated_a.load(Ordering::Relaxed);
+        let collapsed_names = collapsed_m.into_inner().unwrap();
         self.merge_names_index(cid, &collapsed_names);
         let manifest_path =
             crate::manifest::write_corpus_manifest(&crate::manifest::CorpusManifestSpec {
