@@ -32,7 +32,7 @@ pub(crate) fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
     base64_decode(&uri[comma + 1..])
 }
 
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     const fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),

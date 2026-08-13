@@ -19,7 +19,14 @@ pub(super) async fn revalidate_if_stale(state: &AppState, path: &str) {
     if state.revalidate_recent.get(&entity).await.is_some() {
         return;
     }
-    state.revalidate_recent.insert(entity.clone(), ()).await;
+    if !state
+        .revalidate_inflight
+        .lock()
+        .unwrap()
+        .insert(entity.clone())
+    {
+        return;
+    }
 
     let jit_root = state.jit_root.clone();
     let ent = entity.clone();
@@ -52,4 +59,6 @@ pub(super) async fn revalidate_if_stale(state: &AppState, path: &str) {
         }
         Err(e) => tracing::error!(error = %e, "revalidate worker panicked"),
     }
+    state.revalidate_recent.insert(entity.clone(), ()).await;
+    state.revalidate_inflight.lock().unwrap().remove(&entity);
 }

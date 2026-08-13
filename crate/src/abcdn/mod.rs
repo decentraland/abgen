@@ -292,7 +292,8 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
         tracing::info!(
             "JIT content revalidation ENABLED (ABGEN_JIT_CONTENT_DIGEST): manifest requests \
              re-download and digest entity content; stale conversions are pruned when bytes \
-             change under an unchanged declared hash"
+             change under an unchanged declared hash; content-versioned ids are trusted \
+             from the id alone"
         );
     }
     if let Some(upstream) = &cfg.upstream_ab_cdn {
