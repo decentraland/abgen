@@ -125,11 +125,14 @@ impl DirSink {
             // extension: CON.bundle is still the console.
             let stem = name.split('.').next().unwrap_or(name);
             let upper = stem.to_ascii_uppercase();
+            // Byte patterns, not string slicing: a multi-byte stem like 😀
+            // is 4 bytes long and &upper[..3] would panic mid-character.
             let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-                || (upper.len() == 4
-                    && matches!(&upper[..3], "COM" | "LPT")
-                    && upper.as_bytes()[3].is_ascii_digit()
-                    && upper.as_bytes()[3] != b'0');
+                || matches!(
+                    upper.as_bytes(),
+                    [b'C', b'O', b'M', d] | [b'L', b'P', b'T', d]
+                        if d.is_ascii_digit() && *d != b'0'
+                );
             if reserved {
                 return Err(format!(
                     "refusing artifact {name:?}: {stem} names a device on this platform"

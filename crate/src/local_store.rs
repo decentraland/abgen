@@ -115,7 +115,11 @@ mod tests {
         let name = s.path_of(&cid);
         let name = name.file_name().unwrap().to_string_lossy();
         assert!(name.starts_with("xn-"), "collapsed name, got {name}");
-        assert!(name.len() <= 46, "fixed-length name, got {} bytes", name.len());
+        assert!(
+            name.len() <= 46,
+            "fixed-length name, got {} bytes",
+            name.len()
+        );
 
         // Distinct oversized cids must not share an entry.
         let other = format!("b64-{}", "R".repeat(260));
