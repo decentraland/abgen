@@ -52,7 +52,7 @@ ENV ABGEN_ROOT=/opt/abgen \
     ABGEN_SHADER_BUNDLE=/opt/abgen/shader/scene_ignore_windows \
     ABGEN_OUT_ROOT=/data/out \
     ABGEN_CACHE_DIR=/data/cache \
-    HTTP_SERVER_HOST=0.0.0.0 \
+    ABGEN_HTTP_HOST=0.0.0.0 \
     ABGEN_LOG_FORMAT=json
 
 USER abgen

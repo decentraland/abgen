@@ -56,8 +56,12 @@ impl Config {
         };
 
         Ok(Self {
-            http_host: env::var("HTTP_SERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
-            http_port: get_port("HTTP_SERVER_PORT", 5147)?,
+            // ABGEN_HTTP_HOST/PORT are the canonical (namespaced) names; the legacy generic
+            // HTTP_SERVER_* names keep working as a fallback so existing deployments don't break.
+            http_host: env::var("ABGEN_HTTP_HOST")
+                .or_else(|_| env::var("HTTP_SERVER_HOST"))
+                .unwrap_or_else(|_| "127.0.0.1".to_string()),
+            http_port: get_port("ABGEN_HTTP_PORT", get_port("HTTP_SERVER_PORT", 5147)?)?,
             abgen_out_root: env::var("ABGEN_OUT_ROOT")
                 .unwrap_or_else(|_| DEFAULT_ABGEN_OUT_ROOT.to_string()),
             content_url,
