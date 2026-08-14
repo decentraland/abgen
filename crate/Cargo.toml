@@ -1,6 +1,6 @@
 [package]
 name = "abgen"
-version = "0.15.4"
+version = "0.16.0"
 edition = "2021"
 description = "Decentraland asset-bundle converter + ab-cdn-compatible JIT server — clean-room reimplementation of asset-bundle-converter."
 license = "Apache-2.0"

@@ -1,6 +1,6 @@
 {
   "name": "org.decentraland.abgen",
-  "version": "0.15.4",
+  "version": "0.16.0",
   "displayName": "abgen",
   "description": "Decentraland asset-bundle conversion in-process: glTF/GLB + textures in, Unity AssetBundles out, with no Editor spawn and no sidecar. Thin C# bindings over the abgen native library (Rust, C ABI).",
   "unity": "2021.3",
