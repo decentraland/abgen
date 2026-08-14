@@ -106,7 +106,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let s = LocalContentStore::new(&tmp);
 
-        // Longer than any NAME_MAX: must be stored under a fixed-length collapsed name.
         let cid = format!("b64-{}", "Q".repeat(260));
         s.write(&cid, b"payload").unwrap();
         assert!(s.exists(&cid));
@@ -121,11 +120,9 @@ mod tests {
             name.len()
         );
 
-        // Distinct oversized cids must not share an entry.
         let other = format!("b64-{}", "R".repeat(260));
         assert_ne!(s.path_of(&cid), s.path_of(&other));
 
-        // Names within the limit keep production behavior: stored verbatim.
         let ok_cid = format!("b64-{}", "Q".repeat(196));
         s.write(&ok_cid, b"x").unwrap();
         assert!(s.exists(&ok_cid));

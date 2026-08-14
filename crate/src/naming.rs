@@ -41,6 +41,19 @@ pub fn ensure_writable_component(name: &str) -> Result<()> {
     );
 }
 
+/// True for sdk-commands' content-versioned preview ids (js-sdk-toolchain
+/// #1529): `b64-` + base64 of `path NUL mtime-machineId`. Paths and hostnames
+/// cannot contain NUL, so the byte can never appear in a plain
+/// `path-machineId` id — its presence means the id itself changes whenever
+/// the file's bytes do, and byte revalidation proves nothing the id doesn't
+/// already say.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn is_content_versioned_id(id: &str) -> bool {
+    id.strip_prefix("b64-")
+        .and_then(crate::gltf::base64_decode)
+        .is_some_and(|decoded| decoded.contains(&0))
+}
+
 const GLB_MAGIC: u32 = 0x46546C67;
 const GLB_CHUNK_TYPE_JSON: u32 = 0x4E4F534A;
 const GLB_HEADER_BYTES: usize = 12;
@@ -442,10 +455,7 @@ mod tests {
         assert!(mixed.len() > FS_COMPONENT_MAX_BYTES);
         let stored = fs_safe_component(&mixed);
         assert!(stored.starts_with("xn-"));
-        // Unity lowercases bundle names on request; the collapsed lookup must
-        // stay as case-forgiving as the verbatim path it replaces.
         assert_eq!(stored, fs_safe_component(&mixed.to_lowercase()));
-        // Short names still pass through byte-identical, case preserved.
         assert_eq!(fs_safe_component("Qmhash_windows"), "Qmhash_windows");
     }
 
@@ -576,5 +586,16 @@ mod xcheck {
         );
         assert_eq!(file_extension("."), ".");
         assert_eq!(file_extension("noext."), ".");
+    }
+
+    #[test]
+    fn content_versioned_id_detection() {
+        assert!(is_content_versioned_id("b64-cAAxMjMtaA=="));
+        assert!(!is_content_versioned_id("b64-cC1o"));
+        assert!(!is_content_versioned_id(
+            "bafkreibxefote3jeusciwqxxrvwu5b4qi7uzg6lf3avexadfg7xkkz5gge"
+        ));
+        assert!(!is_content_versioned_id("b64-!!!not-base64!!!"));
+        assert!(!is_content_versioned_id("b64-"));
     }
 }

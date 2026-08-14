@@ -115,18 +115,10 @@ impl DirSink {
                 "refusing artifact {name:?}: not a single path component"
             ));
         }
-        // Only where the filesystem actually behaves this way. Artifact names
-        // come from converted content, so a scene carrying con.glb would
-        // otherwise fail to convert on Linux for a hazard Linux does not have.
         #[cfg(windows)]
         {
-            // CON/NUL/COM1 open devices rather than files, so the write reports
-            // success and the bytes vanish. The reservation survives an
-            // extension: CON.bundle is still the console.
             let stem = name.split('.').next().unwrap_or(name);
             let upper = stem.to_ascii_uppercase();
-            // Byte patterns, not string slicing: a multi-byte stem like 😀
-            // is 4 bytes long and &upper[..3] would panic mid-character.
             let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
                 || matches!(
                     upper.as_bytes(),
@@ -138,8 +130,6 @@ impl DirSink {
                     "refusing artifact {name:?}: {stem} names a device on this platform"
                 ));
             }
-            // Stripped on write, so "x." and "x" would collide and the second
-            // artifact would silently replace the first.
             if name.ends_with(' ') || name.ends_with('.') {
                 return Err(format!(
                     "refusing artifact {name:?}: a trailing space or dot is not preserved here"
@@ -449,8 +439,6 @@ fn main() {
                     eprintln!("abgen-host: --out-dir needs a directory");
                     std::process::exit(EXIT_PROTOCOL);
                 };
-                // Checked before the request is read: a caller that mistypes the
-                // path learns now, not after a conversion has been paid for.
                 let path = PathBuf::from(d);
                 if !path.is_dir() {
                     eprintln!("abgen-host: --out-dir {path:?} is not a directory");
@@ -506,8 +494,6 @@ fn main() {
             (code, !sink.failed.load(Ordering::Relaxed))
         }
     };
-    // A conversion that succeeded but could not be written is a failure: the
-    // caller would otherwise see success frames and an empty directory.
     let code = if wrote_all { code } else { EXIT_OUTPUT };
 
     let mut out = std::io::stdout().lock();
@@ -572,7 +558,6 @@ mod tests {
                 "should have refused {bad:?}"
             );
         }
-        // near-misses that are perfectly ordinary names
         for ok in [
             "COM0",
             "COM10",
@@ -671,7 +656,6 @@ mod tests {
         .map(String::from)
         .collect();
 
-        // deterministic pseudo-random names over a nasty alphabet
         let alphabet: Vec<char> = "ab/\\.:\u{0}\u{202e} .-~%".chars().collect();
         let mut state: u64 = 0x9e3779b97f4a7c15;
         for _ in 0..4000 {
@@ -705,7 +689,6 @@ mod tests {
                 continue;
             }
             accepted += 1;
-            // an accepted name must resolve to a file whose parent IS the dir
             let target = dir.join(name);
             let parent = target.parent().unwrap();
             assert_eq!(
@@ -715,7 +698,6 @@ mod tests {
                 real,
                 "accepted name escaped the directory: {name:?}"
             );
-            // and writing it must not create anything outside
             if sink.write_artifact(name, b"z").is_ok() {
                 let written = real.join(name);
                 assert!(written.starts_with(&real), "wrote outside: {written:?}");
@@ -727,7 +709,6 @@ mod tests {
             "fuzz corpus rejected everything - test is vacuous"
         );
 
-        // nothing escaped into the parent of the output directory
         for entry in std::fs::read_dir(real.parent().unwrap()).unwrap() {
             let n = entry.unwrap().file_name();
             let n = n.to_string_lossy();
@@ -759,14 +740,12 @@ mod tests {
             std::fs::read(dir.join("scene_windows")).unwrap(),
             b"bundle-bytes"
         );
-        // nothing half-written left over: only the published artifact
         let left: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left.len(), 1, "unexpected leftovers: {left:?}");
 
-        // a refused name must not create anything
         assert!(sink.write_artifact("../escape", b"x").is_err());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
 

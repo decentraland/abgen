@@ -94,6 +94,8 @@ pub struct AppStateInner {
     pub upstream_registry_cache: Cache<String, Option<UpstreamAbRecord>>,
 
     pub revalidate_recent: Cache<String, ()>,
+
+    pub revalidate_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// The asset-bundle fields of an upstream registry record, passed through
@@ -177,6 +179,7 @@ impl AppStateInner {
                 .max_capacity(10_000)
                 .time_to_live(env_ttl("ABGEN_REVALIDATE_DEBOUNCE_S", 2))
                 .build(),
+            revalidate_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -254,8 +257,6 @@ impl AppStateInner {
         if !self.jit_cache.enabled() {
             return;
         }
-        // Key and dir both use the storage-safe component so boot-time seeding
-        // (which reads dir names) and request-time touches stay consistent.
         let stored = crate::naming::fs_safe_component(entity);
         let dir = self.jit_root.join(&*stored);
         let bytes = super::jitcache::dir_size(&dir);

@@ -717,8 +717,6 @@ impl Proxy {
             .count();
         let _progress = ProgressGuard { proxy: self, cid };
 
-        // Pre-pass: resolve names, dedup, and skip space hits sequentially, so the
-        // parallel phase below is a pure per-file build list with no shared bookkeeping.
         struct WorkItem {
             order: usize,
             file: String,
@@ -786,10 +784,6 @@ impl Proxy {
             });
         }
 
-        // Parallel phase: N file-level workers. BC7 block encoding already spans every
-        // core via rayon's global pool during its bursts; these workers exist to overlap
-        // the single-threaded phases (fetch, GLB parse, BC5/DXT1, IO) of one file with
-        // another file's encode. Capped to bound peak decoded-image memory, not cores.
         use std::sync::atomic::{AtomicUsize, Ordering};
         let jobs = corpus_file_jobs().min(work.len().max(1));
         let built_m: Mutex<Vec<(usize, String)>> = Mutex::new(prebuilt);
@@ -917,6 +911,11 @@ impl Proxy {
         Ok(built)
     }
 
+    /// Digest-map entry recorded for a content-versioned id. Never a valid
+    /// hex digest, so an older binary that byte-digested such ids sees a
+    /// mismatch and self-heals with one ordinary revalidation pass.
+    const VERSIONED_ID_DIGEST: &'static str = "id-versioned";
+
     /// Freshness pass for content servers whose declared hashes are not
     /// content-addressed (the sdk-commands preview server derives them from
     /// file paths, so an edited file keeps its hash forever). Re-downloads the
@@ -926,7 +925,10 @@ impl Proxy {
     /// build-cache bundles, and removes the entity's corpus dir under
     /// `corpus_root` so the next request rebuilds it. Unchanged assets keep
     /// their build-cache entries, so the rebuild only reconverts what changed.
-    /// Returns the declared hashes whose bytes changed.
+    /// Content-versioned ids ([`naming::is_content_versioned_id`]) are judged
+    /// from the id alone — no download, no digest — keeping the pass O(1) in
+    /// scene size for corpora that use them. Returns the declared hashes whose
+    /// content changed.
     pub fn refresh_entity_content(&self, cid: &str, corpus_root: &Path) -> Result<Vec<String>> {
         let scene = self
             .catalyst
@@ -952,6 +954,17 @@ impl Proxy {
                 continue;
             }
             if fresh.contains_key(&c.hash) {
+                continue;
+            }
+            if naming::is_content_versioned_id(&c.hash) {
+                if !old.contains_key(&c.hash) {
+                    changed.push(c.hash.clone());
+                }
+                let (is_glb, _) = is_convertible(&c.file);
+                if is_glb {
+                    glb_hashes.insert(c.hash.to_lowercase());
+                }
+                fresh.insert(c.hash.clone(), Self::VERSIONED_ID_DIGEST.to_string());
                 continue;
             }
             let bytes = match self.catalyst.fetch_content(&c.hash) {
@@ -1620,6 +1633,69 @@ mod tests {
         assert_eq!(c4, vec!["qmtex".to_string()]);
         assert!(!glb_bundle.exists());
         assert!(!tex_bundle.exists());
+
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    /// Content-versioned ids (#41): the id embeds the file's mtime, so the
+    /// pass must judge freshness from the id alone — an id the previous pass
+    /// recorded is fresh, an unrecorded one is a changed file — and must
+    /// never fetch the bytes behind either.
+    #[test]
+    fn refresh_entity_content_trusts_content_versioned_ids() {
+        let cache = temp_cache("revalidate_versioned");
+        let _ = std::fs::remove_dir_all(&cache);
+        std::fs::create_dir_all(&cache).unwrap();
+        let corpus = cache.join("corpus");
+
+        let v1 = "b64-L3MvbS5nbGIAMTIzLWhvc3Q=";
+        let v2 = "b64-L3MvbS5nbGIANDU2LWhvc3Q=";
+
+        let mk = |vid: &str, tex: &[u8]| {
+            let entity = serde_json::json!({
+                "id": "bafkreva",
+                "type": "scene",
+                "content": [
+                    {"file": "m.glb", "hash": vid},
+                    {"file": "tex.png", "hash": "qmtex"},
+                ]
+            });
+            let (host, seen) = super::stub::serve(vec![
+                (
+                    "/contents/bafkreva".to_string(),
+                    200,
+                    serde_json::to_vec(&entity).unwrap(),
+                ),
+                ("/contents/qmtex".to_string(), 200, tex.to_vec()),
+            ]);
+            let p = Proxy::new(ProxyConfig {
+                catalyst_url: format!("http://{host}"),
+                cache_dir: cache.to_string_lossy().into_owned(),
+                ..Default::default()
+            });
+            (p, seen)
+        };
+
+        let (p1, seen1) = mk(v1, b"TEX1");
+        let c1 = p1.refresh_entity_content("bafkreva", &corpus).unwrap();
+        assert_eq!(c1, vec![v1.to_string(), "qmtex".to_string()]);
+        assert!(
+            !seen1.lock().unwrap().iter().any(|p| p.contains("b64-")),
+            "versioned id must never be fetched: {:?}",
+            seen1.lock().unwrap()
+        );
+
+        let (p2, seen2) = mk(v1, b"TEX1");
+        assert!(p2
+            .refresh_entity_content("bafkreva", &corpus)
+            .unwrap()
+            .is_empty());
+        assert!(!seen2.lock().unwrap().iter().any(|p| p.contains("b64-")));
+
+        let (p3, seen3) = mk(v2, b"TEX1");
+        let c3 = p3.refresh_entity_content("bafkreva", &corpus).unwrap();
+        assert_eq!(c3, vec![v2.to_string()]);
+        assert!(!seen3.lock().unwrap().iter().any(|p| p.contains("b64-")));
 
         let _ = std::fs::remove_dir_all(&cache);
     }
