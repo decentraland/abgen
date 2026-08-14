@@ -3949,6 +3949,32 @@ fn est_list_group2(
 
 fn build_partition_plan(px: ptr<function, array<vec4<i32>, 16>>, include7: bool) -> PartitionPlan {
     var plan: PartitionPlan;
+    // Explicit stores, not implicit zero-init (see optresults_clear): a
+    // residue-holding use_list flag would route the compress stage through a
+    // never-written SolutionList, and bc7_test_plans emits every field —
+    // including lists the gated fills below never touch.
+    plan.part0 = 0u;
+    plan.part13 = 0u;
+    plan.part2 = 0u;
+    plan.use_list13 = 0u;
+    plan.use_list2 = 0u;
+    plan.use_list0 = 0u;
+    // Direct nested stores; a helper taking ptr<function, SolutionList> to
+    // these fields panics naga's SPIR-V backend (30.0, back/spv/block.rs).
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        plan.list13.sols[i].index = 0u;
+        plan.list13.sols[i].err = vec2<u32>(0u, 0u);
+        plan.list2.sols[i].index = 0u;
+        plan.list2.sols[i].err = vec2<u32>(0u, 0u);
+        plan.list0.sols[i].index = 0u;
+        plan.list0.sols[i].err = vec2<u32>(0u, 0u);
+        plan.list7.sols[i].index = 0u;
+        plan.list7.sols[i].err = vec2<u32>(0u, 0u);
+    }
+    plan.list13.len = 0u;
+    plan.list2.len = 0u;
+    plan.list0.len = 0u;
+    plan.list7.len = 0u;
     if (params.use_mode[1] != 0u || params.use_mode[3] != 0u) {
         if (params.op_max_mode13 == 1u) {
             plan.part13 = estimate_partition(1u, px);
@@ -4228,6 +4254,28 @@ struct OptResults {
     pbits: array<vec2<u32>, 3>,
     rotation: u32,
     index_selector: u32,
+}
+
+// Explicit stores, not WGSL's implicit zero-init: on NVIDIA Vulkan (592.00,
+// RTX 5050) a function-space OptResults spills to scratch that arrives holding
+// residue of earlier dispatches — reads of never-written fields are then
+// dispatch-order-dependent. Every OptResults whose fields can reach an encoder
+// or the output buffer without an unconditional write in between must be
+// cleared through this, so the no-win/partial-fill paths stay deterministic.
+fn optresults_clear(o: ptr<function, OptResults>) {
+    (*o).mode = 0u;
+    (*o).partn = 0u;
+    (*o).rotation = 0u;
+    (*o).index_selector = 0u;
+    for (var i = 0u; i < 3u; i = i + 1u) {
+        (*o).low[i] = vec4<i32>(0);
+        (*o).high[i] = vec4<i32>(0);
+        (*o).pbits[i] = vec2<u32>(0u);
+    }
+    for (var i = 0u; i < 48u; i = i + 1u) {
+        (*o).selectors[i] = 0;
+        (*o).alpha_selectors[i] = 0;
+    }
 }
 
 const MODE4_SCALE_BITS: u32 = 0x3e7cfcfdu;
@@ -4566,6 +4614,7 @@ fn handle_block_solid(cr: u32, cg: u32, cb: u32, ca: i32) -> vec4<u32> {
     let eg = opt_tables[OPT_MODE5_OFF + cg];
     let eb = opt_tables[OPT_MODE5_OFF + cb];
     var opt: OptResults;
+    optresults_clear(&opt);
     opt.mode = 5u;
     opt.low[0] = vec4<i32>(i32(er & 0xffu), i32(eg & 0xffu), i32(eb & 0xffu), ca);
     opt.high[0] = vec4<i32>(i32(er >> 8u), i32(eg >> 8u), i32(eb >> 8u), ca);
@@ -4961,6 +5010,7 @@ fn bc7_test_mode4(@builtin(global_invocation_id) giv: vec3<u32>) {
         px[i] = in_vec4i(ib + 8u + i * 4u);
     }
     var opt: OptResults;
+    optresults_clear(&opt);
     handle_alpha_block_mode4(&px, p, lo_a, hi_a, &opt, &err);
     write_alpha45(gid * ALPHA45_OUT_STRIDE, err, &opt);
 }
@@ -4981,6 +5031,7 @@ fn bc7_test_mode5(@builtin(global_invocation_id) giv: vec3<u32>) {
         px[i] = in_vec4i(ib + 6u + i * 4u);
     }
     var opt: OptResults;
+    optresults_clear(&opt);
     let err = handle_alpha_block_mode5(&px, p, lo_a, hi_a, &opt);
     write_alpha45(gid * ALPHA45_OUT_STRIDE, err, &opt);
 }
@@ -5209,6 +5260,7 @@ fn compress_trials(
         base.perceptual = params.perceptual != 0u;
     }
     var opt: OptResults;
+    optresults_clear(&opt);
     var best_err = U64_MAX;
     var sols2: SolutionList;
     if (!is_alpha && (params.use_mode[1] != 0u || params.use_mode[3] != 0u)) {
@@ -5301,8 +5353,22 @@ fn compress_trials(
                     let e5 = handle_alpha_block_mode5(&rp, pr, tlo, thi, &trial);
                     if (lt64(e5, best_err)) {
                         best_err = e5;
-                        opt = trial;
+                        // Field copies, not `opt = trial`: the whole-struct
+                        // copy of OptResults miscompiles under the NVIDIA
+                        // Vulkan compiler in this kernel's inlining context —
+                        // color selectors read back ~0 (same class as the
+                        // Tint notes at the rounding fences; the probe kernel
+                        // runs the identical handler correctly).
+                        opt.mode = trial.mode;
+                        opt.index_selector = trial.index_selector;
                         opt.rotation = rotation;
+                        opt.partn = 0u;
+                        opt.low[0] = trial.low[0];
+                        opt.high[0] = trial.high[0];
+                        for (var i = 0u; i < 16u; i = i + 1u) {
+                            opt.selectors[i] = trial.selectors[i];
+                            opt.alpha_selectors[i] = trial.alpha_selectors[i];
+                        }
                     }
                 }
             }
