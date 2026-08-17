@@ -148,7 +148,7 @@ restore it - it never fetches or re-downloads:
 ### Server (`crate/src/abcdn/config.rs`)
 | Var | Default | Meaning |
 |---|---|---|
-| `HTTP_SERVER_HOST` / `HTTP_SERVER_PORT` | `127.0.0.1` / `5147` | bind address |
+| `ABGEN_HTTP_HOST` / `ABGEN_HTTP_PORT` | `127.0.0.1` / `5147` | bind address (legacy aliases `HTTP_SERVER_HOST` / `HTTP_SERVER_PORT` still honored) |
 | `ABGEN_OUT_ROOT` | `./data/ab-generator/out` | corpus root served + JIT write-back target (may start empty) |
 | `ABGEN_CATALYST_URL` | `http://127.0.0.1:5141/content` | content server (standalone: `https://peer.decentraland.org/content`) |
 | `ABGEN_CONTENT_DISK` | unset | optional local content-store root (disk-first client) |

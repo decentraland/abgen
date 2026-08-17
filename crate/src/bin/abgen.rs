@@ -20,8 +20,8 @@ USAGE:
   abgen --version | -V  print the version
 
 ENV:
-  HTTP_SERVER_HOST          bind host (default 127.0.0.1)
-  HTTP_SERVER_PORT          bind port (default 5147)
+  ABGEN_HTTP_HOST           bind host (default 127.0.0.1; legacy alias HTTP_SERVER_HOST)
+  ABGEN_HTTP_PORT           bind port (default 5147; legacy alias HTTP_SERVER_PORT)
   ABGEN_OUT_ROOT            bundle corpus/output root (default ./data/ab-generator/out)
   ABGEN_CATALYST_URL        upstream catalyst content URL (default http://127.0.0.1:5141/content)
   ABGEN_CACHE_DIR           in-process JIT cache dir (default ./abgen-serve-cache)
