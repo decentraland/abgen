@@ -1,6 +1,6 @@
 [package]
 name = "abgen-native"
-version = "0.16.0"
+version = "0.16.1"
 edition = "2021"
 description = "C-ABI shared library export of abgen's conversion pipeline — embeddable in Unity and any native host."
 license = "Apache-2.0"
