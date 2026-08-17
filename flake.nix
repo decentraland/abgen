@@ -31,7 +31,7 @@
 
       buildSource = lib.fileset.toSource {
         root = ./.;
-        fileset = lib.fileset.traceVal buildFileset;
+        fileset = buildFileset;
       };
 
       buildId = builtins.substring 0 12 (builtins.hashString "sha256"
