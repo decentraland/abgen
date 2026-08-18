@@ -81,9 +81,15 @@ pub fn convert_entity(
 
     let mut results = Vec::with_capacity(platforms.len());
     for platform in platforms {
+        let started = std::time::Instant::now();
         let built = proxy
             .build_entity_into_corpus(&cfg.out_root, entity_id, platform, content_server)
             .with_context(|| format!("convert {entity_id} for {platform}"))?;
+        eprintln!(
+            "convert: {entity_id} {platform}: {} bundle(s) in {:.1}s",
+            built.len(),
+            started.elapsed().as_secs_f64()
+        );
         let manifest_path = cid_dir.join(format!("{platform}.manifest.json"));
         let exit_code = read_exit_code(&manifest_path).unwrap_or(0);
         results.push(PlatformOutcome {
