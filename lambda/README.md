@@ -25,13 +25,13 @@ per-entity hit/miss counts are logged and returned in the response.
 | 3 | S3 publishing — abgen's native "space" writes bundles + manifests through during the build; no `.br` variants (no client of this pipeline fetches them) | done |
 | 4 | registry SQS notification | deferred (registry duplicate is a follow-up) |
 | 5 | already-converted skip (entity-level manifest check) **and** per-file asset reuse (space probe per digest-named glb) | done |
-| 6 | container image (`provided.al2023`) | TODO |
+| 6 | container image (`Dockerfile.lambda`) | done |
 
 ## Local run (no AWS)
 
 ```bash
-cargo build --release --manifest-path lambda/Cargo.toml
-OUT_ROOT=/tmp/ab-out ./lambda/target/release/abgen-lambda --once lambda/examples/event-manual.json
+cargo build --release -p abgen-lambda      # workspace member; binary in target/release/
+OUT_ROOT=/tmp/ab-out ./target/release/abgen-lambda --once lambda/examples/event-manual.json
 ```
 
 Leaves the corpus under `OUT_ROOT/{entityId}/{platform}/` plus
@@ -69,6 +69,31 @@ them automatically.
 | wearable & emote bundles (entity-scoped) | `{AB_VERSION}/{entityId}/{bundleName}` |
 | manifests | `manifest/{entityId}_{platform}.json` |
 | scene sources (`main.crdt`, `scene.json`, main script; clean scene builds) | `{AB_VERSION}/{entityId}/{file}` |
+
+## Container image & Lambda settings
+
+`Dockerfile.lambda` at the repo root (build with `--platform linux/arm64` —
+Graviton is ~20% cheaper and abgen is CPU-portable). The binary implements
+the Lambda runtime API itself, so no AWS base image is needed; push to ECR
+and point the function at the image.
+
+Recommended function config:
+
+| setting | value | why |
+|---------|-------|-----|
+| architecture | `arm64` | 20% cheaper compute |
+| memory | 10240 MB | buys the max 6 vCPUs — texture encoding is CPU-bound |
+| timeout | 900 s | the hard ceiling; worst-case scenes need the room |
+| ephemeral storage | 10240 MB | `/tmp` holds the content cache + corpus |
+| SQS trigger | batch size 1, visibility timeout ≥ 900 s, DLQ after ~3 receives | one entity per invocation; whales land in the DLQ |
+| reserved concurrency | ~20 | politeness cap on catalyst downloads |
+
+**One-time bucket seeding (infra phase):** clients fetch the well-known
+shader bundles from the CDN, and this pipeline has no JIT to materialize
+them on demand. The vendored payloads ship in the image under
+`/opt/abgen/shader`; seed them into the bucket once per AB version (e.g. by
+briefly running the abgen server pointed at the bucket, or a future
+`--seed-shaders` mode).
 
 Bundles and manifests are written through to S3 by the build itself
 (abgen's space); scene sources are published by the handler afterwards.

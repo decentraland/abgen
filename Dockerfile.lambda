@@ -1,0 +1,51 @@
+# abgen-lambda — the asset-bundle conversion pipeline as one AWS Lambda
+# container image. See lambda/README.md.
+#
+# Deliberately NOT based on public.ecr.aws/lambda/provided: the binary
+# implements the Lambda runtime API itself (lambda/src/runtime.rs), so any
+# image works, and this mirrors the JIT-server image (Dockerfile) — same
+# build base, same runtime base, same shader/template payload layout.
+#
+# Build for Graviton (20% cheaper Lambda compute; abgen is CPU-portable):
+#   docker buildx build --platform linux/arm64 -f Dockerfile.lambda \
+#     -t abgen-lambda --build-arg COMMIT_HASH=$(git rev-parse HEAD) .
+
+FROM rust:1-bookworm AS build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+RUN cargo build --release --locked -p abgen-lambda
+
+FROM debian:bookworm-slim
+
+ARG COMMIT_HASH=unknown
+LABEL org.opencontainers.image.revision=$COMMIT_HASH
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libturbojpeg0 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home --uid 10001 abgen
+
+COPY --from=build /src/target/release/abgen-lambda /usr/local/bin/abgen-lambda
+
+# Build templates are embedded in the binary; ABGEN_ROOT overrides them with
+# these identical files and, more importantly, carries the vendored shader
+# payloads (~1.4 MB) so shader seeding can run from this image without a
+# rebuild (the CDN bucket needs a one-time shader seed — lambda/README.md).
+COPY --from=build /src/template /opt/abgen/template
+COPY --from=build /src/crate/shader /opt/abgen/shader
+
+# Lambda's filesystem is read-only except /tmp; size ephemeral storage
+# accordingly (10 GB recommended).
+ENV ABGEN_ROOT=/opt/abgen \
+    ABGEN_CACHE_DIR=/tmp/abgen-cache \
+    OUT_ROOT=/tmp/abgen-out
+
+USER abgen
+
+ENTRYPOINT ["/usr/local/bin/abgen-lambda"]
