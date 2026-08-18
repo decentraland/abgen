@@ -1,6 +1,7 @@
 # Rust
 /target
 /crate/target
+/lambda/target
 /crate/abgen-wasm/target/
 /crate/abgen-node/target/
 .cargo-home/
