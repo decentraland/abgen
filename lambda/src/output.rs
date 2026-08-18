@@ -1,12 +1,18 @@
 //! Publishing conversion output to the CDN bucket.
 //!
-//! TODO(step 3): brotli-compress and upload to S3 with the same keys,
-//! content types and headers the Node consumer-server used:
-//!   * bundles:  `{version}/{bundleName}` (+ `.br` siblings)
+//! TODO(step 3): upload to S3 with the same keys, content types and headers
+//! the Node consumer-server used:
+//!   * bundles:  `{version}/{bundleName}`
 //!   * manifest: `manifest/{entityId}_{platform}.json`
 //! then remove the local corpus dir. Signing will be hand-rolled SigV4 over
 //! ureq (credentials from the Lambda execution-role env), keeping the binary
 //! async-free.
+//!
+//! Deliberately NOT uploaded: the `.br` brotli siblings prod stores next to
+//! every file. They exist for legacy web clients; this pipeline's only
+//! consumer is unity-explorer, which fetches raw names (verified 2026-08:
+//! no `.br` fetches in unity-explorer or aang-renderer). Edge compression
+//! can cover a future web consumer without re-adding them.
 //!
 //! Until then this stub reports what it *would* upload, and `--once` runs
 //! leave the corpus under OUT_ROOT for inspection.

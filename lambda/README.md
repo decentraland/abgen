@@ -22,7 +22,7 @@ per-entity hit/miss counts are logged and returned in the response.
 |------|------|-------|
 | 1 | texture-encode cache (dual-emit) | done |
 | 2 | event parsing, `--once` local mode, dual-platform conversion | done |
-| 3 | brotli + S3 upload (SigV4 over ureq) | TODO |
+| 3 | S3 upload (SigV4 over ureq; no `.br` variants — no client of this pipeline fetches them) | TODO |
 | 4 | registry SQS notification | TODO |
 | 5 | already-converted / missing-files skip | TODO |
 | 6 | container image (`provided.al2023`) | TODO |
