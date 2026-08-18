@@ -91,6 +91,28 @@ fn validated_entity_id(id: &str) -> Result<String> {
     Ok(id.to_string())
 }
 
+/// Strict SSRF guard, mirroring the consumer-server's
+/// `isAllowedContentServerUrl`: the content-server URL travels in the
+/// attacker-influenced SQS payload, so when an allowlist is configured the
+/// URL must be https and its host must EXACTLY match an allowed catalyst
+/// host (exact, not suffix — the whole point of an allowlist). Ports and
+/// userinfo tricks fail closed: the authority must be a bare allowed host.
+pub fn ensure_allowed_content_server(url: &str, allowed: &[String]) -> Result<()> {
+    let Some(rest) = url.strip_prefix("https://") else {
+        bail!("content server {url:?} rejected: https required");
+    };
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let host = authority.split(':').next().unwrap_or("");
+    if authority.contains('@') || host.is_empty() || !allowed.iter().any(|a| a == host) {
+        bail!("content server host {host:?} is not in ALLOWED_CONTENT_SERVER_HOSTS");
+    }
+    Ok(())
+}
+
 /// abgen's catalyst client wants the content root (`…/content`) and appends
 /// `/contents/{hash}` itself; events sometimes carry the `/contents` form.
 fn normalize_content_server(url: &str) -> String {
@@ -162,5 +184,19 @@ mod tests {
     fn rejects_deployment_without_content_server() {
         let e = serde_json::json!({"entity": {"entityId": "bafknourl"}});
         assert!(jobs_from_event(&e).is_err());
+    }
+
+    #[test]
+    fn content_server_allowlist() {
+        let allowed = vec!["peer.decentraland.org".to_string()];
+        let ok = |u: &str| ensure_allowed_content_server(u, &allowed).is_ok();
+        assert!(ok("https://peer.decentraland.org/content"));
+        assert!(ok("https://PEER.decentraland.org"));
+        assert!(ok("https://peer.decentraland.org:443/content"));
+        assert!(!ok("http://peer.decentraland.org/content")); // https only
+        assert!(!ok("https://evil.example.com/content"));
+        assert!(!ok("https://peer.decentraland.org.evil.com/content")); // exact, not suffix
+        assert!(!ok("https://peer.decentraland.org@evil.com/content")); // userinfo trick
+        assert!(!ok("https://sub.peer.decentraland.org/content"));
     }
 }

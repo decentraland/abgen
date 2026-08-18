@@ -28,6 +28,11 @@ pub struct Config {
     pub keep_output: bool,
     /// asset-bundle-registry queue. `REGISTRY_QUEUE_URL`. TODO(step 4).
     pub registry_queue_url: Option<String>,
+    /// SSRF guard (`ALLOWED_CONTENT_SERVER_HOSTS`, comma-separated): when
+    /// set, a job's content server must be https with an exactly-matching
+    /// host, or the job is rejected. Unset (local runs) = unrestricted;
+    /// deployments should always set it (the Pulumi stack does).
+    pub allowed_content_server_hosts: Option<Vec<String>>,
 }
 
 impl Config {
@@ -57,6 +62,15 @@ impl Config {
                 .unwrap_or(false),
             registry_queue_url: std::env::var("REGISTRY_QUEUE_URL")
                 .ok()
+                .filter(|v| !v.is_empty()),
+            allowed_content_server_hosts: std::env::var("ALLOWED_CONTENT_SERVER_HOSTS")
+                .ok()
+                .map(|raw| {
+                    raw.split(',')
+                        .map(|h| h.trim().to_ascii_lowercase())
+                        .filter(|h| !h.is_empty())
+                        .collect::<Vec<_>>()
+                })
                 .filter(|v| !v.is_empty()),
         }
     }

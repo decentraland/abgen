@@ -134,6 +134,12 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
         .content_server_url
         .as_deref()
         .unwrap_or(&cfg.default_content_server);
+    // SSRF guard: the content server travels in the attacker-influenced SQS
+    // payload; with an allowlist configured, off-list hosts are rejected
+    // (message retries → DLQ, where the attempt is visible).
+    if let Some(allowed) = &cfg.allowed_content_server_hosts {
+        event::ensure_allowed_content_server(content_server, allowed)?;
+    }
     let proxy = convert::make_proxy(cfg, content_server);
 
     // Entity-level already-converted skip (consumer-server semantics): a
