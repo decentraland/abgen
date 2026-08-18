@@ -11,8 +11,9 @@ use std::path::PathBuf;
 
 pub struct PlatformOutcome {
     pub platform: String,
-    /// Bundle file names abgen reports as built (aliases excluded), relative
-    /// to `dir`.
+    /// Bundle names in the manifest (aliases excluded). Note: names satisfied
+    /// by the space's per-file reuse probe are listed here but were neither
+    /// rebuilt nor written to `dir` — they already exist on the CDN.
     pub built: Vec<String>,
     /// abgen's corpus exit code: 0 clean, 12 some assets failed but tolerated.
     pub exit_code: i32,
@@ -45,17 +46,12 @@ impl EntityOutcome {
     }
 }
 
-pub fn convert_entity(
-    cfg: &Config,
-    entity_id: &str,
-    content_server: &str,
-    platforms: &[String],
-) -> Result<EntityOutcome> {
-    use abgen::live::{Proxy, ProxyConfig};
-
-    let (h0, m0, _, _) = abgen::texencode_cache::stats();
-
-    let proxy = Proxy::new(ProxyConfig {
+/// One Proxy per job (events carry their own content server). With
+/// `use_space` on and `ABGEN_S3_ENDPOINT`/`ABGEN_S3_BUCKET` set, the build
+/// probes per-file asset reuse and writes bundles + manifests through to S3
+/// itself; without the env it warns once and runs local-only.
+pub fn make_proxy(cfg: &Config, content_server: &str) -> std::sync::Arc<abgen::live::Proxy> {
+    abgen::live::Proxy::new(abgen::live::ProxyConfig {
         catalyst_url: content_server.to_string(),
         cache_dir: cfg.cache_dir.clone(),
         version: cfg.version.clone(),
@@ -63,8 +59,19 @@ pub fn convert_entity(
         // digests abgen computes here are the ones we upload and announce, so
         // the pipeline is self-consistent end to end.
         asset_reuse: true,
+        use_space: true,
         ..Default::default()
-    });
+    })
+}
+
+pub fn convert_entity(
+    cfg: &Config,
+    proxy: &std::sync::Arc<abgen::live::Proxy>,
+    entity_id: &str,
+    content_server: &str,
+    platforms: &[String],
+) -> Result<EntityOutcome> {
+    let (h0, m0, _, _) = abgen::texencode_cache::stats();
 
     std::fs::create_dir_all(&cfg.out_root)
         .with_context(|| format!("mkdir {}", cfg.out_root.display()))?;

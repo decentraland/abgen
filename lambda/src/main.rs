@@ -6,12 +6,15 @@
 //!   1. parse the event — an SQS record batch whose bodies are catalyst
 //!      `DeploymentToSqs` payloads, or a plain
 //!      `{"entityId": "...", "contentServerUrl": "..."}` for manual invokes,
-//!   2. skip work that is already on the CDN            (TODO: step 5),
-//!   3. convert the entity for every configured platform in one process with
-//!      the texture-encode cache enabled — the mac pass reuses the windows
-//!      pass's BC7/DXT encodes ("dual-emit"),
-//!   4. brotli + upload bundles and manifests to S3     (TODO: step 3),
-//!   5. notify the asset-bundle-registry SQS queue      (TODO: step 4).
+//!   2. skip platforms whose manifest is already current on the CDN,
+//!   3. convert the remaining platforms in one process with the
+//!      texture-encode cache enabled — the mac pass reuses the windows
+//!      pass's BC7/DXT encodes ("dual-emit") — while abgen's space probes
+//!      per-file asset reuse and writes bundles + manifests through to S3
+//!      during the build,
+//!   4. publish scene sources (`main.crdt`, `scene.json`, main script),
+//!   5. notify the asset-bundle-registry SQS queue (deferred — registry
+//!      duplicate ships as a follow-up).
 //!
 //! No async runtime: the Lambda runtime API is a plain HTTP long-poll, served
 //! with the same blocking ureq the rest of abgen uses. Cold start is the
@@ -24,7 +27,6 @@
 //!                                  the result JSON and exit — full local run
 //!                                  without any AWS.
 
-mod aws;
 mod catalyst;
 mod config;
 mod convert;
@@ -32,7 +34,6 @@ mod event;
 mod notify;
 mod output;
 mod runtime;
-mod s3;
 
 use anyhow::{Context, Result};
 
@@ -67,9 +68,9 @@ fn main() {
                  --once EVENT.json handles a single event locally and exits.\n\
                  \n\
                  env: PLATFORMS (windows,mac), AB_VERSION (v49), ABGEN_CACHE_DIR,\n\
-                 \x20    CONTENT_SERVER_URL, OUT_ROOT, KEEP_OUTPUT,\n\
-                 \x20    S3_BUCKET, AWS_REGION, S3_ENDPOINT, S3_ACL (+ AWS credentials),\n\
-                 \x20    REGISTRY_QUEUE_URL"
+                 \x20    CONTENT_SERVER_URL, OUT_ROOT, KEEP_OUTPUT, REGISTRY_QUEUE_URL,\n\
+                 \x20    ABGEN_S3_ENDPOINT, ABGEN_S3_BUCKET, ABGEN_S3_REGION,\n\
+                 \x20    ABGEN_S3_PATH_STYLE, ABGEN_S3_READ_ONLY (+ AWS credentials)"
             );
         }
         Some(other) => {
@@ -129,15 +130,23 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
         }));
     }
 
-    let client = output::client_from(cfg)?;
+    let content_server = job
+        .content_server_url
+        .as_deref()
+        .unwrap_or(&cfg.default_content_server);
+    let proxy = convert::make_proxy(cfg, content_server);
 
-    // Already-converted skip (consumer-server semantics): a platform whose
-    // manifest exists with exitCode 0 at the current AB version needs no
-    // work. Partially-converted entities rebuild only the missing targets.
+    // Entity-level already-converted skip (consumer-server semantics): a
+    // platform whose manifest exists with exitCode 0 at the current AB
+    // version needs no work; partially-converted entities rebuild only the
+    // missing targets. Finer-grained per-FILE reuse happens inside the build
+    // itself (the space probe). `force` bypasses this manifest check, but
+    // per-file reuse still applies — existing canonical bundles are never
+    // overwritten.
     let mut pending: Vec<String> = cfg.platforms.clone();
-    if let Some(client) = client.as_ref().filter(|_| !job.force) {
+    if !job.force {
         pending.retain(|platform| {
-            let done = output::platform_converted(client, cfg, &job.entity_id, platform);
+            let done = output::platform_converted(&proxy, cfg, &job.entity_id, platform);
             if done {
                 eprintln!(
                     "skip: {} {platform} already converted at {}",
@@ -153,21 +162,17 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
         }
     }
 
-    let content_server = job
-        .content_server_url
-        .as_deref()
-        .unwrap_or(&cfg.default_content_server);
-
-    // The entity document drives the upload layout (scene → canonical
-    // `{version}/assets`, others → entity-scoped) and scene-source publishing.
+    // The entity document drives scene-source publishing (and records the
+    // entity type in the summary).
     let agent = catalyst::agent();
     let entity_doc = catalyst::fetch_entity(&agent, content_server, &job.entity_id)?;
 
-    let outcome = convert::convert_entity(cfg, &job.entity_id, content_server, &pending)?;
+    let outcome = convert::convert_entity(cfg, &proxy, &job.entity_id, content_server, &pending)?;
 
-    // Publish + notify, then drop the local corpus (Lambda /tmp is 10 GB and
-    // shared across warm invocations) unless a local run wants to inspect it.
-    let published = output::publish(cfg, &agent, client.as_ref(), &entity_doc, &outcome)
+    // Bundles + manifests were written through to the space during the build;
+    // publish() adds scene sources. Then drop the local corpus (Lambda /tmp
+    // is 10 GB, shared across warm invocations) unless a local run wants it.
+    let published = output::publish(cfg, &agent, &proxy, &entity_doc, &outcome)
         .and_then(|upload| notify::send(cfg, &outcome).map(|notified| (upload, notified)));
     if !cfg.keep_output {
         let _ = std::fs::remove_dir_all(&outcome.cid_dir);

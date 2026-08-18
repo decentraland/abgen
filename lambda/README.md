@@ -22,9 +22,9 @@ per-entity hit/miss counts are logged and returned in the response.
 |------|------|-------|
 | 1 | texture-encode cache (dual-emit) | done |
 | 2 | event parsing, `--once` local mode, dual-platform conversion | done |
-| 3 | S3 upload (SigV4 over ureq; no `.br` variants — no client of this pipeline fetches them) | done |
+| 3 | S3 publishing — abgen's native "space" writes bundles + manifests through during the build; no `.br` variants (no client of this pipeline fetches them) | done |
 | 4 | registry SQS notification | deferred (registry duplicate is a follow-up) |
-| 5 | already-converted / missing-files skip | done |
+| 5 | already-converted skip (entity-level manifest check) **and** per-file asset reuse (space probe per digest-named glb) | done |
 | 6 | container image (`provided.al2023`) | TODO |
 
 ## Local run (no AWS)
@@ -48,16 +48,18 @@ all hits.
 | `ABGEN_CACHE_DIR` | `$TMPDIR/abgen-cache` | content download cache (point at `/tmp` on Lambda) |
 | `CONTENT_SERVER_URL` | foundation catalyst | fallback when the event carries none |
 | `OUT_ROOT` | `$TMPDIR/abgen-lambda-out` | local conversion output root |
-| `S3_BUCKET` | — | CDN bucket; unset = leave output on disk only |
-| `AWS_REGION` | `us-east-1` | bucket/queue region (Lambda sets it) |
-| `S3_ENDPOINT` | — | custom S3 endpoint (minio/localstack; switches to path-style) |
-| `S3_ACL` | — | e.g. `public-read` to mirror prod ACL buckets; unset for OAC buckets |
-| `KEEP_OUTPUT` | off (`--once` forces on) | keep the local corpus after upload |
-| `REGISTRY_QUEUE_URL` | — | registry queue (step 4) |
+| `ABGEN_S3_ENDPOINT` | — | S3 endpoint (e.g. `https://s3.us-east-1.amazonaws.com`); **required to enable publishing** — unset leaves output on disk only |
+| `ABGEN_S3_BUCKET` | — | CDN bucket name |
+| `ABGEN_S3_REGION` | `AWS_REGION` → `us-east-1` | bucket region |
+| `ABGEN_S3_PATH_STYLE` | off | path-style addressing (minio/localstack) |
+| `ABGEN_S3_READ_ONLY` | off | probe/reuse without writing (dry runs) |
+| `KEEP_OUTPUT` | off (`--once` forces on) | keep the local corpus after the run |
+| `REGISTRY_QUEUE_URL` | — | registry queue (step 4, deferred) |
 
-AWS credentials come from the standard env (`AWS_ACCESS_KEY_ID`,
-`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) — on Lambda, the execution role
-provides them.
+S3 is abgen's built-in "space" client (SigV4, ureq). Credentials come from
+the standard env (`AWS_ACCESS_KEY_ID`/`SECRET`/`SESSION_TOKEN`) or the
+container credential endpoint — on Lambda/ECS the execution role provides
+them automatically.
 
 ## CDN key layout (mirrors prod exactly)
 
@@ -68,9 +70,22 @@ provides them.
 | manifests | `manifest/{entityId}_{platform}.json` |
 | scene sources (`main.crdt`, `scene.json`, main script; clean scene builds) | `{AB_VERSION}/{entityId}/{file}` |
 
-Bundle objects: `application/wasm`, `public, max-age=31536000, immutable`.
-Manifests: `application/json`, `private, max-age=0, no-cache`. No `.br`
-siblings (see step 3 note above).
+Bundles and manifests are written through to S3 by the build itself
+(abgen's space); scene sources are published by the handler afterwards.
+The space sets plain content types and no Cache-Control — **cache policy
+must live on the CDN distribution**: long/immutable TTLs for
+`{AB_VERSION}/…` (keys are content-addressed) and TTL 0 for `manifest/…`.
+No `.br` siblings (see step 3 note above).
+
+## Per-file asset reuse
+
+Inside the build, every digest-named scene glb is HEAD-probed at
+`{AB_VERSION}/assets/{name}` and skipped when it already exists (it still
+appears in the manifest) — the consumer-server's `cachedHashes` mechanism,
+natively. A redeployed scene with one changed model converts one model.
+`"force": true` bypasses the entity-level manifest skip, but per-file reuse
+still applies: existing canonical bundles are never overwritten (their keys
+are content-addressed, so a differing bundle gets a different name).
 
 ## Event shapes accepted
 

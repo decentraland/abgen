@@ -18,18 +18,13 @@ pub struct Config {
     /// Where conversion output lands locally before upload (and where it stays
     /// in `--once` runs for inspection). `OUT_ROOT`.
     pub out_root: PathBuf,
-    /// Target CDN bucket. `S3_BUCKET`; unset = leave output on disk only.
-    pub s3_bucket: Option<String>,
-    /// `AWS_REGION` / `AWS_DEFAULT_REGION`, default `us-east-1`.
-    pub s3_region: String,
-    /// `S3_ENDPOINT` — custom endpoint (minio/localstack); switches the
-    /// client to path-style addressing.
-    pub s3_endpoint: Option<String>,
-    /// `S3_ACL` — e.g. `public-read` to mirror prod's ACL-based buckets.
-    /// Unset = no ACL header (buckets fronted by CloudFront OAC reject ACLs).
-    pub s3_acl: Option<String>,
     /// Keep the local corpus after publishing (`KEEP_OUTPUT=1`; always on for
     /// `--once` runs so the output can be inspected).
+    ///
+    /// S3 itself is configured through abgen's space env: `ABGEN_S3_ENDPOINT`
+    /// (required to enable), `ABGEN_S3_BUCKET`, `ABGEN_S3_REGION`,
+    /// `ABGEN_S3_PATH_STYLE`, `ABGEN_S3_READ_ONLY`; credentials from the
+    /// standard AWS env / container role.
     pub keep_output: bool,
     /// asset-bundle-registry queue. `REGISTRY_QUEUE_URL`. TODO(step 4).
     pub registry_queue_url: Option<String>,
@@ -57,10 +52,6 @@ impl Config {
             out_root: std::env::var("OUT_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| std::env::temp_dir().join("abgen-lambda-out")),
-            s3_bucket: std::env::var("S3_BUCKET").ok().filter(|v| !v.is_empty()),
-            s3_region: crate::aws::region_from_env(),
-            s3_endpoint: std::env::var("S3_ENDPOINT").ok().filter(|v| !v.is_empty()),
-            s3_acl: std::env::var("S3_ACL").ok().filter(|v| !v.is_empty()),
             keep_output: std::env::var("KEEP_OUTPUT").map(|v| v == "1").unwrap_or(false),
             registry_queue_url: std::env::var("REGISTRY_QUEUE_URL")
                 .ok()

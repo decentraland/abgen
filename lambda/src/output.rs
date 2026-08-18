@@ -1,65 +1,43 @@
-//! Publishing conversion output to the CDN bucket, mirroring the Node
-//! consumer-server's layout exactly:
+//! Publishing — almost entirely delegated to abgen's native "space" (its
+//! built-in SigV4 S3 integration, battle-tested by the JIT server).
 //!
-//!   * scene bundles (asset-reuse/canonical): `{version}/assets/{bundleName}`
-//!   * wearable/emote bundles (entity-scoped): `{version}/{entityId}/{bundleName}`
-//!   * manifests: `manifest/{entityId}_{platform}.json` — abgen's corpus
-//!     manifest is shape-identical to prod's ({version, files, exitCode,
-//!     contentServerUrl, date}), uploaded verbatim
-//!   * scene sources (clean scene conversions only): `main.crdt`,
-//!     `scene.json` and `entity.metadata.main` to `{version}/{entityId}/…` —
-//!     the desktop explorer fetches these from the CDN (issue #7625)
+//! With `use_space` on, `build_entity_into_corpus` itself:
+//!   * probes `{version}/assets/{bundleName}` per digest-named scene glb and
+//!     skips rebuilding files that already exist (per-file asset reuse — the
+//!     consumer-server's `cachedHashes` equivalent; reused names still appear
+//!     in the manifest),
+//!   * uploads each newly built bundle DURING the build (write-through) —
+//!     canonical `{version}/assets/…` for digest-named files,
+//!     entity-scoped `{version}/{entityId}/…` otherwise,
+//!   * uploads the manifest to `manifest/{entityId}_{platform}.json`.
 //!
-//! Headers mirror prod: bundles `application/wasm` + immutable caching (odd
-//! but load-bearing — it is what makes the edge cache them), manifests
-//! `application/json` + no-cache. Deliberately NOT uploaded: the `.br`
-//! brotli siblings prod stores next to every file — no client of this
-//! pipeline fetches them (verified 2026-08: unity-explorer and aang-renderer
-//! have zero `.br` references); edge compression can cover a future web
-//! consumer.
+//! That is exactly the prod key layout. What this module still owns:
+//!   * the entity-level already-converted check (manifest GET + exitCode/
+//!     version compare — the consumer's `shouldIgnoreConversion`),
+//!   * scene sources (`main.crdt`, `scene.json`, `metadata.main`) to
+//!     `{version}/{entityId}/…` for the desktop explorer (#7625).
+//!
+//! Caching/content-type headers: the space PUTs plain content types and no
+//! Cache-Control. Cache policy lives at the CDN layer instead — the
+//! CloudFront distribution must set long TTLs for `{version}/…` (names are
+//! content-addressed/immutable) and TTL 0 for `manifest/…`. No `.br`
+//! variants (no client of this pipeline fetches them).
 
 use crate::config::Config;
 use crate::convert::EntityOutcome;
-use crate::{catalyst, s3};
-use anyhow::{Context, Result};
-
-const BUNDLE_CONTENT_TYPE: &str = "application/wasm";
-const IMMUTABLE: &str = "public, max-age=31536000, immutable";
-const MANIFEST_CONTENT_TYPE: &str = "application/json";
-const MANIFEST_CACHE: &str = "private, max-age=0, no-cache";
-
-/// The S3 client for the configured bucket, or `None` when publishing is
-/// disabled (no `S3_BUCKET` — local-only runs).
-pub fn client_from(cfg: &Config) -> Result<Option<s3::S3Client>> {
-    match &cfg.s3_bucket {
-        Some(bucket) => Ok(Some(s3::S3Client::new(
-            bucket,
-            &cfg.s3_region,
-            cfg.s3_endpoint.as_deref(),
-            cfg.s3_acl.as_deref(),
-        )?)),
-        None => Ok(None),
-    }
-}
+use crate::catalyst;
+use abgen::live::Proxy;
+use anyhow::Result;
+use std::sync::Arc;
 
 /// Mirrors the consumer-server's `shouldIgnoreConversion`: a platform counts
 /// as already converted only when its manifest exists, parses, has
 /// `exitCode == 0` (a tolerated-failure 12 gets another chance) and carries
-/// the current AB version. Any fetch/parse problem means "convert".
-pub fn platform_converted(
-    client: &s3::S3Client,
-    cfg: &Config,
-    entity_id: &str,
-    platform: &str,
-) -> bool {
-    let key = format!("manifest/{entity_id}_{platform}.json");
-    let bytes = match client.get_object(&key) {
-        Ok(Some(b)) => b,
-        Ok(None) => return false,
-        Err(e) => {
-            eprintln!("probe: {key}: {e:#} — converting to be safe");
-            return false;
-        }
+/// the current AB version. Any fetch/parse problem means "convert". With no
+/// space configured this is always false.
+pub fn platform_converted(proxy: &Arc<Proxy>, cfg: &Config, entity_id: &str, platform: &str) -> bool {
+    let Some(bytes) = proxy.space_get_manifest(&format!("{entity_id}_{platform}")) else {
+        return false;
     };
     let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return false;
@@ -68,84 +46,48 @@ pub fn platform_converted(
         && json.get("version").and_then(serde_json::Value::as_str) == Some(cfg.version.as_str())
 }
 
+/// Bundles and manifests were already written through by the build; this
+/// publishes the remaining scene-source files and reports what happened.
 pub fn publish(
     cfg: &Config,
     agent: &ureq::Agent,
-    client: Option<&s3::S3Client>,
+    proxy: &Arc<Proxy>,
     entity_doc: &serde_json::Value,
     outcome: &EntityOutcome,
 ) -> Result<serde_json::Value> {
-    let (Some(bucket), Some(client)) = (&cfg.s3_bucket, client) else {
-        let total: usize = outcome.platforms.iter().map(|p| p.built.len()).sum();
+    let total_bundles: usize = outcome.platforms.iter().map(|p| p.built.len()).sum();
+    if !proxy.space_configured() {
         eprintln!(
-            "output: no S3_BUCKET configured — corpus left at {} ({total} file(s))",
+            "output: no space configured (set ABGEN_S3_ENDPOINT/ABGEN_S3_BUCKET) — \
+             corpus left at {} ({total_bundles} bundle(s))",
             cfg.out_root.display(),
         );
         return Ok(serde_json::json!({
             "uploaded": false,
             "local": cfg.out_root.display().to_string(),
         }));
-    };
+    }
 
     let entity_type = entity_doc
         .get("type")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("scene");
-    let is_scene = entity_type == "scene";
-    // Scenes share canonical digest-named keys across entities; everything
-    // else is entity-scoped. Matches the consumer's useAssetReuse gate, which
-    // is scene-only, and abgen's own digest-naming gate.
-    let bundle_prefix = if is_scene {
-        format!("{}/assets", cfg.version)
-    } else {
-        format!("{}/{}", cfg.version, outcome.entity_id)
-    };
-
-    let mut uploaded = 0usize;
-    for p in &outcome.platforms {
-        for name in &p.built {
-            let stored = p.dir.join(&*abgen::naming::fs_safe_component(name));
-            let bytes = std::fs::read(&stored)
-                .with_context(|| format!("read built bundle {}", stored.display()))?;
-            client
-                .put_object(
-                    &format!("{bundle_prefix}/{name}"),
-                    &bytes,
-                    BUNDLE_CONTENT_TYPE,
-                    IMMUTABLE,
-                )
-                .with_context(|| format!("upload bundle {name}"))?;
-            uploaded += 1;
-        }
-        let manifest_bytes = std::fs::read(&p.manifest_path)
-            .with_context(|| format!("read manifest {}", p.manifest_path.display()))?;
-        client
-            .put_object(
-                &format!("manifest/{}_{}.json", outcome.entity_id, p.platform),
-                &manifest_bytes,
-                MANIFEST_CONTENT_TYPE,
-                MANIFEST_CACHE,
-            )
-            .with_context(|| format!("upload manifest for {}", p.platform))?;
-        uploaded += 1;
-    }
-
     let mut scene_sources = 0usize;
-    if is_scene && outcome.exit_code() == 0 {
-        scene_sources = upload_scene_sources(cfg, agent, client, entity_doc, outcome)?;
+    if entity_type == "scene" && outcome.exit_code() == 0 {
+        scene_sources = upload_scene_sources(cfg, agent, proxy, entity_doc, outcome);
     }
 
     eprintln!(
-        "output: uploaded {uploaded} object(s) + {scene_sources} scene source(s) \
-         for {} to s3://{bucket}/{bundle_prefix}/…",
+        "output: {} — bundles+manifests written through by the build \
+         ({total_bundles} manifest entr{} across {} platform(s)), {scene_sources} scene source(s)",
         outcome.entity_id,
+        if total_bundles == 1 { "y" } else { "ies" },
+        outcome.platforms.len(),
     );
     Ok(serde_json::json!({
         "uploaded": true,
-        "bucket": bucket,
-        "objects": uploaded,
+        "manifestEntries": total_bundles,
         "sceneSources": scene_sources,
-        "bundlePrefix": bundle_prefix,
     }))
 }
 
@@ -156,10 +98,10 @@ pub fn publish(
 fn upload_scene_sources(
     cfg: &Config,
     agent: &ureq::Agent,
-    client: &s3::S3Client,
+    proxy: &Arc<Proxy>,
     entity_doc: &serde_json::Value,
     outcome: &EntityOutcome,
-) -> Result<usize> {
+) -> usize {
     let mut wanted: Vec<String> = vec!["main.crdt".to_string(), "scene.json".to_string()];
     if let Some(main) = entity_doc
         .pointer("/metadata/main")
@@ -206,10 +148,9 @@ fn upload_scene_sources(
             "application/octet-stream"
         };
         let key = format!("{}/{}/{file}", cfg.version, outcome.entity_id);
-        match client.put_object(&key, &bytes, content_type, IMMUTABLE) {
-            Ok(()) => count += 1,
-            Err(e) => eprintln!("output: failed to upload scene source {file}: {e:#}"),
-        }
+        // space_put_key logs failures itself (best-effort, like prod).
+        proxy.space_put_key(&key, &bytes, content_type);
+        count += 1;
     }
-    Ok(count)
+    count
 }
