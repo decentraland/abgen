@@ -13,14 +13,10 @@ pub struct PlatformOutcome {
     pub platform: String,
     /// Bundle names in the manifest (aliases excluded). Note: names satisfied
     /// by the space's per-file reuse probe are listed here but were neither
-    /// rebuilt nor written to `dir` — they already exist on the CDN.
+    /// rebuilt nor written locally — they already exist on the CDN.
     pub built: Vec<String>,
     /// abgen's corpus exit code: 0 clean, 12 some assets failed but tolerated.
     pub exit_code: i32,
-    /// `{out_root}/{cid}/{platform}/` — where the bundle files sit.
-    pub dir: PathBuf,
-    /// `{out_root}/{cid}/{platform}.manifest.json`.
-    pub manifest_path: PathBuf,
 }
 
 pub struct EntityOutcome {
@@ -96,8 +92,6 @@ pub fn convert_entity(
             platform: platform.clone(),
             built,
             exit_code,
-            dir: cid_dir.join(platform),
-            manifest_path,
         });
     }
 

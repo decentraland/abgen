@@ -23,9 +23,9 @@
 //! content-addressed/immutable) and TTL 0 for `manifest/…`. No `.br`
 //! variants (no client of this pipeline fetches them).
 
+use crate::catalyst;
 use crate::config::Config;
 use crate::convert::EntityOutcome;
-use crate::catalyst;
 use abgen::live::Proxy;
 use anyhow::Result;
 use std::sync::Arc;
@@ -35,7 +35,12 @@ use std::sync::Arc;
 /// `exitCode == 0` (a tolerated-failure 12 gets another chance) and carries
 /// the current AB version. Any fetch/parse problem means "convert". With no
 /// space configured this is always false.
-pub fn platform_converted(proxy: &Arc<Proxy>, cfg: &Config, entity_id: &str, platform: &str) -> bool {
+pub fn platform_converted(
+    proxy: &Arc<Proxy>,
+    cfg: &Config,
+    entity_id: &str,
+    platform: &str,
+) -> bool {
     let Some(bytes) = proxy.space_get_manifest(&format!("{entity_id}_{platform}")) else {
         return false;
     };
@@ -87,7 +92,10 @@ pub fn publish(
     Ok(serde_json::json!({
         "uploaded": true,
         "manifestEntries": total_bundles,
-        "sceneSources": scene_sources,
+        // "Attempted" is honest: space_put_key is fire-and-forget (logs its
+        // own failures), so a failed PUT still counts here — best-effort,
+        // like prod's scene-source uploader.
+        "sceneSourcesAttempted": scene_sources,
     }))
 }
 

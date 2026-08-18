@@ -57,10 +57,7 @@ fn job_from_value(v: &Value) -> Result<Job> {
         });
     }
     // DeploymentToSqs.
-    if let Some(id) = v
-        .pointer("/entity/entityId")
-        .and_then(Value::as_str)
-    {
+    if let Some(id) = v.pointer("/entity/entityId").and_then(Value::as_str) {
         let is_lods = v.get("lods").map(|l| !l.is_null()).unwrap_or(false);
         let content_server_url = v
             .get("contentServerUrls")

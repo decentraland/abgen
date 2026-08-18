@@ -52,7 +52,9 @@ impl Config {
             out_root: std::env::var("OUT_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| std::env::temp_dir().join("abgen-lambda-out")),
-            keep_output: std::env::var("KEEP_OUTPUT").map(|v| v == "1").unwrap_or(false),
+            keep_output: std::env::var("KEEP_OUTPUT")
+                .map(|v| v == "1")
+                .unwrap_or(false),
             registry_queue_url: std::env::var("REGISTRY_QUEUE_URL")
                 .ok()
                 .filter(|v| !v.is_empty()),

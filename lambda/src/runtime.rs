@@ -40,9 +40,8 @@ pub fn serve(
 
         match handler(cfg, &event) {
             Ok(response) => {
-                let url = format!(
-                    "http://{api}/{API_VERSION}/runtime/invocation/{request_id}/response"
-                );
+                let url =
+                    format!("http://{api}/{API_VERSION}/runtime/invocation/{request_id}/response");
                 if let Err(e) = post_json(&agent, &url, &response) {
                     eprintln!("runtime: failed to post response for {request_id}: {e:#}");
                 }
