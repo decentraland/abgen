@@ -111,11 +111,12 @@ pub fn get_or_encode(
         s.misses += 1;
     }
     let result = f()?;
+    let len = result.0.len();
     let mut s = store().lock().unwrap();
-    if s.bytes + result.0.len() <= max_bytes() {
+    if s.bytes + len <= max_bytes() {
         if let std::collections::hash_map::Entry::Vacant(e) = s.map.entry(k) {
-            s.bytes += result.0.len();
             e.insert((result.0.clone(), result.1));
+            s.bytes += len;
         }
     }
     Some(result)
