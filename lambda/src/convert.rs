@@ -49,6 +49,7 @@ pub fn convert_entity(
     cfg: &Config,
     entity_id: &str,
     content_server: &str,
+    platforms: &[String],
 ) -> Result<EntityOutcome> {
     use abgen::live::{Proxy, ProxyConfig};
 
@@ -71,14 +72,14 @@ pub fn convert_entity(
         .out_root
         .join(&*abgen::naming::fs_safe_component(entity_id));
 
-    let mut platforms = Vec::with_capacity(cfg.platforms.len());
-    for platform in &cfg.platforms {
+    let mut results = Vec::with_capacity(platforms.len());
+    for platform in platforms {
         let built = proxy
             .build_entity_into_corpus(&cfg.out_root, entity_id, platform, content_server)
             .with_context(|| format!("convert {entity_id} for {platform}"))?;
         let manifest_path = cid_dir.join(format!("{platform}.manifest.json"));
         let exit_code = read_exit_code(&manifest_path).unwrap_or(0);
-        platforms.push(PlatformOutcome {
+        results.push(PlatformOutcome {
             platform: platform.clone(),
             built,
             exit_code,
@@ -97,7 +98,7 @@ pub fn convert_entity(
         entity_id: entity_id.to_string(),
         content_server: content_server.to_string(),
         cid_dir,
-        platforms,
+        platforms: results,
         cache_hits: h1.saturating_sub(h0),
         cache_misses: m1.saturating_sub(m0),
     })

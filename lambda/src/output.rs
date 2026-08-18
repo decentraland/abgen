@@ -28,13 +28,54 @@ const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const MANIFEST_CONTENT_TYPE: &str = "application/json";
 const MANIFEST_CACHE: &str = "private, max-age=0, no-cache";
 
+/// The S3 client for the configured bucket, or `None` when publishing is
+/// disabled (no `S3_BUCKET` — local-only runs).
+pub fn client_from(cfg: &Config) -> Result<Option<s3::S3Client>> {
+    match &cfg.s3_bucket {
+        Some(bucket) => Ok(Some(s3::S3Client::new(
+            bucket,
+            &cfg.s3_region,
+            cfg.s3_endpoint.as_deref(),
+            cfg.s3_acl.as_deref(),
+        )?)),
+        None => Ok(None),
+    }
+}
+
+/// Mirrors the consumer-server's `shouldIgnoreConversion`: a platform counts
+/// as already converted only when its manifest exists, parses, has
+/// `exitCode == 0` (a tolerated-failure 12 gets another chance) and carries
+/// the current AB version. Any fetch/parse problem means "convert".
+pub fn platform_converted(
+    client: &s3::S3Client,
+    cfg: &Config,
+    entity_id: &str,
+    platform: &str,
+) -> bool {
+    let key = format!("manifest/{entity_id}_{platform}.json");
+    let bytes = match client.get_object(&key) {
+        Ok(Some(b)) => b,
+        Ok(None) => return false,
+        Err(e) => {
+            eprintln!("probe: {key}: {e:#} — converting to be safe");
+            return false;
+        }
+    };
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    json.get("exitCode").and_then(serde_json::Value::as_i64) == Some(0)
+        && json.get("version").and_then(serde_json::Value::as_str) == Some(cfg.version.as_str())
+}
+
 pub fn publish(
     cfg: &Config,
     agent: &ureq::Agent,
+    client: Option<&s3::S3Client>,
     entity_doc: &serde_json::Value,
     outcome: &EntityOutcome,
 ) -> Result<serde_json::Value> {
-    let Some(bucket) = &cfg.s3_bucket else {
+    let (Some(bucket), Some(client)) = (&cfg.s3_bucket, client) else {
         let total: usize = outcome.platforms.iter().map(|p| p.built.len()).sum();
         eprintln!(
             "output: no S3_BUCKET configured — corpus left at {} ({total} file(s))",
@@ -59,13 +100,6 @@ pub fn publish(
     } else {
         format!("{}/{}", cfg.version, outcome.entity_id)
     };
-
-    let client = s3::S3Client::new(
-        bucket,
-        &cfg.s3_region,
-        cfg.s3_endpoint.as_deref(),
-        cfg.s3_acl.as_deref(),
-    )?;
 
     let mut uploaded = 0usize;
     for p in &outcome.platforms {
@@ -98,7 +132,7 @@ pub fn publish(
 
     let mut scene_sources = 0usize;
     if is_scene && outcome.exit_code() == 0 {
-        scene_sources = upload_scene_sources(cfg, agent, &client, entity_doc, outcome)?;
+        scene_sources = upload_scene_sources(cfg, agent, client, entity_doc, outcome)?;
     }
 
     eprintln!(

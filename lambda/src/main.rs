@@ -129,8 +129,29 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
         }));
     }
 
-    // TODO(step 5): manifest HEAD on the CDN — return early when every
-    // configured platform is already converted.
+    let client = output::client_from(cfg)?;
+
+    // Already-converted skip (consumer-server semantics): a platform whose
+    // manifest exists with exitCode 0 at the current AB version needs no
+    // work. Partially-converted entities rebuild only the missing targets.
+    let mut pending: Vec<String> = cfg.platforms.clone();
+    if let Some(client) = client.as_ref().filter(|_| !job.force) {
+        pending.retain(|platform| {
+            let done = output::platform_converted(client, cfg, &job.entity_id, platform);
+            if done {
+                eprintln!(
+                    "skip: {} {platform} already converted at {}",
+                    job.entity_id, cfg.version
+                );
+            }
+            !done
+        });
+        if pending.is_empty() {
+            return Ok(serde_json::json!({
+                "entityId": job.entity_id, "skipped": "already-converted"
+            }));
+        }
+    }
 
     let content_server = job
         .content_server_url
@@ -142,11 +163,11 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
     let agent = catalyst::agent();
     let entity_doc = catalyst::fetch_entity(&agent, content_server, &job.entity_id)?;
 
-    let outcome = convert::convert_entity(cfg, &job.entity_id, content_server)?;
+    let outcome = convert::convert_entity(cfg, &job.entity_id, content_server, &pending)?;
 
     // Publish + notify, then drop the local corpus (Lambda /tmp is 10 GB and
     // shared across warm invocations) unless a local run wants to inspect it.
-    let published = output::publish(cfg, &agent, &entity_doc, &outcome)
+    let published = output::publish(cfg, &agent, client.as_ref(), &entity_doc, &outcome)
         .and_then(|upload| notify::send(cfg, &outcome).map(|notified| (upload, notified)));
     if !cfg.keep_output {
         let _ = std::fs::remove_dir_all(&outcome.cid_dir);

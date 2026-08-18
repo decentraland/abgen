@@ -13,6 +13,9 @@ pub struct Job {
     /// `DeploymentToSqs.lods` was present: a LOD-generation job, not an
     /// entity conversion.
     pub is_lods: bool,
+    /// `"force": true` in the payload — convert even when the CDN already
+    /// has a current manifest (manual requeues).
+    pub force: bool,
 }
 
 /// Accepts, in order of detection:
@@ -39,6 +42,8 @@ pub fn jobs_from_event(event: &Value) -> Result<Vec<Job>> {
 }
 
 fn job_from_value(v: &Value) -> Result<Job> {
+    let force = v.get("force").and_then(Value::as_bool).unwrap_or(false);
+
     // Manual payload.
     if let Some(id) = v.get("entityId").and_then(Value::as_str) {
         return Ok(Job {
@@ -48,6 +53,7 @@ fn job_from_value(v: &Value) -> Result<Job> {
                 .and_then(Value::as_str)
                 .map(normalize_content_server),
             is_lods: false,
+            force,
         });
     }
     // DeploymentToSqs.
@@ -69,6 +75,7 @@ fn job_from_value(v: &Value) -> Result<Job> {
             entity_id: validated_entity_id(id)?,
             content_server_url,
             is_lods,
+            force,
         });
     }
     bail!("unrecognized event shape: expected entityId or entity.entityId")
@@ -126,6 +133,14 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].entity_id, "bafkdef456");
         assert!(!jobs[0].is_lods);
+    }
+
+    #[test]
+    fn parses_force_flag() {
+        let e = serde_json::json!({"entityId": "bafkforce1", "force": true});
+        assert!(jobs_from_event(&e).unwrap()[0].force);
+        let e = serde_json::json!({"entityId": "bafkforce2"});
+        assert!(!jobs_from_event(&e).unwrap()[0].force);
     }
 
     #[test]

@@ -23,8 +23,8 @@ per-entity hit/miss counts are logged and returned in the response.
 | 1 | texture-encode cache (dual-emit) | done |
 | 2 | event parsing, `--once` local mode, dual-platform conversion | done |
 | 3 | S3 upload (SigV4 over ureq; no `.br` variants — no client of this pipeline fetches them) | done |
-| 4 | registry SQS notification | TODO |
-| 5 | already-converted / missing-files skip | TODO |
+| 4 | registry SQS notification | deferred (registry duplicate is a follow-up) |
+| 5 | already-converted / missing-files skip | done |
 | 6 | container image (`provided.al2023`) | TODO |
 
 ## Local run (no AWS)
@@ -78,4 +78,15 @@ SQS record batches whose bodies are catalyst `DeploymentToSqs` payloads
 (`{"entity":{"entityId":…},"contentServerUrls":[…]}`), or a plain
 `{"entityId":…, "contentServerUrl":…}` for manual invokes. LOD jobs
 (`lods` present) are acknowledged and skipped — LOD generation stays on the
-Unity pipeline.
+Unity pipeline. `"force": true` in either shape bypasses the
+already-converted skip.
+
+## Already-converted skip
+
+Before converting, each configured platform's `manifest/{entityId}_{platform}.json`
+is fetched from the bucket. A platform is skipped when the manifest exists,
+has `exitCode == 0` and matches the current `AB_VERSION` — the
+consumer-server's `shouldIgnoreConversion` semantics. Partially-converted
+entities rebuild only the missing targets; when everything is current, the
+invocation returns `{"skipped": "already-converted"}` in seconds. Any
+fetch/parse problem fails open (converts) — uploads are idempotent.

@@ -55,6 +55,64 @@ impl S3Client {
         })
     }
 
+    /// Signed GET. `Ok(None)` when the object does not exist — S3 answers
+    /// 404 with `s3:ListBucket` granted, 403 without it, so both map to
+    /// "missing" (a real permission problem then surfaces on the first PUT).
+    pub fn get_object(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        const EMPTY_SHA256: &str =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let canonical_uri = format!("{}/{}", self.path_prefix, aws::uri_encode(key, false));
+        let url = format!("{}{}", self.base_url, canonical_uri);
+
+        let mut last: Option<String> = None;
+        for attempt in 0..RETRIES {
+            let (amz_date, date) = aws::amz_date_now();
+            let auth = aws::authorization_header(
+                &self.creds,
+                &aws::SignParams {
+                    method: "GET",
+                    host: &self.host,
+                    canonical_uri: &canonical_uri,
+                    canonical_query: "",
+                    extra_headers: &[],
+                    payload_sha256_hex: EMPTY_SHA256,
+                    service: "s3",
+                    region: &self.region,
+                    amz_date: &amz_date,
+                    date: &date,
+                },
+            );
+            let mut req = self
+                .agent
+                .get(&url)
+                .header("Authorization", &auth)
+                .header("x-amz-date", &amz_date)
+                .header("x-amz-content-sha256", EMPTY_SHA256);
+            if let Some(token) = &self.creds.session_token {
+                req = req.header("x-amz-security-token", token);
+            }
+            match req.call() {
+                Ok(resp) => {
+                    let mut buf = Vec::new();
+                    use std::io::Read;
+                    resp.into_body().into_reader().read_to_end(&mut buf)?;
+                    return Ok(Some(buf));
+                }
+                Err(ureq::Error::StatusCode(404)) => return Ok(None),
+                Err(ureq::Error::StatusCode(403)) => {
+                    eprintln!(
+                        "s3: GET {key} → 403; treating as missing (grant s3:ListBucket for clean 404s)"
+                    );
+                    return Ok(None);
+                }
+                Err(ureq::Error::StatusCode(code)) => last = Some(format!("HTTP {code}")),
+                Err(e) => last = Some(e.to_string()),
+            }
+            std::thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
+        }
+        bail!("GET s3://…/{key} failed after {RETRIES} attempts: {}", last.unwrap_or_default())
+    }
+
     pub fn put_object(
         &self,
         key: &str,
