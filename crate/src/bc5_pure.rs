@@ -125,6 +125,29 @@ pub fn encode_dxt5_crn_mip_chain(
     flip: bool,
     quality_level: u32,
 ) -> Option<(Vec<u8>, i32)> {
+    let params = [
+        mip_count.map(i64::from).unwrap_or(-1),
+        flip as i64,
+        quality_level as i64,
+    ];
+    crate::texencode_cache::get_or_encode(
+        crate::texencode_cache::Kind::Dxt5Crn,
+        rgba,
+        width,
+        height,
+        &params,
+        || encode_dxt5_crn_mip_chain_uncached(rgba, width, height, mip_count, flip, quality_level),
+    )
+}
+
+fn encode_dxt5_crn_mip_chain_uncached(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    mip_count: Option<i32>,
+    flip: bool,
+    quality_level: u32,
+) -> Option<(Vec<u8>, i32)> {
     let w = width as usize;
     let h = height as usize;
     assert_eq!(rgba.len(), w * h * 4);

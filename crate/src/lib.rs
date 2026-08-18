@@ -53,6 +53,7 @@ pub mod skeleton;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod space;
 pub mod tangents;
+pub mod texencode_cache;
 pub mod texprofile;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod tmppath;

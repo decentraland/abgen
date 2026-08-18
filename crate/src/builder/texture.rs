@@ -207,6 +207,19 @@ fn encode_inglb_dxt5_stub(width: u32, height: u32, mips: i32) -> (Vec<u8>, i32) 
 
 pub(super) fn encode_dxt5_mip_chain_real(img: &RgbaImage, mips: i32, srgb: bool) -> (Vec<u8>, i32) {
     let (w, h) = img.dimensions();
+    crate::texencode_cache::get_or_encode(
+        crate::texencode_cache::Kind::Bc3,
+        img.as_raw(),
+        w,
+        h,
+        &[mips as i64, srgb as i64],
+        || Some(encode_dxt5_mip_chain_real_uncached(img, mips, srgb)),
+    )
+    .expect("bc3 encode closure always returns Some")
+}
+
+fn encode_dxt5_mip_chain_real_uncached(img: &RgbaImage, mips: i32, srgb: bool) -> (Vec<u8>, i32) {
+    let (w, h) = img.dimensions();
     let (w, h) = (w as usize, h as usize);
     let src = img.as_raw();
     let mut flipped = vec![0u8; w * h * 4];
