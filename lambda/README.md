@@ -88,12 +88,12 @@ Recommended function config:
 | SQS trigger | batch size 1, visibility timeout ≥ 900 s, DLQ after ~3 receives | one entity per invocation; whales land in the DLQ |
 | reserved concurrency | ~20 | politeness cap on catalyst downloads |
 
-**One-time bucket seeding (infra phase):** clients fetch the well-known
-shader bundles from the CDN, and this pipeline has no JIT to materialize
-them on demand. The vendored payloads ship in the image under
-`/opt/abgen/shader`; seed them into the bucket once per AB version (e.g. by
-briefly running the abgen server pointed at the bucket, or a future
-`--seed-shaders` mode).
+**Shader bundles:** none need seeding for unity-explorer — it resolves the
+shared shader dependencies (`COMMON_SHADERS`) from its own embedded
+StreamingAssets, never from the CDN. The vendored payloads still ship in
+the image under `/opt/abgen/shader` (via `ABGEN_ROOT`) in case a
+non-embedding client ever points at this bucket; such requests would
+surface as `404`s in the CloudFront logs.
 
 Bundles and manifests are written through to S3 by the build itself
 (abgen's space); scene sources are published by the handler afterwards.
