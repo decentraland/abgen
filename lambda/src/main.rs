@@ -24,12 +24,15 @@
 //!                                  the result JSON and exit — full local run
 //!                                  without any AWS.
 
+mod aws;
+mod catalyst;
 mod config;
 mod convert;
 mod event;
 mod notify;
 mod output;
 mod runtime;
+mod s3;
 
 use anyhow::{Context, Result};
 
@@ -42,7 +45,9 @@ fn main() {
                 std::process::exit(2);
             };
             init();
-            let cfg = config::Config::from_env();
+            let mut cfg = config::Config::from_env();
+            // Local runs keep the corpus on disk for inspection.
+            cfg.keep_output = true;
             match run_once(&cfg, path) {
                 Ok(v) => {
                     println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
@@ -62,7 +67,9 @@ fn main() {
                  --once EVENT.json handles a single event locally and exits.\n\
                  \n\
                  env: PLATFORMS (windows,mac), AB_VERSION (v49), ABGEN_CACHE_DIR,\n\
-                 \x20    CONTENT_SERVER_URL, OUT_ROOT, S3_BUCKET, REGISTRY_QUEUE_URL"
+                 \x20    CONTENT_SERVER_URL, OUT_ROOT, KEEP_OUTPUT,\n\
+                 \x20    S3_BUCKET, AWS_REGION, S3_ENDPOINT, S3_ACL (+ AWS credentials),\n\
+                 \x20    REGISTRY_QUEUE_URL"
             );
         }
         Some(other) => {
@@ -129,10 +136,22 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
         .content_server_url
         .as_deref()
         .unwrap_or(&cfg.default_content_server);
+
+    // The entity document drives the upload layout (scene → canonical
+    // `{version}/assets`, others → entity-scoped) and scene-source publishing.
+    let agent = catalyst::agent();
+    let entity_doc = catalyst::fetch_entity(&agent, content_server, &job.entity_id)?;
+
     let outcome = convert::convert_entity(cfg, &job.entity_id, content_server)?;
 
-    let upload = output::publish(cfg, &outcome)?;
-    let notified = notify::send(cfg, &outcome)?;
+    // Publish + notify, then drop the local corpus (Lambda /tmp is 10 GB and
+    // shared across warm invocations) unless a local run wants to inspect it.
+    let published = output::publish(cfg, &agent, &entity_doc, &outcome)
+        .and_then(|upload| notify::send(cfg, &outcome).map(|notified| (upload, notified)));
+    if !cfg.keep_output {
+        let _ = std::fs::remove_dir_all(&outcome.cid_dir);
+    }
+    let (upload, notified) = published?;
 
     eprintln!(
         "done: {} platforms={} exitCode={} texcache hits={} misses={}",

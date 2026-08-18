@@ -22,7 +22,7 @@ per-entity hit/miss counts are logged and returned in the response.
 |------|------|-------|
 | 1 | texture-encode cache (dual-emit) | done |
 | 2 | event parsing, `--once` local mode, dual-platform conversion | done |
-| 3 | S3 upload (SigV4 over ureq; no `.br` variants — no client of this pipeline fetches them) | TODO |
+| 3 | S3 upload (SigV4 over ureq; no `.br` variants — no client of this pipeline fetches them) | done |
 | 4 | registry SQS notification | TODO |
 | 5 | already-converted / missing-files skip | TODO |
 | 6 | container image (`provided.al2023`) | TODO |
@@ -48,8 +48,29 @@ all hits.
 | `ABGEN_CACHE_DIR` | `$TMPDIR/abgen-cache` | content download cache (point at `/tmp` on Lambda) |
 | `CONTENT_SERVER_URL` | foundation catalyst | fallback when the event carries none |
 | `OUT_ROOT` | `$TMPDIR/abgen-lambda-out` | local conversion output root |
-| `S3_BUCKET` | — | CDN bucket (step 3) |
+| `S3_BUCKET` | — | CDN bucket; unset = leave output on disk only |
+| `AWS_REGION` | `us-east-1` | bucket/queue region (Lambda sets it) |
+| `S3_ENDPOINT` | — | custom S3 endpoint (minio/localstack; switches to path-style) |
+| `S3_ACL` | — | e.g. `public-read` to mirror prod ACL buckets; unset for OAC buckets |
+| `KEEP_OUTPUT` | off (`--once` forces on) | keep the local corpus after upload |
 | `REGISTRY_QUEUE_URL` | — | registry queue (step 4) |
+
+AWS credentials come from the standard env (`AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) — on Lambda, the execution role
+provides them.
+
+## CDN key layout (mirrors prod exactly)
+
+| what | key |
+|------|-----|
+| scene bundles (canonical / asset-reuse) | `{AB_VERSION}/assets/{bundleName}` |
+| wearable & emote bundles (entity-scoped) | `{AB_VERSION}/{entityId}/{bundleName}` |
+| manifests | `manifest/{entityId}_{platform}.json` |
+| scene sources (`main.crdt`, `scene.json`, main script; clean scene builds) | `{AB_VERSION}/{entityId}/{file}` |
+
+Bundle objects: `application/wasm`, `public, max-age=31536000, immutable`.
+Manifests: `application/json`, `private, max-age=0, no-cache`. No `.br`
+siblings (see step 3 note above).
 
 ## Event shapes accepted
 

@@ -1,47 +1,181 @@
-//! Publishing conversion output to the CDN bucket.
+//! Publishing conversion output to the CDN bucket, mirroring the Node
+//! consumer-server's layout exactly:
 //!
-//! TODO(step 3): upload to S3 with the same keys, content types and headers
-//! the Node consumer-server used:
-//!   * bundles:  `{version}/{bundleName}`
-//!   * manifest: `manifest/{entityId}_{platform}.json`
-//! then remove the local corpus dir. Signing will be hand-rolled SigV4 over
-//! ureq (credentials from the Lambda execution-role env), keeping the binary
-//! async-free.
+//!   * scene bundles (asset-reuse/canonical): `{version}/assets/{bundleName}`
+//!   * wearable/emote bundles (entity-scoped): `{version}/{entityId}/{bundleName}`
+//!   * manifests: `manifest/{entityId}_{platform}.json` — abgen's corpus
+//!     manifest is shape-identical to prod's ({version, files, exitCode,
+//!     contentServerUrl, date}), uploaded verbatim
+//!   * scene sources (clean scene conversions only): `main.crdt`,
+//!     `scene.json` and `entity.metadata.main` to `{version}/{entityId}/…` —
+//!     the desktop explorer fetches these from the CDN (issue #7625)
 //!
-//! Deliberately NOT uploaded: the `.br` brotli siblings prod stores next to
-//! every file. They exist for legacy web clients; this pipeline's only
-//! consumer is unity-explorer, which fetches raw names (verified 2026-08:
-//! no `.br` fetches in unity-explorer or aang-renderer). Edge compression
-//! can cover a future web consumer without re-adding them.
-//!
-//! Until then this stub reports what it *would* upload, and `--once` runs
-//! leave the corpus under OUT_ROOT for inspection.
+//! Headers mirror prod: bundles `application/wasm` + immutable caching (odd
+//! but load-bearing — it is what makes the edge cache them), manifests
+//! `application/json` + no-cache. Deliberately NOT uploaded: the `.br`
+//! brotli siblings prod stores next to every file — no client of this
+//! pipeline fetches them (verified 2026-08: unity-explorer and aang-renderer
+//! have zero `.br` references); edge compression can cover a future web
+//! consumer.
 
 use crate::config::Config;
 use crate::convert::EntityOutcome;
-use anyhow::Result;
+use crate::{catalyst, s3};
+use anyhow::{Context, Result};
 
-pub fn publish(cfg: &Config, outcome: &EntityOutcome) -> Result<serde_json::Value> {
-    let total_files: usize = outcome.platforms.iter().map(|p| p.built.len()).sum();
-    match &cfg.s3_bucket {
-        Some(bucket) => {
-            eprintln!(
-                "output: TODO(step 3) would upload {total_files} bundle(s) + {} manifest(s) \
-                 for {} to s3://{bucket}/{}/… — corpus left at {}",
-                outcome.platforms.len(),
-                outcome.entity_id,
-                cfg.version,
-                cfg.out_root.display(),
-            );
-            Ok(serde_json::json!({ "uploaded": false, "pendingStep": 3, "bucket": bucket }))
+const BUNDLE_CONTENT_TYPE: &str = "application/wasm";
+const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+const MANIFEST_CONTENT_TYPE: &str = "application/json";
+const MANIFEST_CACHE: &str = "private, max-age=0, no-cache";
+
+pub fn publish(
+    cfg: &Config,
+    agent: &ureq::Agent,
+    entity_doc: &serde_json::Value,
+    outcome: &EntityOutcome,
+) -> Result<serde_json::Value> {
+    let Some(bucket) = &cfg.s3_bucket else {
+        let total: usize = outcome.platforms.iter().map(|p| p.built.len()).sum();
+        eprintln!(
+            "output: no S3_BUCKET configured — corpus left at {} ({total} file(s))",
+            cfg.out_root.display(),
+        );
+        return Ok(serde_json::json!({
+            "uploaded": false,
+            "local": cfg.out_root.display().to_string(),
+        }));
+    };
+
+    let entity_type = entity_doc
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("scene");
+    let is_scene = entity_type == "scene";
+    // Scenes share canonical digest-named keys across entities; everything
+    // else is entity-scoped. Matches the consumer's useAssetReuse gate, which
+    // is scene-only, and abgen's own digest-naming gate.
+    let bundle_prefix = if is_scene {
+        format!("{}/assets", cfg.version)
+    } else {
+        format!("{}/{}", cfg.version, outcome.entity_id)
+    };
+
+    let client = s3::S3Client::new(
+        bucket,
+        &cfg.s3_region,
+        cfg.s3_endpoint.as_deref(),
+        cfg.s3_acl.as_deref(),
+    )?;
+
+    let mut uploaded = 0usize;
+    for p in &outcome.platforms {
+        for name in &p.built {
+            let stored = p.dir.join(&*abgen::naming::fs_safe_component(name));
+            let bytes = std::fs::read(&stored)
+                .with_context(|| format!("read built bundle {}", stored.display()))?;
+            client
+                .put_object(
+                    &format!("{bundle_prefix}/{name}"),
+                    &bytes,
+                    BUNDLE_CONTENT_TYPE,
+                    IMMUTABLE,
+                )
+                .with_context(|| format!("upload bundle {name}"))?;
+            uploaded += 1;
         }
-        None => {
-            eprintln!(
-                "output: no S3_BUCKET configured — corpus left at {} ({} file(s))",
-                cfg.out_root.display(),
-                total_files,
-            );
-            Ok(serde_json::json!({ "uploaded": false, "local": cfg.out_root.display().to_string() }))
+        let manifest_bytes = std::fs::read(&p.manifest_path)
+            .with_context(|| format!("read manifest {}", p.manifest_path.display()))?;
+        client
+            .put_object(
+                &format!("manifest/{}_{}.json", outcome.entity_id, p.platform),
+                &manifest_bytes,
+                MANIFEST_CONTENT_TYPE,
+                MANIFEST_CACHE,
+            )
+            .with_context(|| format!("upload manifest for {}", p.platform))?;
+        uploaded += 1;
+    }
+
+    let mut scene_sources = 0usize;
+    if is_scene && outcome.exit_code() == 0 {
+        scene_sources = upload_scene_sources(cfg, agent, &client, entity_doc, outcome)?;
+    }
+
+    eprintln!(
+        "output: uploaded {uploaded} object(s) + {scene_sources} scene source(s) \
+         for {} to s3://{bucket}/{bundle_prefix}/…",
+        outcome.entity_id,
+    );
+    Ok(serde_json::json!({
+        "uploaded": true,
+        "bucket": bucket,
+        "objects": uploaded,
+        "sceneSources": scene_sources,
+        "bundlePrefix": bundle_prefix,
+    }))
+}
+
+/// `main.crdt`, `scene.json` and the entity's declared main script, fetched
+/// from the catalyst and re-published entity-scoped. Best-effort per file
+/// (mirrors prod, which logs and continues): a missing source file must not
+/// fail a finished conversion.
+fn upload_scene_sources(
+    cfg: &Config,
+    agent: &ureq::Agent,
+    client: &s3::S3Client,
+    entity_doc: &serde_json::Value,
+    outcome: &EntityOutcome,
+) -> Result<usize> {
+    let mut wanted: Vec<String> = vec!["main.crdt".to_string(), "scene.json".to_string()];
+    if let Some(main) = entity_doc
+        .pointer("/metadata/main")
+        .and_then(serde_json::Value::as_str)
+    {
+        wanted.push(main.to_string());
+    }
+
+    let empty = Vec::new();
+    let content = entity_doc
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&empty);
+    let hash_for = |file: &str| -> Option<&str> {
+        content.iter().find_map(|c| {
+            (c.get("file").and_then(serde_json::Value::as_str) == Some(file))
+                .then(|| c.get("hash").and_then(serde_json::Value::as_str))
+                .flatten()
+        })
+    };
+
+    let mut count = 0usize;
+    for file in &wanted {
+        let Some(hash) = hash_for(file) else {
+            eprintln!("output: {file} not in entity content, skipping scene-source upload");
+            continue;
+        };
+        let url = format!(
+            "{}/contents/{hash}",
+            outcome.content_server.trim_end_matches('/')
+        );
+        let bytes = match catalyst::get_bytes(agent, &url) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("output: failed to fetch scene source {file}: {e:#}");
+                continue;
+            }
+        };
+        let content_type = if file.ends_with(".js") {
+            "application/javascript"
+        } else if file.ends_with(".json") {
+            "application/json"
+        } else {
+            "application/octet-stream"
+        };
+        let key = format!("{}/{}/{file}", cfg.version, outcome.entity_id);
+        match client.put_object(&key, &bytes, content_type, IMMUTABLE) {
+            Ok(()) => count += 1,
+            Err(e) => eprintln!("output: failed to upload scene source {file}: {e:#}"),
         }
     }
+    Ok(count)
 }

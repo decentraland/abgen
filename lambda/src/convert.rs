@@ -25,6 +25,8 @@ pub struct PlatformOutcome {
 pub struct EntityOutcome {
     pub entity_id: String,
     pub content_server: String,
+    /// `{out_root}/{cid}/` — removed after publishing unless keep_output.
+    pub cid_dir: PathBuf,
     pub platforms: Vec<PlatformOutcome>,
     /// Texture-encode cache hits/misses across this entity's platforms — the
     /// dual-emit saving made visible (hits ≈ second platform's encodes).
@@ -94,6 +96,7 @@ pub fn convert_entity(
     Ok(EntityOutcome {
         entity_id: entity_id.to_string(),
         content_server: content_server.to_string(),
+        cid_dir,
         platforms,
         cache_hits: h1.saturating_sub(h0),
         cache_misses: m1.saturating_sub(m0),
