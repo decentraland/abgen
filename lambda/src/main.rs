@@ -4,6 +4,7 @@ mod convert;
 mod emf;
 mod event;
 mod http;
+mod lod;
 mod notify;
 mod output;
 mod runtime;
@@ -51,7 +52,10 @@ fn main() {
                  \x20    ABGEN_SNS_TOPIC_ARN, ABGEN_SNS_ENDPOINT,\n\
                  \x20    ABGEN_REDIS_URL, ABGEN_REDIS_TTL_SECONDS,\n\
                  \x20    ABGEN_HTTP_SECRET (required by the Function URL POST path),\n\
-                 \x20    ABGEN_EMF_NAMESPACE (CloudWatch EMF metrics on stdout)"
+                 \x20    ABGEN_EMF_NAMESPACE (CloudWatch EMF metrics on stdout),\n\
+                 \x20    ENABLE_LODS (off: LOD jobs are acked and skipped; on: levels 0+1\n\
+                 \x20    are regenerated from the scene and written to LOD/<level>/ and\n\
+                 \x20    lods-unity/manifests/ — the deployment's FBX sources are unused)"
             );
         }
         Some(other) => {
@@ -177,10 +181,13 @@ fn job_outcome(summary: &Result<serde_json::Value>) -> &'static str {
 }
 
 fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Value> {
-    if job.is_lods {
-        eprintln!("skip: LOD job for {} (unsupported here)", job.entity_id);
+    if job.is_lods && !cfg.lods_enabled {
+        eprintln!(
+            "skip: LOD job for {} (LOD generation is off; set ENABLE_LODS=1)",
+            job.entity_id
+        );
         return Ok(serde_json::json!({
-            "entityId": job.entity_id, "skipped": "lods-unsupported"
+            "entityId": job.entity_id, "skipped": "lods-disabled"
         }));
     }
 
@@ -192,6 +199,10 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
         event::ensure_allowed_content_server(content_server, allowed)?;
     }
     let proxy = convert::make_proxy(cfg, content_server);
+
+    if job.is_lods {
+        return lod::convert(cfg, &proxy, &job.entity_id, content_server);
+    }
 
     let mut pending: Vec<String> = cfg.platforms.clone();
     let mut already: Vec<String> = Vec::new();
@@ -385,7 +396,7 @@ mod tests {
         let e = json!({"entity": {"entityId": "bafklod789"}, "lods": ["https://x/lod0.glb"]});
         assert_eq!(
             handle(&cfg, &e).unwrap(),
-            json!({"jobs": [{"entityId": "bafklod789", "skipped": "lods-unsupported"}]})
+            json!({"jobs": [{"entityId": "bafklod789", "skipped": "lods-disabled"}]})
         );
     }
 
