@@ -301,8 +301,27 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
             .increment(p.built.len() as u64);
     }
 
-    let published =
-        output::publish(cfg, &agent, &proxy, &entity_doc, &outcome).and_then(|upload| {
+    let published = publish_forget_notify(
+        || output::publish(cfg, &agent, &proxy, &entity_doc, &outcome),
+        || {
+            if job.force {
+                // A concurrent non-force redelivery may have re-marked from
+                // the old manifest while this force job ran; drop the markers
+                // again the moment the (possibly downgraded) result is
+                // published — before notify, whose SNS retries would widen the
+                // stale-marker window and whose failure must not skip the
+                // forget. A re-mark landing after this point is the residual
+                // race documented in the README.
+                for platform in &cfg.platforms {
+                    if let Some(key) =
+                        output::converted_marker_key(&proxy, cfg, &job.entity_id, platform)
+                    {
+                        abgen::rediscache::forget(&key);
+                    }
+                }
+            }
+        },
+        || {
             let mut finished: Vec<notify::Finished> = outcome
                 .platforms
                 .iter()
@@ -316,24 +335,12 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
                 status_code: notify::STATUS_ALREADY_CONVERTED,
             }));
             notify::send_finished(cfg, &job.entity_id, content_server, false, &finished)
-                .map(|notified| (upload, notified))
-        });
+        },
+    );
     if !cfg.keep_output {
         let _ = std::fs::remove_dir_all(&outcome.cid_dir);
     }
     let (upload, notified) = published?;
-
-    if job.force {
-        // A concurrent non-force redelivery may have re-marked from the old
-        // manifest while this force job ran; drop the markers again now that
-        // the (possibly downgraded) result is published. A re-mark landing
-        // after this point is the residual race documented in the README.
-        for platform in &cfg.platforms {
-            if let Some(key) = output::converted_marker_key(&proxy, cfg, &job.entity_id, platform) {
-                abgen::rediscache::forget(&key);
-            }
-        }
-    }
 
     eprintln!(
         "done: {} platforms={} exitCode={} texcache hits={} misses={}",
@@ -362,6 +369,20 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
         "upload": upload,
         "notified": notified,
     }))
+}
+
+/// Sequences the terminal steps of a conversion: `forget` runs immediately
+/// after a successful publish and before `notify`, and runs even when notify
+/// then fails — a stale converted-ok marker must never outlive a publish
+/// because SNS was slow or down.
+fn publish_forget_notify<U>(
+    publish: impl FnOnce() -> Result<U>,
+    forget: impl FnOnce(),
+    notify: impl FnOnce() -> Result<bool>,
+) -> Result<(U, bool)> {
+    let upload = publish()?;
+    forget();
+    notify().map(|notified| (upload, notified))
 }
 
 #[cfg(test)]
@@ -477,6 +498,59 @@ mod tests {
         let body = json!({"entity": {"entityId": "bafklod789"}, "lods": ["https://x/lod0.glb"]});
         let e = json!({"Records": [{"messageId": "m-1", "body": body.to_string()}]});
         assert_eq!(handle(&cfg, &e).unwrap(), json!({"batchItemFailures": []}));
+    }
+
+    #[test]
+    fn forget_runs_after_publish_and_before_notify_even_when_notify_fails() {
+        use std::cell::RefCell;
+        let log: RefCell<Vec<&str>> = RefCell::new(Vec::new());
+        let result = publish_forget_notify(
+            || {
+                log.borrow_mut().push("publish");
+                Ok(1)
+            },
+            || log.borrow_mut().push("forget"),
+            || {
+                log.borrow_mut().push("notify");
+                anyhow::bail!("sns down")
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(*log.borrow(), vec!["publish", "forget", "notify"]);
+
+        let log: RefCell<Vec<&str>> = RefCell::new(Vec::new());
+        let (upload, notified) = publish_forget_notify(
+            || {
+                log.borrow_mut().push("publish");
+                Ok(2)
+            },
+            || log.borrow_mut().push("forget"),
+            || {
+                log.borrow_mut().push("notify");
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!((upload, notified), (2, true));
+        assert_eq!(*log.borrow(), vec!["publish", "forget", "notify"]);
+    }
+
+    #[test]
+    fn failed_publish_skips_forget_and_notify() {
+        let log: std::cell::RefCell<Vec<&str>> = std::cell::RefCell::new(Vec::new());
+        let r: Result<(i32, bool)> = publish_forget_notify(
+            || {
+                log.borrow_mut().push("publish");
+                anyhow::bail!("s3 down")
+            },
+            || log.borrow_mut().push("forget"),
+            || {
+                log.borrow_mut().push("notify");
+                Ok(true)
+            },
+        );
+        assert!(r.is_err());
+        assert_eq!(*log.borrow(), vec!["publish"]);
     }
 
     #[test]

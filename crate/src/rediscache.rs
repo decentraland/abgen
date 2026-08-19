@@ -413,11 +413,16 @@ impl State {
         self.with_conn("set", |c| c.expect_ok(&["SET", key, "1", "EX", &ttl]));
     }
 
-    fn forget(&self, key: &str) {
+    /// `false` when the DEL did not run or failed (backoff window, connect or
+    /// op error) — the callers stay fail-open, but a skipped delete is a
+    /// correctness hazard (a stale converted-ok marker can outlive a force
+    /// reconversion), not a missed optimization, so it must be visible.
+    fn forget(&self, key: &str) -> bool {
         self.with_conn("del", |c| match c.command(&["DEL", key])? {
             Reply::Error(e) => Err(io_err(format!("DEL: {e}"))),
             _ => Ok(()),
-        });
+        })
+        .is_some()
     }
 }
 
@@ -433,10 +438,17 @@ pub fn mark(key: &str) {
     }
 }
 
-/// Drops a key so the next check goes back to the source of truth.
+/// Drops a key so the next check goes back to the source of truth. Fail-open
+/// like every other op, but loudly: a DEL that did not happen means the key
+/// can keep answering `hit` for up to its TTL.
 pub fn forget(key: &str) {
     if let Some(st) = state() {
-        st.forget(key);
+        if !st.forget(key) {
+            tracing::warn!(
+                key = %key,
+                "redis DEL skipped or failed; a stale marker may keep answering hits for up to its TTL"
+            );
+        }
     }
 }
 
@@ -715,6 +727,29 @@ mod tests {
         assert!(st.hit("k"));
         server.join().expect("server");
         assert_eq!(commands.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn forget_reports_whether_the_del_ran() {
+        // Connection 1: DEL answered OK -> true. Connection 2 is never opened:
+        // the -ERR on the next DEL tears the conn down and starts the backoff,
+        // during which forget must return false without reconnecting.
+        let (target, commands, server) =
+            fake_redis(vec![vec![b":1\r\n", b"-ERR readonly\r\n"], vec![b":1\r\n"]]);
+        let st = test_state(target, 60);
+
+        assert!(st.forget("k"), "successful DEL");
+        assert!(!st.forget("k"), "-ERR DEL must report failure");
+        assert!(!st.forget("k"), "backoff-skipped DEL must report failure");
+        assert_eq!(
+            commands.lock().unwrap().len(),
+            2,
+            "backoff must not reconnect"
+        );
+
+        st.slot.lock().unwrap().last_failure = Instant::now().checked_sub(FAILURE_BACKOFF);
+        assert!(st.forget("k"), "DEL after backoff rewind");
+        server.join().expect("server");
     }
 
     #[test]

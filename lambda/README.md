@@ -155,6 +155,12 @@ marker caches a *mutable* artifact, the manifest verdict. Two consequences:
 - **out-of-band reconversions** — force or manual reconversions done outside
   abgen (anything that rewrites `manifest/…` without going through this
   handler) leave the markers stale for up to the TTL.
+- **fail-open deletes** — like every other op, the force path's marker
+  `DEL` fails open: if Redis is unreachable (or inside the 30 s backoff
+  window) exactly when a force job drops its markers, a stale converted-ok
+  marker can survive for up to the TTL and mask the downgraded result. The
+  skipped delete is logged at `warn` and counted in
+  `abgen_rediscache_total{result="error"}`; a second `force` clears it.
 
 Unset `ABGEN_REDIS_URL` and none of this exists — behavior is identical to
 today's S3-only path.
