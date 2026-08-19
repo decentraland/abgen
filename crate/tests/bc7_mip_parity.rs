@@ -85,8 +85,6 @@ fn bc7_mip_chain_hash() {
             fnv1a(&mut hash, &out);
             fnv1a(&mut hash, &count.to_le_bytes());
         }
-        // Slow is the production profile for basecolor; keep it on the small
-        // sizes so the test stays under a few seconds.
         if w * h <= 64 * 64 {
             let (out, count) = encode_bc7_mip_chain_with_profile(
                 &rgba,

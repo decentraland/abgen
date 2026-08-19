@@ -1,7 +1,3 @@
-# wasm32 flake check. Like nix/checks.nix, outside the buildId hash set:
-# check edits must never move buildId. Toolchain pins mirror
-# crate/abgen-wasm/toolchain/flake.nix, which stays the local-dev entry
-# point.
 { pkgs, crane, rust-overlay, buildSource, repoVersion }:
 
 let
@@ -13,18 +9,12 @@ let
 
   wasi = pkgs.pkgsCross.wasi32;
   wasiCC = wasi.stdenv.cc;
-  # Derived, not hardcoded: nixpkgs renamed the wasi target (wasm32-unknown-
-  # wasi -> wasm32-unknown-wasip1), and hardcoded tool names broke the check
-  # with ToolNotFound the moment this moved off the subflake's older pin.
   wasiPrefix = wasiCC.targetPrefix;
   wasiTriple = pkgs.lib.removeSuffix "-" wasiPrefix;
 
   commonArgs = {
     pname = "abgen-wasm-check";
     version = repoVersion;
-    # abgen-wasm is workspace-excluded with its own lockfile; the path dep
-    # abgen = { path = ".." } needs the surrounding repo tree, so keep the
-    # full build source and re-root cargo at the crate.
     src = buildSource;
     cargoLock = ../crate/abgen-wasm/Cargo.lock;
     cargoToml = ../crate/abgen-wasm/Cargo.toml;
@@ -38,18 +28,12 @@ let
     env = {
       CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
       RUSTFLAGS = "-C target-feature=+simd128";
-      # The vendored C deps (libjpeg9c/crunch/draco) compile against wasi
-      # headers even for the unknown-unknown target; abgen-wasm's build.rs
-      # links the wasi static libs via WASI_*_LIB.
       CC_wasm32_unknown_unknown = "${wasiCC}/bin/${wasiPrefix}cc";
       CXX_wasm32_unknown_unknown = "${wasiCC}/bin/${wasiPrefix}c++";
       AR_wasm32_unknown_unknown = "${wasiCC.bintools}/bin/${wasiPrefix}ar";
       CFLAGS_wasm32_unknown_unknown = "--target=${wasiTriple}";
       CXXFLAGS_wasm32_unknown_unknown = "--target=${wasiTriple}";
     };
-    # wasi-libc's archive layout moved across nixpkgs (lib -> lib/<triple>),
-    # which broke the link with "unable to find library -lsetjmp/-lc" when
-    # these were hardcoded /lib. Locate the archives instead of guessing.
     preBuild = ''
       WASI_LIBC_LIB="$(dirname "$(find ${wasiCC.libc} -name libc.a -print -quit)")"
       WASI_LIBCXX_LIB="$(dirname "$(find ${wasi.llvmPackages.libcxx} -name 'libc++.a' -print -quit)")"

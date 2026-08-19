@@ -134,10 +134,6 @@ fn bc7(c: &mut Criterion) {
         })
     });
 
-    // The BC7 mip chain is the shape the Lambda actually runs: one call
-    // encodes every level, and the small tail levels are where a per-level
-    // join barrier costs the most. `mip_chain_rgba32` above only measures the
-    // resize/quantize half, so it cannot see scheduling changes in the encoder.
     let (bw2, bh2) = (512usize, 512usize);
     let bc7_mip_src = texture_rgba_alpha(bw2, bh2, 0x243F6A88);
     group.throughput(Throughput::Bytes((bw2 * bh2 * 4) as u64));
