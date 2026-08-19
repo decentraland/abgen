@@ -24,9 +24,9 @@ if [ "${#ABGEN_BUILD_ID}" -ne 12 ]; then
   exit 1
 fi
 
-version="$(sed -n 's/^version = "\(.*\)"$/\1/p; /^version = "/q' "$ROOT/crate/Cargo.toml")"
+version="$(sed -n 's/^version = "\(.*\)"$/\1/p; /^version = "/q' "$ROOT/Cargo.toml")"
 [ -n "$version" ] || {
-  echo "write-build-info: no version in $ROOT/crate/Cargo.toml" >&2
+  echo "write-build-info: no workspace.package version in $ROOT/Cargo.toml" >&2
   exit 1
 }
 

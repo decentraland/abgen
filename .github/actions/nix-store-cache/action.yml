@@ -1,0 +1,37 @@
+name: nix + store cache
+description: >
+  Install nix and restore/save the repo's nix store cache. Single source of
+  the key scheme: every workflow that touches a nix store goes through this
+  action, so the "these blocks must stay identical" coupling between
+  cache-warm and its consumers is structural instead of a comment.
+  runner.arch is part of the key so x86_64 and aarch64 stores never cross.
+
+inputs:
+  family:
+    description: >
+      Key family. "build" hashes everything crane's deps derivation depends
+      on ('**/Cargo.toml': every member manifest feeds dummy-src; a manifest
+      missing from the hash would produce a stale exact hit that never
+      re-saves). "wasm" is its own family holding only the wasm toolchain
+      closure — sharing a family would let the image caches' purge rotation
+      evict it (and vice versa).
+    default: build
+
+runs:
+  using: composite
+  steps:
+    - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
+      with:
+        extra-conf: |
+          max-jobs = auto
+          cores = 0
+
+    - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569
+      with:
+        primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ inputs.family == 'wasm' && 'wasm-' || '' }}${{ inputs.family == 'wasm' && hashFiles('crate/abgen-wasm/toolchain/flake.lock', 'crate/abgen-wasm/toolchain/flake.nix') || hashFiles('flake.lock', 'Cargo.lock', '**/Cargo.toml', 'flake.nix', 'rust-toolchain.toml') }}
+        restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-${{ inputs.family == 'wasm' && 'wasm-' || '' }}
+        gc-max-store-size-linux: 4294967296
+        purge: true
+        purge-prefixes: nix-${{ runner.os }}-${{ runner.arch }}-${{ inputs.family == 'wasm' && 'wasm-' || '' }}
+        purge-last-accessed: 604800
+        purge-primary-key: never
