@@ -122,17 +122,19 @@ fn handle_http(cfg: &config::Config, req: &http::Request) -> serde_json::Value {
 fn run_jobs(cfg: &config::Config, event: &serde_json::Value) -> Result<serde_json::Value> {
     match event::parse_event(event)? {
         event::Event::Direct(job) => Ok(serde_json::json!({
-            "jobs": [instrumented_job(cfg, &job)?]
+            "jobs": [instrumented_job(cfg, Ok(job))?]
         })),
         event::Event::Sqs(records) => run_batch(records, |job| instrumented_job(cfg, job)),
     }
 }
 
 /// Every job — direct, SQS record, or HTTP-submitted — goes through here so
-/// the per-job outcome counters and duration histogram see all of them.
-fn instrumented_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Value> {
+/// the per-job outcome counters and duration histogram see all of them,
+/// including records that failed to parse (a poison-pill message redelivering
+/// until the DLQ must show up as `outcome="error"`, not only in stderr).
+fn instrumented_job(cfg: &config::Config, job: Result<event::Job>) -> Result<serde_json::Value> {
     let started = std::time::Instant::now();
-    let summary = handle_job(cfg, job);
+    let summary = job.and_then(|job| handle_job(cfg, &job));
     let outcome = job_outcome(&summary);
     metrics::histogram!("abgen_lambda_job_duration_seconds", "outcome" => outcome)
         .record(started.elapsed().as_secs_f64());
@@ -145,7 +147,7 @@ fn instrumented_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json
 /// of failing — and so redelivering — every record in the batch.
 fn run_batch(
     records: Vec<event::Record>,
-    mut run: impl FnMut(&event::Job) -> Result<serde_json::Value>,
+    mut run: impl FnMut(Result<event::Job>) -> Result<serde_json::Value>,
 ) -> Result<serde_json::Value> {
     let mut failures = Vec::new();
     for (i, record) in records.into_iter().enumerate() {
@@ -153,7 +155,7 @@ fn run_batch(
             .message_id
             .clone()
             .unwrap_or_else(|| format!("record {i}"));
-        match record.job.and_then(|job| run(&job)) {
+        match run(record.job) {
             Ok(summary) => eprintln!("ok {label}: {summary}"),
             Err(err) => {
                 eprintln!("failed {label}: {err:#}");
@@ -171,7 +173,7 @@ fn run_batch(
     Ok(serde_json::json!({ "batchItemFailures": failures }))
 }
 
-fn job_outcome(summary: &Result<serde_json::Value>) -> &'static str {
+pub(crate) fn job_outcome(summary: &Result<serde_json::Value>) -> &'static str {
     match summary {
         Err(_) => "error",
         Ok(v) if v.get("skipped").is_some() => "skipped",
@@ -228,7 +230,8 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
                     status_code: notify::STATUS_ALREADY_CONVERTED,
                 })
                 .collect();
-            let notified = notify::send_finished(cfg, &job.entity_id, content_server, &finished)?;
+            let notified =
+                notify::send_finished(cfg, &job.entity_id, content_server, false, &finished)?;
             return Ok(serde_json::json!({
                 "entityId": job.entity_id, "skipped": "already-converted", "notified": notified
             }));
@@ -271,7 +274,7 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
                 platform: p,
                 status_code: notify::STATUS_ALREADY_CONVERTED,
             }));
-            notify::send_finished(cfg, &job.entity_id, content_server, &finished)
+            notify::send_finished(cfg, &job.entity_id, content_server, false, &finished)
                 .map(|notified| (upload, notified))
         });
     if !cfg.keep_output {
@@ -325,6 +328,22 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Explicit config so no test depends on ambient env vars (`ENABLE_LODS=1`
+    /// once sent the lod tests below through the real network-touching lane).
+    fn test_cfg() -> config::Config {
+        config::Config {
+            platforms: vec!["windows".to_string(), "mac".to_string()],
+            version: "v49".to_string(),
+            cache_dir: "/tmp/cache".to_string(),
+            default_content_server: "https://peer.decentraland.org/content".to_string(),
+            out_root: std::path::PathBuf::from("/tmp/out"),
+            keep_output: false,
+            allowed_content_server_hosts: None,
+            http_secret: None,
+            lods_enabled: false,
+        }
+    }
+
     fn record(message_id: Option<&str>, entity_id: &str) -> event::Record {
         event::Record {
             message_id: message_id.map(str::to_string),
@@ -340,6 +359,7 @@ mod tests {
     fn run(records: Vec<event::Record>, failing: &[&str]) -> Result<serde_json::Value> {
         let failing: Vec<String> = failing.iter().map(|s| s.to_string()).collect();
         run_batch(records, |job| {
+            let job = job?;
             if failing.contains(&job.entity_id) {
                 anyhow::bail!("boom");
             }
@@ -392,7 +412,7 @@ mod tests {
 
     #[test]
     fn direct_invokes_keep_the_job_summary_shape() {
-        let cfg = config::Config::from_env();
+        let cfg = test_cfg();
         let e = json!({"entity": {"entityId": "bafklod789"}, "lods": ["https://x/lod0.glb"]});
         assert_eq!(
             handle(&cfg, &e).unwrap(),
@@ -402,9 +422,89 @@ mod tests {
 
     #[test]
     fn lod_records_are_acknowledged_not_reported_as_failures() {
-        let cfg = config::Config::from_env();
+        let cfg = test_cfg();
         let body = json!({"entity": {"entityId": "bafklod789"}, "lods": ["https://x/lod0.glb"]});
         let e = json!({"Records": [{"messageId": "m-1", "body": body.to_string()}]});
         assert_eq!(handle(&cfg, &e).unwrap(), json!({"batchItemFailures": []}));
+    }
+
+    #[test]
+    fn job_outcome_classification() {
+        assert_eq!(job_outcome(&Err(anyhow::anyhow!("x"))), "error");
+        assert_eq!(
+            job_outcome(&Ok(json!({"skipped": "lods-disabled"}))),
+            "skipped"
+        );
+        assert_eq!(job_outcome(&Ok(json!({"exitCode": 1}))), "failed");
+        assert_eq!(job_outcome(&Ok(json!({"exitCode": 0}))), "converted");
+        // Success summaries must carry a top-level exitCode — without one the
+        // job counts as failed (this miscounted every successful LOD job once).
+        assert_eq!(job_outcome(&Ok(json!({"entityId": "e"}))), "failed");
+    }
+
+    /// A record whose body fails to parse must still hit the per-job metrics
+    /// (`abgen_lambda_jobs_total{outcome="error"}`) — a poison-pill message
+    /// redelivering to the DLQ was previously invisible in EMF.
+    #[test]
+    fn parse_failures_are_counted_in_job_metrics() {
+        use metrics::{
+            Counter, CounterFn, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString,
+            Unit,
+        };
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        type Registered = (String, Vec<(String, String)>, Arc<AtomicU64>);
+        #[derive(Default)]
+        struct Capture {
+            counters: Mutex<Vec<Registered>>,
+        }
+        struct Count(Arc<AtomicU64>);
+        impl CounterFn for Count {
+            fn increment(&self, v: u64) {
+                self.0.fetch_add(v, Ordering::Relaxed);
+            }
+            fn absolute(&self, v: u64) {
+                self.0.store(v, Ordering::Relaxed);
+            }
+        }
+        impl Recorder for Capture {
+            fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn register_counter(&self, key: &Key, _: &Metadata<'_>) -> Counter {
+                let cell = Arc::new(AtomicU64::new(0));
+                self.counters.lock().unwrap().push((
+                    key.name().to_string(),
+                    key.labels()
+                        .map(|l| (l.key().to_string(), l.value().to_string()))
+                        .collect(),
+                    cell.clone(),
+                ));
+                Counter::from_arc(Arc::new(Count(cell)))
+            }
+            fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> Gauge {
+                Gauge::noop()
+            }
+            fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+                Histogram::noop()
+            }
+        }
+
+        let capture = Capture::default();
+        let cfg = test_cfg();
+        let summary = metrics::with_local_recorder(&capture, || {
+            instrumented_job(&cfg, Err(anyhow::anyhow!("body is not JSON")))
+        });
+        assert!(summary.is_err());
+        let counters = capture.counters.lock().unwrap();
+        let (_, _, count) = counters
+            .iter()
+            .find(|(name, labels, _)| {
+                name == "abgen_lambda_jobs_total"
+                    && labels.iter().any(|(k, v)| k == "outcome" && v == "error")
+            })
+            .expect("jobs_total{outcome=error} must be registered");
+        assert_eq!(count.load(Ordering::Relaxed), 1);
     }
 }

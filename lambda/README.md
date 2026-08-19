@@ -75,16 +75,22 @@ them automatically. The SNS client shares the same credential resolution.
 
 ## Finished events (SNS)
 
-With `ABGEN_SNS_TOPIC_ARN` set, every terminal branch publishes one
-`AssetBundleConversionFinishedEvent` per platform — the exact shape and
-`type`/`subType` message attributes production's consumer-server publishes
-(`consumer-server/src/adapters/sns.ts`), so a registry-side consumer with
-`rawMessageDelivery: true` receives byte-compatible bodies:
+With `ABGEN_SNS_TOPIC_ARN` set, every terminal branch of a *conversion* job
+publishes one `AssetBundleConversionFinishedEvent` per platform — the exact
+shape and `type`/`subType` message attributes production's consumer-server
+publishes (`consumer-server/src/adapters/sns.ts`), so a registry-side consumer
+with `rawMessageDelivery: true` receives byte-compatible bodies:
 
 - converted platforms carry their conversion exit code as `statusCode`
 - already-converted skips publish `statusCode: 13`, matching prod's
   triage fast path — one event per processed job, and a redelivered SQS
   message re-notifies if an earlier publish failed after upload
+- a successful `ENABLE_LODS=1` LOD job publishes one event per supported
+  platform with `isLods: true` and `statusCode: 0`, mirroring upstream's
+  `publishFinishedEvent(…, isLods: !!job.lods)`; the two LOD *skip* branches
+  (`lods-disabled`, `lods-no-supported-platform`) ack the message and
+  deliberately publish nothing — with LODs off, generation (and its events)
+  stays on the Unity pipeline
 
 Publish failures fail the invocation (SQS redelivers); with the ARN unset
 nothing is published and the run reports `"notified": false`.
@@ -288,7 +294,9 @@ simplify → bundle, levels 0 and 1, for every configured platform that has a
 LOD lane (`windows|mac|linux`; `webgl` is dropped with a log line). The
 result passes the same structural self-gate as the JIT lane — a gate failure
 fails the job and publishes nothing — and is then uploaded under the
-unversioned `LOD/…` and `lods-unity/manifests/…` keys above.
+unversioned `LOD/…` and `lods-unity/manifests/…` keys above, followed by one
+finished event per platform with `isLods: true` (see
+[Finished events](#finished-events-sns)).
 
 ```bash
 ENABLE_LODS=1 OUT_ROOT=/tmp/ab-out ./target/release/abgen-lambda \

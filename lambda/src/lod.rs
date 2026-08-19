@@ -59,6 +59,19 @@ pub fn convert(
     let objects = abgen::lods::published_objects(&scene_dir, &LEVELS);
     let uploaded = publish(cfg, proxy, &objects)?;
 
+    // Prod parity: upstream's conversion-orchestrator publishes one finished
+    // event per completed LOD conversion with `isLods: !!job.lods`
+    // (runFullConversionAndPublish). A publish failure propagates so SQS
+    // redelivers and re-notifies, like the non-LOD lane.
+    let finished: Vec<crate::notify::Finished> = platforms
+        .iter()
+        .map(|p| crate::notify::Finished {
+            platform: p,
+            status_code: 0,
+        })
+        .collect();
+    let notified = crate::notify::send_finished(cfg, entity_id, content_server, true, &finished)?;
+
     let bundle_bytes: usize = outcome.levels.iter().map(|l| l.bundle_bytes).sum();
     eprintln!(
         "done: {entity_id} lods scene={} levels={} platforms={} bytes={bundle_bytes} \
@@ -76,19 +89,49 @@ pub fn convert(
     );
     drop(guard);
 
-    Ok(serde_json::json!({
+    let levels: Vec<(u32, usize)> = outcome
+        .levels
+        .iter()
+        .map(|l| (l.level, l.bundle_bytes))
+        .collect();
+    Ok(success_summary(
+        entity_id,
+        &outcome.scene_id,
+        &platforms,
+        &levels,
+        objects.len(),
+        uploaded,
+        notified,
+    ))
+}
+
+/// The success summary a converted LOD job returns. Carries a top-level
+/// `exitCode: 0` so `job_outcome` classifies it as `converted` — a summary
+/// without one counts as `failed` in the job metrics.
+fn success_summary(
+    entity_id: &str,
+    scene_id: &str,
+    platforms: &[String],
+    levels: &[(u32, usize)],
+    objects: usize,
+    uploaded: bool,
+    notified: bool,
+) -> serde_json::Value {
+    serde_json::json!({
         "entityId": entity_id,
-        "sceneId": outcome.scene_id,
+        "sceneId": scene_id,
+        "exitCode": 0,
         "lods": {
             "platforms": platforms,
-            "levels": outcome.levels.iter().map(|l| serde_json::json!({
-                "level": l.level,
-                "bundleBytes": l.bundle_bytes,
+            "levels": levels.iter().map(|&(level, bundle_bytes)| serde_json::json!({
+                "level": level,
+                "bundleBytes": bundle_bytes,
             })).collect::<Vec<_>>(),
-            "objects": objects.len(),
+            "objects": objects,
             "uploaded": uploaded,
         },
-    }))
+        "notified": notified,
+    })
 }
 
 pub fn supported_platforms(configured: &[String]) -> (Vec<String>, Vec<String>) {
@@ -221,6 +264,25 @@ mod tests {
         assert!(p.tri_cap_auto);
         assert!(p.crop);
         assert_eq!(p.iss, "auto");
+    }
+
+    #[test]
+    fn success_summary_counts_as_converted_in_job_metrics() {
+        let s = success_summary(
+            "bafkscene",
+            "sid",
+            &["windows".to_string(), "mac".to_string()],
+            &[(0, 1024), (1, 512)],
+            7,
+            true,
+            true,
+        );
+        assert_eq!(s["exitCode"], 0);
+        assert_eq!(s["notified"], true);
+        assert_eq!(s["lods"]["levels"][1]["bundleBytes"], 512);
+        // The regression this guards: a success summary without a top-level
+        // exitCode is classified "failed" by the job metrics.
+        assert_eq!(crate::job_outcome(&Ok(s)), "converted");
     }
 
     #[test]
