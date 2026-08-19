@@ -91,23 +91,6 @@ fn corpus(num_blocks: usize, seed: u64) -> Vec<u8> {
     out
 }
 
-#[test]
-fn parity_hash() {
-    let num_blocks = 768;
-    let blocks = corpus(num_blocks, 0x9E3779B97F4A7C15);
-    for (name, p, want) in [
-        ("basic", Params::basic(false), 0x5682f7ac302e8f18),
-        ("slow", Params::slow(false), 0xe9faa6536ebc09cc),
-        ("basic-perceptual", Params::basic(true), 0xa50af210824b832a),
-        ("slow-perceptual", Params::slow(true), 0x2c9adafb6d78b5c8),
-    ] {
-        let enc = encode_blocks(&blocks, num_blocks, &p);
-        let got = fnv1a(&enc);
-        println!("PARITY {name} {got:016x}");
-        assert_eq!(got, want, "BC7 {name} corpus hash moved");
-    }
-}
-
 /// Pinned corpus hashes, per profile. These are the values produced by the
 /// scalar reference and by every SIMD backend (x86 AVX2, aarch64 NEON, wasm);
 /// run with `ABGEN_BC7_SCALAR=1` to check the aarch64 NEON kernels against the

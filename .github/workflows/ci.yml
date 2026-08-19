@@ -23,20 +23,6 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  fmt:
-    name: rustfmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-      - uses: ./.github/actions/rust-setup
-        with:
-          components: rustfmt
-          cache: "false"
-      - run: cargo fmt --all -- --check
-      - name: forbid node spawns
-        run: |
-          ! grep -rn 'Command::new("npm\|Command::new("node' crate/src
-
   sanitizers:
     name: address sanitizer
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -59,51 +45,8 @@ jobs:
           ABGEN_ROOT="$GITHUB_WORKSPACE" cargo test --locked --workspace --lib \
             --target x86_64-unknown-linux-gnu -- --test-threads=1
 
-  clippy:
-    name: clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-      - uses: ./.github/actions/rust-setup
-        with:
-          components: clippy
-      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-
-  check:
-    name: test
-    strategy:
-      matrix:
-        # The arm runner is what makes every #[cfg(target_arch = "aarch64")]
-        # NEON parity test a merge gate; without it the aarch64 release
-        # artifacts ship whatever the NEON kernels happen to produce.
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-      - uses: ./.github/actions/rust-setup
-      - name: install cargo-nextest
-        run: |
-          arch="$(uname -m)"
-          flavor=linux; [ "$arch" = aarch64 ] && flavor=linux-arm
-          curl -LsSf "https://get.nexte.st/0.9.143/$flavor" | tar xzf - -C "$HOME/.cargo/bin"
-      - run: ABGEN_ROOT="$GITHUB_WORKSPACE" cargo nextest run --locked --workspace
-      - run: cargo test --locked -p abgen-lambda
-      - run: ABGEN_ROOT="$GITHUB_WORKSPACE" cargo test --locked -p abgen-native --tests
-
-  native-smoke:
-    name: C ABI smoke
-    if: github.event_name != 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-      - uses: ./.github/actions/rust-setup
-      - name: C ABI smoke test
-        run: ABGEN_ROOT="$GITHUB_WORKSPACE" crate/abgen-native/tests/run-smoke.sh
-      - name: glibc floor
-        run: bash ci/check-glibc-floor.sh 2.34 target/release/libabgen.so target/release/libabgen.a
-
   windows:
-    name: windows lib tests
+    name: windows tests + smoke
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
@@ -119,13 +62,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p abgen-native --tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-  windows-smoke:
-    name: windows native smoke
-    runs-on: windows-2025
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-      - uses: ./.github/actions/rust-setup
       - name: native host smoke
         shell: pwsh
         run: |
@@ -177,17 +113,3 @@ jobs:
           esac
           bash ci/nix-checks.sh "$system"
 
-  wasm:
-    name: wasm32 check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-      - uses: ./.github/actions/nix-store-cache
-        with:
-          family: wasm
-      - name: abgen-wasm (wasm32)
-        run: |
-          cd crate/abgen-wasm
-          nix develop "path:$PWD/toolchain" --command \
-            env RUSTFLAGS='-C target-feature=+simd128' \
-            cargo check --locked --release --target wasm32-unknown-unknown

@@ -4,9 +4,13 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     crane.url = "github:ipetkov/crane/v0.23.4";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, crane }:
+  outputs = { self, nixpkgs, crane, rust-overlay }:
     let
       lib = nixpkgs.lib;
       # No x86_64-darwin: the pinned nixpkgs throws on import for it.
@@ -84,6 +88,10 @@
             inherit pkgs craneLib buildSource buildEnv sourceDateEpoch repoVersion;
           };
           inherit (build) abgenPkg abgenConsumersPkg;
+
+          wasmCheck = import ./nix/wasm.nix {
+            inherit pkgs crane rust-overlay buildSource repoVersion;
+          };
 
           abgenNativePkg = pkgs.runCommand "abgen-native-${repoVersion}" { } ''
             mkdir -p $out/bin $out/lib
@@ -167,7 +175,7 @@
           };
 
           checks = import ./nix/checks.nix {
-            inherit lib system pkgs craneLib;
+            inherit lib system pkgs craneLib wasmCheck;
             inherit (build) commonArgs cargoArtifacts abgenConsumersPkg;
           };
 

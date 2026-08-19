@@ -789,7 +789,10 @@ jobs:
   image:
     name: ghcr image
     needs: build-id
-    if: startsWith(github.ref, 'refs/tags/') || needs.build-id.outputs.image_docker != ''
+    # Tags always run (they push); otherwise only when no prebuilt artifact
+    # exists yet — a non-tag run with a prebuilt would skip every step and
+    # burn a runner fetching an artifact it discards.
+    if: startsWith(github.ref, 'refs/tags/') || needs.build-id.outputs.image_docker == ''
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -864,7 +867,8 @@ jobs:
   lambda-image:
     name: ECR lambda image
     needs: build-id
-    if: startsWith(github.ref, 'refs/tags/') || needs.build-id.outputs.image_lambda != ''
+    # Same gate as the ghcr image: tags push, non-tag runs only build.
+    if: startsWith(github.ref, 'refs/tags/') || needs.build-id.outputs.image_lambda == ''
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read

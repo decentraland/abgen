@@ -2,7 +2,8 @@
 # must never move buildId. Arch-independent checks exist only on
 # x86_64-linux so ci/nix-checks.sh can build every attr a system carries
 # without running them twice across arch families.
-{ lib, system, pkgs, craneLib, commonArgs, cargoArtifacts, abgenConsumersPkg }:
+{ lib, system, pkgs, craneLib, commonArgs, cargoArtifacts, abgenConsumersPkg
+, wasmCheck }:
 
 let
   src = commonArgs.src;
@@ -23,6 +24,8 @@ let
       cargoExtraArgs = "--locked";
       cargoClippyExtraArgs = "--workspace --all-targets -- -D warnings";
     });
+
+    wasm-check = wasmCheck;
   };
 
   archDependent = {

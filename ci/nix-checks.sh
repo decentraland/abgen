@@ -21,4 +21,8 @@ done <<<"$names"
 printf 'building %s check(s):\n' "${#attrs[@]}"
 printf '  %s\n' "${attrs[@]}"
 
-nix build --keep-going --no-link --print-build-logs "${attrs[@]}"
+# Quiet first: -L streams every check's full build log into the runner
+# log even when green. On failure, rerun with logs — only the failed
+# derivations rebuild, everything else is a store hit.
+nix build --keep-going --no-link "${attrs[@]}" \
+  || nix build --keep-going --no-link --print-build-logs "${attrs[@]}"
