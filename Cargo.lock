@@ -54,6 +54,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "abgen-lambda"
+version = "0.1.0"
+dependencies = [
+ "abgen",
+ "anyhow",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "abgen-native"
 version = "0.16.2"
 dependencies = [

@@ -266,6 +266,54 @@ pub fn encode_bc7_mip_chain_with_profile(
     perceptual: bool,
     profile: Bc7Profile,
 ) -> (Vec<u8>, i32) {
+    let params = [
+        mip_count.map(i64::from).unwrap_or(-1),
+        flip as i64,
+        srgb as i64,
+        perceptual as i64,
+        match profile {
+            Bc7Profile::Slow => 0,
+            Bc7Profile::Basic => 1,
+        },
+        encode_backend_tag(),
+    ];
+    crate::texencode_cache::get_or_encode(
+        crate::texencode_cache::Kind::Bc7,
+        rgba,
+        width,
+        height,
+        &params,
+        || {
+            Some(encode_bc7_mip_chain_with_profile_uncached(
+                rgba, width, height, mip_count, flip, srgb, perceptual, profile,
+            ))
+        },
+    )
+    .expect("bc7 encode closure always returns Some")
+}
+
+fn encode_backend_tag() -> i64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        crate::gpu_dispatch::enabled() as i64
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        0
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_bc7_mip_chain_with_profile_uncached(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    mip_count: Option<i32>,
+    flip: bool,
+    srgb: bool,
+    perceptual: bool,
+    profile: Bc7Profile,
+) -> (Vec<u8>, i32) {
     #[cfg(not(target_arch = "wasm32"))]
     if crate::gpu_dispatch::enabled() {
         if let Some(r) = crate::gpu_dispatch::encode_bc7_mip_chain(

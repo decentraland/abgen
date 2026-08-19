@@ -227,6 +227,34 @@ pub fn encode_dxt1_mip_chain(
     flip: bool,
     srgb: bool,
 ) -> (Vec<u8>, i32) {
+    let params = [
+        mip_count.map(i64::from).unwrap_or(-1),
+        flip as i64,
+        srgb as i64,
+    ];
+    crate::texencode_cache::get_or_encode(
+        crate::texencode_cache::Kind::Dxt1,
+        rgba,
+        width,
+        height,
+        &params,
+        || {
+            Some(encode_dxt1_mip_chain_uncached(
+                rgba, width, height, mip_count, flip, srgb,
+            ))
+        },
+    )
+    .expect("dxt1 encode closure always returns Some")
+}
+
+fn encode_dxt1_mip_chain_uncached(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    mip_count: Option<i32>,
+    flip: bool,
+    srgb: bool,
+) -> (Vec<u8>, i32) {
     let w = width as usize;
     let h = height as usize;
     assert_eq!(rgba.len(), w * h * 4);

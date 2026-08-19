@@ -1,0 +1,10 @@
+# Keep image build contexts small: build artifacts and VCS metadata are
+# never needed inside the image (COMMIT_HASH comes in as a build arg).
+.git
+target
+lambda/target
+crate/target
+crate/abgen-wasm/target
+crate/abgen-node/target
+.cargo-home
+site/wasm/abgen_wasm.wasm
