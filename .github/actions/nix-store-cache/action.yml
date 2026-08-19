@@ -28,6 +28,10 @@ runs:
         extra-conf: |
           max-jobs = auto
           cores = 0
+          # The store snapshot is GC-trimmed at save; a cached eval cache can
+          # then reference .drv files the trim deleted ("store path ... does
+          # not exist" at evaluation). Never trust it.
+          eval-cache = false
 
     # The family token is unconditional (and versioned) so no family's
     # restore/purge prefix is a string prefix of another family's keys:
