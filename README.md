@@ -142,12 +142,13 @@ Enabled when `ABGEN_S3_BUCKET` is non-empty (or `ABGEN_USE_SPACE=1`):
 - `ABGEN_FALLBACK_VERSION` (default `v41`) - extra version prefix tried on space-cache lookups
 - `ABGEN_WORLDS_CONTENT_URL` - worlds-content-server fallback for entity/content fetches that miss the primary source (default public worlds server; `0`/`off`/empty disables)
 
-Uploads carry the production consumer-server's object metadata, derived from the key by
+Uploads carry each key family's production writer's object metadata, derived from the key by
 `space::object_headers`: bundles `application/wasm` + `public,max-age=31536000,immutable`
 (cdn-uploader's comma-joined spelling), scene sources (`.js`/`.json`/`.crdt`) the direct-upload
-spelling `public, max-age=31536000, immutable`, manifests (`manifest/…`, `lods-unity/manifests/…`)
-`application/json` + `private, max-age=0, no-cache`, `.br` keys
-`public,no-transform,max-age=31536000,immutable`. No `Content-Encoding` is set on `.br` objects.
+spelling `public, max-age=31536000, immutable`, manifests (`manifest/…`) `application/json` +
+`private, max-age=0, no-cache`, ISS descriptors (`lods-unity/manifests/…`)
+`public, max-age=31536000` (lod-generator-unity's spelling), `.br` keys
+`public,no-transform,max-age=31536000,immutable` + `Content-Encoding: br` (as cdn-uploader sets).
 
 ### Asset-reuse mode (upstream converter parity)
 ON by default, matching the ab-cdn deployment's asset-reuse naming from v49 onward: scene

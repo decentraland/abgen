@@ -95,6 +95,13 @@ with `rawMessageDelivery: true` receives byte-compatible bodies:
 Publish failures fail the invocation (SQS redelivers); with the ARN unset
 nothing is published and the run reports `"notified": false`.
 
+One deliberate divergence from prod: on a conversion *exception* upstream's
+conversion-task uploads a `manifest/{entityId}_failed.json` sentinel for
+dashboards to poll. Here a hard failure is not terminal — the invocation
+fails, SQS redelivers, and the message eventually lands in the DLQ — so no
+failure sentinel is written; watch the DLQ (and
+`abgen_lambda_jobs_total{outcome="error"}`) instead.
+
 **This must be a dedicated topic, never the shared `event-driven-sns` bus**:
 the prod registry's subscription filter matches every `asset-bundle` event,
 and events from this pipeline describe a different CDN bucket. The message
@@ -258,17 +265,24 @@ surface as `404`s in the CloudFront logs.
 Bundles and manifests are written through to S3 by the build itself
 (abgen's space); scene sources are published by the handler afterwards.
 Every object carries the same Content-Type / Cache-Control the production
-consumer-server writes, derived from the key by `space::object_headers`:
-bundles are `application/wasm` + `public,max-age=31536000,immutable`
-(cdn-uploader's comma-joined spelling), scene sources (`.js`/`.json`/`.crdt`)
-the direct-upload spelling `public, max-age=31536000, immutable`,
-manifests (`manifest/…`, `lods-unity/manifests/…`) are `application/json`
-+ `private, max-age=0, no-cache`. That is origin-level defense in depth —
-**cache policy still must live on the CDN distribution**: long/immutable
-TTLs for `{AB_VERSION}/…` (keys are content-addressed) and TTL 0 for
-`manifest/…`. No `.br` siblings (see step 3 note above), and no
-`Content-Encoding` is set on the `.br` objects the LOD/bvwebgpu lanes do
-write.
+writer of its key family sets, derived from the key by
+`space::object_headers`: bundles are `application/wasm` +
+`public,max-age=31536000,immutable` (cdn-uploader's comma-joined spelling),
+scene sources (`.js`/`.json`/`.crdt`) the direct-upload spelling
+`public, max-age=31536000, immutable`, manifests (`manifest/…`) are
+`application/json` + `private, max-age=0, no-cache`, and ISS descriptors
+(`lods-unity/manifests/…`) are `public, max-age=31536000` — the
+lod-generator-unity storage adapter's `CACHE_CONTROL_ONE_YEAR`, whose keys
+these are (they embed the content-addressed entity id; they are *not*
+rewritten-in-place consumer-server manifests). `.br` objects additionally
+carry `Content-Encoding: br`, like every brotli variant cdn-uploader
+writes. That is origin-level defense in depth — **cache policy still must
+live on the CDN distribution**: long/immutable TTLs for `{AB_VERSION}/…`
+(keys are content-addressed) and TTL 0 for `manifest/…`. No `.br` siblings
+of asset bundles (see step 3 note above). Two remaining divergences from
+cdn-uploader, both deliberate: no `decompressed-content-length` object
+metadata, and no `ACL: public-read` (grant reads via bucket policy /
+CloudFront OAC, not object ACLs).
 
 ## Per-file asset reuse
 

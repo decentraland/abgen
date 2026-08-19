@@ -382,6 +382,11 @@ async fn lod_space_read_through(
     resp
 }
 
+/// Server-lane write-back. Upload metadata is deliberately shared with the
+/// lambda lane: `space::object_headers` derives Content-Type / Cache-Control /
+/// Content-Encoding from the key (#60), replacing the per-call-site
+/// `application/octet-stream` this path used to send, so origin objects match
+/// their production writers no matter which lane wrote them.
 pub(super) fn spawn_lod_writeback(state: &AppState, sid: &str) {
     let Some(proxy) = state.live_proxy.clone() else {
         return;

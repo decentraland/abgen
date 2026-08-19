@@ -439,12 +439,13 @@ pub fn s3_source_urls(
 pub struct PublishedObject {
     pub key: String,
     pub path: PathBuf,
-    pub content_type: &'static str,
 }
 
 /// Space objects a generated LOD scene directory publishes, keyed the way the
 /// abcdn asks for them: bundles at `LOD/{level}/{file}` and the ISS descriptor
 /// at `lods-unity/manifests/{file}` — both unversioned, unlike asset bundles.
+/// Upload metadata (Content-Type/Cache-Control/Content-Encoding) is derived
+/// from the key by `space::object_headers`, not carried here.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn published_objects(scene_dir: &Path, levels: &[u32]) -> Vec<PublishedObject> {
     let mut out: Vec<PublishedObject> = Vec::new();
@@ -454,7 +455,6 @@ pub fn published_objects(scene_dir: &Path, levels: &[u32]) -> Vec<PublishedObjec
             out.push(PublishedObject {
                 key: format!("LOD/{level}/{name}"),
                 path: dir.join(&name),
-                content_type: "application/octet-stream",
             });
         }
     }
@@ -466,11 +466,6 @@ pub fn published_objects(scene_dir: &Path, levels: &[u32]) -> Vec<PublishedObjec
         out.push(PublishedObject {
             key: format!("lods-unity/manifests/{name}"),
             path: scene_dir.join(&name),
-            content_type: if name.ends_with(".json") {
-                "application/json"
-            } else {
-                "application/octet-stream"
-            },
         });
     }
     out
@@ -718,9 +713,6 @@ mod tests {
                 "lods-unity/manifests/bafkscene_InitialSceneState.json.br",
             ]
         );
-        assert_eq!(objs[0].content_type, "application/octet-stream");
-        assert_eq!(objs[3].content_type, "application/json");
-        assert_eq!(objs[4].content_type, "application/octet-stream");
         assert_eq!(objs[2].path, scene.join("LOD/1/bafkscene_1_mac"));
         assert!(published_objects(&base.join("missing"), &[0, 1]).is_empty());
         let _ = std::fs::remove_dir_all(&base);
