@@ -7,6 +7,10 @@ use std::sync::Arc;
 
 /// Bucket+version-scoped so an `AB_VERSION` bump can't suppress reconversion;
 /// only verdicts read back from S3 are cached — never our own fail-soft uploads.
+/// Unlike content-addressed probe keys this caches a MUTABLE artifact: a
+/// reconversion done outside this lambda leaves a stale marker for up to the
+/// TTL. In-lambda force jobs clear markers before and after rebuilding, which
+/// narrows but does not close that window.
 pub fn converted_marker_key(
     proxy: &Arc<Proxy>,
     cfg: &Config,

@@ -4,8 +4,13 @@
 //! stored (canonical keys are immutable, so a positive can't go stale;
 //! negatives never — a concurrent build may upload the object any moment),
 //! and every Redis error fails open to the real probe with a backoff.
+//!
+//! Keys are deliberately `abgen:`-prefixed and bucket-scoped, so this cache
+//! is NOT interoperable with consumer-server's (which keys by raw S3 key) —
+//! the cluster is dedicated, and cross-pipeline sharing would let hits
+//! describing one CDN leak into another.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -19,6 +24,7 @@ const DEFAULT_TTL_SECONDS: u64 = 86_400;
 struct Target {
     host: String,
     port: u16,
+    username: Option<String>,
     password: Option<String>,
     db: Option<u32>,
 }
@@ -41,15 +47,15 @@ fn parse_url(url: &str) -> Result<Target, String> {
         Some((r, _)) => (r, None),
         None => (rest, None),
     };
-    let (password, hostport) = match rest.rsplit_once('@') {
+    let (username, password, hostport) = match rest.rsplit_once('@') {
         Some((userinfo, hp)) => {
-            let pass = match userinfo.split_once(':') {
-                Some((_user, p)) => p,
-                None => userinfo,
+            let (user, pass) = match userinfo.split_once(':') {
+                Some((u, p)) => (Some(u.to_string()).filter(|u| !u.is_empty()), p),
+                None => (None, userinfo),
             };
-            (Some(pass.to_string()).filter(|p| !p.is_empty()), hp)
+            (user, Some(pass.to_string()).filter(|p| !p.is_empty()), hp)
         }
-        None => (None, rest),
+        None => (None, None, rest),
     };
     let (host, port) = match hostport.rsplit_once(':') {
         Some((h, p)) => (h, p.parse::<u16>().map_err(|_| format!("bad port {p:?}"))?),
@@ -61,6 +67,7 @@ fn parse_url(url: &str) -> Result<Target, String> {
     Ok(Target {
         host: host.to_string(),
         port,
+        username,
         password,
         db,
     })
@@ -172,7 +179,10 @@ fn connect(target: &Target) -> std::io::Result<Conn> {
         writer: stream,
     };
     if let Some(pass) = &target.password {
-        conn.expect_ok(&["AUTH", pass])?;
+        match &target.username {
+            Some(user) => conn.expect_ok(&["AUTH", user, pass])?,
+            None => conn.expect_ok(&["AUTH", pass])?,
+        }
     }
     if let Some(db) = target.db {
         conn.expect_ok(&["SELECT", &db.to_string()])?;
@@ -185,14 +195,88 @@ struct ConnSlot {
     last_failure: Option<Instant>,
 }
 
-struct State {
+struct Client {
     target: Target,
     ttl_seconds: u64,
     slot: Mutex<ConnSlot>,
 }
 
-fn state() -> Option<&'static State> {
-    static S: OnceLock<Option<State>> = OnceLock::new();
+impl Client {
+    fn with_conn<T>(
+        &self,
+        op: &'static str,
+        f: impl FnOnce(&mut Conn) -> std::io::Result<T>,
+    ) -> Option<T> {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.conn.is_none() {
+            if let Some(at) = slot.last_failure {
+                if at.elapsed() < FAILURE_BACKOFF {
+                    return None;
+                }
+            }
+            match connect(&self.target) {
+                Ok(c) => slot.conn = Some(c),
+                Err(e) => {
+                    slot.last_failure = Some(Instant::now());
+                    metrics::counter!("abgen_rediscache_total", "op" => "connect", "result" => "error")
+                        .increment(1);
+                    tracing::warn!(
+                        host = %self.target.host,
+                        error = %e,
+                        "redis connect failed; hit-cache bypassed for {FAILURE_BACKOFF:?}"
+                    );
+                    return None;
+                }
+            }
+        }
+        let conn = slot.conn.as_mut().expect("connection just ensured");
+        match f(conn) {
+            Ok(v) => {
+                slot.last_failure = None;
+                Some(v)
+            }
+            Err(e) => {
+                slot.conn = None;
+                slot.last_failure = Some(Instant::now());
+                metrics::counter!("abgen_rediscache_total", "op" => op, "result" => "error")
+                    .increment(1);
+                tracing::warn!(error = %e, "redis {op} failed; hit-cache bypassed for {FAILURE_BACKOFF:?}");
+                None
+            }
+        }
+    }
+
+    fn hit(&self, key: &str) -> bool {
+        let r = self.with_conn("exists", |c| match c.command(&["EXISTS", key])? {
+            Reply::Integer(n) => Ok(n > 0),
+            Reply::Error(e) => Err(io_err(format!("EXISTS: {e}"))),
+            other => Err(io_err(format!("EXISTS: unexpected reply {other:?}"))),
+        });
+        let result = match r {
+            Some(true) => "hit",
+            Some(false) => "miss",
+            None => return false,
+        };
+        metrics::counter!("abgen_rediscache_total", "op" => "exists", "result" => result)
+            .increment(1);
+        r == Some(true)
+    }
+
+    fn mark(&self, key: &str) {
+        let ttl = self.ttl_seconds.to_string();
+        self.with_conn("set", |c| c.expect_ok(&["SET", key, "1", "EX", &ttl]));
+    }
+
+    fn forget(&self, key: &str) {
+        self.with_conn("del", |c| match c.command(&["DEL", key])? {
+            Reply::Error(e) => Err(io_err(format!("DEL: {e}"))),
+            _ => Ok(()),
+        });
+    }
+}
+
+fn client() -> Option<&'static Client> {
+    static S: OnceLock<Option<Client>> = OnceLock::new();
     S.get_or_init(|| {
         let url = std::env::var("ABGEN_REDIS_URL")
             .ok()
@@ -204,7 +288,7 @@ fn state() -> Option<&'static State> {
                     .and_then(|v| v.parse::<u64>().ok())
                     .filter(|&t| t > 0)
                     .unwrap_or(DEFAULT_TTL_SECONDS);
-                Some(State {
+                Some(Client {
                     target,
                     ttl_seconds,
                     slot: Mutex::new(ConnSlot {
@@ -223,79 +307,26 @@ fn state() -> Option<&'static State> {
 }
 
 pub fn enabled() -> bool {
-    state().is_some()
-}
-
-fn with_conn<T>(op: &str, f: impl FnOnce(&mut Conn) -> std::io::Result<T>) -> Option<T> {
-    let st = state()?;
-    let mut slot = st.slot.lock().unwrap_or_else(|e| e.into_inner());
-    if slot.conn.is_none() {
-        if let Some(at) = slot.last_failure {
-            if at.elapsed() < FAILURE_BACKOFF {
-                return None;
-            }
-        }
-        match connect(&st.target) {
-            Ok(c) => slot.conn = Some(c),
-            Err(e) => {
-                slot.last_failure = Some(Instant::now());
-                metrics::counter!("abgen_rediscache_total", "op" => "connect", "result" => "error")
-                    .increment(1);
-                tracing::warn!(
-                    host = %st.target.host,
-                    error = %e,
-                    "redis connect failed; hit-cache bypassed for {FAILURE_BACKOFF:?}"
-                );
-                return None;
-            }
-        }
-    }
-    let conn = slot.conn.as_mut().expect("connection just ensured");
-    match f(conn) {
-        Ok(v) => {
-            slot.last_failure = None;
-            Some(v)
-        }
-        Err(e) => {
-            slot.conn = None;
-            slot.last_failure = Some(Instant::now());
-            tracing::warn!(error = %e, "redis {op} failed; hit-cache bypassed for {FAILURE_BACKOFF:?}");
-            None
-        }
-    }
+    client().is_some()
 }
 
 /// True iff the key is present. Any error or disabled cache is a miss.
 pub fn hit(key: &str) -> bool {
-    let r = with_conn("EXISTS", |c| match c.command(&["EXISTS", key])? {
-        Reply::Integer(n) => Ok(n > 0),
-        Reply::Error(e) => Err(io_err(format!("EXISTS: {e}"))),
-        other => Err(io_err(format!("EXISTS: unexpected reply {other:?}"))),
-    });
-    let result = match r {
-        Some(true) => "hit",
-        Some(false) => "miss",
-        None => return false,
-    };
-    metrics::counter!("abgen_rediscache_total", "op" => "exists", "result" => result).increment(1);
-    r == Some(true)
+    client().map(|c| c.hit(key)).unwrap_or(false)
 }
 
 /// Records a confirmed-positive existence check. Fire-and-forget.
 pub fn mark(key: &str) {
-    let Some(st) = state() else {
-        return;
-    };
-    let ttl = st.ttl_seconds.to_string();
-    with_conn("SET", |c| c.expect_ok(&["SET", key, "1", "EX", &ttl]));
+    if let Some(c) = client() {
+        c.mark(key)
+    }
 }
 
 /// Drops a key so the next check goes back to the source of truth.
 pub fn forget(key: &str) {
-    with_conn("DEL", |c| match c.command(&["DEL", key])? {
-        Reply::Error(e) => Err(io_err(format!("DEL: {e}"))),
-        _ => Ok(()),
-    });
+    if let Some(c) = client() {
+        c.forget(key)
+    }
 }
 
 #[cfg(test)]
@@ -310,6 +341,7 @@ mod tests {
             Target {
                 host: "cache.internal".to_string(),
                 port: 6379,
+                username: None,
                 password: None,
                 db: None,
             }
@@ -323,19 +355,19 @@ mod tests {
             Target {
                 host: "10.0.0.5".to_string(),
                 port: 6380,
+                username: None,
                 password: Some("sekret".to_string()),
                 db: Some(2),
             }
         );
         // Userinfo without a colon is treated as the password.
+        let t = parse_url("redis://sekret@host").unwrap();
+        assert_eq!((t.username, t.password), (None, Some("sekret".to_string())));
+        // user:password keeps both — ElastiCache RBAC needs 2-arg AUTH.
+        let t = parse_url("redis://alice:sekret@host").unwrap();
         assert_eq!(
-            parse_url("redis://sekret@host").unwrap().password,
-            Some("sekret".to_string())
-        );
-        // A user:password pair keeps only the password.
-        assert_eq!(
-            parse_url("redis://default:sekret@host").unwrap().password,
-            Some("sekret".to_string())
+            (t.username, t.password),
+            (Some("alice".to_string()), Some("sekret".to_string()))
         );
         // Trailing slash without a db index is tolerated.
         assert_eq!(parse_url("redis://host/").unwrap().db, None);
@@ -381,5 +413,100 @@ mod tests {
         assert!(read_reply(&mut r).is_err());
         let mut r = Cursor::new(b"$5\r\nab\r\n".to_vec());
         assert!(read_reply(&mut r).is_err());
+    }
+
+    fn read_command(r: &mut impl BufRead) -> Option<Vec<String>> {
+        let mut line = String::new();
+        if r.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        let n: usize = line.trim_start_matches('*').trim().parse().ok()?;
+        let mut parts = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut len_line = String::new();
+            r.read_line(&mut len_line).ok()?;
+            let len: usize = len_line.trim_start_matches('$').trim().parse().ok()?;
+            let mut buf = vec![0u8; len + 2];
+            r.read_exact(&mut buf).ok()?;
+            buf.truncate(len);
+            parts.push(String::from_utf8(buf).ok()?);
+        }
+        Some(parts)
+    }
+
+    /// Scripted RESP server: answers each command with the next canned reply,
+    /// records what it saw, then reports whether the client tried a second
+    /// connection (it must not, during backoff).
+    fn fake_redis(
+        replies: &'static [&'static str],
+    ) -> (u16, std::thread::JoinHandle<(Vec<String>, bool)>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(sock.try_clone().expect("clone"));
+            let mut writer = sock;
+            let mut seen = Vec::new();
+            let mut replies = replies.iter();
+            while let Some(cmd) = read_command(&mut reader) {
+                seen.push(cmd.join(" "));
+                match replies.next() {
+                    Some(r) => writer.write_all(r.as_bytes()).expect("write"),
+                    None => break,
+                }
+            }
+            std::thread::sleep(Duration::from_millis(150));
+            listener.set_nonblocking(true).expect("nonblocking");
+            let reconnected = listener.accept().is_ok();
+            (seen, reconnected)
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn wire_flow_auth_select_and_fail_open_backoff() {
+        let (port, server) = fake_redis(&[
+            "+OK\r\n",          // AUTH alice sekret
+            "+OK\r\n",          // SELECT 2
+            ":1\r\n",           // EXISTS k1 → hit
+            "+OK\r\n",          // SET k1 1 EX 86400
+            ":1\r\n",           // DEL k1
+            "-ERR loading\r\n", // EXISTS k2 → fail open, drop conn
+        ]);
+        let client = Client {
+            target: Target {
+                host: "127.0.0.1".to_string(),
+                port,
+                username: Some("alice".to_string()),
+                password: Some("sekret".to_string()),
+                db: Some(2),
+            },
+            ttl_seconds: 86_400,
+            slot: Mutex::new(ConnSlot {
+                conn: None,
+                last_failure: None,
+            }),
+        };
+        assert!(client.hit("k1"));
+        client.mark("k1");
+        client.forget("k1");
+        assert!(!client.hit("k2"), "-ERR must read as a miss");
+        assert!(
+            !client.hit("k3"),
+            "inside backoff: miss without reconnecting"
+        );
+        let (seen, reconnected) = server.join().expect("join");
+        assert_eq!(
+            seen,
+            vec![
+                "AUTH alice sekret",
+                "SELECT 2",
+                "EXISTS k1",
+                "SET k1 1 EX 86400",
+                "DEL k1",
+                "EXISTS k2",
+            ]
+        );
+        assert!(!reconnected, "client must back off after an error");
     }
 }

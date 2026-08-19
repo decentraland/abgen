@@ -174,6 +174,18 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
     }
     let (upload, notified) = published?;
 
+    if job.force {
+        // A concurrent non-force delivery can re-mark from the pre-force
+        // manifest while this run rebuilds; clear again now that the new
+        // manifests are the truth. Still TTL-bounded, not airtight — see
+        // converted_marker_key.
+        for platform in &cfg.platforms {
+            if let Some(key) = output::converted_marker_key(&proxy, cfg, &job.entity_id, platform) {
+                abgen::rediscache::forget(&key);
+            }
+        }
+    }
+
     eprintln!(
         "done: {} platforms={} exitCode={} texcache hits={} misses={}",
         outcome.entity_id,

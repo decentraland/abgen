@@ -123,6 +123,20 @@ Semantics (mirrors consumer-server's asset-reuse cache):
   entity markers it bypasses, since a reconversion can downgrade a manifest.
 - 24 h TTL bounds the keyspace across `AB_VERSION` bumps.
 
+One divergence from consumer-server, on purpose: the **entity-level
+already-converted marker has no upstream analog** (consumer-server re-fetches
+the manifest on every event). It caches a mutable artifact, so a
+reconversion done outside this lambda leaves the marker stale for up to the
+TTL; in-lambda `force` jobs clear their markers before and after rebuilding.
+Keys are `abgen:`-prefixed and bucket-scoped — deliberately NOT interoperable
+with consumer-server's cache (which keys by raw S3 key), since the cluster is
+dedicated and cross-CDN sharing would be wrong anyway.
+
+Observability: `abgen_rediscache_total{op,result}` counts hits, misses, and
+errors per operation (connect/exists/set/del) in the repo-wide `abgen_*`
+namespace (upstream uses `ab_converter_*`). The Lambda installs no metrics
+recorder yet — see #64.
+
 Unset `ABGEN_REDIS_URL` and none of this exists — behavior is identical to
 today's S3-only path.
 
