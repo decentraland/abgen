@@ -18,8 +18,6 @@ pub(crate) fn transform_img(bytes: &[u8]) -> Result<Vec<u8>> {
 
 const DDS_HEADER_LEN: usize = 148;
 
-// BC7 is fixed-rate, so the encoded size (header + full mip chain) is exact
-// from the target dimensions alone; images the encode cannot shrink skip it.
 fn encoded_dds_len(w: u32, h: u32) -> usize {
     let (tw, th) = crate::texprofile::bc7_target_size(w, h, super::BVW_TEXTURE_MAX);
     let mips = crate::bc7_pure::compute_default_mip_count(tw, th);

@@ -52,8 +52,6 @@ fn embedded_bundle(name: &str) -> Option<&'static [u8]> {
     EMBEDDED.iter().find(|(n, _)| *n == name).map(|(_, b)| *b)
 }
 
-/// `ABGEN_SHADER_BUNDLE` names `scene_ignore_windows` itself; siblings such as
-/// `scene_ignore_mac` resolve from the same directory.
 fn override_path(name: &str) -> Option<PathBuf> {
     let raw = std::env::var("ABGEN_SHADER_BUNDLE")
         .ok()
@@ -69,7 +67,6 @@ fn override_path(name: &str) -> Option<PathBuf> {
     })
 }
 
-/// Where the shader bundles are coming from, for logs and operator messages.
 pub fn bundle_source(name: &str) -> String {
     match override_path(name) {
         Some(p) => format!("{} (ABGEN_SHADER_BUNDLE)", p.display()),
@@ -77,8 +74,6 @@ pub fn bundle_source(name: &str) -> String {
     }
 }
 
-/// Takes the override path rather than reading the env, so the no-fallback
-/// contract is testable without mutating process-wide state.
 fn read_override(p: &Path, name: &str) -> Result<Vec<u8>> {
     std::fs::read(p).with_context(|| {
         format!(

@@ -295,10 +295,6 @@ pub(crate) fn cmd_compare(argv: &[String]) -> Result<i32> {
         bail!("compare needs exactly two bundle paths");
     }
 
-    // Era gate: LOD comparisons only target reference builds from the v49
-    // converter era onward. The version is not recorded inside the bundle
-    // (its embedded metadata `version` is the schema version "1.0"), so the
-    // caller passes the registry-reported asset-bundle version.
     if let Some(v) = &prod_ab {
         if abgen::lods::ab_version_is_lod_era(v) {
             println!("INFO era: prod asset-bundle version {v} (post-v49 lane)");

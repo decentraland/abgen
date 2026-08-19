@@ -1,15 +1,4 @@
 #!/usr/bin/env bash
-# Assembles the npm packages from the release archives and publishes them.
-#
-#   npm/publish.sh <version> <artifacts-dir> [--dry-run]
-#
-# <artifacts-dir> must hold abgen-v<version>-<target>.tar.gz for every target
-# below (the release workflow's build artifacts). Platform packages are the
-# archive contents verbatim - binary next to template/ + shader/, the layout
-# the exe-dir asset fallback expects - plus a stamped package.json. The @dcl/abgen
-# connector package publishes last so it never points at missing platforms.
-# --dry-run packs tarballs into <artifacts-dir>/npm-dist instead of publishing.
-# ABGEN_NPM_SCOPE overrides the @dcl scope for scratch publishes from forks.
 set -euo pipefail
 
 VERSION="${1:?usage: publish.sh <version> <artifacts-dir> [--dry-run]}"

@@ -6,15 +6,6 @@ pub(crate) fn require() -> bool {
     std::env::var("ABGEN_GPU_REQUIRE_WGPU").as_deref() == Ok("1")
 }
 
-/// An adapter these golden tests can say anything about.
-///
-/// Skips when there is no adapter, and equally when the only one is a software
-/// rasterizer: `DeviceType::Cpu` (GitHub's Windows runners expose "Microsoft
-/// Basic Render Driver [Dx12 Cpu]") cannot run these compute shaders, failing
-/// inside wgpu itself rather than merely producing different bytes. abgen
-/// would not use such an adapter either — `enable_gpu` qualifies before
-/// enabling anything — so a failure here would describe the runner, not the
-/// code.
 pub(crate) fn gpu_or_skip(test: &str) -> Option<&'static Gpu> {
     match gpu() {
         Ok(g) => {
@@ -39,16 +30,6 @@ pub(crate) fn gpu_or_skip(test: &str) -> Option<&'static Gpu> {
     }
 }
 
-/// Like [`gpu_or_skip`], but for the golden tests specifically.
-///
-/// Only the adapter's *identity* gates these, never its output. An earlier
-/// version asked the qualification battery — which runs
-/// `encode_bc7_mip_chain`, the very code the goldens check — so a real
-/// regression made the battery diverge, "disqualified" the backend, and the
-/// goldens skipped green. A test may not consult the thing it is testing.
-///
-/// `gpu_or_skip` already drops software rasterizers, which is what actually
-/// fails here. This exists so the intent is stated where the goldens read it.
 pub(crate) fn qualified_gpu_or_skip(test: &str) -> Option<&'static Gpu> {
     gpu_or_skip(test)
 }

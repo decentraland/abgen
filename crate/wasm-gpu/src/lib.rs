@@ -1,15 +1,3 @@
-//! WebGPU encode module for the wasm demo: the same bit-exact WGSL BC7 lane
-//! the native wgpu backend runs, hosted in its own worker because browser
-//! GPU readback is async-only. `gpu_init` acquires the adapter and
-//! self-qualifies it against the in-module CPU oracle over the native
-//! qualification matrix (sizes × srgb × perceptual × profile) — an adapter
-//! that is not bit-identical to the CPU path is refused, exactly like the
-//! native per-device contract. `gpu_encode` then services one request at a
-//! time from the convert workers' SharedArrayBuffer bridge.
-//!
-//! Request layout (LE, mirrors abgen-wasm's gpu_host_encode): u32 width,
-//! u32 height, i32 mips, u32 flags (bit0 flip, bit1 srgb, bit2 perceptual,
-//! bit3 profile-basic), then rgba bytes. Response: the raw BC7 mip chain.
 
 use abgen::bc7_pure;
 use abgen::gpu::{build_engine, encode_bc7_mip_chain_on, init_gpu, Bc7Profile, Engine, Gpu};
@@ -28,8 +16,6 @@ fn cpu_profile(p: Bc7Profile) -> bc7_pure::Bc7Profile {
     }
 }
 
-/// Deterministic RGBA test texture (self-contained LCG; the qualification
-/// only needs inputs whose CPU encode is computed in this same module).
 fn gen_texture(seed: u64, w: u32, h: u32) -> Vec<u8> {
     let mut s = seed.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(1);
     let mut out = Vec::with_capacity((w * h * 4) as usize);
@@ -101,8 +87,6 @@ async fn qualify(g: &Gpu, eng: &Engine) -> Result<(), String> {
     Ok(())
 }
 
-/// Acquire + qualify the adapter. Resolves to the adapter summary string on
-/// success; rejects (and leaves the module unarmed) on any failure.
 #[wasm_bindgen]
 pub async fn gpu_init() -> Result<String, JsValue> {
     let g = init_gpu().await.map_err(|e| JsValue::from_str(&e))?;
@@ -128,11 +112,6 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-/// Run the Tint bisection harness (abgen::gpu::bisect): the native wgpu_bc7
-/// golden test drivers replayed against this browser's WGSL compiler, one
-/// result per `bc7_test_*` entry. Deliberately does NOT require qualification
-/// to have passed — bisect exists precisely to localize a qualification
-/// failure. Reuses the gpu_init device when armed, otherwise acquires its own.
 #[wasm_bindgen]
 pub async fn gpu_bisect() -> Result<String, JsValue> {
     let state = STATE.with(|s| s.borrow().clone());
@@ -191,8 +170,6 @@ pub async fn gpu_encode(req: &[u8]) -> Result<js_sys::Uint8Array, JsValue> {
     } else {
         Bc7Profile::Slow
     };
-    // Rc out of the thread-local: encode awaits GPU readback and must not
-    // hold the RefCell borrow across the await.
     let state = STATE.with(|s| s.borrow().clone());
     let Some(state) = state else {
         return Err(JsValue::from_str("gpu_init has not succeeded"));

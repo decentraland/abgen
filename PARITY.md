@@ -55,5 +55,4 @@ Validated by **render/visual comparison** instead.
 
 The byte gates can't speak to encoder-block noise or wearables. The check for both is a **Unity render
 gate**: convert with `abgen`, render the result and the upstream bundle in a Unity host, compare images
-(screenshots + diff heatmaps) into pass/fail verdicts. The compare pipeline drives this stage; the
-README documents pointing it at a Unity Editor.
+(screenshots + diff heatmaps) into pass/fail verdicts.
