@@ -144,9 +144,9 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
 
     let outcome = convert::convert_entity(cfg, &proxy, &job.entity_id, content_server, &pending)?;
 
-    metrics::counter!("abgen_lambda_texencode_cache_total", "result" => "hit")
+    metrics::counter!("abgen_lambda_texencode_cache_total", "outcome" => "hit")
         .increment(outcome.cache_hits);
-    metrics::counter!("abgen_lambda_texencode_cache_total", "result" => "miss")
+    metrics::counter!("abgen_lambda_texencode_cache_total", "outcome" => "miss")
         .increment(outcome.cache_misses);
     for p in &outcome.platforms {
         metrics::counter!("abgen_lambda_bundles_total", "platform" => p.platform.clone())

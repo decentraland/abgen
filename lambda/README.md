@@ -84,8 +84,17 @@ beyond `serde_json`. `AWS_LAMBDA_FUNCTION_NAME` (set by Lambda) becomes a
 | `abgen_lambda_jobs_total`, `abgen_lambda_job_duration_seconds` | `outcome` (`converted`/`skipped`/`failed`/`error`) | handler |
 | `abgen_lambda_convert_duration_seconds` | `platform` | per-platform build |
 | `abgen_lambda_bundles_total` | `platform` | manifest entries written |
-| `abgen_lambda_texencode_cache_total` | `result` (`hit`/`miss`) | dual-emit texture cache |
+| `abgen_lambda_texencode_cache_total` | `outcome` (`hit`/`miss`) | dual-emit texture cache |
 | `abgen_space_request_duration_seconds`, `abgen_space_transfer_bytes_total`, `abgen_space_object_bytes`, `abgen_space_errors_total` | `op`, `result`, `direction` | `abgen::live` S3 client |
+
+Naming: the upstream consumer-server's registry
+(`consumer-server/src/metrics.ts`, `ab_converter_*`) instruments a different
+pipeline (task queues, triage, Unity exit codes); none of these lambda-side
+concepts overlaps it one-to-one, so all names stay in this repo's `abgen_*`
+namespace — deliberately, in upstream's style (snake_case, `_total`/`_seconds`
+suffixes). Label conventions do follow upstream where a concept rhymes:
+hit/miss counters use the label `outcome`, like upstream's
+`ab_converter_glb_deps_cache_total{outcome ∈ hit,miss}`.
 
 Histograms are emitted as a value array plus exact `_sum`/`_count` metrics.
 EMF caps an array at 100 values, so longer runs are downsampled to 100
