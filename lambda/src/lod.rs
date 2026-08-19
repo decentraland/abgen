@@ -142,7 +142,9 @@ fn publish(
     for obj in objects {
         let bytes =
             std::fs::read(&obj.path).with_context(|| format!("read {}", obj.path.display()))?;
-        proxy.space_put_key(&obj.key, &bytes, obj.content_type);
+        // Content-Type/Cache-Control are derived from the key inside the
+        // space client (#60), LOD lanes included.
+        proxy.space_put_key(&obj.key, &bytes);
     }
     Ok(true)
 }
