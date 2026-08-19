@@ -58,13 +58,36 @@ all hits.
 | `ABGEN_S3_PATH_STYLE` | off | path-style addressing (minio/localstack) |
 | `ABGEN_S3_READ_ONLY` | off | probe/reuse without writing (dry runs) |
 | `KEEP_OUTPUT` | off (`--once` forces on) | keep the local corpus after the run |
-| `REGISTRY_QUEUE_URL` | — | registry queue (step 4, deferred) |
+| `ABGEN_SNS_TOPIC_ARN` | — (off) | SNS topic for `AssetBundleConversionFinished` events (see below) |
+| `ABGEN_SNS_ENDPOINT` | `sns.{region}.amazonaws.com` | endpoint override (localstack); region comes from the ARN |
 | `ALLOWED_CONTENT_SERVER_HOSTS` | — (**fail-open**) | comma-separated allowlist of hosts an event's `contentServerUrl` may name; **unset means any https host is accepted**, so every deployment should set it. The `lambdaImage` bakes in `peer.decentraland.org`; a function env var overrides it. |
 
 S3 is abgen's built-in "space" client (SigV4, ureq). Credentials come from
 the standard env (`AWS_ACCESS_KEY_ID`/`SECRET`/`SESSION_TOKEN`) or the
 container credential endpoint — on Lambda/ECS the execution role provides
-them automatically.
+them automatically. The SNS client shares the same credential resolution.
+
+## Finished events (SNS)
+
+With `ABGEN_SNS_TOPIC_ARN` set, every terminal branch publishes one
+`AssetBundleConversionFinishedEvent` per platform — the exact shape and
+`type`/`subType` message attributes production's consumer-server publishes
+(`consumer-server/src/adapters/sns.ts`), so a registry-side consumer with
+`rawMessageDelivery: true` receives byte-compatible bodies:
+
+- converted platforms carry their conversion exit code as `statusCode`
+- already-converted skips publish `statusCode: 13`, matching prod's
+  triage fast path — one event per processed job, and a redelivered SQS
+  message re-notifies if an earlier publish failed after upload
+
+Publish failures fail the invocation (SQS redelivers); with the ARN unset
+nothing is published and the run reports `"notified": false`.
+
+**This must be a dedicated topic, never the shared `event-driven-sns` bus**:
+the prod registry's subscription filter matches every `asset-bundle` event,
+and events from this pipeline describe a different CDN bucket. The message
+attributes are what SQS filter policies match on — the body alone would be
+dropped by every filtered subscription.
 
 ## CDN key layout (mirrors prod exactly)
 

@@ -55,6 +55,8 @@ pub mod ress;
 pub mod sbp_order;
 pub mod skeleton;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod sns;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod space;
 pub mod tangents;
 pub mod texencode_cache;
