@@ -623,13 +623,21 @@ mod tests {
                 "application/wasm",
                 IMMUTABLE_BUNDLE,
             ),
-            ("v41/assets/Qmhash_mac", "application/wasm", IMMUTABLE_BUNDLE),
+            (
+                "v41/assets/Qmhash_mac",
+                "application/wasm",
+                IMMUTABLE_BUNDLE,
+            ),
             (
                 "v41/dcl/scene_ignore_windows",
                 "application/wasm",
                 IMMUTABLE_BUNDLE,
             ),
-            ("LOD/1/bafkscene_1_windows", "application/wasm", IMMUTABLE_BUNDLE),
+            (
+                "LOD/1/bafkscene_1_windows",
+                "application/wasm",
+                IMMUTABLE_BUNDLE,
+            ),
             (
                 "v41/bafkScene/Qmhash_windows.br",
                 "application/wasm",
@@ -650,7 +658,11 @@ mod tests {
                 "application/json",
                 NO_CACHE,
             ),
-            ("v41/bafkScene/scene.json", "application/json", IMMUTABLE_SOURCE),
+            (
+                "v41/bafkScene/scene.json",
+                "application/json",
+                IMMUTABLE_SOURCE,
+            ),
             (
                 "v41/bafkScene/bin/game.js",
                 "application/javascript",
@@ -686,7 +698,11 @@ mod tests {
     #[test]
     fn put_sends_key_derived_content_type_and_cache_control() {
         for (key, ct, cc) in [
-            ("v41/cid/Qmhash_windows", "application/wasm", IMMUTABLE_BUNDLE),
+            (
+                "v41/cid/Qmhash_windows",
+                "application/wasm",
+                IMMUTABLE_BUNDLE,
+            ),
             ("manifest/cid_windows.json", "application/json", NO_CACHE),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

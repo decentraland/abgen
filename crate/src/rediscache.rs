@@ -652,14 +652,17 @@ mod tests {
     fn err_reply_fails_open_and_backs_off() {
         // Connection 1: EXISTS answered with -ERR (fail open, start backoff).
         // Connection 2: only reached after the backoff is rewound.
-        let (target, commands, server) =
-            fake_redis(vec![vec![b"-ERR nope\r\n"], vec![b":1\r\n"]]);
+        let (target, commands, server) = fake_redis(vec![vec![b"-ERR nope\r\n"], vec![b":1\r\n"]]);
         let st = test_state(target, 60);
 
         assert!(!st.hit("k"), "-ERR must be a miss, never a hit");
         // Backoff active: no reconnect, still a miss, server sees nothing new.
         assert!(!st.hit("k"));
-        assert_eq!(commands.lock().unwrap().len(), 1, "backoff must not reconnect");
+        assert_eq!(
+            commands.lock().unwrap().len(),
+            1,
+            "backoff must not reconnect"
+        );
 
         // Rewind the backoff window; the next probe reconnects and hits.
         st.slot.lock().unwrap().last_failure = Instant::now().checked_sub(FAILURE_BACKOFF);
