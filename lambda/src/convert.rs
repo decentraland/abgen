@@ -69,11 +69,15 @@ pub fn convert_entity(
         let built = proxy
             .build_entity_into_corpus(&cfg.out_root, entity_id, platform, content_server)
             .with_context(|| format!("convert {entity_id} for {platform}"))?;
+        let elapsed = started.elapsed().as_secs_f64();
         eprintln!(
-            "convert: {entity_id} {platform}: {} bundle(s) in {:.1}s",
+            "convert: {entity_id} {platform}: {} bundle(s) in {elapsed:.1}s",
             built.len(),
-            started.elapsed().as_secs_f64()
         );
+        metrics::histogram!(
+            "abgen_lambda_convert_duration_seconds", "platform" => platform.clone()
+        )
+        .record(elapsed);
         let manifest_path = cid_dir.join(format!("{platform}.manifest.json"));
         let exit_code = read_exit_code(&manifest_path).unwrap_or(0);
         results.push(PlatformOutcome {

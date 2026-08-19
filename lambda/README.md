@@ -64,6 +64,7 @@ all hits.
 | `ABGEN_REDIS_TTL_SECONDS` | `86400` | TTL on cached positive probes |
 | `ABGEN_HTTP_SECRET` | — (**fail-closed**) | shared secret the Function URL POST path requires in `x-abgen-secret`; unset means every HTTP invocation is refused with `503` |
 | `ALLOWED_CONTENT_SERVER_HOSTS` | — (**fail-open**) | comma-separated allowlist of hosts an event's `contentServerUrl` may name; **unset means any https host is accepted**, so every deployment should set it. The `lambdaImage` bakes in `peer.decentraland.org`; a function env var overrides it. |
+| `ABGEN_EMF_NAMESPACE` | — (off) | CloudWatch namespace for EMF metrics (e.g. `abgen/lambda`); unset means no recorder is installed and every `metrics::` call stays a no-op |
 
 S3 is abgen's built-in "space" client (SigV4, ureq). Credentials come from
 the standard env (`AWS_ACCESS_KEY_ID`/`SECRET`/`SESSION_TOKEN`) or the
@@ -154,6 +155,36 @@ Upstream equivalents, for anyone porting a deployment: the consumer-server
 reads the same two knobs as `REDIS_URL` (`components.ts`) and
 `REDIS_CACHE_TTL_SECONDS` (`scenes/component.ts`); the `ABGEN_` names follow
 this repo's env var convention deliberately.
+
+## Metrics (CloudWatch EMF)
+
+Lambda has no metrics agent, so the counters the crate already records went
+nowhere. With `ABGEN_EMF_NAMESPACE` set, the binary installs a `metrics`
+recorder that accumulates in-process and, at the end of every invocation,
+writes [Embedded Metric Format](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format_Specification.html)
+JSON lines to stdout — one line per label set. CloudWatch Logs turns those
+into metrics with no API calls, no extra IAM permissions, and no dependency
+beyond `serde_json`. `AWS_LAMBDA_FUNCTION_NAME` (set by Lambda) becomes a
+`ServiceName` dimension; metric labels become the remaining dimensions.
+
+| metric | dimensions | from |
+|--------|------------|------|
+| `abgen_lambda_invocations_total`, `abgen_lambda_invocation_duration_seconds` | `result` | runtime loop |
+| `abgen_lambda_jobs_total`, `abgen_lambda_job_duration_seconds` | `outcome` (`converted`/`skipped`/`failed`/`error`) | handler |
+| `abgen_lambda_convert_duration_seconds` | `platform` | per-platform build |
+| `abgen_lambda_bundles_total` | `platform` | manifest entries written |
+| `abgen_lambda_texencode_cache_total` | `result` (`hit`/`miss`) | dual-emit texture cache |
+| `abgen_space_request_duration_seconds`, `abgen_space_transfer_bytes_total`, `abgen_space_object_bytes`, `abgen_space_errors_total` | `op`, `result`, `direction` | `abgen::live` S3 client |
+
+Histograms are emitted as a value array plus exact `_sum`/`_count` metrics.
+EMF caps an array at 100 values, so longer runs are downsampled to 100
+evenly spaced values of the sorted sample (min, max and percentile shape
+survive; `_sum`/`_count` stay exact).
+
+Deliberately out of scope: per-invocation dimensions such as entity id (a
+metric dimension per entity would blow up CloudWatch custom-metric cost —
+the entity id is already in the text log line next to it) and configurable
+extra dimensions.
 
 ## CDN key layout (mirrors prod exactly)
 

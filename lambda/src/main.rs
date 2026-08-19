@@ -1,6 +1,7 @@
 mod catalyst;
 mod config;
 mod convert;
+mod emf;
 mod event;
 mod http;
 mod notify;
@@ -20,7 +21,9 @@ fn main() {
             init();
             let mut cfg = config::Config::from_env();
             cfg.keep_output = true;
-            match run_once(&cfg, path) {
+            let result = run_once(&cfg, path);
+            emf::flush();
+            match result {
                 Ok(v) => {
                     println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
                     if v["statusCode"].as_u64().unwrap_or(200) >= 400 {
@@ -47,7 +50,8 @@ fn main() {
                  \x20    ABGEN_S3_PATH_STYLE, ABGEN_S3_READ_ONLY (+ AWS credentials),\n\
                  \x20    ABGEN_SNS_TOPIC_ARN, ABGEN_SNS_ENDPOINT,\n\
                  \x20    ABGEN_REDIS_URL, ABGEN_REDIS_TTL_SECONDS,\n\
-                 \x20    ABGEN_HTTP_SECRET (required by the Function URL POST path)"
+                 \x20    ABGEN_HTTP_SECRET (required by the Function URL POST path),\n\
+                 \x20    ABGEN_EMF_NAMESPACE (CloudWatch EMF metrics on stdout)"
             );
         }
         Some(other) => {
@@ -63,6 +67,7 @@ fn main() {
 }
 
 fn init() {
+    emf::init();
     abgen::builder::require_templates().unwrap_or_else(|e| {
         eprintln!(
             "fatal: build templates unavailable ({}): {e:#}",
@@ -112,9 +117,23 @@ fn handle_http(cfg: &config::Config, req: &http::Request) -> serde_json::Value {
 
 fn run_jobs(cfg: &config::Config, event: &serde_json::Value) -> Result<serde_json::Value> {
     match event::parse_event(event)? {
-        event::Event::Direct(job) => Ok(serde_json::json!({ "jobs": [handle_job(cfg, &job)?] })),
-        event::Event::Sqs(records) => run_batch(records, |job| handle_job(cfg, job)),
+        event::Event::Direct(job) => Ok(serde_json::json!({
+            "jobs": [instrumented_job(cfg, &job)?]
+        })),
+        event::Event::Sqs(records) => run_batch(records, |job| instrumented_job(cfg, job)),
     }
+}
+
+/// Every job — direct, SQS record, or HTTP-submitted — goes through here so
+/// the per-job outcome counters and duration histogram see all of them.
+fn instrumented_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Value> {
+    let started = std::time::Instant::now();
+    let summary = handle_job(cfg, job);
+    let outcome = job_outcome(&summary);
+    metrics::histogram!("abgen_lambda_job_duration_seconds", "outcome" => outcome)
+        .record(started.elapsed().as_secs_f64());
+    metrics::counter!("abgen_lambda_jobs_total", "outcome" => outcome).increment(1);
+    summary
 }
 
 /// Runs an SQS batch and answers in the `ReportBatchItemFailures` format: a
@@ -146,6 +165,15 @@ fn run_batch(
         }
     }
     Ok(serde_json::json!({ "batchItemFailures": failures }))
+}
+
+fn job_outcome(summary: &Result<serde_json::Value>) -> &'static str {
+    match summary {
+        Err(_) => "error",
+        Ok(v) if v.get("skipped").is_some() => "skipped",
+        Ok(v) if v.get("exitCode").and_then(serde_json::Value::as_i64) != Some(0) => "failed",
+        Ok(_) => "converted",
+    }
 }
 
 fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Value> {
@@ -208,6 +236,15 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
     let entity_doc = catalyst::fetch_entity(&agent, content_server, &job.entity_id)?;
 
     let outcome = convert::convert_entity(cfg, &proxy, &job.entity_id, content_server, &pending)?;
+
+    metrics::counter!("abgen_lambda_texencode_cache_total", "outcome" => "hit")
+        .increment(outcome.cache_hits);
+    metrics::counter!("abgen_lambda_texencode_cache_total", "outcome" => "miss")
+        .increment(outcome.cache_misses);
+    for p in &outcome.platforms {
+        metrics::counter!("abgen_lambda_bundles_total", "platform" => p.platform.clone())
+            .increment(p.built.len() as u64);
+    }
 
     let published =
         output::publish(cfg, &agent, &proxy, &entity_doc, &outcome).and_then(|upload| {
