@@ -8,21 +8,45 @@ pub struct Job {
     pub force: bool,
 }
 
-pub fn jobs_from_event(event: &Value) -> Result<Vec<Job>> {
+pub struct Record {
+    /// `None` when the record carries no usable `messageId`; such a record can
+    /// never be named in a `batchItemFailures` entry.
+    pub message_id: Option<String>,
+    pub job: Result<Job>,
+}
+
+pub enum Event {
+    /// Direct invoke (console, `--once`, manual payload): no partial-batch protocol.
+    Direct(Job),
+    Sqs(Vec<Record>),
+}
+
+pub fn parse_event(event: &Value) -> Result<Event> {
     if let Some(records) = event.get("Records").and_then(Value::as_array) {
-        let mut jobs = Vec::with_capacity(records.len());
-        for (i, record) in records.iter().enumerate() {
-            let body = record
-                .get("body")
-                .and_then(Value::as_str)
-                .with_context(|| format!("SQS record {i} has no string body"))?;
-            let parsed: Value = serde_json::from_str(body)
-                .with_context(|| format!("SQS record {i} body is not JSON"))?;
-            jobs.push(job_from_value(&parsed).with_context(|| format!("SQS record {i}"))?);
-        }
-        return Ok(jobs);
+        let parsed = records
+            .iter()
+            .enumerate()
+            .map(|(i, record)| Record {
+                message_id: record
+                    .get("messageId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string),
+                job: job_from_record(record).with_context(|| format!("SQS record {i}")),
+            })
+            .collect();
+        return Ok(Event::Sqs(parsed));
     }
-    Ok(vec![job_from_value(event)?])
+    Ok(Event::Direct(job_from_value(event)?))
+}
+
+fn job_from_record(record: &Value) -> Result<Job> {
+    let body = record
+        .get("body")
+        .and_then(Value::as_str)
+        .context("no string body")?;
+    let parsed: Value = serde_json::from_str(body).context("body is not JSON")?;
+    job_from_value(&parsed)
 }
 
 fn job_from_value(v: &Value) -> Result<Job> {
@@ -98,6 +122,20 @@ fn normalize_content_server(url: &str) -> String {
 mod tests {
     use super::*;
 
+    fn jobs_from_event(event: &Value) -> Result<Vec<Job>> {
+        match parse_event(event)? {
+            Event::Direct(job) => Ok(vec![job]),
+            Event::Sqs(records) => records.into_iter().map(|r| r.job).collect(),
+        }
+    }
+
+    fn records(event: &Value) -> Vec<Record> {
+        match parse_event(event).unwrap() {
+            Event::Sqs(records) => records,
+            Event::Direct(_) => panic!("expected an SQS batch"),
+        }
+    }
+
     #[test]
     fn parses_manual_payload() {
         let e = serde_json::json!({"entityId": "bafkabc123", "contentServerUrl": "https://peer.decentraland.org/content/contents/"});
@@ -123,6 +161,25 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].entity_id, "bafkdef456");
         assert!(!jobs[0].is_lods);
+    }
+
+    #[test]
+    fn keeps_per_record_message_ids_and_isolates_parse_errors() {
+        let ok = serde_json::json!({"entityId": "bafkok0001"}).to_string();
+        let e = serde_json::json!({"Records": [
+            {"messageId": "m-1", "body": ok},
+            {"messageId": "m-2", "body": "not json"},
+            {"messageId": "", "body": "{}"},
+            {"body": "{}"},
+        ]});
+        let records = records(&e);
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].message_id.as_deref(), Some("m-1"));
+        assert_eq!(records[0].job.as_ref().unwrap().entity_id, "bafkok0001");
+        assert_eq!(records[1].message_id.as_deref(), Some("m-2"));
+        assert!(records[1].job.is_err());
+        assert!(records[2].message_id.is_none());
+        assert!(records[3].message_id.is_none());
     }
 
     #[test]

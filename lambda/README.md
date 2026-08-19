@@ -99,7 +99,7 @@ Recommended function config:
 | memory | 10240 MB | buys the max 6 vCPUs — texture encoding is CPU-bound |
 | timeout | 900 s | the hard ceiling; worst-case scenes need the room |
 | ephemeral storage | 10240 MB | `/tmp` holds the content cache + corpus |
-| SQS trigger | batch size 1, visibility timeout ≥ 900 s, DLQ after ~3 receives | one entity per invocation; whales land in the DLQ |
+| SQS trigger | batch size 1, `ReportBatchItemFailures`, visibility timeout ≥ 900 s, DLQ after ~3 receives | one entity per invocation; whales land in the DLQ |
 | reserved concurrency | ~20 | politeness cap on catalyst downloads |
 
 **Shader bundles:** none need seeding for unity-explorer — it resolves the
@@ -134,6 +134,23 @@ SQS record batches whose bodies are catalyst `DeploymentToSqs` payloads
 (`lods` present) are acknowledged and skipped — LOD generation stays on the
 Unity pipeline. `"force": true` in either shape bypasses the
 already-converted skip.
+
+## Partial batch responses
+
+An SQS batch answers in the event-source mapping's `ReportBatchItemFailures`
+format — `{"batchItemFailures": [{"itemIdentifier": "<messageId>"}, …]}`,
+empty when every record converted. A record that fails to parse or to convert
+is reported by its own message id and redelivered alone; the rest of the batch
+is deleted. Only a batch whose failing record carries no `messageId` fails the
+whole invocation, since such a failure cannot be named (a real SQS record
+always has one; hand-written `--once` fixtures may not).
+
+Direct invokes — the console, `--once` with a non-`Records` payload — are not
+part of the protocol and keep answering `{"jobs": [ … ]}`, failing the
+invocation on error. Per-record summaries of an SQS batch go to the log.
+
+Batch size is 1 today, which makes the two behaviours equivalent; the format
+is implemented so raising it does not need a code change.
 
 ## Already-converted skip
 
