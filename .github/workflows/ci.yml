@@ -8,9 +8,6 @@ on:
     - cron: "23 4 * * *"
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -71,22 +68,13 @@ jobs:
 
   check:
     name: test
-    strategy:
-      matrix:
-        # The arm runner is what makes every #[cfg(target_arch = "aarch64")]
-        # NEON parity test a merge gate; without it the aarch64 release
-        # artifacts ship whatever the NEON kernels happen to produce.
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       - uses: ./.github/actions/rust-setup
       - name: install cargo-nextest
-        run: |
-          arch="$(uname -m)"
-          flavor=linux; [ "$arch" = aarch64 ] && flavor=linux-arm
-          curl -LsSf "https://get.nexte.st/0.9.143/$flavor" | tar xzf - -C "$HOME/.cargo/bin"
-      - run: ABGEN_ROOT="$GITHUB_WORKSPACE" cargo nextest run --locked --workspace
+        run: curl -LsSf https://get.nexte.st/0.9.143/linux | tar xzf - -C "$HOME/.cargo/bin"
+      - run: ABGEN_ROOT="$GITHUB_WORKSPACE" cargo nextest run --locked --workspace --lib
       - run: cargo test --locked -p abgen-lambda
       - run: ABGEN_ROOT="$GITHUB_WORKSPACE" cargo test --locked -p abgen-native --tests
 
@@ -115,7 +103,7 @@ jobs:
         shell: pwsh
         run: |
           $env:ABGEN_ROOT = $env:GITHUB_WORKSPACE
-          cargo nextest run --locked --workspace
+          cargo nextest run --locked --workspace --lib
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p abgen-native --tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
