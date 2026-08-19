@@ -127,8 +127,17 @@ fn main() {
         format!("-DCMAKE_INSTALL_PREFIX={draco_build}/install"),
     ];
     if aarch64_linux {
+        // ISA floor is Armv8.2+dotprod on purpose: aarch64-linux artifacts
+        // only run on Graviton (>= 2 == Neoverse-N1). See libjpeg9c/build.rs.
         cfg_args.push("-DCMAKE_C_FLAGS=-mcpu=neoverse-n1".into());
         cfg_args.push("-DCMAKE_CXX_FLAGS=-mcpu=neoverse-n1".into());
+    }
+    if target.contains("apple-darwin") {
+        // Cross-compiling mac-on-mac (x86_64 leg builds on the arm runner):
+        // cmake defaults to the HOST arch, and arm64 draco objects fail the
+        // x86_64 link with "symbol(s) not found for architecture x86_64".
+        let arch = if target.starts_with("aarch64") { "arm64" } else { "x86_64" };
+        cfg_args.push(format!("-DCMAKE_OSX_ARCHITECTURES={arch}"));
     }
     let status = Command::new("cmake")
         .args(&cfg_args)
