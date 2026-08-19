@@ -7,7 +7,6 @@ pub struct Config {
     pub default_content_server: String,
     pub out_root: PathBuf,
     pub keep_output: bool,
-    pub registry_queue_url: Option<String>,
     pub allowed_content_server_hosts: Option<Vec<String>>,
 }
 
@@ -36,9 +35,6 @@ impl Config {
             keep_output: std::env::var("KEEP_OUTPUT")
                 .map(|v| v == "1")
                 .unwrap_or(false),
-            registry_queue_url: std::env::var("REGISTRY_QUEUE_URL")
-                .ok()
-                .filter(|v| !v.is_empty()),
             allowed_content_server_hosts: std::env::var("ALLOWED_CONTENT_SERVER_HOSTS")
                 .ok()
                 .map(|raw| {

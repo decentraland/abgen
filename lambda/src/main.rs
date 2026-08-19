@@ -38,9 +38,10 @@ fn main() {
                  --once EVENT.json handles a single event locally and exits.\n\
                  \n\
                  env: PLATFORMS (windows,mac), AB_VERSION (v49), ABGEN_CACHE_DIR,\n\
-                 \x20    CONTENT_SERVER_URL, OUT_ROOT, KEEP_OUTPUT, REGISTRY_QUEUE_URL,\n\
+                 \x20    CONTENT_SERVER_URL, OUT_ROOT, KEEP_OUTPUT,\n\
                  \x20    ABGEN_S3_ENDPOINT, ABGEN_S3_BUCKET, ABGEN_S3_REGION,\n\
-                 \x20    ABGEN_S3_PATH_STYLE, ABGEN_S3_READ_ONLY (+ AWS credentials)"
+                 \x20    ABGEN_S3_PATH_STYLE, ABGEN_S3_READ_ONLY (+ AWS credentials),\n\
+                 \x20    ABGEN_SNS_TOPIC_ARN, ABGEN_SNS_ENDPOINT"
             );
         }
         Some(other) => {
@@ -65,6 +66,9 @@ fn init() {
     });
     abgen::arm_gpu_default();
     abgen::texencode_cache::enable();
+    if abgen::sns::Sns::global().is_some() {
+        eprintln!("init: finished-event publishing enabled (ABGEN_SNS_TOPIC_ARN)");
+    }
 }
 
 fn run_once(cfg: &config::Config, path: &str) -> Result<serde_json::Value> {
@@ -101,6 +105,7 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
     let proxy = convert::make_proxy(cfg, content_server);
 
     let mut pending: Vec<String> = cfg.platforms.clone();
+    let mut already: Vec<String> = Vec::new();
     if !job.force {
         pending.retain(|platform| {
             let done = output::platform_converted(&proxy, cfg, &job.entity_id, platform);
@@ -109,12 +114,23 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
                     "skip: {} {platform} already converted at {}",
                     job.entity_id, cfg.version
                 );
+                already.push(platform.clone());
             }
             !done
         });
         if pending.is_empty() {
+            // Prod publishes from every terminal branch, incl. already-converted
+            // (13); this also re-notifies on redelivery after a failed publish.
+            let finished: Vec<notify::Finished> = already
+                .iter()
+                .map(|p| notify::Finished {
+                    platform: p,
+                    status_code: notify::STATUS_ALREADY_CONVERTED,
+                })
+                .collect();
+            let notified = notify::send_finished(cfg, &job.entity_id, content_server, &finished)?;
             return Ok(serde_json::json!({
-                "entityId": job.entity_id, "skipped": "already-converted"
+                "entityId": job.entity_id, "skipped": "already-converted", "notified": notified
             }));
         }
     }
@@ -124,8 +140,23 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
 
     let outcome = convert::convert_entity(cfg, &proxy, &job.entity_id, content_server, &pending)?;
 
-    let published = output::publish(cfg, &agent, &proxy, &entity_doc, &outcome)
-        .and_then(|upload| notify::send(cfg, &outcome).map(|notified| (upload, notified)));
+    let published =
+        output::publish(cfg, &agent, &proxy, &entity_doc, &outcome).and_then(|upload| {
+            let mut finished: Vec<notify::Finished> = outcome
+                .platforms
+                .iter()
+                .map(|p| notify::Finished {
+                    platform: &p.platform,
+                    status_code: p.exit_code,
+                })
+                .collect();
+            finished.extend(already.iter().map(|p| notify::Finished {
+                platform: p,
+                status_code: notify::STATUS_ALREADY_CONVERTED,
+            }));
+            notify::send_finished(cfg, &job.entity_id, content_server, &finished)
+                .map(|notified| (upload, notified))
+        });
     if !cfg.keep_output {
         let _ = std::fs::remove_dir_all(&outcome.cid_dir);
     }

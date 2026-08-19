@@ -9,18 +9,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
-struct ResolvedCreds {
-    access_key: String,
-    secret_key: String,
-    session_token: Option<String>,
+pub(crate) struct ResolvedCreds {
+    pub(crate) access_key: String,
+    pub(crate) secret_key: String,
+    pub(crate) session_token: Option<String>,
 }
 
-struct CachedCreds {
+pub(crate) struct CachedCreds {
     creds: ResolvedCreds,
     expires_epoch: u64,
 }
 
-enum CredsSource {
+pub(crate) enum CredsSource {
     Static(ResolvedCreds),
     Container {
         url: String,
@@ -43,7 +43,7 @@ pub struct Space {
     creds: CredsSource,
 }
 
-fn agent() -> &'static ureq::Agent {
+pub(crate) fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
         ureq::Agent::config_builder()
@@ -53,7 +53,7 @@ fn agent() -> &'static ureq::Agent {
     })
 }
 
-fn hex(b: &[u8]) -> String {
+pub(crate) fn hex(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
     for x in b {
         s.push_str(&format!("{x:02x}"));
@@ -73,12 +73,12 @@ fn uri_encode_key(key: &str) -> String {
     }
     out
 }
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
     hex(&h.finalize())
 }
-fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+pub(crate) fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut m = HmacSha256::new_from_slice(key).expect("hmac key");
     m.update(data);
     m.finalize().into_bytes().to_vec()
@@ -91,7 +91,7 @@ fn now_epoch() -> u64 {
         .unwrap_or(0)
 }
 
-fn timestamps() -> (String, String) {
+pub(crate) fn timestamps() -> (String, String) {
     let secs = now_epoch();
     let days = (secs / 86_400) as i64;
     let sod = (secs % 86_400) as i64;
@@ -123,8 +123,10 @@ fn warn_once_403(key: &str) {
     }
 }
 
-impl Space {
-    pub fn from_env() -> Option<Space> {
+impl CredsSource {
+    /// Static env vars first, then the ECS container credential endpoint;
+    /// shared by S3 here and SNS in [`crate::sns`].
+    pub(crate) fn from_env() -> Option<CredsSource> {
         let first = |vars: &[&str]| {
             vars.iter()
                 .find_map(|v| std::env::var(v).ok().filter(|s| !s.is_empty()))
@@ -140,7 +142,7 @@ impl Space {
             }),
             _ => None,
         };
-        let creds = match static_creds {
+        Some(match static_creds {
             Some(c) => CredsSource::Static(c),
             None => {
                 let url = first(&["AWS_CONTAINER_CREDENTIALS_FULL_URI"]).or_else(|| {
@@ -153,7 +155,17 @@ impl Space {
                     cache: Mutex::new(None),
                 }
             }
+        })
+    }
+}
+
+impl Space {
+    pub fn from_env() -> Option<Space> {
+        let first = |vars: &[&str]| {
+            vars.iter()
+                .find_map(|v| std::env::var(v).ok().filter(|s| !s.is_empty()))
         };
+        let creds = CredsSource::from_env()?;
 
         let endpoint = first(&["ABGEN_S3_ENDPOINT"])?;
         let (scheme, host) = match endpoint.split_once("://") {
@@ -218,7 +230,13 @@ impl Space {
     }
 
     fn creds(&self) -> Result<ResolvedCreds> {
-        match &self.creds {
+        self.creds.resolve()
+    }
+}
+
+impl CredsSource {
+    pub(crate) fn resolve(&self) -> Result<ResolvedCreds> {
+        match self {
             CredsSource::Static(c) => Ok(c.clone()),
             CredsSource::Container {
                 url,
@@ -265,7 +283,9 @@ impl Space {
             }
         }
     }
+}
 
+impl Space {
     fn path(&self, key: &str) -> String {
         let encoded = uri_encode_key(key);
         match (self.path_style, &self.bucket) {
