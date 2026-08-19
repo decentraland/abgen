@@ -380,16 +380,6 @@ fn encode_bc7_mip_chain_with_profile_uncached(
     let w = width as usize;
     let h = height as usize;
     assert_eq!(rgba.len(), w * h * 4);
-    let flipped: Vec<u8> = if flip {
-        let mut out = vec![0u8; w * h * 4];
-        for y in 0..h {
-            let src = &rgba[(h - 1 - y) * w * 4..(h - 1 - y) * w * 4 + w * 4];
-            out[y * w * 4..y * w * 4 + w * 4].copy_from_slice(src);
-        }
-        out
-    } else {
-        rgba.to_vec()
-    };
 
     let mip_count = mip_count.unwrap_or_else(|| compute_default_mip_count(width, height));
     let params = match profile {
@@ -397,46 +387,41 @@ fn encode_bc7_mip_chain_with_profile_uncached(
         Bc7Profile::Basic => Params::basic(perceptual),
     };
 
+    // The flip is fused into the source row index instead of materialising a
+    // flipped copy of the whole image first: every destination pixel is still
+    // produced by the identical expression from the identical source pixel.
     let mut cur: Vec<f32> = vec![0f32; w * h * 4];
-    for i in 0..(w * h) {
-        let r = flipped[i * 4];
-        let g = flipped[i * 4 + 1];
-        let b = flipped[i * 4 + 2];
-        let a = flipped[i * 4 + 3] as f32;
-        if srgb {
-            cur[i * 4] = srgb_to_linear_u8(r);
-            cur[i * 4 + 1] = srgb_to_linear_u8(g);
-            cur[i * 4 + 2] = srgb_to_linear_u8(b);
-            cur[i * 4 + 3] = a;
-        } else {
-            cur[i * 4] = r as f32;
-            cur[i * 4 + 1] = g as f32;
-            cur[i * 4 + 2] = b as f32;
-            cur[i * 4 + 3] = a;
+    for y in 0..h {
+        let sy = if flip { h - 1 - y } else { y };
+        let src = &rgba[sy * w * 4..sy * w * 4 + w * 4];
+        let dst = &mut cur[y * w * 4..y * w * 4 + w * 4];
+        for x in 0..w {
+            let r = src[x * 4];
+            let g = src[x * 4 + 1];
+            let b = src[x * 4 + 2];
+            let a = src[x * 4 + 3] as f32;
+            if srgb {
+                dst[x * 4] = srgb_to_linear_u8(r);
+                dst[x * 4 + 1] = srgb_to_linear_u8(g);
+                dst[x * 4 + 2] = srgb_to_linear_u8(b);
+                dst[x * 4 + 3] = a;
+            } else {
+                dst[x * 4] = r as f32;
+                dst[x * 4 + 1] = g as f32;
+                dst[x * 4 + 2] = b as f32;
+                dst[x * 4 + 3] = a;
+            }
         }
     }
     let mut cw = w;
     let mut ch = h;
 
-    let mut parts: Vec<u8> = Vec::new();
+    // Phase 1, serial: every level's block-major u8 buffer. box_halve and the
+    // quantizers are well under 1% of the cycles here, and doing them up front
+    // is what lets the encode of *all* levels share one parallel region.
+    let mut levels: Vec<(Vec<u8>, usize)> = Vec::with_capacity(mip_count.max(0) as usize);
     for m in 0..mip_count {
-        let mut level = vec![0u8; cw * ch * 4];
-        for i in 0..(cw * ch) {
-            if srgb {
-                level[i * 4] = linear_to_srgb_u8(cur[i * 4]);
-                level[i * 4 + 1] = linear_to_srgb_u8(cur[i * 4 + 1]);
-                level[i * 4 + 2] = linear_to_srgb_u8(cur[i * 4 + 2]);
-            } else {
-                level[i * 4] = round_half_up_u8(cur[i * 4]);
-                level[i * 4 + 1] = round_half_up_u8(cur[i * 4 + 1]);
-                level[i * 4 + 2] = round_half_up_u8(cur[i * 4 + 2]);
-            }
-            level[i * 4 + 3] = round_half_up_u8(cur[i * 4 + 3]);
-        }
-        let (padded, pw, ph) = pad_to_block_size(&level, cw, ch);
-        let (blocks, n) = scanline_to_blocks(&padded, pw, ph);
-        let comp = encode_blocks(&blocks, n, &params);
-        parts.extend_from_slice(&comp);
+        levels.push(level_to_blocks(&cur, cw, ch, srgb));
         if m < mip_count - 1 {
             let (next, nw, nh) = box_halve(&cur, cw, ch);
             cur = next;
@@ -444,7 +429,132 @@ fn encode_bc7_mip_chain_with_profile_uncached(
             ch = nh;
         }
     }
+    drop(cur);
+
+    let total = levels.iter().map(|(_, n)| n * 16).sum::<usize>();
+    debug_assert_eq!(total, compute_mip_chain_size(width, height, mip_count));
+    let mut parts = vec![0u8; total];
+
+    // Phase 2, parallel: one flat task list over (level, block range). Chunks
+    // are a fixed multiple of SIMD_W and never cross a level boundary, so the
+    // groups handed to compress_group are exactly the groups the per-level
+    // `par_chunks(SIMD_W * 64)` produced - including each level's trailing
+    // partial group. Each task owns a disjoint output slice, so there is no
+    // collect, no serial re-copy and no per-level join barrier.
+    const TASK_BLOCKS: usize = 64;
+    let mut tasks: Vec<(usize, usize, usize)> = Vec::new();
+    for (li, (_, n)) in levels.iter().enumerate() {
+        let mut b = 0usize;
+        while b < *n {
+            let cnt = TASK_BLOCKS.min(n - b);
+            tasks.push((li, b, cnt));
+            b += cnt;
+        }
+    }
+    let mut slices: Vec<&mut [u8]> = Vec::with_capacity(tasks.len());
+    {
+        let mut rest: &mut [u8] = &mut parts;
+        for &(_, _, cnt) in &tasks {
+            let (a, b) = rest.split_at_mut(cnt * 16);
+            slices.push(a);
+            rest = b;
+        }
+        debug_assert!(rest.is_empty());
+    }
+
+    use rayon::prelude::*;
+    slices
+        .into_par_iter()
+        .zip(tasks.par_iter())
+        .for_each(|(dst, &(li, start, cnt))| {
+            let src = &levels[li].0;
+            let mut group: Vec<[ColorI; 16]> = Vec::with_capacity(SIMD_W);
+            let mut o = 0usize;
+            let mut b = 0usize;
+            while b < cnt {
+                let g = SIMD_W.min(cnt - b);
+                group.clear();
+                for k in 0..g {
+                    let bi = start + b + k;
+                    group.push(block_from_bytes(&src[bi * 64..bi * 64 + 64]));
+                }
+                for blk in compress_group(&group, &params) {
+                    dst[o..o + 16].copy_from_slice(&blk);
+                    o += 16;
+                }
+                b += g;
+            }
+        });
+
+    if let Some(path) = bc7_capture_path() {
+        use std::io::Write;
+        let mut off = 0usize;
+        for (blocks, n) in &levels {
+            let mut rec = Vec::with_capacity(n * 80);
+            for i in 0..*n {
+                rec.extend_from_slice(&parts[off + i * 16..off + i * 16 + 16]);
+                rec.extend_from_slice(&blocks[i * 64..i * 64 + 64]);
+            }
+            off += n * 16;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _g = BC7_CAPTURE_LOCK.lock().unwrap();
+                let _ = f.write_all(&rec);
+            }
+        }
+    }
+
     (parts, mip_count)
+}
+
+/// One mip level's pixels, quantized and laid out block-major, ready for
+/// `compress_group`. For block-aligned levels the bytes go straight from the
+/// f32 working image into block order - the quantizers are pure per-pixel
+/// functions, so emitting in block order instead of scanline order and then
+/// shuffling produces the identical bytes, minus a full-image copy and the
+/// no-op `to_vec` inside `pad_to_block_size`.
+fn level_to_blocks(cur: &[f32], cw: usize, ch: usize, srgb: bool) -> (Vec<u8>, usize) {
+    if cw.is_multiple_of(4) && ch.is_multiple_of(4) {
+        let bw = cw / 4;
+        let bh = ch / 4;
+        let mut out = vec![0u8; bw * bh * 64];
+        let mut o = 0usize;
+        for by in 0..bh {
+            for bx in 0..bw {
+                for r in 0..4 {
+                    let row = (by * 4 + r) * cw + bx * 4;
+                    for c in 0..4 {
+                        quantize_px(cur, row + c, srgb, &mut out[o..o + 4]);
+                        o += 4;
+                    }
+                }
+            }
+        }
+        return (out, bw * bh);
+    }
+    let mut level = vec![0u8; cw * ch * 4];
+    for i in 0..(cw * ch) {
+        quantize_px(cur, i, srgb, &mut level[i * 4..i * 4 + 4]);
+    }
+    let (padded, pw, ph) = pad_to_block_size(&level, cw, ch);
+    scanline_to_blocks(&padded, pw, ph)
+}
+
+#[inline]
+fn quantize_px(cur: &[f32], i: usize, srgb: bool, dst: &mut [u8]) {
+    if srgb {
+        dst[0] = linear_to_srgb_u8(cur[i * 4]);
+        dst[1] = linear_to_srgb_u8(cur[i * 4 + 1]);
+        dst[2] = linear_to_srgb_u8(cur[i * 4 + 2]);
+    } else {
+        dst[0] = round_half_up_u8(cur[i * 4]);
+        dst[1] = round_half_up_u8(cur[i * 4 + 1]);
+        dst[2] = round_half_up_u8(cur[i * 4 + 2]);
+    }
+    dst[3] = round_half_up_u8(cur[i * 4 + 3]);
 }
 
 #[cfg(all(test, target_arch = "aarch64"))]

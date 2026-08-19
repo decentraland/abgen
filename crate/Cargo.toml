@@ -149,6 +149,10 @@ name = "bc7-parity-o08"
 path = "examples/bc7_parity_o08.rs"
 
 [[test]]
+name = "bc7_mip_parity"
+path = "tests/bc7_mip_parity.rs"
+harness = true
+[[test]]
 name = "o15_parity"
 path = "tests/o15_parity.rs"
 [[test]]

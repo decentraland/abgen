@@ -425,35 +425,13 @@ pub(super) fn evaluate_solution(
     } else {
         let wgp = wg * PR_WEIGHT;
         let wbp = wb * PB_WEIGHT;
-        let mut wy = [0f32; 16];
-        let mut wcr = [0f32; 16];
-        let mut wcb = [0f32; 16];
-
-        for i in 0..16 {
-            let r = wc[i][0];
-            let g = wc[i][1];
-            let b = wc[i][2];
-            let y = r * 0.2126 + g * 0.7152 + b * 0.0722;
-            wy[i] = y;
-            wcr[i] = r - y;
-            wcb[i] = b - y;
-        }
-        #[cfg(target_arch = "x86_64")]
-        let simd_done = if has_avx2() && (n == 4 || n == 8 || n == 16) {
-            let mut wa4 = [0f32; 16];
-            if p.has_alpha {
-                for i in 0..16 {
-                    wa4[i] = wc[i][3];
-                }
-            }
+        #[cfg(target_arch = "aarch64")]
+        let neon_perc_done = if has_neon() && (n == 4 || n == 8 || n == 16) {
             total_errf = unsafe {
-                eval_perceptual_avx2(
+                neon::eval_perceptual_neon(
                     num_pixels,
                     pixels,
-                    &wy,
-                    &wcr,
-                    &wcb,
-                    &wa4,
+                    &wc,
                     wr,
                     wgp,
                     wbp,
@@ -467,56 +445,104 @@ pub(super) fn evaluate_solution(
         } else {
             false
         };
-        #[cfg(not(target_arch = "x86_64"))]
-        let simd_done = false;
-        if simd_done {
-        } else if p.has_alpha {
-            for i in 0..num_pixels {
-                let r = pixels[i].c[0] as f32;
-                let g = pixels[i].c[1] as f32;
-                let b = pixels[i].c[2] as f32;
-                let a = pixels[i].c[3] as f32;
-                let y = r * 0.2126 + g * 0.7152 + b * 0.0722;
-                let cr = r - y;
-                let cb = b - y;
-                let mut best_err = 1e10f32;
-                let mut best_sel = 0i32;
-                for j in 0..n {
-                    let dl = y - wy[j];
-                    let dcr = cr - wcr[j];
-                    let dcb = cb - wcb[j];
-                    let da = a - wc[j][3];
-                    let err = wr * dl * dl + wgp * dcr * dcr + wbp * dcb * dcb + wa * da * da;
-                    if err < best_err {
-                        best_err = err;
-                        best_sel = j as i32;
-                    }
-                }
-                total_errf += best_err;
-                res.selectors_temp[i] = best_sel;
-            }
+        #[cfg(not(target_arch = "aarch64"))]
+        let neon_perc_done = false;
+        if neon_perc_done {
+            // handled by the NEON kernel above
         } else {
-            for i in 0..num_pixels {
-                let r = pixels[i].c[0] as f32;
-                let g = pixels[i].c[1] as f32;
-                let b = pixels[i].c[2] as f32;
+            let mut wy = [0f32; 16];
+            let mut wcr = [0f32; 16];
+            let mut wcb = [0f32; 16];
+
+            for i in 0..16 {
+                let r = wc[i][0];
+                let g = wc[i][1];
+                let b = wc[i][2];
                 let y = r * 0.2126 + g * 0.7152 + b * 0.0722;
-                let cr = r - y;
-                let cb = b - y;
-                let mut best_err = 1e10f32;
-                let mut best_sel = 0i32;
-                for j in 0..n {
-                    let dl = y - wy[j];
-                    let dcr = cr - wcr[j];
-                    let dcb = cb - wcb[j];
-                    let err = wr * dl * dl + wgp * dcr * dcr + wbp * dcb * dcb;
-                    if err < best_err {
-                        best_err = err;
-                        best_sel = j as i32;
+                wy[i] = y;
+                wcr[i] = r - y;
+                wcb[i] = b - y;
+            }
+            #[cfg(target_arch = "x86_64")]
+            let simd_done = if has_avx2() && (n == 4 || n == 8 || n == 16) {
+                let mut wa4 = [0f32; 16];
+                if p.has_alpha {
+                    for i in 0..16 {
+                        wa4[i] = wc[i][3];
                     }
                 }
-                total_errf += best_err;
-                res.selectors_temp[i] = best_sel;
+                total_errf = unsafe {
+                    eval_perceptual_avx2(
+                        num_pixels,
+                        pixels,
+                        &wy,
+                        &wcr,
+                        &wcb,
+                        &wa4,
+                        wr,
+                        wgp,
+                        wbp,
+                        wa,
+                        p.has_alpha,
+                        n,
+                        &mut res.selectors_temp,
+                    )
+                };
+                true
+            } else {
+                false
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let simd_done = false;
+            if simd_done {
+            } else if p.has_alpha {
+                for i in 0..num_pixels {
+                    let r = pixels[i].c[0] as f32;
+                    let g = pixels[i].c[1] as f32;
+                    let b = pixels[i].c[2] as f32;
+                    let a = pixels[i].c[3] as f32;
+                    let y = r * 0.2126 + g * 0.7152 + b * 0.0722;
+                    let cr = r - y;
+                    let cb = b - y;
+                    let mut best_err = 1e10f32;
+                    let mut best_sel = 0i32;
+                    for j in 0..n {
+                        let dl = y - wy[j];
+                        let dcr = cr - wcr[j];
+                        let dcb = cb - wcb[j];
+                        let da = a - wc[j][3];
+                        let err = wr * dl * dl + wgp * dcr * dcr + wbp * dcb * dcb + wa * da * da;
+                        if err < best_err {
+                            best_err = err;
+                            best_sel = j as i32;
+                        }
+                    }
+                    total_errf += best_err;
+                    res.selectors_temp[i] = best_sel;
+                }
+            } else {
+                for i in 0..num_pixels {
+                    let r = pixels[i].c[0] as f32;
+                    let g = pixels[i].c[1] as f32;
+                    let b = pixels[i].c[2] as f32;
+                    let y = r * 0.2126 + g * 0.7152 + b * 0.0722;
+                    let cr = r - y;
+                    let cb = b - y;
+                    let mut best_err = 1e10f32;
+                    let mut best_sel = 0i32;
+                    for j in 0..n {
+                        let dl = y - wy[j];
+                        let dcr = cr - wcr[j];
+                        let dcb = cb - wcb[j];
+                        let err = wr * dl * dl + wgp * dcr * dcr + wbp * dcb * dcb;
+                        if err < best_err {
+                            best_err = err;
+                            best_sel = j as i32;
+                        }
+                    }
+                    total_errf += best_err;
+                    res.selectors_temp[i] = best_sel;
+                }
             }
         }
     }
@@ -941,6 +967,182 @@ mod neon {
                 t = vsetq_lane_f32::<3>(0.0, t);
             }
             vst1q_f32(wc[i].as_mut_ptr(), t);
+        }
+    }
+
+    /// Perceptual (YCrCb) selector search, NEON port of `eval_perceptual_avx2`.
+    ///
+    /// ROWS = n/4 float32x4 candidate rows (n=4 -> 1, n=8 -> 2, n=16 -> 4).
+    /// Op order mirrors the scalar loop exactly: no fused multiply-add anywhere,
+    /// `total_errf` accumulates in ascending pixel order, and the selector is the
+    /// LOWEST index whose error equals the row minimum (scalar uses strict `<`).
+    #[inline(always)]
+    unsafe fn eval_perceptual_impl<const ROWS: usize, const HAS_ALPHA: bool>(
+        num_pixels: usize,
+        pixels: &[ColorI],
+        wc: &[[f32; 4]; 16],
+        wr: f32,
+        wgp: f32,
+        wbp: f32,
+        wa: f32,
+        selectors_temp: &mut [i32; 16],
+    ) -> f32 {
+        let cy_r = vdupq_n_f32(0.2126);
+        let cy_g = vdupq_n_f32(0.7152);
+        let cy_b = vdupq_n_f32(0.0722);
+        let mut wyv = [vdupq_n_f32(0.0); ROWS];
+        let mut wcrv = [vdupq_n_f32(0.0); ROWS];
+        let mut wcbv = [vdupq_n_f32(0.0); ROWS];
+        let mut wav4 = [vdupq_n_f32(0.0); ROWS];
+        let mut bitv = [vdupq_n_u32(0); ROWS];
+        for row in 0..ROWS {
+            // wc is [[f32;4];16] row-major, so vld4q de-interleaves 4 entries into
+            // per-channel lanes: .0 = r of entries 4*row..4*row+4, etc.
+            let t = vld4q_f32(wc[row * 4].as_ptr());
+            let y = vaddq_f32(
+                vaddq_f32(vmulq_f32(t.0, cy_r), vmulq_f32(t.1, cy_g)),
+                vmulq_f32(t.2, cy_b),
+            );
+            wyv[row] = y;
+            wcrv[row] = vsubq_f32(t.0, y);
+            wcbv[row] = vsubq_f32(t.2, y);
+            wav4[row] = t.3;
+            let base = 4 * row;
+            let bits: [u32; 4] = [1 << base, 2 << base, 4 << base, 8 << base];
+            bitv[row] = vld1q_u32(bits.as_ptr());
+        }
+        let wrv = vdupq_n_f32(wr);
+        let wgpv = vdupq_n_f32(wgp);
+        let wbpv = vdupq_n_f32(wbp);
+        let wav = vdupq_n_f32(wa);
+
+        let mut total_errf = 0f32;
+        for i in 0..num_pixels {
+            let r = pixels[i].c[0] as f32;
+            let g = pixels[i].c[1] as f32;
+            let b = pixels[i].c[2] as f32;
+            let y = r * 0.2126 + g * 0.7152 + b * 0.0722;
+            let cr = r - y;
+            let cb = b - y;
+            let yv = vdupq_n_f32(y);
+            let crv = vdupq_n_f32(cr);
+            let cbv = vdupq_n_f32(cb);
+            let av = if HAS_ALPHA {
+                vdupq_n_f32(pixels[i].c[3] as f32)
+            } else {
+                vdupq_n_f32(0.0)
+            };
+
+            let mut errs = [vdupq_n_f32(0.0); ROWS];
+            for row in 0..ROWS {
+                let dl = vsubq_f32(yv, wyv[row]);
+                let dcr = vsubq_f32(crv, wcrv[row]);
+                let dcb = vsubq_f32(cbv, wcbv[row]);
+                let mut e = vaddq_f32(
+                    vaddq_f32(
+                        vmulq_f32(vmulq_f32(wrv, dl), dl),
+                        vmulq_f32(vmulq_f32(wgpv, dcr), dcr),
+                    ),
+                    vmulq_f32(vmulq_f32(wbpv, dcb), dcb),
+                );
+                if HAS_ALPHA {
+                    let da = vsubq_f32(av, wav4[row]);
+                    e = vaddq_f32(e, vmulq_f32(vmulq_f32(wav, da), da));
+                }
+                errs[row] = e;
+            }
+
+            let mut comb = errs[0];
+            for row in 1..ROWS {
+                comb = vminq_f32(comb, errs[row]);
+            }
+            let best = vminvq_f32(comb);
+            let bv = vdupq_n_f32(best);
+            let mut mask = 0u32;
+            for row in 0..ROWS {
+                mask |= vaddvq_u32(vandq_u32(vceqq_f32(errs[row], bv), bitv[row]));
+            }
+            total_errf += best;
+            selectors_temp[i] = mask.trailing_zeros() as i32;
+        }
+        total_errf
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn eval_perceptual_neon(
+        num_pixels: usize,
+        pixels: &[ColorI],
+        wc: &[[f32; 4]; 16],
+        wr: f32,
+        wgp: f32,
+        wbp: f32,
+        wa: f32,
+        has_alpha: bool,
+        n: usize,
+        selectors_temp: &mut [i32; 16],
+    ) -> f32 {
+        match (n, has_alpha) {
+            (4, false) => eval_perceptual_impl::<1, false>(
+                num_pixels,
+                pixels,
+                wc,
+                wr,
+                wgp,
+                wbp,
+                wa,
+                selectors_temp,
+            ),
+            (4, true) => eval_perceptual_impl::<1, true>(
+                num_pixels,
+                pixels,
+                wc,
+                wr,
+                wgp,
+                wbp,
+                wa,
+                selectors_temp,
+            ),
+            (8, false) => eval_perceptual_impl::<2, false>(
+                num_pixels,
+                pixels,
+                wc,
+                wr,
+                wgp,
+                wbp,
+                wa,
+                selectors_temp,
+            ),
+            (8, true) => eval_perceptual_impl::<2, true>(
+                num_pixels,
+                pixels,
+                wc,
+                wr,
+                wgp,
+                wbp,
+                wa,
+                selectors_temp,
+            ),
+            (_, false) => eval_perceptual_impl::<4, false>(
+                num_pixels,
+                pixels,
+                wc,
+                wr,
+                wgp,
+                wbp,
+                wa,
+                selectors_temp,
+            ),
+            (_, true) => eval_perceptual_impl::<4, true>(
+                num_pixels,
+                pixels,
+                wc,
+                wr,
+                wgp,
+                wbp,
+                wa,
+                selectors_temp,
+            ),
         }
     }
 

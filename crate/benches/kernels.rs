@@ -98,6 +98,8 @@ fn bc7(c: &mut Criterion) {
     for (name, params) in [
         ("basic", abgen::bc7_pure::Params::basic(false)),
         ("slow", abgen::bc7_pure::Params::slow(false)),
+        ("basic_perc", abgen::bc7_pure::Params::basic(true)),
+        ("slow_perc", abgen::bc7_pure::Params::slow(true)),
     ] {
         group.bench_with_input(BenchmarkId::from_parameter(name), &params, |b, p| {
             b.iter(|| abgen::bc7_pure::encode_blocks(black_box(&blocks), black_box(n), p))
@@ -108,6 +110,8 @@ fn bc7(c: &mut Criterion) {
     for (name, params) in [
         ("basic_alpha", abgen::bc7_pure::Params::basic(false)),
         ("slow_alpha", abgen::bc7_pure::Params::slow(false)),
+        ("basic_alpha_perc", abgen::bc7_pure::Params::basic(true)),
+        ("slow_alpha_perc", abgen::bc7_pure::Params::slow(true)),
     ] {
         group.bench_with_input(BenchmarkId::from_parameter(name), &params, |b, p| {
             b.iter(|| abgen::bc7_pure::encode_blocks(black_box(&ablocks), black_box(an), p))
@@ -129,6 +133,33 @@ fn bc7(c: &mut Criterion) {
             )
         })
     });
+
+    // The BC7 mip chain is the shape the Lambda actually runs: one call
+    // encodes every level, and the small tail levels are where a per-level
+    // join barrier costs the most. `mip_chain_rgba32` above only measures the
+    // resize/quantize half, so it cannot see scheduling changes in the encoder.
+    let (bw2, bh2) = (512usize, 512usize);
+    let bc7_mip_src = texture_rgba_alpha(bw2, bh2, 0x243F6A88);
+    group.throughput(Throughput::Bytes((bw2 * bh2 * 4) as u64));
+    for (name, profile) in [
+        ("mip_chain_bc7_basic", abgen::bc7_pure::Bc7Profile::Basic),
+        ("mip_chain_bc7_slow", abgen::bc7_pure::Bc7Profile::Slow),
+    ] {
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                abgen::bc7_pure::encode_bc7_mip_chain_with_profile(
+                    black_box(&bc7_mip_src),
+                    bw2 as u32,
+                    bh2 as u32,
+                    None,
+                    false,
+                    true,
+                    true,
+                    profile,
+                )
+            })
+        });
+    }
     group.finish()
 }
 

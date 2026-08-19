@@ -1,6 +1,11 @@
 use super::*;
 use std::arch::aarch64::*;
 
+/// 16 pixels, 4 per NEON vector: every chunk loop is a constant-trip loop so
+/// LLVM unrolls it and keeps the gathered lanes in registers instead of
+/// spilling the `[float32x4_t; 4]` scratch to the stack for a runtime index.
+const MAX_CHUNKS: usize = 4;
+
 #[inline]
 unsafe fn load_tab(src: &[f32; 16]) -> uint8x16x4_t {
     let p = src.as_ptr() as *const u8;
@@ -29,13 +34,35 @@ unsafe fn tbl_gather(tab: uint8x16x4_t, bidx: uint8x16_t) -> float32x4_t {
     vreinterpretq_f32_u8(vqtbl4q_u8(tab, bidx))
 }
 
+/// Left-to-right accumulate of the first `cnt` lanes of `v` into `acc`.
+///
+/// Same add order as the scalar per-pixel loop. The `cnt == 4` case (every
+/// chunk but a partial last one) is extracted lane-by-lane in registers: the
+/// stack store/reload it replaces was a store-to-load-forwarding stall sitting
+/// directly on the serial fadd dependency chain that is this kernel's critical
+/// path.
 #[inline]
 unsafe fn sum4(v: float32x4_t, cnt: usize, acc: &mut f32) {
-    let mut a = [0f32; 4];
-    vst1q_f32(a.as_mut_ptr(), v);
-    for &t in &a[..cnt] {
-        *acc += t;
+    if cnt == 4 {
+        let mut a = *acc;
+        a += vgetq_lane_f32::<0>(v);
+        a += vgetq_lane_f32::<1>(v);
+        a += vgetq_lane_f32::<2>(v);
+        a += vgetq_lane_f32::<3>(v);
+        *acc = a;
+        return;
     }
+    let mut a = *acc;
+    if cnt > 0 {
+        a += vgetq_lane_f32::<0>(v);
+    }
+    if cnt > 1 {
+        a += vgetq_lane_f32::<1>(v);
+    }
+    if cnt > 2 {
+        a += vgetq_lane_f32::<2>(v);
+    }
+    *acc = a;
 }
 
 pub(super) fn est_idx_neon(
@@ -63,19 +90,31 @@ pub(super) fn est_idx_neon(
         let v0 = vdupq_n_f32(0.0);
         let (mut minr, mut ming, mut minb) = (v255, v255, v255);
         let (mut maxr, mut maxg, mut maxb) = (v0, v0, v0);
-        for c in 0..nchunks {
+        for c in 0..MAX_CHUNKS {
+            if c >= nchunks {
+                break;
+            }
             let cnt = (num_pixels - c * 4).min(4);
             let bidx = byte_idx(idxs.as_ptr().add(c * 4));
             rv[c] = tbl_gather(rt, bidx);
             gv[c] = tbl_gather(gt_, bidx);
             bv[c] = tbl_gather(bt, bidx);
-            let valid = vcgtq_s32(vdupq_n_s32(cnt as i32), lane);
-            minr = vminq_f32(minr, vbslq_f32(valid, rv[c], v255));
-            ming = vminq_f32(ming, vbslq_f32(valid, gv[c], v255));
-            minb = vminq_f32(minb, vbslq_f32(valid, bv[c], v255));
-            maxr = vmaxq_f32(maxr, vbslq_f32(valid, rv[c], v0));
-            maxg = vmaxq_f32(maxg, vbslq_f32(valid, gv[c], v0));
-            maxb = vmaxq_f32(maxb, vbslq_f32(valid, bv[c], v0));
+            if cnt == 4 {
+                minr = vminq_f32(minr, rv[c]);
+                ming = vminq_f32(ming, gv[c]);
+                minb = vminq_f32(minb, bv[c]);
+                maxr = vmaxq_f32(maxr, rv[c]);
+                maxg = vmaxq_f32(maxg, gv[c]);
+                maxb = vmaxq_f32(maxb, bv[c]);
+            } else {
+                let valid = vcgtq_s32(vdupq_n_s32(cnt as i32), lane);
+                minr = vminq_f32(minr, vbslq_f32(valid, rv[c], v255));
+                ming = vminq_f32(ming, vbslq_f32(valid, gv[c], v255));
+                minb = vminq_f32(minb, vbslq_f32(valid, bv[c], v255));
+                maxr = vmaxq_f32(maxr, vbslq_f32(valid, rv[c], v0));
+                maxg = vmaxq_f32(maxg, vbslq_f32(valid, gv[c], v0));
+                maxb = vmaxq_f32(maxb, vbslq_f32(valid, bv[c], v0));
+            }
         }
         let lr = vminvq_f32(minr);
         let lg = vminvq_f32(ming);
@@ -128,7 +167,10 @@ pub(super) fn est_idx_neon(
         let wbv = vdupq_n_f32(wb);
 
         let mut total_errf = 0f32;
-        for c in 0..nchunks {
+        for c in 0..MAX_CHUNKS {
+            if c >= nchunks {
+                break;
+            }
             let d = vaddq_f32(
                 vaddq_f32(vmulq_f32(farv, rv[c]), vmulq_f32(fagv, gv[c])),
                 vmulq_f32(fabv, bv[c]),
@@ -185,13 +227,27 @@ pub(super) fn est_mode7_idx_neon(
         let v0 = vdupq_n_f32(0.0);
         let (mut minr, mut ming, mut minb, mut mina) = (v255, v255, v255, v255);
         let (mut maxr, mut maxg, mut maxb, mut maxa) = (v0, v0, v0, v0);
-        for c in 0..nchunks {
+        for c in 0..MAX_CHUNKS {
+            if c >= nchunks {
+                break;
+            }
             let cnt = (num_pixels - c * 4).min(4);
             let bidx = byte_idx(idxs.as_ptr().add(c * 4));
             rv[c] = tbl_gather(rt, bidx);
             gv[c] = tbl_gather(gt_, bidx);
             bv[c] = tbl_gather(bt, bidx);
             av[c] = tbl_gather(at, bidx);
+            if cnt == 4 {
+                minr = vminq_f32(minr, rv[c]);
+                ming = vminq_f32(ming, gv[c]);
+                minb = vminq_f32(minb, bv[c]);
+                mina = vminq_f32(mina, av[c]);
+                maxr = vmaxq_f32(maxr, rv[c]);
+                maxg = vmaxq_f32(maxg, gv[c]);
+                maxb = vmaxq_f32(maxb, bv[c]);
+                maxa = vmaxq_f32(maxa, av[c]);
+                continue;
+            }
             let valid = vcgtq_s32(vdupq_n_s32(cnt as i32), lane);
             minr = vminq_f32(minr, vbslq_f32(valid, rv[c], v255));
             ming = vminq_f32(ming, vbslq_f32(valid, gv[c], v255));
@@ -259,7 +315,10 @@ pub(super) fn est_mode7_idx_neon(
         let wav = vdupq_n_f32(wa);
 
         let mut total_errf = 0f32;
-        for c in 0..nchunks {
+        for c in 0..MAX_CHUNKS {
+            if c >= nchunks {
+                break;
+            }
             let d = vaddq_f32(
                 vaddq_f32(
                     vaddq_f32(vmulq_f32(farv, rv[c]), vmulq_f32(fagv, gv[c])),
@@ -461,7 +520,10 @@ unsafe fn subset_err_rgb_pre(pre: &PreRgbNeon, idxs: &[i32; 16], num_pixels: usi
     let v0 = vdupq_n_f32(0.0);
     let (mut minr, mut ming, mut minb) = (v255, v255, v255);
     let (mut maxr, mut maxg, mut maxb) = (v0, v0, v0);
-    for c in 0..nchunks {
+    for c in 0..MAX_CHUNKS {
+        if c >= nchunks {
+            break;
+        }
         let cnt = (num_pixels - c * 4).min(4);
         let bidx = byte_idx(idxs.as_ptr().add(c * 4));
         rv[c] = tbl_gather(pre.rt, bidx);
@@ -519,7 +581,10 @@ unsafe fn subset_err_rgb_pre(pre: &PreRgbNeon, idxs: &[i32; 16], num_pixels: usi
     let dibv = vdupq_n_f32(dib);
 
     let mut total_errf = 0f32;
-    for c in 0..nchunks {
+    for c in 0..MAX_CHUNKS {
+        if c >= nchunks {
+            break;
+        }
         let d = vaddq_f32(
             vaddq_f32(vmulq_f32(farv, rv[c]), vmulq_f32(fagv, gv[c])),
             vmulq_f32(fabv, bv[c]),
@@ -565,7 +630,10 @@ unsafe fn subset_err_rgba_pre(pre: &PreRgbaNeon, idxs: &[i32; 16], num_pixels: u
     let v0 = vdupq_n_f32(0.0);
     let (mut minr, mut ming, mut minb, mut mina) = (v255, v255, v255, v255);
     let (mut maxr, mut maxg, mut maxb, mut maxa) = (v0, v0, v0, v0);
-    for c in 0..nchunks {
+    for c in 0..MAX_CHUNKS {
+        if c >= nchunks {
+            break;
+        }
         let cnt = (num_pixels - c * 4).min(4);
         let bidx = byte_idx(idxs.as_ptr().add(c * 4));
         rv[c] = tbl_gather(pre.rt, bidx);
@@ -630,7 +698,10 @@ unsafe fn subset_err_rgba_pre(pre: &PreRgbaNeon, idxs: &[i32; 16], num_pixels: u
     let diav = vdupq_n_f32(dia);
 
     let mut total_errf = 0f32;
-    for c in 0..nchunks {
+    for c in 0..MAX_CHUNKS {
+        if c >= nchunks {
+            break;
+        }
         let d = vaddq_f32(
             vaddq_f32(
                 vaddq_f32(vmulq_f32(farv, rv[c]), vmulq_f32(fagv, gv[c])),

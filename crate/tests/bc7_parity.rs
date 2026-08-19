@@ -107,3 +107,30 @@ fn parity_hash() {
         assert_eq!(got, want, "BC7 {name} corpus hash moved");
     }
 }
+
+/// Pinned corpus hashes, per profile. These are the values produced by the
+/// scalar reference and by every SIMD backend (x86 AVX2, aarch64 NEON, wasm);
+/// run with `ABGEN_BC7_SCALAR=1` to check the aarch64 NEON kernels against the
+/// scalar path. Any move here is a parity regression.
+#[test]
+fn parity_hash_pinned() {
+    let num_blocks = 768;
+    let blocks = corpus(num_blocks, 0x9E3779B97F4A7C15);
+    for (name, p, want) in [
+        ("basic", Params::basic(false), 0x5682_f7ac_302e_8f18u64),
+        ("slow", Params::slow(false), 0xe9fa_a653_6ebc_09ccu64),
+        (
+            "basic-perceptual",
+            Params::basic(true),
+            0xa50a_f210_824b_832au64,
+        ),
+        (
+            "slow-perceptual",
+            Params::slow(true),
+            0x2c9a_dafb_6d78_b5c8u64,
+        ),
+    ] {
+        let enc = encode_blocks(&blocks, num_blocks, &p);
+        assert_eq!(fnv1a(&enc), want, "BC7 corpus hash moved for {name}");
+    }
+}
