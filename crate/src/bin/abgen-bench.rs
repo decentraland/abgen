@@ -142,8 +142,6 @@ fn time_once(files: &[(String, Vec<u8>)], platform: &str) -> Run {
             }
             _ => {}
         }
-        // The span a phase owns is the gap until whatever was emitted next;
-        // the last mark's span runs to the end of the run.
         let next = marks.get(i + 1).map(|(t, _, _)| *t).unwrap_or(total);
         *per_stage.entry(ev.clone()).or_default() += next.saturating_sub(*at);
     }
@@ -262,8 +260,6 @@ fn main() {
         }
     }
 
-    // Entity ids and directories name the same thing two ways; taking both
-    // would silently bench a different corpus than either flag implies.
     if id_list.is_some() && !targets.is_empty() {
         eprintln!("abgen-bench: --entity-ids and entity directories are alternatives, not a union");
         std::process::exit(2);
@@ -285,8 +281,6 @@ fn main() {
         for id in ids {
             match read_entity_id(&store, &id) {
                 Ok(files) if !files.is_empty() => jobs.push((id, files)),
-                // A partially synced store is the normal case at this size, so
-                // a missing entity is a skip and not a run-ending error.
                 Ok(_) => eprintln!("abgen-bench: {id} has no content; skipped"),
                 Err(e) => eprintln!("abgen-bench: {id}: {e}; skipped"),
             }
