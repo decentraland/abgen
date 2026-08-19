@@ -4,10 +4,14 @@
 //! stored (canonical keys are immutable, so a positive can't go stale;
 //! negatives never — a concurrent build may upload the object any moment),
 //! and every Redis error fails open to the real probe with a backoff.
+//!
+//! `rediss://` speaks the same RESP over rustls, for clusters with in-transit
+//! encryption required; server certificates are verified against the webpki
+//! root bundle.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -22,16 +26,18 @@ struct Target {
     user: Option<String>,
     password: Option<String>,
     db: Option<u32>,
+    tls: bool,
 }
 
 fn parse_url(url: &str) -> Result<Target, String> {
-    let rest = url.strip_prefix("redis://").ok_or_else(|| {
-        if url.starts_with("rediss://") {
-            "rediss:// (TLS) is not supported by the built-in client".to_string()
-        } else {
-            format!("unsupported scheme in {url:?} (expected redis://)")
-        }
-    })?;
+    let (rest, tls) = match url.strip_prefix("rediss://") {
+        Some(rest) => (rest, true),
+        None => (
+            url.strip_prefix("redis://")
+                .ok_or_else(|| format!("unsupported scheme in {url:?} (expected redis(s)://)"))?,
+            false,
+        ),
+    };
     let (rest, db) = match rest.split_once('/') {
         Some((r, d)) if !d.is_empty() => {
             let db = d
@@ -65,6 +71,7 @@ fn parse_url(url: &str) -> Result<Target, String> {
         user,
         password,
         db,
+        tls,
     })
 }
 
@@ -133,15 +140,91 @@ fn read_reply(r: &mut impl BufRead) -> std::io::Result<Reply> {
     }
 }
 
+/// Plain TCP or the same socket wrapped in a rustls session (`rediss://`,
+/// what ElastiCache calls in-transit encryption). Both are blocking, so the
+/// RESP codec above is unaware of which one it is talking through.
+enum Stream {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Stream {
+    fn socket(&self) -> &TcpStream {
+        match self {
+            Stream::Plain(s) => s,
+            Stream::Tls(s) => &s.sock,
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.read(buf),
+            Stream::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.write(buf),
+            Stream::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Stream::Plain(s) => s.flush(),
+            Stream::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// Roots for `rediss://`, built once: the webpki bundle ureq already carries,
+/// which chains ElastiCache's Amazon-issued server certificates.
+fn tls_config() -> Arc<rustls::ClientConfig> {
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let roots = rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            };
+            let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("ring provider supports the default protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            Arc::new(cfg)
+        })
+        .clone()
+}
+
+fn tls_handshake(host: &str, sock: TcpStream) -> std::io::Result<Stream> {
+    let server = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| io_err(format!("bad TLS server name {host:?}: {e}")))?;
+    let session = rustls::ClientConnection::new(tls_config(), server)
+        .map_err(|e| io_err(format!("TLS setup failed: {e}")))?;
+    let mut stream = rustls::StreamOwned::new(session, sock);
+    // Drives the handshake to completion, so a bad peer/cert fails here rather
+    // than inside the first command.
+    stream.flush()?;
+    Ok(Stream::Tls(Box::new(stream)))
+}
+
 struct Conn {
-    reader: BufReader<TcpStream>,
-    writer: TcpStream,
+    io: BufReader<Stream>,
 }
 
 impl Conn {
     fn command(&mut self, args: &[&str]) -> std::io::Result<Reply> {
-        self.writer.write_all(&encode_command(args))?;
-        read_reply(&mut self.reader)
+        let stream = self.io.get_mut();
+        stream.write_all(&encode_command(args))?;
+        stream.flush()?;
+        read_reply(&mut self.io)
     }
 
     /// An `-ERR` reply becomes an io error so the caller tears the connection down.
@@ -164,14 +247,21 @@ fn connect(target: &Target) -> std::io::Result<Conn> {
                 "redis host resolved to nothing",
             )
         })?;
-    let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    stream.set_nodelay(true)?;
-    let reader = BufReader::new(stream.try_clone()?);
+    let sock = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+    // The handshake costs round-trips a single command doesn't, so it gets the
+    // connect budget; steady-state IO is tightened back down afterwards.
+    sock.set_read_timeout(Some(CONNECT_TIMEOUT))?;
+    sock.set_write_timeout(Some(CONNECT_TIMEOUT))?;
+    sock.set_nodelay(true)?;
+    let stream = if target.tls {
+        tls_handshake(&target.host, sock)?
+    } else {
+        Stream::Plain(sock)
+    };
+    stream.socket().set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.socket().set_write_timeout(Some(IO_TIMEOUT))?;
     let mut conn = Conn {
-        reader,
-        writer: stream,
+        io: BufReader::new(stream),
     };
     if let Some(pass) = &target.password {
         // 2-arg AUTH when the URL names a user (Redis 6 ACLs / ElastiCache RBAC).
@@ -331,6 +421,7 @@ pub fn forget(key: &str) {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::net::TcpListener;
 
     #[test]
     fn parses_plain_host() {
@@ -342,8 +433,28 @@ mod tests {
                 user: None,
                 password: None,
                 db: None,
+                tls: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_tls_urls() {
+        assert_eq!(
+            parse_url("rediss://:sekret@cache.internal:6380/1").unwrap(),
+            Target {
+                host: "cache.internal".to_string(),
+                port: 6380,
+                user: None,
+                password: Some("sekret".to_string()),
+                db: Some(1),
+                tls: true,
+            }
+        );
+        // Same default port as plain redis — ElastiCache in-transit encryption
+        // keeps 6379.
+        let t = parse_url("rediss://cache.internal").unwrap();
+        assert_eq!((t.port, t.tls), (6379, true));
     }
 
     #[test]
@@ -356,6 +467,7 @@ mod tests {
                 user: None,
                 password: Some("sekret".to_string()),
                 db: Some(2),
+                tls: false,
             }
         );
         // Userinfo without a colon is treated as the password.
@@ -372,8 +484,8 @@ mod tests {
 
     #[test]
     fn rejects_bad_urls() {
-        assert!(parse_url("rediss://host").unwrap_err().contains("TLS"));
         assert!(parse_url("http://host").is_err());
+        assert!(parse_url("rediss://host:notaport").is_err());
         assert!(parse_url("redis://host:notaport").is_err());
         assert!(parse_url("redis://:pass@").is_err());
         assert!(parse_url("redis://host/notadb").is_err());
@@ -414,7 +526,6 @@ mod tests {
 
     // ---- loopback fake-RESP server (same pattern as sns.rs's capture test) ----
 
-    use std::io::Read;
     use std::sync::Arc;
 
     type Commands = Arc<Mutex<Vec<Vec<String>>>>;
@@ -446,6 +557,7 @@ mod tests {
             user: None,
             password: None,
             db: None,
+            tls: false,
         };
         (target, commands, handle)
     }
@@ -554,5 +666,75 @@ mod tests {
         assert!(st.hit("k"));
         server.join().expect("server");
         assert_eq!(commands.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn plain_connection_authenticates_selects_and_commands() {
+        let listener = TcpListener::bind("localhost:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let mut writer = sock;
+            let mut seen = Vec::new();
+            while seen.len() < 3 {
+                let args = read_command(&mut reader);
+                let reply: &[u8] = if args[0] == "EXISTS" {
+                    b":1\r\n"
+                } else {
+                    b"+OK\r\n"
+                };
+                writer.write_all(reply).unwrap();
+                seen.push(args);
+            }
+            seen
+        });
+
+        let target = Target {
+            host: "localhost".to_string(),
+            port,
+            user: None,
+            password: Some("pw".to_string()),
+            db: Some(3),
+            tls: false,
+        };
+        let mut conn = connect(&target).unwrap();
+        assert_eq!(conn.command(&["EXISTS", "k"]).unwrap(), Reply::Integer(1));
+
+        let seen = server.join().unwrap();
+        assert_eq!(seen[0], ["AUTH", "pw"]);
+        assert_eq!(seen[1], ["SELECT", "3"]);
+        assert_eq!(seen[2], ["EXISTS", "k"]);
+    }
+
+    /// No cert fixture here: the point is that `rediss://` reaches the wire as a
+    /// TLS ClientHello (with SNI) instead of plaintext RESP, and that a peer
+    /// which doesn't speak TLS is a clean error rather than a hang or a panic.
+    #[test]
+    fn tls_target_opens_with_a_client_hello() {
+        let listener = TcpListener::bind("localhost:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).unwrap();
+            buf.truncate(n);
+            let _ = sock.write_all(b"-ERR this port is plaintext\r\n");
+            buf
+        });
+
+        let target = Target {
+            host: "localhost".to_string(),
+            port,
+            user: None,
+            password: None,
+            db: None,
+            tls: true,
+        };
+        assert!(connect(&target).is_err());
+
+        let hello = server.join().unwrap();
+        assert_eq!(&hello[..3], &[0x16, 0x03, 0x01]);
+        assert!(hello.windows(9).any(|w| w == b"localhost"));
     }
 }
