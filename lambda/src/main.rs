@@ -83,12 +83,41 @@ fn run_once(cfg: &config::Config, path: &str) -> Result<serde_json::Value> {
 }
 
 fn handle(cfg: &config::Config, event: &serde_json::Value) -> Result<serde_json::Value> {
-    let jobs = event::jobs_from_event(event)?;
-    let mut summaries = Vec::with_capacity(jobs.len());
-    for job in &jobs {
-        summaries.push(handle_job(cfg, job)?);
+    match event::parse_event(event)? {
+        event::Event::Direct(job) => Ok(serde_json::json!({ "jobs": [handle_job(cfg, &job)?] })),
+        event::Event::Sqs(records) => run_batch(records, |job| handle_job(cfg, job)),
     }
-    Ok(serde_json::json!({ "jobs": summaries }))
+}
+
+/// Runs an SQS batch and answers in the `ReportBatchItemFailures` format: a
+/// failing record is reported by message id and redelivered on its own instead
+/// of failing — and so redelivering — every record in the batch.
+fn run_batch(
+    records: Vec<event::Record>,
+    mut run: impl FnMut(&event::Job) -> Result<serde_json::Value>,
+) -> Result<serde_json::Value> {
+    let mut failures = Vec::new();
+    for (i, record) in records.into_iter().enumerate() {
+        let label = record
+            .message_id
+            .clone()
+            .unwrap_or_else(|| format!("record {i}"));
+        match record.job.and_then(|job| run(&job)) {
+            Ok(summary) => eprintln!("ok {label}: {summary}"),
+            Err(err) => {
+                eprintln!("failed {label}: {err:#}");
+                // Without a message id the failure cannot be reported, and
+                // succeeding here would delete the record: fail the invocation.
+                let Some(id) = record.message_id else {
+                    return Err(err.context(format!(
+                        "SQS record {i} has no messageId — cannot report a partial-batch failure"
+                    )));
+                };
+                failures.push(serde_json::json!({ "itemIdentifier": id }));
+            }
+        }
+    }
+    Ok(serde_json::json!({ "batchItemFailures": failures }))
 }
 
 fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Value> {
@@ -213,4 +242,93 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
         "upload": upload,
         "notified": notified,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn record(message_id: Option<&str>, entity_id: &str) -> event::Record {
+        event::Record {
+            message_id: message_id.map(str::to_string),
+            job: Ok(event::Job {
+                entity_id: entity_id.to_string(),
+                content_server_url: None,
+                is_lods: false,
+                force: false,
+            }),
+        }
+    }
+
+    fn run(records: Vec<event::Record>, failing: &[&str]) -> Result<serde_json::Value> {
+        let failing: Vec<String> = failing.iter().map(|s| s.to_string()).collect();
+        run_batch(records, |job| {
+            if failing.contains(&job.entity_id) {
+                anyhow::bail!("boom");
+            }
+            Ok(json!({ "entityId": job.entity_id }))
+        })
+    }
+
+    #[test]
+    fn reports_no_failures_when_every_record_succeeds() {
+        let batch = vec![
+            record(Some("m-1"), "bafkone"),
+            record(Some("m-2"), "bafktwo"),
+        ];
+        assert_eq!(run(batch, &[]).unwrap(), json!({"batchItemFailures": []}));
+    }
+
+    #[test]
+    fn reports_only_the_failing_records() {
+        let batch = vec![
+            record(Some("m-1"), "bafkone"),
+            record(Some("m-2"), "bafktwo"),
+            record(Some("m-3"), "bafkthree"),
+        ];
+        assert_eq!(
+            run(batch, &["bafktwo"]).unwrap(),
+            json!({"batchItemFailures": [{"itemIdentifier": "m-2"}]})
+        );
+    }
+
+    #[test]
+    fn reports_records_that_failed_to_parse() {
+        let batch = vec![
+            event::Record {
+                message_id: Some("m-1".into()),
+                job: Err(anyhow::anyhow!("body is not JSON")),
+            },
+            record(Some("m-2"), "bafktwo"),
+        ];
+        assert_eq!(
+            run(batch, &[]).unwrap(),
+            json!({"batchItemFailures": [{"itemIdentifier": "m-1"}]})
+        );
+    }
+
+    #[test]
+    fn fails_the_invocation_when_a_failed_record_has_no_message_id() {
+        let batch = vec![record(None, "bafkone")];
+        assert!(run(batch, &["bafkone"]).is_err());
+    }
+
+    #[test]
+    fn direct_invokes_keep_the_job_summary_shape() {
+        let cfg = config::Config::from_env();
+        let e = json!({"entity": {"entityId": "bafklod789"}, "lods": ["https://x/lod0.glb"]});
+        assert_eq!(
+            handle(&cfg, &e).unwrap(),
+            json!({"jobs": [{"entityId": "bafklod789", "skipped": "lods-unsupported"}]})
+        );
+    }
+
+    #[test]
+    fn lod_records_are_acknowledged_not_reported_as_failures() {
+        let cfg = config::Config::from_env();
+        let body = json!({"entity": {"entityId": "bafklod789"}, "lods": ["https://x/lod0.glb"]});
+        let e = json!({"Records": [{"messageId": "m-1", "body": body.to_string()}]});
+        assert_eq!(handle(&cfg, &e).unwrap(), json!({"batchItemFailures": []}));
+    }
 }
