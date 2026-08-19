@@ -58,6 +58,7 @@ version = "0.17.0"
 dependencies = [
  "abgen",
  "anyhow",
+ "metrics",
  "serde",
  "serde_json",
  "ureq",
