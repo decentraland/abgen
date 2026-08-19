@@ -1,0 +1,10 @@
+{
+  "entity": {
+    "entityId": "bafkreidudwlm33df2wpqvv4amaiorhcdatp77gf57cf6vidz5hnfipx244",
+    "authChain": []
+  },
+  "contentServerUrls": ["https://peer.decentraland.org/content"],
+  "lods": [
+    "https://lod-generator-unity-cdn-decentraland-org-contentbucket-4bd1977.s3.amazonaws.com/lods-unity/fbx-deprecated-sources/-17,-21/LOD/Sources/1707776785658/bafkreidudwlm33df2wpqvv4amaiorhcdatp77gf57cf6vidz5hnfipx244_0.fbx"
+  ]
+}

@@ -9,6 +9,7 @@ pub struct Config {
     pub keep_output: bool,
     pub registry_queue_url: Option<String>,
     pub allowed_content_server_hosts: Option<Vec<String>>,
+    pub lods_enabled: bool,
 }
 
 impl Config {
@@ -48,6 +49,7 @@ impl Config {
                         .collect::<Vec<_>>()
                 })
                 .filter(|v| !v.is_empty()),
+            lods_enabled: abgen::clihelp::env_bool("ENABLE_LODS", false),
         }
     }
 }

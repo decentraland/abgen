@@ -30,6 +30,7 @@ entities. The Lambda handler enables it once and clears it after each entity.
 | 4 | registry SQS notification | deferred (registry duplicate is a follow-up) |
 | 5 | already-converted skip (entity-level manifest check) **and** per-file asset reuse (space probe per digest-named glb) | done |
 | 6 | container image (`nix build .#lambdaImage`) | done |
+| 7 | LOD jobs — regenerated from the scene via `lodgen`, opt-in with `ENABLE_LODS` | done (FBX sources still not transcoded) |
 
 ## Local run (no AWS)
 
@@ -59,6 +60,7 @@ all hits.
 | `ABGEN_S3_READ_ONLY` | off | probe/reuse without writing (dry runs) |
 | `KEEP_OUTPUT` | off (`--once` forces on) | keep the local corpus after the run |
 | `REGISTRY_QUEUE_URL` | — | registry queue (step 4, deferred) |
+| `ENABLE_LODS` | off | generate LOD levels 0+1 for `lods` jobs instead of acking and skipping them (see [LOD jobs](#lod-jobs)) |
 | `ALLOWED_CONTENT_SERVER_HOSTS` | — (**fail-open**) | comma-separated allowlist of hosts an event's `contentServerUrl` may name; **unset means any https host is accepted**, so every deployment should set it. The `lambdaImage` bakes in `peer.decentraland.org`; a function env var overrides it. |
 
 S3 is abgen's built-in "space" client (SigV4, ureq). Credentials come from
@@ -74,6 +76,8 @@ them automatically.
 | wearable & emote bundles (entity-scoped) | `{AB_VERSION}/{entityId}/{bundleName}` |
 | manifests | `manifest/{entityId}_{platform}.json` |
 | scene sources (`main.crdt`, `scene.json`, main script; clean scene builds) | `{AB_VERSION}/{entityId}/{file}` |
+| LOD bundles (+ `.br`), `ENABLE_LODS=1` only | `LOD/{level}/{sceneId}_{level}_{platform}` |
+| ISS descriptor (+ `.br`), `ENABLE_LODS=1` only | `lods-unity/manifests/{sceneId}_InitialSceneState.json` |
 
 ## Container image & Lambda settings
 
@@ -131,9 +135,38 @@ are content-addressed, so a differing bundle gets a different name).
 SQS record batches whose bodies are catalyst `DeploymentToSqs` payloads
 (`{"entity":{"entityId":…},"contentServerUrls":[…]}`), or a plain
 `{"entityId":…, "contentServerUrl":…}` for manual invokes. LOD jobs
-(`lods` present) are acknowledged and skipped — LOD generation stays on the
-Unity pipeline. `"force": true` in either shape bypasses the
-already-converted skip.
+(`lods` present) take the [LOD lane](#lod-jobs). `"force": true` in either
+shape bypasses the already-converted skip.
+
+## LOD jobs
+
+A deployment event with a `lods` array is a LOD job. Those URLs point at the
+legacy Unity generator's **FBX** sources; abgen has no FBX importer, so it
+does not transcode them. With `ENABLE_LODS=1` the handler instead
+*regenerates* the LODs from the scene entity through the same `lodgen` chain
+the abcdn server runs JIT (`abgen-lod generate`): resolve placements (ISS
+descriptor, else the embedded scene runtime) → assemble → crop → atlas →
+simplify → bundle, levels 0 and 1, for every configured platform that has a
+LOD lane (`windows|mac|linux`; `webgl` is dropped with a log line). The
+result passes the same structural self-gate as the JIT lane — a gate failure
+fails the job and publishes nothing — and is then uploaded under the
+unversioned `LOD/…` and `lods-unity/manifests/…` keys above.
+
+```bash
+ENABLE_LODS=1 OUT_ROOT=/tmp/ab-out ./target/release/abgen-lambda \
+  --once lambda/examples/event-lods.json
+```
+
+Without `ENABLE_LODS` (the default) LOD jobs are acked and skipped with
+`{"skipped": "lods-disabled"}`, i.e. LOD generation stays on the Unity
+pipeline. Turn it on per environment: a LOD build is a whole-scene bake and
+costs far more CPU/RAM/time than a single-entity conversion, so size the
+function (memory, timeout, SQS visibility) for it first.
+
+Known boundaries: level 2 is never emitted (production stopped emitting it),
+the deployment's FBX source URLs are ignored rather than converted, and level
+0 is the ISS-era pass-through bake rather than the retired legacy LOD0 shape
+(same divergence `abgen-lod generate` documents).
 
 ## Already-converted skip
 

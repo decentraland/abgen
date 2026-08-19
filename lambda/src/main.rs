@@ -2,6 +2,7 @@ mod catalyst;
 mod config;
 mod convert;
 mod event;
+mod lod;
 mod notify;
 mod output;
 mod runtime;
@@ -40,7 +41,10 @@ fn main() {
                  env: PLATFORMS (windows,mac), AB_VERSION (v49), ABGEN_CACHE_DIR,\n\
                  \x20    CONTENT_SERVER_URL, OUT_ROOT, KEEP_OUTPUT, REGISTRY_QUEUE_URL,\n\
                  \x20    ABGEN_S3_ENDPOINT, ABGEN_S3_BUCKET, ABGEN_S3_REGION,\n\
-                 \x20    ABGEN_S3_PATH_STYLE, ABGEN_S3_READ_ONLY (+ AWS credentials)"
+                 \x20    ABGEN_S3_PATH_STYLE, ABGEN_S3_READ_ONLY (+ AWS credentials),\n\
+                 \x20    ENABLE_LODS (off: LOD jobs are acked and skipped; on: levels 0+1\n\
+                 \x20    are regenerated from the scene and written to LOD/<level>/ and\n\
+                 \x20    lods-unity/manifests/ — the deployment's FBX sources are unused)"
             );
         }
         Some(other) => {
@@ -84,10 +88,13 @@ fn handle(cfg: &config::Config, event: &serde_json::Value) -> Result<serde_json:
 }
 
 fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Value> {
-    if job.is_lods {
-        eprintln!("skip: LOD job for {} (unsupported here)", job.entity_id);
+    if job.is_lods && !cfg.lods_enabled {
+        eprintln!(
+            "skip: LOD job for {} (LOD generation is off; set ENABLE_LODS=1)",
+            job.entity_id
+        );
         return Ok(serde_json::json!({
-            "entityId": job.entity_id, "skipped": "lods-unsupported"
+            "entityId": job.entity_id, "skipped": "lods-disabled"
         }));
     }
 
@@ -99,6 +106,10 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
         event::ensure_allowed_content_server(content_server, allowed)?;
     }
     let proxy = convert::make_proxy(cfg, content_server);
+
+    if job.is_lods {
+        return lod::convert(cfg, &proxy, &job.entity_id, content_server);
+    }
 
     let mut pending: Vec<String> = cfg.platforms.clone();
     if !job.force {
