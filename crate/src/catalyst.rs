@@ -86,8 +86,13 @@ pub struct CatalystClient {
 
 impl CatalystClient {
     pub fn new(base_url: &str) -> Self {
+        // No redirects: a host allowlist (ALLOWED_CONTENT_SERVER_HOSTS in
+        // the lambda) only pins the first hop, so a 302 from an allowed
+        // catalyst would re-point the fetch anywhere. Catalysts serve
+        // /contents directly; a redirect is a loud error, not a hop.
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(HTTP_TIMEOUT_SECS)))
+            .max_redirects(0)
             .build()
             .into();
         CatalystClient {
@@ -280,10 +285,6 @@ impl CatalystClient {
         })
     }
 
-    /// Resolve an entity by id via `POST /entities/active` — the route the
-    /// upstream LOD converter uses on catalyst-style hosts. Unlike
-    /// `fetch_entity` (`GET /contents/{id}`), only ACTIVE entities match:
-    /// a redeployed scene's old entity id, or a plain content CID, errors.
     pub fn fetch_active_entity_by_id(&self, entity_id: &str) -> Result<Scene> {
         let body = serde_json::json!({ "ids": [entity_id] });
         let raw = self.post_json("/entities/active", &body)?;

@@ -410,14 +410,7 @@ module.exports = {{
 }};
 "
         );
-        let engines: Vec<Box<dyn SceneEngine>> = vec![
-            Box::new(QuickJsEngine),
-            #[cfg(all(
-                feature = "engine-v8",
-                not(all(target_os = "windows", target_env = "gnu"))
-            ))]
-            Box::new(crate::lodgen::scenerun::V8Engine),
-        ];
+        let engines: Vec<Box<dyn SceneEngine>> = vec![Box::new(QuickJsEngine)];
         for engine in engines {
             let outcome = engine.run_capture(job(code.clone(), None)).unwrap();
             assert!(outcome.sent);

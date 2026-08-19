@@ -33,9 +33,6 @@ pub(super) fn embedded_template(file: &str) -> Option<&'static [u8]> {
     EMBEDDED.iter().find(|(n, _)| *n == file).map(|(_, b)| *b)
 }
 
-/// `ABGEN_ROOT`, when set to something non-empty: the directory that contains
-/// `template/`. The documented escape hatch, and how a native host (Unity's C#
-/// layer handing over a `StreamingAssets` path) points abgen at its own copy.
 fn override_root() -> Option<PathBuf> {
     std::env::var("ABGEN_ROOT")
         .ok()
@@ -44,7 +41,6 @@ fn override_root() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Where the templates are coming from, for logs and operator-facing messages.
 pub fn template_source() -> String {
     match override_root() {
         Some(root) => format!("{} (ABGEN_ROOT)", root.join("template").display()),
@@ -52,12 +48,6 @@ pub fn template_source() -> String {
     }
 }
 
-/// One template's bytes: the override's file if `ABGEN_ROOT` is set, otherwise
-/// the embedded copy. An unreadable override is an error, not a fall back —
-/// silently substituting the embedded copy would hide a mistyped override,
-/// which is the same class of bug as the missing-asset silence this replaced.
-/// Takes the root rather than reading the env, so the no-fallback contract is
-/// testable without mutating process-wide state.
 pub(super) fn read_from_root(root: &std::path::Path, file: &str) -> Result<Vec<u8>> {
     let path = root.join("template").join(file);
     std::fs::read(&path).with_context(|| {
@@ -79,14 +69,10 @@ fn template_bytes(file: &str) -> Result<Cow<'static, [u8]>> {
     }
 }
 
-/// Can the primary template be obtained at all? False only when `ABGEN_ROOT`
-/// points somewhere broken.
 pub fn template_available() -> bool {
     template_bytes(ALL_TYPES_TEMPLATE).is_ok()
 }
 
-/// Which required templates cannot be obtained. Empty unless `ABGEN_ROOT` is
-/// set to a directory that is missing some of them.
 pub fn templates_missing() -> Vec<String> {
     REQUIRED_TEMPLATES
         .iter()
@@ -95,8 +81,6 @@ pub fn templates_missing() -> Vec<String> {
         .collect()
 }
 
-/// Which required templates a *given* directory lacks. A pure check on a
-/// caller-supplied path — used to validate a candidate `ABGEN_ROOT`.
 pub fn templates_missing_in(dir: &std::path::Path) -> Vec<String> {
     REQUIRED_TEMPLATES
         .iter()
@@ -105,8 +89,6 @@ pub fn templates_missing_in(dir: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-/// Hard preflight: every required template must be obtainable. Callers that
-/// would otherwise report a zero-bundle success run this first.
 pub fn require_templates() -> Result<()> {
     for f in REQUIRED_TEMPLATES {
         template_bytes(f)?;
@@ -114,9 +96,6 @@ pub fn require_templates() -> Result<()> {
     Ok(())
 }
 
-/// Content identity of the template set actually in use — the embedded copy,
-/// or the override's files when `ABGEN_ROOT` is set. Feeds the build id, so a
-/// process pointed at different templates keys its caches differently.
 pub fn template_identity() -> String {
     use std::sync::OnceLock;
     static CACHE: OnceLock<String> = OnceLock::new();

@@ -1,31 +1,3 @@
-//! The export request blob: one length-prefixed byte buffer, host-agnostic.
-//!
-//! Layout (all integers little-endian u32):
-//!
-//! ```text
-//! u32 file_count
-//!   repeated file_count times:
-//!     u32 name_len, name_len bytes (utf-8 path)
-//!     u32 data_len, data_len bytes
-//! u32 len, len bytes  platform      ("windows" | "mac" | "linux" | "webgl")
-//! u32 len, len bytes  entity_type   ("" = detect from the files)
-//! u8  magenta_missing
-//! u8  lod
-//! u8  mode          (0 convert, 1 scan, 2 convert_only, 3 lod_only)
-//! u8  crop
-//! u32 tri_cap       (0 = uncapped)
-//! u32 len, len bytes  entity_hash   ("" = derive; names the LOD, mode 3)
-//! u32 len, len bytes  only_glb      (mode 2: which file to convert)
-//! u32 entry_count                   (optional content table; 0 = derive)
-//!   repeated entry_count times:
-//!     u32 len, len bytes  file name
-//!     u32 len, len bytes  content hash
-//! ```
-//!
-//! Everything from `tri_cap` on is optional: a short buffer stops the parse
-//! and the rest take defaults, so older hosts keep working.
-
-/// A parsed export request.
 pub struct Input {
     pub files: Vec<(String, Vec<u8>)>,
     pub platform: String,
@@ -57,7 +29,6 @@ fn read_str(buf: &[u8], off: &mut usize) -> Option<String> {
     String::from_utf8(read_chunk(buf, off)?.to_vec()).ok()
 }
 
-/// `None` means malformed — never a half-read request.
 pub fn parse_input(buf: &[u8]) -> Option<Input> {
     let mut off = 0usize;
     let n = read_u32(buf, &mut off)? as usize;
@@ -101,7 +72,6 @@ pub fn parse_input(buf: &[u8]) -> Option<Input> {
     })
 }
 
-/// Builds a request blob, so embedders need not hand-roll the layout.
 pub struct InputBuilder {
     files: Vec<(String, Vec<u8>)>,
     platform: String,
@@ -279,8 +249,6 @@ mod tests {
         assert!(parse_input(&blob).is_none());
     }
 
-    /// A four-byte count must not become a reservation: allocation failure
-    /// aborts, so this is the one malformed input that could crash the host.
     #[test]
     fn a_huge_content_table_count_does_not_reserve() {
         let mut blob = InputBuilder::new().file("a.glb", vec![1u8]).build();

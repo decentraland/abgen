@@ -351,6 +351,14 @@ pub(super) fn est_subset_err(
             super::est_wasm128::est_idx_w128(mode, p, idxs, num_pixels, lf)
         };
     }
+    #[cfg(target_arch = "aarch64")]
+    if let Some(lf) = lf {
+        return if mode == 7 {
+            super::est_neon::est_mode7_idx_neon(p, idxs, num_pixels, lf)
+        } else {
+            super::est_neon::est_idx_neon(mode, p, idxs, num_pixels, lf)
+        };
+    }
     let _ = lf;
     if mode == 7 {
         ccc_est_mode7_idx(p, idxs, num_pixels, pixels)
@@ -362,6 +370,10 @@ pub(super) fn est_subset_err(
 pub(super) fn lanes_f32_if_supported(lanes: &[&[ColorI; 16]]) -> Option<Vec<LaneF32>> {
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     if super::est_wasm128::qualified() {
+        return Some(lanes.iter().map(|p| LaneF32::new(p)).collect());
+    }
+    #[cfg(target_arch = "aarch64")]
+    if super::est_neon::qualified() {
         return Some(lanes.iter().map(|p| LaneF32::new(p)).collect());
     }
     if has_avx512vl() && has_avx2() {

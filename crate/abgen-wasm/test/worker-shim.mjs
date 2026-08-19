@@ -1,4 +1,4 @@
-// node worker_threads bootstrap that gives site/wasm/worker.js the browser
+// node worker_threads bootstrap that gives js/worker.js the browser
 // worker globals it expects (self/postMessage/onmessage). onmessage must
 // pre-exist on globalThis or the worker's strict-mode assignment throws.
 import { parentPort, workerData } from 'node:worker_threads';

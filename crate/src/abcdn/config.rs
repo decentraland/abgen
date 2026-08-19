@@ -47,17 +47,12 @@ impl Config {
             .map(|s| s.trim().trim_end_matches('/').to_string())
             .filter(|s| !s.is_empty());
 
-        // A loopback content server is a dev preview server (sdk-commands): its
-        // declared hashes are path-based and never change on edit, so content
-        // revalidation defaults to ON there. Explicit env always wins.
         let jit_content_digest = match env::var("ABGEN_JIT_CONTENT_DIGEST") {
             Ok(_) => crate::clihelp::env_bool("ABGEN_JIT_CONTENT_DIGEST", false),
             Err(_) => is_loopback_url(&content_url),
         };
 
         Ok(Self {
-            // ABGEN_HTTP_HOST/PORT are the canonical (namespaced) names; the legacy generic
-            // HTTP_SERVER_* names keep working as a fallback so existing deployments don't break.
             http_host: env::var("ABGEN_HTTP_HOST")
                 .or_else(|_| env::var("HTTP_SERVER_HOST"))
                 .unwrap_or_else(|_| "127.0.0.1".to_string()),
@@ -95,8 +90,6 @@ impl Config {
             {
                 Some(s) if s.eq_ignore_ascii_case("off") => None,
                 Some(s) if !s.is_empty() => Some(s),
-                // Registry answers must name the versions the CDN actually
-                // serves, so the default pairs with the upstream CDN.
                 _ => upstream_ab_cdn.as_deref().and_then(registry_for_ab_cdn),
             },
         })

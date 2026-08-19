@@ -1,28 +1,3 @@
-//! Publishing — almost entirely delegated to abgen's native "space" (its
-//! built-in SigV4 S3 integration, battle-tested by the JIT server).
-//!
-//! With `use_space` on, `build_entity_into_corpus` itself:
-//!   * probes `{version}/assets/{bundleName}` per digest-named scene glb and
-//!     skips rebuilding files that already exist (per-file asset reuse — the
-//!     consumer-server's `cachedHashes` equivalent; reused names still appear
-//!     in the manifest),
-//!   * uploads each newly built bundle DURING the build (write-through) —
-//!     canonical `{version}/assets/…` for digest-named files,
-//!     entity-scoped `{version}/{entityId}/…` otherwise,
-//!   * uploads the manifest to `manifest/{entityId}_{platform}.json`.
-//!
-//! That is exactly the prod key layout. What this module still owns:
-//!   * the entity-level already-converted check (manifest GET + exitCode/
-//!     version compare — the consumer's `shouldIgnoreConversion`),
-//!   * scene sources (`main.crdt`, `scene.json`, `metadata.main`) to
-//!     `{version}/{entityId}/…` for the desktop explorer (#7625).
-//!
-//! Caching/content-type headers: the space PUTs plain content types and no
-//! Cache-Control. Cache policy lives at the CDN layer instead — the
-//! CloudFront distribution must set long TTLs for `{version}/…` (names are
-//! content-addressed/immutable) and TTL 0 for `manifest/…`. No `.br`
-//! variants (no client of this pipeline fetches them).
-
 use crate::catalyst;
 use crate::config::Config;
 use crate::convert::EntityOutcome;
@@ -30,11 +5,6 @@ use abgen::live::Proxy;
 use anyhow::Result;
 use std::sync::Arc;
 
-/// Mirrors the consumer-server's `shouldIgnoreConversion`: a platform counts
-/// as already converted only when its manifest exists, parses, has
-/// `exitCode == 0` (a tolerated-failure 12 gets another chance) and carries
-/// the current AB version. Any fetch/parse problem means "convert". With no
-/// space configured this is always false.
 pub fn platform_converted(
     proxy: &Arc<Proxy>,
     cfg: &Config,
@@ -51,8 +21,6 @@ pub fn platform_converted(
         && json.get("version").and_then(serde_json::Value::as_str) == Some(cfg.version.as_str())
 }
 
-/// Bundles and manifests were already written through by the build; this
-/// publishes the remaining scene-source files and reports what happened.
 pub fn publish(
     cfg: &Config,
     agent: &ureq::Agent,
@@ -92,17 +60,21 @@ pub fn publish(
     Ok(serde_json::json!({
         "uploaded": true,
         "manifestEntries": total_bundles,
-        // "Attempted" is honest: space_put_key is fire-and-forget (logs its
-        // own failures), so a failed PUT still counts here — best-effort,
-        // like prod's scene-source uploader.
         "sceneSourcesAttempted": scene_sources,
     }))
 }
 
-/// `main.crdt`, `scene.json` and the entity's declared main script, fetched
-/// from the catalyst and re-published entity-scoped. Best-effort per file
-/// (mirrors prod, which logs and continues): a missing source file must not
-/// fail a finished conversion.
+/// Entity-supplied file names end up in S3 object keys, and `uri_encode_key`
+/// preserves '/' and '.', so a hostile name could escape the
+/// `{version}/{entityId}/` prefix.
+fn valid_key_component(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('/')
+        && !name.contains('\\')
+        && !name.bytes().any(|b| b.is_ascii_control())
+        && !name.split('/').any(|seg| seg == "..")
+}
+
 fn upload_scene_sources(
     cfg: &Config,
     agent: &ureq::Agent,
@@ -131,8 +103,20 @@ fn upload_scene_sources(
         })
     };
 
+    if !valid_key_component(&outcome.entity_id) {
+        eprintln!(
+            "output: unsafe entity id {:?}, skipping scene-source upload",
+            outcome.entity_id
+        );
+        return 0;
+    }
+
     let mut count = 0usize;
     for file in &wanted {
+        if !valid_key_component(file) {
+            eprintln!("output: unsafe scene-source name {file:?}, skipping");
+            continue;
+        }
         let Some(hash) = hash_for(file) else {
             eprintln!("output: {file} not in entity content, skipping scene-source upload");
             continue;
@@ -156,9 +140,49 @@ fn upload_scene_sources(
             "application/octet-stream"
         };
         let key = format!("{}/{}/{file}", cfg.version, outcome.entity_id);
-        // space_put_key logs failures itself (best-effort, like prod).
         proxy.space_put_key(&key, &bytes, content_type);
         count += 1;
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_key_component;
+
+    #[test]
+    fn accepts_ordinary_names() {
+        for name in [
+            "main.crdt",
+            "scene.json",
+            "bin/game.js",
+            "assets/models/tree.glb",
+            "bafkreia1b2c3",
+            "file with spaces.png",
+            "trailing/",
+            "a..b/c",
+            "...three-dots",
+        ] {
+            assert!(valid_key_component(name), "should accept {name:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_escaping_names() {
+        for name in [
+            "",
+            "..",
+            "../secret",
+            "a/../../b",
+            "bin/..",
+            "/etc/passwd",
+            "a\\b",
+            "..\\up",
+            "a\nb",
+            "a\0b",
+            "\x1b[2Jclear",
+        ] {
+            assert!(!valid_key_component(name), "should reject {name:?}");
+        }
+    }
 }

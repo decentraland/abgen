@@ -1,6 +1,5 @@
 # abgen
-Standalone Decentraland asset-bundle converter + ab-cdn-compatible JIT server, plus **abgen-compare**,
-a parity pipeline that measures output against the production CDN in a browser. The converter is a
+Standalone Decentraland asset-bundle converter + ab-cdn-compatible JIT server. The converter is a
 clean-room Rust reimplementation of the legacy
 [asset-bundle-converter](https://github.com/decentraland/asset-bundle-converter): GLB/GLTF content from
 any catalyst content server in, Unity AssetBundles layout-compatible with the production
@@ -14,25 +13,10 @@ resolves it for embedding tools - see [npm/abgen](npm/abgen/README.md)). From so
 ```bash
 git clone <this-repo> abgen && cd abgen
 cargo build --release            # no postgres, no openssl, no protobuf
-cargo build --release --examples # bundle dump tools the compare site shells out to
+cargo build --release --examples # bundle dump tools (objdump/texdump/matdump/texcmp/texpng)
 scripts/bootstrap-runtime.sh     # integrity-check the vendored runtime data
-./pipeline/abgen-compare serve   # http://localhost:5197 - setup wizard, then results
-./pipeline/abgen-compare run --pointer '100,100' --platform windows
 ```
-`run` accepts a scene parcel, an entity id, or a wearable/emote URN. It is headless-first: with nothing
-but this repo it fetches the upstream bundles, generates ours, pairs them, and produces
-manifest/structural/texture-decode verdicts. Pixel-level verdicts (rendered screenshots, diff heatmaps)
-are an optional stage that drives a Unity Editor and takes two inputs, stored once:
-```bash
-./pipeline/abgen-compare config set unity_editor  /path/to/6000.x/Unity
-./pipeline/abgen-compare config set unity_project /path/to/unity-explorer/Explorer
-```
-The client-faithful host project is a
-[decentraland/unity-explorer](https://github.com/decentraland/unity-explorer) checkout with
-`harness/unity-explorer-abgen.patch` applied; `harness/project-template/` is the self-contained
-fallback. Verdict labels and thresholds are specified by `pipeline/abgencompare/classify.py` (the
-classifier is the spec). Setup details: [pipeline/README.md](pipeline/README.md) and
-[harness/README.md](harness/README.md).
+There is also a wasm build: `crate/abgen-wasm/` compiles the converter to wasm32 — see its README.
 ## Binaries
 `target/release/` after `cargo build --release`:
 
@@ -43,13 +27,10 @@ classifier is the spec). Setup details: [pipeline/README.md](pipeline/README.md)
 | `abgen-corpus` | batch corpus builder: manifest / `--entity-ids` (add `--fetch-missing` to pull content from a catalyst) / `--world <name>[,...]` (resolve + fetch + convert a world; upstream via `--worlds-url` or `ABGEN_WORLDS_URL`) / `--live-mode` / `--collection-urn` / `--from-reference`; full-corpus runbook in [docs/BATCH.md](docs/BATCH.md) |
 | `abgen-verify` | parity differ (ours vs reference bundles, ppm-bits, `--tolerant`) |
 | `abgen-lod` | LOD lane CLI: `bundle`, `compare`, `placements`, `assemble`, `atlas`, `simplify`, `generate` |
+| `abgen-lambda` | AWS Lambda handler (deployment event in, bundles + manifests to S3; from the `lambda/` workspace member) - see [lambda/README.md](lambda/README.md) |
 
-Plus `pipeline/abgen-compare` (Python >= 3.9, stdlib-only, run in place) and bundle-inspection examples
-(`texdump`, `matdump`, `objdump`, `crndump`, `texcmp`, `texpng`) under `target/release/examples/`.
-`scripts/lod-parity.sh` runs the same baked LOD GLB through the legacy converter (a sibling
-[asset-bundle-converter](https://github.com/decentraland/asset-bundle-converter) checkout + editor) and
-through `abgen-lod bundle`, then diffs the two bundles (`abgen-lod compare` + `matdump`); `--site`
-publishes the verdicts to the compare site's `/lod.html`.
+Plus bundle-inspection examples (`texdump`, `matdump`, `objdump`, `texcmp`, `texpng`) under
+`target/release/examples/`.
 ## Server
 ```bash
 ABGEN_CATALYST_URL=https://peer.decentraland.org/content ./target/release/abgen
@@ -78,30 +59,25 @@ header semantics, and the DB-vs-proxy source selection: [docs/ROUTES.md](docs/RO
 ABGEN_ROOT="$PWD" cargo test --workspace --lib -- --test-threads=1
 ```
 `--test-threads=1` is required: the lib tests share process-wide `ABGEN_ROOT` state.
-## wasm lab
+## wasm
 `crate/abgen-wasm/` compiles the converter lib (default features off) to `wasm32-unknown-unknown` behind
-a hand-rolled C ABI and drives it from the static pages in `site/wasm/` - drop a glb/gltf/zip, get real
-UnityFS bundles in the browser. It is a plain cargo package with its own committed `Cargo.lock`,
-excluded from the workspace: nothing in CI or the release matrix ever needs a wasm toolchain (the
-pinned one lives in `crate/abgen-wasm/toolchain/flake.nix`). `crate/abgen-wasm/README.md` documents the
-build, the headless driver, the native-vs-wasm byte-parity gate and its decoder contract. Layout
-caveat: this repo places `site/` and `template/` at the repo root, while the wasm lane's helper scripts
-and the wasm32-only `include_bytes!` template paths in `crate/src/builder/templates.rs` assume the
-source layout where both are siblings of the crate — an in-repo wasm32 build needs those relative paths
-bumped one level (`../../template/` -> `../../../template/`, and the `../site` copy in
-`crate/abgen-wasm/build.sh` adjusted likewise). No workspace target compiles for wasm32, so the
-divergence never touches CI. Self-hosting the lab: `site/` is fully static - any file server works,
-but it must serve `.wasm` with the `application/wasm` MIME type or `WebAssembly.instantiateStreaming`
-falls over.
-## Live JIT compare
-`abgen-compare watch` compares every entity a running JIT server converts against the upstream ab-cdn
-(bytes / structure / texture decode, no renders) into one rolling run the compare site auto-refreshes,
-with backfill of pre-existing conversions and a crash-safe resume cursor. Every flag has an env twin
-for service deployment; `./pipeline/abgen-compare watch --help` documents them.
+a hand-rolled C ABI; the JS runtime in `crate/abgen-wasm/js/` (worker pool + WebGPU bridge) is what a
+host page embeds. It is a plain cargo package with its own committed `Cargo.lock`, excluded from the
+workspace: nothing in CI or the release matrix ever needs a wasm toolchain (the pinned one lives in
+`crate/abgen-wasm/toolchain/flake.nix`). `crate/abgen-wasm/README.md` documents the build, the headless
+driver, the native-vs-wasm byte-parity gate and its decoder contract. Layout caveat: this repo places
+`template/` at the repo root, while the wasm lane's helper scripts and the wasm32-only `include_bytes!`
+template paths in `crate/src/builder/templates.rs` assume the source layout where it is a sibling of
+the crate — an in-repo wasm32 build needs those relative paths bumped one level (`../../template/` ->
+`../../../template/`). No workspace target compiles for wasm32, so the divergence never touches CI.
 ## Features
-There are no compile-time feature flags. Every capability below builds into every native binary;
-`wasm32` builds target-gate the server, content-DB, and GPU code off automatically. Each capability
-is activated at runtime, not at build time.
+One compile-time feature flag: `server` (on by default) gates the abcdn HTTP server + registry stack
+(axum/tokio/sqlx and the `dcl-contents` crate); the `abgen` bin has `required-features = ["server"]`.
+Library consumers - `lambda/`, `crate/abgen-native/`, `crate/abgen-wasm/` - build with
+`default-features = false` and get the converter without the server stack. Under the default
+features every capability below builds into every native binary; `wasm32` builds target-gate the
+server, content-DB, and GPU code off automatically. Each capability is activated at runtime, not at
+build time.
 
 | Capability | Built | Enable at runtime |
 |---|---|---|
@@ -122,22 +98,17 @@ content-DB, and GPU stacks are `cfg(not(target_arch = "wasm32"))`).
 - rustc/cargo (edition 2021; the vendored `draco_decoder` is edition 2024)
 - cc + a C++ toolchain (vendored crunch, libjpeg9c)
 - cmake + make (`draco_decoder` builds upstream draco C++; missing cmake is the #1 build failure)
-- Python >= 3.9 for `abgen-compare` (stdlib-only; `numpy` + `Pillow` are optional accelerators)
 
 On NixOS: `nix develop`, or `nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#gcc nixpkgs#gnumake
 nixpkgs#cmake nixpkgs#pkg-config`. No openssl (ureq uses rustls), no protobuf. Optional: libturbojpeg
 (dlopen'd, or set `TURBOJPEG_LIB=/path`); without it JPEG decode falls back to the vendored libjpeg9c
 path - valid output but not byte-parity with production; startup logs `turbojpeg_available`.
 ## Platform matrix
-| Platform | Build | Unity renders |
-|---|---|---|
-| Linux x86_64 | native (`nix develop` or bare toolchain) | native Unity editor; primary target |
-| macOS (Apple Silicon) | `nix develop` (clang stdenv) | native Unity editor (Metal); verified end-to-end |
-| Windows | WSL2, checkout on the WSL filesystem | Windows-native Unity through the wslpath bridge (`pipeline/abgencompare/wsl.py`); verified end-to-end |
-
-WSL2: `--unity` accepts `C:\...` or `/mnt/c/...`; paths and `AB_*` env cross the boundary
-automatically; render inputs are staged to `--win-staging` (default `/mnt/c/abgen-runs/<run-id>`); run
-renders from an interactive WSL shell so Unity gets a real GPU session.
+| Platform | Build |
+|---|---|
+| Linux x86_64 | native (`nix develop` or bare toolchain) |
+| macOS (Apple Silicon) | `nix develop` (clang stdenv) |
+| Windows | WSL2, checkout on the WSL filesystem |
 ## Runtime data
 Vendored in-repo and sha256-pinned; a fresh clone is zero-config. `scripts/bootstrap-runtime.sh`
 verifies the sha256 of both sets and, when a payload is missing, prints the git-history commands to
@@ -211,8 +182,11 @@ output is promoted into the serving root, so rejected bundles are never servable
 The container image is built straight from the pinned Nix flake - `nix build .#dockerImage`
 (`dockerTools.buildLayeredImage`, `tini` init, no base OS) - producing an image that runs `abgen` as an
 unprivileged user on `:5147` with `template/` and `shader/` baked in and `ABGEN_ROOT`/`ABGEN_OUT_ROOT`
-preset. The [`.github/workflows/image.yml`](.github/workflows/image.yml) workflow builds that image and
-pushes it to `ghcr.io/decentraland/abgen:<tag>` (and `:latest`) on every `v*` tag. The org
+preset. The `image` job in [`.github/workflows/release.yml`](.github/workflows/release.yml) builds
+that image and pushes it to `ghcr.io/decentraland/abgen:<tag>` (and `:latest`) on every `v*` tag.
+The workspace also ships an AWS Lambda consumer in `lambda/` (the `abgen-lambda` bin);
+`nix build .#lambdaImage` produces its container image, which the `lambda-image` job pushes to ECR
+on the same tags - see [lambda/README.md](lambda/README.md). The org
 services-pipeline that publishes the same service to quay (service-name `abgen`) is configured
 externally in the private `decentraland/definitions` repo, not in this tree. Cutting a release -
 tagging, what the pipeline does, and what to check afterwards: [DEVELOPMENT.md](DEVELOPMENT.md).
@@ -221,10 +195,10 @@ Parity posture and clean-room provenance are documented separately: [PARITY.md](
 [PROVENANCE.md](PROVENANCE.md).
 ## Provenance
 This repository is a generated standalone export: the server crate maps to `crate/` with a small
-overlay; the pipeline/site/harness trees ship verbatim; the content component + unsigned registry
-surface ship as the shared `crate/dcl-contents` crate, copied verbatim from
-the internal tree. Mechanical differences from the internal source: signed/denylist/queue registry
-routes deleted; the server bin is `abgen` and the local build CLI is `abgen-build`.
+overlay; the content component + unsigned registry surface ship as the shared `crate/dcl-contents`
+crate, copied verbatim from the internal tree. Mechanical differences from the internal source:
+signed/denylist/queue registry routes deleted; the server bin is `abgen` and the local build CLI is
+`abgen-build`.
 ## License
 **Apache-2.0** - full text in [LICENSE](LICENSE). Contributions are accepted under the same
 terms. Vendored third-party licenses and

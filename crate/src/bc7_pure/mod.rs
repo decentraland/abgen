@@ -4,6 +4,8 @@ mod alpha;
 mod bits;
 mod ccc;
 mod color;
+#[cfg(target_arch = "aarch64")]
+mod est_neon;
 mod est_simd;
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 mod est_wasm128;

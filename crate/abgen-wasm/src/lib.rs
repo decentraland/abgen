@@ -1,12 +1,3 @@
-//! abgen as a wasm module — the browser host of [`abgen::export`].
-//!
-//! Only the wasm-shaped parts live here: the `env` host imports, the linear-
-//! memory alloc/free pair, and `poc_init`.
-//!
-//! This crate is excluded from the root workspace. While it carried its own
-//! copy of the pipeline nothing compiled it, the copy drifted out of sync with
-//! `abgen`'s API and stopped building unnoticed; sharing the core plus the
-//! `excluded-hosts` CI job is what stops that recurring.
 
 use abgen::export::{self, HostInfo, Sink};
 
@@ -27,9 +18,6 @@ impl Sink for WasmSink {
     }
 }
 
-/// bc7_pure wasm hook: serialize one encode request for the host.
-/// Layout (LE): u32 width, u32 height, i32 mips, u32 flags
-/// (bit0 flip, bit1 srgb, bit2 perceptual, bit3 profile-basic), rgba bytes.
 fn gpu_host_encode(
     rgba: &[u8],
     width: u32,
@@ -89,8 +77,6 @@ pub extern "C" fn poc_init() {
     abgen::bc7_pure::set_encode_hook(gpu_host_encode);
 }
 
-/// Converts one request blob out of linear memory; layout in
-/// `abgen::export::wire`.
 #[unsafe(no_mangle)]
 pub extern "C" fn poc_convert(ptr: *const u8, len: usize) -> i32 {
     let buf = unsafe { std::slice::from_raw_parts(ptr, len) };

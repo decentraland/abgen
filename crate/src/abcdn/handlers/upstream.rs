@@ -3,13 +3,6 @@ use std::io::Read as _;
 
 const UPSTREAM_TIMEOUT_SECS: u64 = 60;
 
-/// Read-through to a production ab-cdn (`ABGEN_UPSTREAM_AB_CDN`). Runs when
-/// the local caches miss, before any JIT build lane: streams the same path
-/// from upstream, storing nothing on disk — this server persists only what
-/// it built for local entities. Keeps wearables/emotes/LODs working when a
-/// client points its whole optimized-assets base URL at this server while
-/// only local scene entities are buildable here, without probing each remote
-/// entity with a doomed local build first.
 pub(super) async fn upstream_fallback(
     state: &AppState,
     path: &str,
@@ -23,7 +16,6 @@ pub(super) async fn upstream_fallback(
     if *method != Method::GET && *method != Method::HEAD {
         return local;
     }
-    // Local preview-server entities/files can never exist upstream.
     if path.split('/').any(|s| s.starts_with("b64-")) {
         return local;
     }
@@ -66,8 +58,6 @@ pub(super) async fn upstream_fallback(
     resp
 }
 
-/// True for ab-cdn request shapes the delivery surface serves; anything else
-/// stays a local 404 rather than being forwarded upstream.
 pub(super) fn upstream_eligible(path: &str) -> bool {
     upstream_dst(path).is_some()
 }

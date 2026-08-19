@@ -1,20 +1,3 @@
-//! Out-of-process conversion helper: the same [`abgen_core::export`] core as
-//! the cdylib, behind a process boundary. One request per process, so a helper
-//! that has already handled a hostile asset never handles a second.
-//!
-//! Protocol, little-endian throughout. stdin, once:
-//!
-//! ```text
-//! u32 request_len | request bytes      (export::wire layout)
-//! ```
-//!
-//! stdout, streamed, and carrying frames only — diagnostics go to stderr:
-//!
-//! ```text
-//! u32 kind | u32 len | payload         repeated, kind = export::Kind
-//! 0xFFFF_FFFF | u32 exit_code          exactly once, last
-//! ```
-
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +6,6 @@ use abgen_core::export::{self, HostInfo, Kind, Sink};
 
 const HOST: HostInfo = HostInfo::new("v-abgen-host", "host://out-of-process");
 
-/// Trailer frame marker. Not a [`Kind`]; the only payload is the exit code.
 const FRAME_DONE: u32 = 0xFFFF_FFFF;
 
 const DEFAULT_CAPPED_THREADS: usize = 8;
@@ -32,17 +14,13 @@ const EXIT_PROTOCOL: i32 = 64;
 const EXIT_LIMIT: i32 = 65;
 const EXIT_OUTPUT: i32 = 66;
 
-/// Longest artifact name we will create. Matches the core's store guard: past
-/// this the OS refuses with a cryptic ENAMETOOLONG far from the cause.
 const NAME_MAX_BYTES: usize = 240;
 
-/// Flushes every frame, so a streaming caller sees progress.
 struct FrameSink {
     out: std::io::Stdout,
 }
 
 impl FrameSink {
-    /// Never holds a second copy of the payload.
     fn frame(&self, kind: u32, parts: &[&[u8]]) {
         let total: usize = parts.iter().map(|p| p.len()).sum();
         let Ok(len) = u32::try_from(total) else {
@@ -84,11 +62,6 @@ impl Sink for FrameSink {
     }
 }
 
-/// Writes artifacts into a directory and frames back the name with an empty
-/// payload, so a host that maps files (Unity's `LoadFromFile`, and anything
-/// else that wants the bytes off its own heap) never receives them through the
-/// pipe. The frame layout is unchanged — `u32 name_len | name | u32 data_len`
-/// with `data_len` zero — so a reader written for [`FrameSink`] still parses it.
 struct DirSink {
     dir: PathBuf,
     inner: FrameSink,
@@ -96,9 +69,6 @@ struct DirSink {
 }
 
 impl DirSink {
-    /// The converter chooses these names from converted content, so a separator
-    /// or `..` would place the file outside `dir`. Only a single ordinary
-    /// component is accepted.
     fn check_name(name: &str) -> Result<(), String> {
         if name.is_empty() {
             return Err("refusing an artifact with an empty name".to_string());
@@ -139,9 +109,6 @@ impl DirSink {
         Ok(())
     }
 
-    /// Written to a sibling temp file and renamed, so a crashed or killed run
-    /// never leaves a half-written artifact for a host to map. Callers treat
-    /// what is in the directory as complete.
     fn write_artifact(&self, name: &str, data: &[u8]) -> Result<(), String> {
         Self::check_name(name)?;
         let tmp = self
@@ -187,8 +154,6 @@ impl Sink for DirSink {
     }
 }
 
-/// Refused before allocating: zero-filling 4 GiB on a bad four-byte prefix
-/// aborts under a memory cap instead of erroring cleanly.
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 fn read_request(stdin: &mut impl Read) -> std::io::Result<Vec<u8>> {
@@ -206,26 +171,9 @@ fn read_request(stdin: &mut impl Read) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Set once the limit is in force, so the re-executed process does not loop.
 #[cfg(target_os = "linux")]
 const REEXEC_MARKER: &str = "ABGEN_HOST_MEMORY_LIMITED";
 
-/// How to re-exec when this binary is started through an explicit loader.
-///
-/// The release archive ships a private glibc and runs the helper as
-/// `lib/ld.so --library-path lib bin/abgen-host.bin`, because the binary is
-/// linked against a loader at an absolute path that exists only on the build
-/// machine. That makes one archive work on NixOS and on ordinary distributions
-/// alike, and it makes the host's glibc version irrelevant.
-///
-/// It also breaks the re-exec, which is why this exists. Under a loader the
-/// kernel's executable is the loader, so `current_exe()` returns `ld.so` and
-/// re-running it with our arguments gets `ld.so: unrecognized option
-/// '--max-memory-mb'` — measured, exit 1, cap silently never applied. The
-/// wrapper therefore states the real command instead of leaving us to infer
-/// it: LOADER is the interpreter, LIBPATH its `--library-path`, BIN the actual
-/// ELF. Unset — a plain `cargo build`, or a distribution that installed the
-/// helper normally — and this falls back to `current_exe()`.
 #[cfg(target_os = "linux")]
 const REEXEC_LOADER: &str = "ABGEN_HOST_LOADER";
 #[cfg(target_os = "linux")]
@@ -233,15 +181,6 @@ const REEXEC_LIBPATH: &str = "ABGEN_HOST_LIBPATH";
 #[cfg(target_os = "linux")]
 const REEXEC_BIN: &str = "ABGEN_HOST_BIN";
 
-/// Applies `RLIMIT_AS` and re-executes.
-///
-/// The re-exec is the whole trick. By the time `main` runs mimalloc has
-/// already reserved its arenas, so an in-process `setrlimit` barely binds —
-/// measured, an 8 MB cap applied that way still converts a glb. Limits are
-/// inherited across `exec`, so replacing the image gives an allocator that
-/// initialises under the cap. Doing it here rather than in the parent is what
-/// bounds children of callers that cannot set rlimits, Unity's
-/// `Process.Start` most notably.
 #[cfg(target_os = "linux")]
 fn apply_memory_limit(mb: u64) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
@@ -306,11 +245,6 @@ fn apply_memory_limit(mb: u64) -> Result<(), String> {
     Err(format!("re-exec under the memory limit failed: {err}"))
 }
 
-/// Darwin enforces no per-process memory rlimit: `setrlimit(RLIMIT_AS)`
-/// returns `EINVAL` at every size, and measured on macOS 26 arm64,
-/// `RLIMIT_AS`/`DATA`/`RSS` set from the parent at 256 MB all let a full
-/// conversion finish. Refused loudly, because a cap that silently does
-/// nothing is worse than none.
 #[cfg(target_os = "macos")]
 fn apply_memory_limit(_mb: u64) -> Result<(), String> {
     Err(
@@ -321,17 +255,6 @@ fn apply_memory_limit(_mb: u64) -> Result<(), String> {
     )
 }
 
-/// Applies a per-process commit cap via a job object.
-///
-/// No `exec` needed: `JOB_OBJECT_LIMIT_PROCESS_MEMORY` bounds *committed*
-/// memory, and an allocator's up-front reservations are reserve-not-commit,
-/// so a limit set here still binds on the allocations that matter. Nested
-/// jobs (Windows 8+) let the process cap itself.
-///
-/// The scale differs sharply from the Linux arm for that same reason:
-/// measured, this binds at 1-4 MB and passes from 8 MB up, where `RLIMIT_AS`
-/// wants gigabytes. Exceeding it aborts the process rather than erroring,
-/// which is what the boundary is for.
 #[cfg(windows)]
 fn apply_memory_limit(mb: u64) -> Result<(), String> {
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -530,9 +453,6 @@ mod tests {
         assert!(DirSink::check_name("a.b.c_mac.bundle").is_ok());
     }
 
-    /// Windows-only by construction: these are ordinary filenames elsewhere, and
-    /// refusing them everywhere would fail a conversion on Linux for a hazard
-    /// Linux does not have.
     #[cfg(windows)]
     #[test]
     fn refuses_windows_device_names_and_stripped_endings() {
@@ -573,8 +493,6 @@ mod tests {
         }
     }
 
-    /// The same names are ordinary files where the filesystem has no opinion on
-    /// them, and must convert rather than fail.
     #[cfg(not(windows))]
     #[test]
     fn device_names_are_ordinary_files_off_windows() {
@@ -594,9 +512,6 @@ mod tests {
         assert!(DirSink::check_name(&"x".repeat(NAME_MAX_BYTES)).is_ok());
     }
 
-    /// The invariant, stated as a property: anything `check_name` accepts must
-    /// land directly inside the output directory. Hostile names come from
-    /// converted content, so this is the untrusted edge.
     #[test]
     fn accepted_names_never_leave_the_directory() {
         let dir = std::env::temp_dir().join(format!("abgen_fuzz_{}", std::process::id()));

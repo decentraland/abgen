@@ -21,13 +21,6 @@ impl LocalContentStore {
         Self { root: root.into() }
     }
 
-    /// Shards by the first two SHA-1 bytes of the cid; the filename is the cid itself,
-    /// collapsed by `fs_safe_component` when it cannot fit in NAME_MAX. Content ids are
-    /// unbounded input (the sdk-commands preview server derives them from absolute source
-    /// paths, and content-versioned ids append an mtime + machine-id tail), so the store
-    /// must stay valid for any id length. Reads and writes both resolve through here,
-    /// which keeps the collapse symmetric without a mapping file, and a collapsed name
-    /// can never collide with a verbatim one (verbatim names are short by definition).
     fn path_for(&self, cid: &str) -> PathBuf {
         use sha1::{Digest, Sha1};
         let digest = Sha1::digest(cid.as_bytes());

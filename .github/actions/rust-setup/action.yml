@@ -1,0 +1,32 @@
+name: rust setup
+description: >
+  Toolchain + cargo cache prelude shared by every rust job. Single source of
+  the pinned toolchain version and the cache prefix. Must run after
+  actions/checkout (a local action cannot resolve before the repo exists).
+
+inputs:
+  toolchain:
+    description: Rust toolchain (the repo pin unless a job needs nightly)
+    default: "1.97.1"
+  components:
+    description: Extra rustup components (comma-separated)
+    default: ""
+  targets:
+    description: Extra compilation targets (comma-separated)
+    default: ""
+  cache:
+    description: Restore/save the cargo cache (Swatinem/rust-cache)
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+    - if: inputs.cache == 'true'
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+      with:
+        prefix-key: v0-rust

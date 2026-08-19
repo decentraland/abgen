@@ -1,25 +1,9 @@
-//! Tint bisection harness (wasm32-only).
-//!
-//! Ports the native `wgpu_bc7/tests/` golden drivers into an async module a
-//! browser page can run under Chrome's WGSL compiler (Tint). Each driver
-//! reproduces the native test's inputs (same xs64 seeds, same case tables) and
-//! CPU references bit-for-bit; instead of asserting, it records pass/first-diff
-//! per entry so the first diverging `bc7_test_*` entry point can be identified
-//! even though later entries keep running.
-//!
-//! Reductions vs native (noted in the entry name string): the one-color pack
-//! sweeps are truncated to the first 20k cases (prefix of the identical
-//! deterministic case list, structured/corner cases all fall in the prefix).
-
 use super::*;
 use crate::gpu::corelib::bc7::probe;
 use crate::gpu::corelib::bc7::{encode_group, group_signature, GROUP_WIDTH};
 use crate::gpu::corelib::mips;
 use crate::gpu::corelib::mode_tree::TREE;
 
-// crate::gpuhost is cfg'd out on wasm32; byte-for-byte copy of
-// gpuhost/oracle.rs Lcg + gen_texture so the block streams match the native
-// tests exactly.
 struct Lcg {
     state: u64,
 }
@@ -68,11 +52,6 @@ pub struct EntryResult {
     pub first_diff: Option<FirstDiff>,
 }
 
-// ---------------------------------------------------------------------------
-// Dispatch plumbing: mirrors testsup::prepare_kernel/dispatch_prepared but the
-// readback awaits the wasm map future (super::map_read) instead of polling.
-// ---------------------------------------------------------------------------
-
 fn prepare_kernel_const(
     g: &Gpu,
     module: &::wgpu::ShaderModule,
@@ -114,9 +93,6 @@ async fn dispatch_prepared(
     .await
 }
 
-// `pad` is the 4th Meta word: the bc7 test/production passes require the bits
-// of 1.0f (job.fone feeds the zmask()/pval integer-launder fences), while the
-// blockify passes require 0 (job.pad is xor'd into the halve accumulator).
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_prepared_wg_pad(
     g: &Gpu,
@@ -227,10 +203,6 @@ impl Harness {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Result recording (replaces testsup::assert_bytes_eq).
-// ---------------------------------------------------------------------------
-
 fn compare(entry: String, cases: u32, stride_bytes: u32, got: &[u8], want: &[u8]) -> EntryResult {
     if got.len() != want.len() {
         return EntryResult {
@@ -261,9 +233,6 @@ fn compare(entry: String, cases: u32, stride_bytes: u32, got: &[u8], want: &[u8]
             let word =
                 |b: &[u8], w: usize| u32::from_le_bytes([b[w], b[w + 1], b[w + 2], b[w + 3]]);
             let stride = if stride_bytes > 0 { stride_bytes } else { 4 };
-            // Diff distribution: how many words differ, over how many cases,
-            // plus the first few (word_index, got, want) triples — enough to
-            // tell one broken case from a shifted stream or systematic drift.
             let mut diff_words = 0u32;
             let mut diff_cases: Vec<u32> = Vec::new();
             let mut samples: Vec<String> = Vec::new();
@@ -313,10 +282,6 @@ fn error_result(entry: &str, cases: u32, err: &str) -> EntryResult {
         first_diff: None,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Shared generators, copied verbatim from wgpu_bc7/tests/mod.rs.
-// ---------------------------------------------------------------------------
 
 fn params4() -> [Params; 4] {
     [
@@ -490,14 +455,6 @@ fn px_from_block(blk: &[u8; 64]) -> [[i32; 4]; 16] {
     px
 }
 
-// ---------------------------------------------------------------------------
-// tables / tables_priv1 / tables_priv2 (from tests/layout.rs). The native test
-// OR-merges the three outputs and compares once; the three entries write
-// disjoint word ranges (see const_word_small/_priv1/_priv2 in bc7.wgsl) and
-// zero elsewhere, so comparing each entry against the want vector masked to
-// its owned ranges is equivalent and attributes a diff to the right entry.
-// ---------------------------------------------------------------------------
-
 fn push_i32s(v: &mut Vec<u32>, s: &[i32]) {
     for &x in s {
         v.push(x as u32);
@@ -582,7 +539,6 @@ impl Harness {
         let out = vec![0u8; total_words * 4];
         let mut want_full = expected_const_words();
         want_full.extend_from_slice(&opt);
-        // Word ranges each entry owns (everything else it writes as zero).
         let small: &[(usize, usize)] = &[
             (0, 140),
             (2188, 2454),
@@ -614,10 +570,6 @@ impl Harness {
         results
     }
 }
-
-// ---------------------------------------------------------------------------
-// u64ops / vecmath / dist / lsq / pack / fixdeg / evalsol (from tests/mathops.rs)
-// ---------------------------------------------------------------------------
 
 impl Harness {
     async fn entry_u64ops(&self, g: &Gpu) -> EntryResult {
@@ -1103,9 +1055,6 @@ impl Harness {
     ) -> EntryResult {
         let t = build_opt_tables();
         let opt_bytes = words_bytes(&opt_tables_words(&t));
-        // Full deterministic case list, then truncate for browser runtime: the
-        // kept prefix (incl. all structured/corner colors) is byte-identical to
-        // the native test's first PACK_CAP cases.
         let mut cases = pack_cases(nsw_options);
         let full = cases.len();
         let name = if cases.len() > PACK_CAP {
@@ -1442,10 +1391,6 @@ impl Harness {
     }
 }
 
-// ---------------------------------------------------------------------------
-// div / eval4way / findopt / ccc (from tests/solver.rs)
-// ---------------------------------------------------------------------------
-
 impl Harness {
     async fn entry_div(&self, g: &Gpu) -> EntryResult {
         let mut cases: Vec<(f32, f32)> = Vec::new();
@@ -1710,8 +1655,6 @@ impl Harness {
                 });
             }
         }
-        // Native asserts ties_found >= 30; here we note a shortfall in the
-        // entry name instead of aborting the whole bisect run.
         let name = if ties_found >= 30 {
             "bc7_test_eval4way".to_string()
         } else {
@@ -2045,10 +1988,6 @@ impl Harness {
     }
 }
 
-// ---------------------------------------------------------------------------
-// classify (from tests/layout.rs)
-// ---------------------------------------------------------------------------
-
 impl Harness {
     async fn entry_classify(&self, g: &Gpu) -> EntryResult {
         let (blocks, want) = classify_cases();
@@ -2070,13 +2009,6 @@ impl Harness {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// est_partition / plans (from tests/partition.rs); both are multi-variant
-// (one dispatch per Params variant, binding 1 = params words). On the first
-// failing variant the entry name is annotated with the variant index and the
-// diff is relative to that variant's output buffer.
-// ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
 fn push_est_case(
@@ -2198,12 +2130,6 @@ fn est_variants() -> Vec<Params> {
 }
 
 impl Harness {
-    /// TEMP DEBUG: dispatch case-238's exact inputs through the op==6 echo
-    /// branch and dump every echoed word — localizes whether the est_idx zero
-    /// under Tint comes from input reads, min/max, the dot chain, or the
-    /// early-return compare.
-    /// Faithful port of wgpu_bc7_solid_golden (tests/partition.rs): the
-    /// solid-block encode path vs probe::block_solid.
     async fn entry_solid(&self, g: &Gpu) -> EntryResult {
         let t = build_opt_tables();
         let opt_bytes = words_bytes(&opt_tables_words(&t));
@@ -2491,14 +2417,6 @@ impl Harness {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Blockify goldens (ported from the tests in crate/src/gpu/wgpu.rs):
-// blockify_linearize / blockify_halve / blockify_quantize_pack vs the corelib
-// mips CPU references. Meta pad word is 0 for these dispatches (production
-// runs the blockify stages with fone=false, and blockify_halve xors job.pad
-// into its accumulator), matching the native test driver exactly.
-// ---------------------------------------------------------------------------
-
 const BF_SIZES: [(u32, u32); 3] = [(64, 64), (128, 32), (37, 53)];
 const BF_SEEDS: [u64; 2] = [1, 7];
 
@@ -2747,24 +2665,6 @@ impl Harness {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Full production pipeline golden (ported from tests/encode.rs
-// wgpu_bc7_encode_blocks_golden): the 3 plan passes + 3 TRIAL_CLASS encode
-// passes over generated block streams vs corelib encode_group, with per-stage
-// divergence attribution:
-//   * after the plan passes the scratch buffer is compared (masked to the
-//     words each pass writes) against CPU mirrors of exactly what the passes
-//     store: classify code, alpha lo/hi + mode-tree hint + list7, and the
-//     estimate_partition(_list) results for modes 1/3, 0 and 2 — the same
-//     probe fns the passes' WGSL calls (est_list_group2 is per-lane identical
-//     to estimate_partition_list for the 2-subset modes it serves);
-//   * each encode pass then readbacks the output and every block whose
-//     (CPU-classified) class the pass owns must be final, attributing the
-//     first differing block to its TRIAL_CLASS.
-// Native compares only final bytes; the per-case block streams here are the
-// exact prefix (cap 128 blocks/case) of the native case list.
-// ---------------------------------------------------------------------------
-
 const ENC_CASE_CAP: usize = 128;
 
 fn texture_blocks(tex: &[u8], w: u32, h: u32, srgb: bool) -> Vec<u8> {
@@ -2864,9 +2764,6 @@ fn encode_blocks_cpu(cp: &Params, t: &OptTables, blocks: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The native case list, each case truncated to its first ENC_CASE_CAP blocks
-/// (128 is a multiple of GROUP_WIDTH; the kept prefix is byte-identical to
-/// the native test's block stream).
 fn encode_cases() -> Vec<(String, Vec<u8>)> {
     let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
     let sizes: &[(u32, u32, &[u64])] = &[
@@ -2931,18 +2828,6 @@ fn set_plan_list(want: &mut [u32], mask: &mut [bool], base: usize, l: &probe::So
     set_plan_word(want, mask, base + 24, *len as u32);
 }
 
-/// CPU mirror of exactly the plan-scratch words the three plan passes write
-/// (see bc7_plan_alpha / bc7_plan_opaque13 / bc7_plan_opaque02 in bc7.wgsl);
-/// mask=false words are not compared (the passes leave them untouched).
-///
-/// The mode-7 and mode-1/3 lists are est_list_group2 products: computed over
-/// the GROUP's class-filtered lanes jointly, because the 2-subset
-/// checkerboard early-out couples lanes (a lane alone can stop at partition
-/// 34 while the same lane inside a group scans 35..63). The mirror therefore
-/// groups blocks by GROUP_WIDTH exactly like the passes; the single-lane
-/// probe here would mismodel (it did: plan word 85 diffs on gradient
-/// textures). Modes 0/2 are 3-subset with no early-out, so the per-lane
-/// probes are exact for them.
 fn expected_plan(cp: &Params, blocks: &[u8]) -> (Vec<u32>, Vec<bool>) {
     let nb = blocks.len() / 64;
     let mut want = vec![0u32; nb * PLAN_STRIDE];
@@ -3043,7 +2928,6 @@ fn expected_plan(cp: &Params, blocks: &[u8]) -> (Vec<u32>, Vec<bool>) {
     (want, mask)
 }
 
-/// Which plan pass owns a given word offset within a block's PLAN_STRIDE.
 fn plan_word_pass(o: usize) -> &'static str {
     match o {
         0..=3 | 85..=109 => "bc7_plan_alpha",
@@ -3079,7 +2963,6 @@ impl Harness {
                 let classes: Vec<u32> = (0..nb)
                     .map(|b| group_signature(&blocks[b * 64..(b + 1) * 64], 1) as u32)
                     .collect();
-                // Stage 1: the three plan passes, scratch threaded through.
                 let mut scratch = vec![0u8; nb * PLAN_STRIDE * 4];
                 for (pi, pipe) in plan_pipes.iter().enumerate() {
                     match dispatch_prepared_wg_pad(
@@ -3107,7 +2990,6 @@ impl Harness {
                         }
                     }
                 }
-                // Masked plan-scratch compare vs the CPU mirror.
                 let sw: Vec<u32> = scratch.chunks_exact(4).map(le_word).collect();
                 let (pw, pm) = expected_plan(&cp, blocks);
                 if let Some(i) = (0..sw.len()).find(|&i| pm[i] && sw[i] != pw[i]) {
@@ -3129,9 +3011,6 @@ impl Harness {
                     });
                     continue 'bucket;
                 }
-                // Stage 2: the three TRIAL_CLASS encode passes, out threaded
-                // through; after each pass every block whose class that pass
-                // owns must already be final.
                 let mut out = vec![0u8; nb * 16];
                 for (ci, pipe) in enc_pipes.iter().enumerate() {
                     match dispatch_prepared_wg_pad(
@@ -3197,8 +3076,6 @@ impl Harness {
                         }
                     }
                 }
-                // Safety net: a block no pass wrote (e.g. GPU classify
-                // disagreeing with CPU) would still be zero here.
                 if out != want {
                     let i = out
                         .iter()
@@ -3235,10 +3112,6 @@ impl Harness {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
 pub async fn run_bisect(g: &crate::gpu::wgpu::Gpu) -> Vec<EntryResult> {
     let module = g
         .device
@@ -3255,8 +3128,6 @@ pub async fn run_bisect(g: &crate::gpu::wgpu::Gpu) -> Vec<EntryResult> {
     let h = Harness { module, blockify };
     let t = build_opt_tables();
     let mut results: Vec<EntryResult> = Vec::new();
-    // Integer sanity → primitives → suspects; every entry runs regardless of
-    // earlier failures.
     results.extend(h.entry_tables(g).await);
     results.push(h.entry_u64ops(g).await);
     results.push(
@@ -3318,8 +3189,6 @@ pub async fn run_bisect(g: &crate::gpu::wgpu::Gpu) -> Vec<EntryResult> {
     results.push(h.entry_eval4way(g).await);
     results.push(h.entry_findopt(g).await);
     results.push(h.entry_plans(g).await);
-    // Pipeline-level entries: blockify stages, then the production 3 plan +
-    // 3 encode passes with per-stage attribution.
     results.push(h.entry_blockify_linearize(g).await);
     results.push(h.entry_blockify_halve(g).await);
     results.push(h.entry_blockify_quantize_pack(g).await);

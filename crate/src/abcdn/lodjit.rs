@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::resolver;
 use super::state::{AppState, ResolveCache};
 use crate::lodgen::simplify::SimplifierBackend;
+use crate::resolver;
 
 pub const REASON_HEADER: &str = "x-abgen-reason";
 pub const JIT_ENV: &str = "ABGEN_LOD_JIT";

@@ -1,32 +1,3 @@
-//! abgen-lambda — the asset-bundle conversion pipeline as one binary, shaped
-//! for AWS Lambda (custom runtime on `provided.al2023`, container image).
-//!
-//! One invocation handles one deployment event end to end:
-//!
-//!   1. parse the event — an SQS record batch whose bodies are catalyst
-//!      `DeploymentToSqs` payloads, or a plain
-//!      `{"entityId": "...", "contentServerUrl": "..."}` for manual invokes,
-//!   2. skip platforms whose manifest is already current on the CDN,
-//!   3. convert the remaining platforms in one process with the
-//!      texture-encode cache enabled — the mac pass reuses the windows
-//!      pass's BC7/DXT encodes ("dual-emit") — while abgen's space probes
-//!      per-file asset reuse and writes bundles + manifests through to S3
-//!      during the build,
-//!   4. publish scene sources (`main.crdt`, `scene.json`, main script),
-//!   5. notify the asset-bundle-registry SQS queue (deferred — registry
-//!      duplicate ships as a follow-up).
-//!
-//! No async runtime: the Lambda runtime API is a plain HTTP long-poll, served
-//! with the same blocking ureq the rest of abgen uses. Cold start is the
-//! binary's exec time.
-//!
-//! Modes:
-//!   abgen-lambda                   serve the Lambda runtime API (requires
-//!                                  AWS_LAMBDA_RUNTIME_API, set by Lambda)
-//!   abgen-lambda --once FILE.json  handle one event read from a file, print
-//!                                  the result JSON and exit — full local run
-//!                                  without any AWS.
-
 mod catalyst;
 mod config;
 mod convert;
@@ -47,7 +18,6 @@ fn main() {
             };
             init();
             let mut cfg = config::Config::from_env();
-            // Local runs keep the corpus on disk for inspection.
             cfg.keep_output = true;
             match run_once(&cfg, path) {
                 Ok(v) => {
@@ -85,7 +55,6 @@ fn main() {
     }
 }
 
-/// One-time process setup shared by both modes.
 fn init() {
     abgen::builder::require_templates().unwrap_or_else(|e| {
         eprintln!(
@@ -94,9 +63,7 @@ fn init() {
         );
         std::process::exit(1);
     });
-    // Lambda has no GPU; this warns once and settles on the CPU encoders.
     abgen::arm_gpu_default();
-    // Dual-emit: the second platform's texture encodes become cache hits.
     abgen::texencode_cache::enable();
 }
 
@@ -107,9 +74,6 @@ fn run_once(cfg: &config::Config, path: &str) -> Result<serde_json::Value> {
     handle(cfg, &event)
 }
 
-/// The Lambda handler: event in, summary JSON out. An `Err` is reported to
-/// the runtime API as a function error, so the SQS message retries and
-/// eventually lands in the DLQ.
 fn handle(cfg: &config::Config, event: &serde_json::Value) -> Result<serde_json::Value> {
     let jobs = event::jobs_from_event(event)?;
     let mut summaries = Vec::with_capacity(jobs.len());
@@ -121,9 +85,6 @@ fn handle(cfg: &config::Config, event: &serde_json::Value) -> Result<serde_json:
 
 fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Value> {
     if job.is_lods {
-        // LOD generation stays on the Unity pipeline; these arrive only if the
-        // queue subscription filter lets them through. Succeed so they are not
-        // retried into the DLQ.
         eprintln!("skip: LOD job for {} (unsupported here)", job.entity_id);
         return Ok(serde_json::json!({
             "entityId": job.entity_id, "skipped": "lods-unsupported"
@@ -134,21 +95,11 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
         .content_server_url
         .as_deref()
         .unwrap_or(&cfg.default_content_server);
-    // SSRF guard: the content server travels in the attacker-influenced SQS
-    // payload; with an allowlist configured, off-list hosts are rejected
-    // (message retries → DLQ, where the attempt is visible).
     if let Some(allowed) = &cfg.allowed_content_server_hosts {
         event::ensure_allowed_content_server(content_server, allowed)?;
     }
     let proxy = convert::make_proxy(cfg, content_server);
 
-    // Entity-level already-converted skip (consumer-server semantics): a
-    // platform whose manifest exists with exitCode 0 at the current AB
-    // version needs no work; partially-converted entities rebuild only the
-    // missing targets. Finer-grained per-FILE reuse happens inside the build
-    // itself (the space probe). `force` bypasses this manifest check, but
-    // per-file reuse still applies — existing canonical bundles are never
-    // overwritten.
     let mut pending: Vec<String> = cfg.platforms.clone();
     if !job.force {
         pending.retain(|platform| {
@@ -168,16 +119,11 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
         }
     }
 
-    // The entity document drives scene-source publishing (and records the
-    // entity type in the summary).
     let agent = catalyst::agent();
     let entity_doc = catalyst::fetch_entity(&agent, content_server, &job.entity_id)?;
 
     let outcome = convert::convert_entity(cfg, &proxy, &job.entity_id, content_server, &pending)?;
 
-    // Bundles + manifests were written through to the space during the build;
-    // publish() adds scene sources. Then drop the local corpus (Lambda /tmp
-    // is 10 GB, shared across warm invocations) unless a local run wants it.
     let published = output::publish(cfg, &agent, &proxy, &entity_doc, &outcome)
         .and_then(|upload| notify::send(cfg, &outcome).map(|notified| (upload, notified)));
     if !cfg.keep_output {

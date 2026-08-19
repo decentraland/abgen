@@ -169,9 +169,6 @@ impl<'a> Builder<'a> {
                     child_trs,
                 )
             };
-            // LOD prefab roots carry the scene's world position (base*16):
-            // verified against a fresh Unity 6000.2.6f2 LODConversion run,
-            // which bakes instantiated.transform.position into the prefab.
             let (wrap_t, wrap_r, wrap_s) = match &self.lod {
                 Some(l) => (l.root_position, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0]),
                 None => (wrap_t, wrap_r, wrap_s),
@@ -596,7 +593,6 @@ impl<'a> Builder<'a> {
             self.insert_role(p, r);
         }
         let (root_t, root_r, root_s) = match &self.lod {
-            // Same base*16 root as the wrap path above — Unity parity.
             Some(l) if assigning_root => (l.root_position, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0]),
             _ => (node.translation, node.rotation, node.scale),
         };

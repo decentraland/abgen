@@ -9,20 +9,6 @@ mod engine;
 #[cfg(not(target_arch = "wasm32"))]
 pub use engine::QuickJsEngine;
 
-#[cfg(all(
-    feature = "engine-v8",
-    not(target_arch = "wasm32"),
-    not(all(target_os = "windows", target_env = "gnu"))
-))]
-mod engine_v8;
-
-#[cfg(all(
-    feature = "engine-v8",
-    not(target_arch = "wasm32"),
-    not(all(target_os = "windows", target_env = "gnu"))
-))]
-pub use engine_v8::V8Engine;
-
 #[cfg(not(target_arch = "wasm32"))]
 pub struct EngineLimits {
     pub memory_bytes: usize,
@@ -116,23 +102,7 @@ fn fetch_sdk6_adaption_layer() -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-#[cfg(all(
-    feature = "engine-v8",
-    not(target_arch = "wasm32"),
-    not(all(target_os = "windows", target_env = "gnu"))
-))]
-fn default_engine() -> impl SceneEngine {
-    V8Engine
-}
-
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    not(target_arch = "wasm32"),
-    not(all(
-        feature = "engine-v8",
-        not(all(target_os = "windows", target_env = "gnu"))
-    ))
-))]
+#[cfg(not(target_arch = "wasm32"))]
 fn default_engine() -> impl SceneEngine {
     QuickJsEngine
 }
@@ -297,9 +267,6 @@ module.exports.onUpdate = async function () {
         (client, ent)
     }
 
-    /// Goldens are pinned to LF in .gitattributes. Normalising here too means
-    /// the comparison does not depend on the checkout honouring that — a CRLF
-    /// working copy failed this on Windows and nowhere else.
     fn lf(s: &str) -> String {
         s.replace("\r\n", "\n")
     }
@@ -428,14 +395,8 @@ module.exports.onUpdate = async function () {
                 }
             };
             QuickJsEngine.run_capture(make_job()).unwrap();
-            let engines: Vec<(&'static str, Box<dyn SceneEngine>)> = vec![
-                ("quickjs", Box::new(QuickJsEngine)),
-                #[cfg(all(
-                    feature = "engine-v8",
-                    not(all(target_os = "windows", target_env = "gnu"))
-                ))]
-                ("v8", Box::new(V8Engine)),
-            ];
+            let engines: Vec<(&'static str, Box<dyn SceneEngine>)> =
+                vec![("quickjs", Box::new(QuickJsEngine))];
             for (name, engine) in engines {
                 let timed = || {
                     let t = Instant::now();

@@ -1,11 +1,3 @@
-//! The four export modes, host-agnostic.
-//!
-//! Lifted verbatim out of `crate/abgen-wasm/src/lib.rs` so the wasm bridge,
-//! the C-ABI cdylib and the node addon share one implementation instead of
-//! three copies that drift. The only thing that changed in the move is where
-//! output goes: the free `emit*` helpers became [`Sink`] calls, and the two
-//! host-identifying manifest fields became [`HostInfo`].
-
 use std::collections::HashMap;
 
 use crate::builder::{build_bundle, BuildOpts};
@@ -216,8 +208,6 @@ fn convert_one(
     }
 }
 
-/// Mode 0: convert every model in the upload, optionally bake the LOD, and
-/// emit the job manifest.
 pub fn convert(input: Input, sink: &dyn Sink, host: HostInfo) -> crate::Result<()> {
     let target = target_of(&input.platform, sink);
     let entity_type = entity_type_of(&input);
@@ -301,8 +291,6 @@ pub fn convert(input: Input, sink: &dyn Sink, host: HostInfo) -> crate::Result<(
     Ok(())
 }
 
-/// Mode 1: report what the upload contains — per-model plan and dependency
-/// edges — without converting anything.
 pub fn scan(input: Input, sink: &dyn Sink) -> crate::Result<()> {
     let target = target_of(&input.platform, sink);
     let entity_type = entity_type_of(&input);
@@ -361,8 +349,6 @@ pub fn scan(input: Input, sink: &dyn Sink) -> crate::Result<()> {
     Ok(())
 }
 
-/// Mode 2: convert exactly one model out of the upload, against a supplied
-/// content table. The shard primitive — a caller fans these out per model.
 pub fn convert_only(input: Input, sink: &dyn Sink) -> crate::Result<()> {
     let target = target_of(&input.platform, sink);
     let entity_type = entity_type_of(&input);
@@ -396,7 +382,6 @@ pub fn convert_only(input: Input, sink: &dyn Sink) -> crate::Result<()> {
     Ok(())
 }
 
-/// Mode 3: bake only the scene LOD, skipping per-model conversion.
 pub fn lod_only(input: Input, sink: &dyn Sink) -> crate::Result<()> {
     let target = target_of(&input.platform, sink);
     if target == "webgl" {
@@ -712,8 +697,6 @@ mod tests {
 
     const TEST_HOST: HostInfo = HostInfo::new("v-abgen-test", "test://inline");
 
-    /// One triangle, one material, buffer inline as a data: URI so the model
-    /// has no external dependencies.
     fn tiny_gltf() -> Vec<u8> {
         const BUF_B64: &str = "AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAAAAABAAIA";
         format!(
@@ -736,8 +719,6 @@ mod tests {
         .into_bytes()
     }
 
-    /// Mode 0 over an upload holding the same model next to a sibling whose
-    /// bytes the caller controls.
     fn convert_with_sibling(sibling: &[u8]) -> Vec<(String, Vec<u8>)> {
         let blob = InputBuilder::new()
             .file("models/tri.gltf", tiny_gltf())
@@ -756,10 +737,6 @@ mod tests {
         got.outputs
     }
 
-    /// The regression this guards: the bundle name keys on the model's own
-    /// content hash, so the body must too. It used to be seeded from a hash
-    /// over every file in the upload, which made an untouched model re-emit
-    /// under the same name with different bytes whenever a sibling changed.
     #[test]
     fn a_model_bundle_ignores_its_siblings() {
         let a = convert_with_sibling(b"console.log('one')");
@@ -777,7 +754,6 @@ mod tests {
         );
     }
 
-    /// Same run twice: no clock, no address, no thread order in the output.
     #[test]
     fn converting_the_same_upload_twice_is_byte_identical() {
         let a = convert_with_sibling(b"console.log('one')");

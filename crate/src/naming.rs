@@ -4,17 +4,8 @@ use std::collections::HashMap;
 
 pub const GLTF_EXTENSIONS: [&str; 2] = [".glb", ".gltf"];
 
-/// Longest id/bundle name stored verbatim as a path component. Catalyst content
-/// hashes are fixed-length (59 chars) so production names sit far below this;
-/// only unbounded ids (the sdk-commands preview server's base64-of-path pseudo
-/// hashes) exceed it. Leaves headroom under the 255-byte filesystem NAME_MAX
-/// for the `.tmp.{pid}.{n}` suffixes of atomic writes.
 const FS_COMPONENT_MAX_BYTES: usize = 200;
 
-/// Maps a served name to the component it is stored under on disk: names within
-/// the limit pass through verbatim (production behavior is byte-identical);
-/// oversized names collapse to a fixed-length digest. Must be applied
-/// symmetrically by writers and resolvers.
 pub fn fs_safe_component(name: &str) -> std::borrow::Cow<'_, str> {
     if name.len() <= FS_COMPONENT_MAX_BYTES {
         return std::borrow::Cow::Borrowed(name);
@@ -23,13 +14,8 @@ pub fn fs_safe_component(name: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(format!("xn-{}", &digest[..40]))
 }
 
-/// NAME_MAX (255 bytes) minus headroom for atomic-write `.tmp.{pid}.{seq}` suffixes.
 pub const FS_WRITE_COMPONENT_MAX_BYTES: usize = 240;
 
-/// Refuses a component that must be stored verbatim but can never fit in NAME_MAX.
-/// Why: letting it through fails later, deep inside a conversion, with the OS's
-/// cryptic error (ENAMETOOLONG; "os error 3"/"123" on Windows) far from the cause —
-/// only unbounded dev-lane ids (b64- base64 of a local path) ever get this long.
 pub fn ensure_writable_component(name: &str) -> Result<()> {
     if name.len() <= FS_WRITE_COMPONENT_MAX_BYTES {
         return Ok(());
@@ -41,12 +27,6 @@ pub fn ensure_writable_component(name: &str) -> Result<()> {
     );
 }
 
-/// True for sdk-commands' content-versioned preview ids (js-sdk-toolchain
-/// #1529): `b64-` + base64 of `path NUL mtime-machineId`. Paths and hostnames
-/// cannot contain NUL, so the byte can never appear in a plain
-/// `path-machineId` id — its presence means the id itself changes whenever
-/// the file's bytes do, and byte revalidation proves nothing the id doesn't
-/// already say.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn is_content_versioned_id(id: &str) -> bool {
     id.strip_prefix("b64-")

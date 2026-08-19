@@ -4,9 +4,9 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::jitcache::JitDiskCache;
 use super::lodjit::LodJit;
 use crate::catalyst::CatalystClient;
+use crate::jitcache::JitDiskCache;
 use dcl_contents::content::ContentComponent;
 use moka::future::Cache;
 
@@ -88,9 +88,6 @@ pub struct AppStateInner {
 
     pub upstream_ab_registry: Option<String>,
 
-    /// Per-entity records fetched from the upstream asset-bundle registry.
-    /// A cached `None` means the registry authoritatively does not know the
-    /// entity (not converted); fetch errors are never cached.
     pub upstream_registry_cache: Cache<String, Option<UpstreamAbRecord>>,
 
     pub revalidate_recent: Cache<String, ()>,
@@ -98,8 +95,6 @@ pub struct AppStateInner {
     pub revalidate_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
-/// The asset-bundle fields of an upstream registry record, passed through
-/// verbatim so clients see the same versions the production CDN serves.
 #[derive(Clone, Debug)]
 pub struct UpstreamAbRecord {
     pub versions: serde_json::Value,
@@ -259,7 +254,7 @@ impl AppStateInner {
         }
         let stored = crate::naming::fs_safe_component(entity);
         let dir = self.jit_root.join(&*stored);
-        let bytes = super::jitcache::dir_size(&dir);
+        let bytes = crate::jitcache::dir_size(&dir);
         if bytes == 0 {
             return;
         }

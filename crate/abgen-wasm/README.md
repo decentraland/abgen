@@ -1,27 +1,26 @@
-# abgen wasm lab — proof of concept
+# abgen wasm
 
 The abgen converter core (the parent crate, default features off) compiled to
-`wasm32-unknown-unknown` and driven from a static web page: drop a
-glb/gltf/zip of a wearable, emote or scene, watch the files convert in
-parallel on a worker pool (one file per worker; a trap fails only its own
-file and the worker is respawned), download real UnityFS bundles + the
-manifest. Nothing leaves the browser.
+`wasm32-unknown-unknown`: it converts glb/gltf uploads (wearables, emotes,
+scenes) into real UnityFS bundles + a manifest, running the file fan-out over a
+worker pool (one file per worker; a trap fails only its own file and the worker
+is respawned). The JS runtime in `js/` (worker + pool + the WebGPU bridge) is
+what a host page embeds; `test/headless*.mjs` drives the same protocol under
+node.
 
-## Run it
+## Build it
 
 ```bash
-bash abgen-wasm/build.sh          # build site/wasm/abgen_wasm.wasm (gitignored artifact)
-bash abgen-wasm/serve.sh          # http://127.0.0.1:5189/wasm/
+bash abgen-wasm/build.sh          # build dist/abgen_wasm.wasm (gitignored artifact)
 ```
 
-`site/wasm/abgen_wasm.wasm` (~4.3 MB) is never committed — `build.sh`
-regenerates it from the tree. The module is a plain cargo package at
-`abgen-wasm/` with its own committed `Cargo.lock`, excluded from the parent
-workspace so the default workspace build/check/test never needs a wasm
-toolchain. The toolchain is pinned in `abgen-wasm/toolchain/flake.nix`
-(rust 1.97.0 + wasm32 target); no wasm-bindgen — the module speaks a
-hand-rolled C ABI (`poc_init` / `poc_alloc` / `poc_convert`, events stream
-back through the imported `env.host_emit`).
+`dist/` is never committed — `build.sh` regenerates it from the tree. The
+module is a plain cargo package at `abgen-wasm/` with its own committed
+`Cargo.lock`, excluded from the parent workspace so the default workspace
+build/check/test never needs a wasm toolchain. The toolchain is pinned in
+`abgen-wasm/toolchain/flake.nix`; the main module needs no wasm-bindgen — it
+speaks a hand-rolled C ABI (`poc_init` / `poc_alloc` / `poc_convert`, events
+stream back through the imported `env.host_emit`).
 
 ## What is real
 
@@ -44,7 +43,7 @@ back through the imported `env.host_emit`).
 - The LOD lane: `lodgen` model merge, InitialSceneState placements (an
   uploaded `*_InitialSceneState.json` descriptor drives the same assemble
   instancing as native), parcel crop, square-POT texture atlas, meshopt
-  decimation (the same vendored meshoptimizer 0.25 sources the native
+  decimation (the same vendored meshoptimizer sources the native
   meshopt lane compiles, built here by the wasi toolchain), GLB emit, the
   `LodBuildParams` bundle path (`DCL/Scene_TexArray` binding, parcel
   clipping/root placement from scene.json), the LOD self-gate. Scene
@@ -57,47 +56,42 @@ back through the imported `env.host_emit`).
 ## The decoder rule (native default vs the gate)
 
 Native GLB JPEG decode defaults to turbojpeg: measured against the upstream
-oracle it is the closer decoder (worst mean channel delta 0.03 vs
-2.99 for IJG 9c), so the wasm port does **not** flip the native default.
-wasm has no dlopen and always decodes through the vendored libjpeg9c. The
-parity gate closes that gap by exporting `ABGEN_JPEG_GLB_9C=1` — the
-existing native escape in `src/gltf/scene_build.rs` — on every native
+oracle it is the closer decoder, so the wasm port does **not** flip the
+native default. wasm has no dlopen and always decodes through the vendored
+libjpeg9c. The parity gate closes that gap by exporting `ABGEN_JPEG_GLB_9C=1`
+— the existing native escape in `src/gltf/scene_build.rs` — on every native
 invocation, so both sides decode identically inside the gate, while the
 production profile (env unset) is unaffected by the wasm port.
 Transcendental call sites in the byte path (`acos`, `powf`, `sin/cos`,
 `log2`) go through `src/detmath.rs` (pure-Rust libm) on both targets
-unconditionally - byte-neutral vs glibc libm on 60/60 real bundles.
+unconditionally - byte-neutral vs glibc libm on real bundles.
 
 ## Remaining gaps vs the native fleet
 
 - Encode is CPU: SIMD128 in the BC7 partition estimator (runtime
-  self-qualified against scalar, worth ~2% wall on a BC7-heavy scene —
-  the estimator is a small slice of the wasm encode) on a pool of workers;
-  native uses AVX-512 or the bit-exact GPU lane. The `+simd128` build
-  flag raises the module floor to engines with wasm SIMD (Chrome 91+,
-  Firefox 89+, Safari 16.4+, Node 16.4+ — older engines reject the module
-  at validation).
+  self-qualified against scalar) on a pool of workers; native uses AVX-512,
+  NEON on aarch64 (Apple Silicon / Graviton), or the bit-exact GPU lane. The `+simd128` build flag raises the module floor
+  to engines with wasm SIMD — older engines reject the module at validation.
 - WebGPU encode is wired via a bridge that keeps `poc_convert` synchronous:
   a separate wasm-bindgen module (`crate/wasm-gpu`, the native GPU lane's
   bit-exact WGSL kernels behind `abgen::gpu`'s wasm32 API) runs in its own
   worker, and convert workers block on a SharedArrayBuffer + `Atomics.wait`
   handshake (`bc7_pure::set_encode_hook` → `host_encode_bc7` import →
-  `site/wasm/gpu-worker.js`, which stays async via `Atomics.waitAsync` for
-  GPU readback). Needs crossOriginIsolated (site/server.py sends COOP/COEP);
-  anything missing degrades to the CPU-SIMD path with a note. The native
+  `js/gpu-worker.js`, which stays async via `Atomics.waitAsync` for
+  GPU readback). Needs crossOriginIsolated (the host must send COOP/COEP
+  headers); anything missing degrades to the CPU-SIMD path with a note. The native
   per-device self-qualification contract carries over: `gpu_init` refuses
   any adapter whose output is not bit-identical to the in-module CPU oracle
   across the native qualification matrix. Status: Chrome's WGSL compiler
   (Tint→MSL) is not bit-exact on Apple Metal — the same kernels
   qualify under native wgpu (Naga) on the same GPU — so the lane arms only
   on adapters that pass; hardening the WGSL against Tint codegen is the
-  open follow-up. `site/wasm/gputest.html` is the end-to-end harness (runs
-  CPU-forced vs GPU-enabled and byte-compares every bundle).
+  open follow-up.
 
 Not a gap: libjpeg error recovery uses actual setjmp/longjmp via
 wasi-libc's `libsetjmp.a` (the LLVM Wasm-SjLj transform over wasm
-exception handling, legacy `try`/`catch` encoding — Chrome 95+, Firefox
-100+, Safari 15.2+, Node 17+). A malformed JPEG fails per-image exactly
+exception handling, legacy `try`/`catch` encoding). A malformed JPEG fails
+per-image exactly
 like native instead of trapping the module; the EH compile flags are scoped
 to the libjpeg9c build (`third_party/libjpeg9c/build.rs`), and the final
 link adds `libsetjmp.a` in `abgen-wasm/build.rs`. crnlib's bundled `jpgd`
@@ -111,16 +105,16 @@ file loader is never called.
   last, overriding cc-rs's `--target=wasm32-unknown-unknown`).
 - `abgen-wasm/build.rs` links wasi-libc's `libc.a` plus `libc++.a`/`libc++abi.a`
   into the final cdylib; the resulting `wasi_snapshot_preview1` imports
-  (stdio/env/prestat) are stubbed in `site/wasm/worker.js` — `fd_prestat_get`
+  (stdio/env/prestat) are stubbed in `js/worker.js` — `fd_prestat_get`
   must return EBADF(8) so libc's preopen scan terminates.
 - `poc_init` calls `__wasm_call_ctors` explicitly (reactor model); without
   that reference wasm-ld wraps every export in command-model ctor/dtor calls
   and the first export invocation traps in `__funcs_on_exit`.
 - Headless verification: `abgen-wasm/test/make-fixtures.py` + `node
-  abgen-wasm/test/headless.mjs <out> windows '' <fixture.glb>` (single
-  instance) or `headless-pool.mjs` (the same page pool over a
-  worker_threads shim, `--workers=N`); full cross-target gate:
-  `bash abgen-wasm/test/parity.sh`.
+  abgen-wasm/test/headless.mjs <out> <platform> '' <fixture.glb>` (single
+  instance) or `headless-pool.mjs` (the same pool over a worker_threads
+  shim, `--workers=N`); full cross-target gate: `bash
+  abgen-wasm/test/parity.sh`.
 
 ## Cross-target byte gate
 
@@ -128,11 +122,9 @@ file loader is never called.
 `abgen`/`abgen-lod` binaries from the same tree, regenerates the fixtures,
 converts every one on both sides (native under `ABGEN_JPEG_GLB_9C=1`, per
 the decoder rule above), and sha256-compares each produced artifact across
-the twelve fixtures: jpeg, crunched-normal, draco, PNG-gAMA,
-`KHR_texture_transform` rotation, generated tangents, multi-material, a
-two-parcel scene with its LOD1 bake, a dense grid decimated through the
-meshopt tri cap, a parcel-overhanging slab through the crop planes, an
-InitialSceneState placements assemble, and a good/corrupt JPEG pair.
+the fixture set (geometry, texture, draco, tangent generation, multi-
+material, scene + LOD bake, decimation, crop, ISS placements, and a
+good/corrupt JPEG pair).
 
 Coverage boundaries, stated exactly:
 

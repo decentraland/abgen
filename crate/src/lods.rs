@@ -12,12 +12,8 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_LODS_BUCKET: &str = "https://lod-generator-unity-cdn-decentraland-org-contentbucket-4bd1977.s3.amazonaws.com/lods-unity/fbx-deprecated-sources";
 
-/// LOD comparisons only target reference builds from the v49 converter era
-/// onward; older asset-bundle versions (v36 classic LODs, the webgl-era v7,
-/// …) are legacy artifacts, not comparison targets.
 pub const LOD_ERA_MIN_AB_VERSION: u32 = 49;
 
-/// Parse an asset-bundle version tag ("v49", "49") to its number.
 pub fn ab_version_num(version: &str) -> Option<u32> {
     version
         .trim()
@@ -26,8 +22,6 @@ pub fn ab_version_num(version: &str) -> Option<u32> {
         .ok()
 }
 
-/// Era gate for LOD comparisons: true only for asset-bundle versions from
-/// v49 onward. Missing/unparseable versions gate as legacy.
 pub fn ab_version_is_lod_era(version: &str) -> bool {
     ab_version_num(version).is_some_and(|n| n >= LOD_ERA_MIN_AB_VERSION)
 }
@@ -49,11 +43,6 @@ pub struct LodOptions {
 
     pub keep_forward_plus: bool,
 
-    /// Explicit scene geometry override applied to every source. `None` makes
-    /// `convert_lods*` resolve each source's scene entity (the `{sceneId}` in
-    /// the `{sceneId}_{level}` filename) from the content server, falling back
-    /// to zeroed clipping with a warning when the entity cannot be resolved —
-    /// the same behavior as the upstream Unity LOD converter.
     pub lod: Option<LodGenMeta>,
 }
 
@@ -240,8 +229,6 @@ fn prepare_lod_source(client: &CatalystClient, locator: &str) -> Result<(String,
     Ok((sid, level, glb))
 }
 
-/// Hostname discriminator the upstream converter uses to pick the entity
-/// API shape; a URL that fails to parse counts as catalyst-style, like there.
 #[cfg(not(target_arch = "wasm32"))]
 fn is_worlds_host(base_url: &str) -> bool {
     let rest = base_url.split("://").nth(1).unwrap_or(base_url);
@@ -250,10 +237,6 @@ fn is_worlds_host(base_url: &str) -> bool {
         .starts_with("worlds-content-server")
 }
 
-/// Resolve base/parcels for a LOD scene id exactly the way the upstream
-/// converter does: `POST /entities/active` on catalyst-style hosts (so a
-/// stale/redeployed entity id does NOT resolve), `GET /contents/{id}` on
-/// worlds-content-server hosts (which have no active-entities route).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn resolve_scene_geometry(
     client: &CatalystClient,
@@ -267,9 +250,6 @@ pub fn resolve_scene_geometry(
     crate::lodgen::scene_geometry(&ent)
 }
 
-/// Resolve a LOD source's scene geometry, mirroring the upstream Unity
-/// converter: when the entity cannot be resolved the conversion proceeds
-/// with zeroed clipping and a warning instead of failing.
 #[cfg(not(target_arch = "wasm32"))]
 fn resolve_scene_meta(client: &CatalystClient, sid: &str) -> LodGenMeta {
     match resolve_scene_geometry(client, sid) {

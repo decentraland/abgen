@@ -54,6 +54,20 @@ fn estimate_partition_group(mode: usize, lanes: &[&[ColorI; 16]], cp: &Params) -
         }
         return best_partition;
     }
+    #[cfg(target_arch = "aarch64")]
+    if let Some(lfs) = &lanes_f32 {
+        for lane in 0..n {
+            best_partition[lane] = super::est_neon::est_partition_lane_neon(
+                mode,
+                &params,
+                &lfs[lane],
+                subset_tab,
+                total_partitions,
+                total_subsets,
+            );
+        }
+        return best_partition;
+    }
     let mut best_err = vec![u64::MAX; n];
     let mut retired = vec![false; n];
     for partition in 0..total_partitions {
@@ -178,6 +192,53 @@ pub(super) fn estimate_partition_list_group(
                         max_solutions,
                     )
                 };
+            }
+        }
+        let mut out = Vec::with_capacity(n);
+        for lane in 0..n {
+            let take = (num_solutions[lane]).min(max_solutions_in) as usize;
+            out.push(sols[lane][..take].to_vec());
+        }
+        return out;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if let Some(lfs) = &lanes_f32 {
+        let cb = BC7E_2SUBSET_CHECKERBOARD_PARTITION_INDEX as u32;
+        let phase1_end = if total_subsets == 2 {
+            (cb + 1).min(total_partitions)
+        } else {
+            total_partitions
+        };
+        for lane in 0..n {
+            i_at[lane] = super::est_neon::est_partition_list_lane_neon(
+                mode,
+                &params,
+                &lfs[lane],
+                subset_tab,
+                0,
+                phase1_end,
+                total_subsets,
+                &mut sols[lane],
+                &mut num_solutions[lane],
+                max_solutions,
+            );
+        }
+        let stop =
+            total_subsets == 2 && cb < total_partitions && i_at[..n].iter().all(|&i| i >= THRESH);
+        if !stop && phase1_end < total_partitions {
+            for lane in 0..n {
+                super::est_neon::est_partition_list_lane_neon(
+                    mode,
+                    &params,
+                    &lfs[lane],
+                    subset_tab,
+                    phase1_end,
+                    total_partitions,
+                    total_subsets,
+                    &mut sols[lane],
+                    &mut num_solutions[lane],
+                    max_solutions,
+                );
             }
         }
         let mut out = Vec::with_capacity(n);

@@ -340,8 +340,6 @@ fn cmd_bundle(argv: &[String]) -> Result<i32> {
     let client = CatalystClient::from_args(&catalyst, None);
     let (base_parcel, parcel_list) = match (&base, &parcels) {
         (Some(b), Some(p)) => (parse_parcel(b)?, parse_parcels(p)?),
-        // Upstream converter behavior: an unresolvable scene entity is a
-        // warning, not an error — the bundle is built with zeroed clipping.
         (None, None) => match entity_geometry(&client, &entity) {
             Ok(geometry) => geometry,
             Err(e) => {

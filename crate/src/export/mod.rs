@@ -1,33 +1,17 @@
-//! abgen's conversion pipeline packaged for embedding: content bytes in,
-//! bundle bytes out, progress through a callback. Hosts supply request bytes
-//! ([`wire`]) and a [`Sink`]; `abgen-wasm`, `abgen-native` and `abgen-node`
-//! share this and so cannot drift.
-//!
-//! [`run`] is synchronous and calls [`Sink::emit`] on the calling thread only,
-//! never retaining the sink past return — a host may pass a callback pointing
-//! at stack state.
-
 pub mod convert;
 pub mod wire;
 
 pub use wire::{parse_input, Input, InputBuilder};
 
-/// Payload kind. Values are ABI: append, never renumber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Kind {
-    /// UTF-8 JSON progress event, discriminated by its `ev` field.
     Json = 0,
-    /// One artifact, as `u32 name_len | name | u32 data_len | data`.
     Output = 1,
-    /// UTF-8 error message, fatal to the run.
     Error = 2,
-    /// UTF-8 JSON job manifest. Once, last, convert mode only.
     Manifest = 3,
 }
 
-/// Where a run's output goes. Implementations must not panic: on the native
-/// host that unwinds across a C frame.
 pub trait Sink {
     fn emit(&self, kind: Kind, bytes: &[u8]);
 
@@ -35,8 +19,6 @@ pub trait Sink {
         self.emit(Kind::Json, v.to_string().as_bytes());
     }
 
-    /// Framing is the C ABI's contract, not the core's. Overriding this avoids
-    /// a full copy of every artifact — hundreds of MB on a large scene.
     fn emit_output(&self, name: &str, data: &[u8]) {
         let mut blob = Vec::with_capacity(8 + name.len() + data.len());
         blob.extend_from_slice(&(name.len() as u32).to_le_bytes());
@@ -57,11 +39,9 @@ impl<T: Sink + ?Sized> Sink for &T {
     }
 }
 
-/// Host identity, stamped into the manifest.
 #[derive(Debug, Clone, Copy)]
 pub struct HostInfo {
     pub manifest_version: &'static str,
-    /// Content arrives inline, so this records the embedding, not a fetch URL.
     pub content_server_url: &'static str,
 }
 
@@ -74,14 +54,10 @@ impl HostInfo {
     }
 }
 
-/// Exit codes. Mirrored in the C header and the node addon.
 pub const OK: i32 = 0;
 pub const ERR_MALFORMED_INPUT: i32 = 1;
 pub const ERR_CONVERT_FAILED: i32 = 2;
 
-/// Runs one export request end to end. On failure the reason was already
-/// emitted as [`Kind::Error`]. Per-file failures are *not* run failures: they
-/// arrive as `file-error` events and land in the manifest's `exitCode`.
 pub fn run(request: &[u8], sink: &dyn Sink, host: HostInfo) -> i32 {
     let Some(input) = wire::parse_input(request) else {
         sink.emit_error("malformed input blob");
@@ -90,12 +66,6 @@ pub fn run(request: &[u8], sink: &dyn Sink, host: HostInfo) -> i32 {
     run_parsed(input, sink, host)
 }
 
-/// Arms the GPU encode path once per process, on first use.
-///
-/// On by default rather than a knob, because the capability test already
-/// decides: `arm_gpu_default` honours `ABGEN_GPU_BACKEND=off`, applies the
-/// measured macOS default (integrated Metal loses to the CPU at BC7), and on
-/// any failure leaves the CPU path in place.
 #[cfg(not(target_arch = "wasm32"))]
 fn arm_gpu_once() {
     static ARMED: std::sync::Once = std::sync::Once::new();
@@ -106,11 +76,9 @@ fn arm_gpu_once() {
     });
 }
 
-/// The browser lane reaches the GPU through the host's WebGPU bridge.
 #[cfg(target_arch = "wasm32")]
 fn arm_gpu_once() {}
 
-/// [`run`] against an already-parsed request.
 pub fn run_parsed(input: Input, sink: &dyn Sink, host: HostInfo) -> i32 {
     arm_gpu_once();
     if input.mode != 1 {
@@ -137,13 +105,11 @@ pub fn run_parsed(input: Input, sink: &dyn Sink, host: HostInfo) -> i32 {
     }
 }
 
-/// Collects a run's emissions, for hosts that want the result not a stream.
 #[derive(Default)]
 pub struct CollectingSink {
     inner: std::sync::Mutex<Collected>,
 }
 
-/// One run's emissions, grouped by kind.
 #[derive(Default, Debug)]
 pub struct Collected {
     pub events: Vec<String>,

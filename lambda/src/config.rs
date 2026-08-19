@@ -1,37 +1,13 @@
-//! Environment-driven configuration, read once at startup.
-
 use std::path::PathBuf;
 
 pub struct Config {
-    /// Platforms built per entity, in order. First one pays for the texture
-    /// encodes; the rest hit the cache. `PLATFORMS`, default `windows,mac`.
     pub platforms: Vec<String>,
-    /// Asset-bundle version tag baked into manifests and S3 key prefixes.
-    /// `AB_VERSION`, default `v49`.
     pub version: String,
-    /// abgen's content/download cache. On Lambda point this at `/tmp` storage
-    /// so warm containers reuse downloads. `ABGEN_CACHE_DIR`.
     pub cache_dir: String,
-    /// Content server used when the event does not carry one.
-    /// `CONTENT_SERVER_URL`, default the foundation catalyst.
     pub default_content_server: String,
-    /// Where conversion output lands locally before upload (and where it stays
-    /// in `--once` runs for inspection). `OUT_ROOT`.
     pub out_root: PathBuf,
-    /// Keep the local corpus after publishing (`KEEP_OUTPUT=1`; always on for
-    /// `--once` runs so the output can be inspected).
-    ///
-    /// S3 itself is configured through abgen's space env: `ABGEN_S3_ENDPOINT`
-    /// (required to enable), `ABGEN_S3_BUCKET`, `ABGEN_S3_REGION`,
-    /// `ABGEN_S3_PATH_STYLE`, `ABGEN_S3_READ_ONLY`; credentials from the
-    /// standard AWS env / container role.
     pub keep_output: bool,
-    /// asset-bundle-registry queue. `REGISTRY_QUEUE_URL`. TODO(step 4).
     pub registry_queue_url: Option<String>,
-    /// SSRF guard (`ALLOWED_CONTENT_SERVER_HOSTS`, comma-separated): when
-    /// set, a job's content server must be https with an exactly-matching
-    /// host, or the job is rejected. Unset (local runs) = unrestricted;
-    /// deployments should always set it (the Pulumi stack does).
     pub allowed_content_server_hosts: Option<Vec<String>>,
 }
 

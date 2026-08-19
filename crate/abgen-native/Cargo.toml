@@ -1,53 +1,35 @@
 [package]
 name = "abgen-native"
-version = "0.16.2"
+version.workspace = true
 edition = "2021"
 description = "C-ABI shared library export of abgen's conversion pipeline — embeddable in Unity and any native host."
 license = "Apache-2.0"
 publish = false
 
 [lib]
-# Ships as `libabgen.so` / `libabgen.dylib` / `abgen.dll`: the export is abgen,
-# not a subcomponent of it. Its own package rather than another crate-type on
-# `abgen` so the FFI boundary can deny panic sites outright (src/lib.rs), which
-# the encoder itself cannot — `abgen` unwraps and index-slices by design.
 name = "abgen"
-# cdylib for DllImport/dlopen consumers; staticlib so a native host can link
-# the pipeline in rather than ship a second file.
 crate-type = ["cdylib", "staticlib"]
-# Two lib targets named `abgen` are a hard rustdoc error, and the contract
-# external consumers read is include/abgen.h.
 doc = false
 
-# The isolated counterpart to the cdylib, shipped alongside it so a host can
-# pick per-call which boundary it wants.
 [[bin]]
 name = "abgen-host"
 path = "src/bin/abgen-host.rs"
 
 [dependencies]
-# Renamed on import: the dependency and this crate's own lib target are both
-# called `abgen`, so the extern name has to differ from the crate name.
-abgen_core = { path = "..", package = "abgen" }
+abgen_core = { path = "..", package = "abgen", default-features = false }
 rayon = "1"
 serde_json = "1"
 
 [dev-dependencies]
-# Integration tests see the package's dev-deps, not the lib's dependencies —
-# and this lib is cdylib/staticlib, which a test cannot link against anyway.
-abgen_core = { path = "..", package = "abgen" }
+abgen_core = { path = "..", package = "abgen", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
-# setrlimit(RLIMIT_AS) in abgen-host: what makes the boundary a bound.
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# Job objects: the Windows counterpart of the RLIMIT_AS cap above.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
-    # CreateJobObjectW takes a SECURITY_ATTRIBUTES; without this the binding
-    # is not emitted and the import fails to resolve.
     "Win32_Security",
 ] }

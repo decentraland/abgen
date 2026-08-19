@@ -4,12 +4,17 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     crane.url = "github:ipetkov/crane/v0.23.4";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, crane }:
+  outputs = { self, nixpkgs, crane, rust-overlay }:
     let
       lib = nixpkgs.lib;
-      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      # No x86_64-darwin: the pinned nixpkgs throws on import for it.
+      systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
 
       sourceDateEpoch = "315532800";
 
@@ -20,10 +25,9 @@
           ./rust-toolchain.toml
           ./crate
           ./template
+          ./lambda/Cargo.toml
+          ./lambda/src
         ])
-        # buildId is embedded in every binary. Neither npm scaffolding nor prose
-        # can change compiled output, so including them would move all six
-        # targets' artifact hashes on a packaging or typo edit.
         (lib.fileset.unions [
           ./crate/abgen-node/npm
           (lib.fileset.fileFilter (file: file.hasExt "md") ./crate)
@@ -34,12 +38,15 @@
         fileset = buildFileset;
       };
 
+      # nix/checks.nix stays out of this list: check edits must not move
+      # buildId.
       buildId = builtins.substring 0 12 (builtins.hashString "sha256"
         (builtins.concatStringsSep "\n" [
           (baseNameOf (builtins.unsafeDiscardStringContext buildSource.outPath))
           (builtins.hashFile "sha256" ./rust-toolchain.toml)
           (builtins.hashFile "sha256" ./flake.lock)
           (builtins.hashFile "sha256" ./flake.nix)
+          (builtins.hashFile "sha256" ./nix/build.nix)
         ]));
 
       buildEnv = {
@@ -49,6 +56,8 @@
 
       rustChannel = (builtins.fromTOML
         (builtins.readFile ./rust-toolchain.toml)).toolchain.channel;
+
+      repoVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
       perSystem = lib.genAttrs systems (system:
         let
@@ -75,23 +84,27 @@
           ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ gcc ];
           sharedLibExt = pkgs.stdenv.hostPlatform.extensions.sharedLibrary;
 
-          crateVersion = (builtins.fromTOML (builtins.readFile ./crate/Cargo.toml)).package.version;
-
-          commonArgs = {
-            pname = "abgen";
-            version = crateVersion;
-            src = buildSource;
-            nativeBuildInputs = with pkgs; [ cmake pkg-config git ];
-            doCheck = false;
-            env.SOURCE_DATE_EPOCH = sourceDateEpoch;
+          build = import ./nix/build.nix {
+            inherit pkgs craneLib buildSource buildEnv sourceDateEpoch repoVersion;
           };
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+          inherit (build) abgenPkg abgenConsumersPkg;
 
-          abgenPkg = craneLib.buildPackage (commonArgs // {
-            inherit cargoArtifacts;
-            env = buildEnv;
-            cargoExtraArgs = "--locked --bin abgen";
-          });
+          wasmCheck = import ./nix/wasm.nix {
+            inherit pkgs crane rust-overlay buildSource repoVersion;
+          };
+
+          abgenNativePkg = pkgs.runCommand "abgen-native-${repoVersion}" { } ''
+            mkdir -p $out/bin $out/lib
+            cp ${abgenPkg}/bin/abgen $out/bin/
+            cp ${abgenConsumersPkg}/bin/abgen-host $out/bin/
+            cp ${abgenConsumersPkg}/lib/* $out/lib/
+          '';
+
+          runtimeData = pkgs.runCommand "abgen-runtime" { } ''
+            mkdir -p $out/opt/abgen
+            cp -r ${buildSource}/template $out/opt/abgen/template
+            cp -r ${buildSource}/crate/shader $out/opt/abgen/shader
+          '';
         in
         assert _toolchainMatches;
         {
@@ -110,35 +123,13 @@
 
           packages.buildId = buildId;
 
-          packages.abgen-native = craneLib.buildPackage (commonArgs // {
-            inherit cargoArtifacts;
-            pname = "abgen-native";
-            env = buildEnv;
-            buildPhaseCargoCommand = ''
-              cargoBuildLog=$(mktemp cargoBuildLogXXXX.json)
-              cargoWithProfile build --message-format json-render-diagnostics --locked --bin abgen >>"$cargoBuildLog"
-              cargoWithProfile build --message-format json-render-diagnostics --locked --package abgen-native >>"$cargoBuildLog"
-            '';
-          });
+          packages.abgen-native = abgenNativePkg;
 
-          packages.abgen-corpus = craneLib.buildPackage (commonArgs // {
-            inherit cargoArtifacts;
-            pname = "abgen-corpus";
-            env = buildEnv;
-            cargoExtraArgs = "--locked --bin abgen-corpus";
-          });
+          packages.abgen-corpus = build.abgenCorpusPkg;
 
-          packages.dockerImage =
-            let
-              runtimeData = pkgs.runCommand "abgen-runtime" { } ''
-                mkdir -p $out/opt/abgen
-                cp -r ${buildSource}/template $out/opt/abgen/template
-                cp -r ${buildSource}/crate/shader $out/opt/abgen/shader
-              '';
-            in
-            pkgs.dockerTools.buildLayeredImage {
+          packages.dockerImage = pkgs.dockerTools.buildLayeredImage {
             name = "abgen";
-            tag = "0.1.0";
+            tag = repoVersion;
             contents = [ abgenPkg pkgs.tini pkgs.cacert pkgs.libjpeg_turbo runtimeData ];
             fakeRootCommands = ''
               mkdir -p data/out data/cache
@@ -151,7 +142,7 @@
                 "ABGEN_SHADER_BUNDLE=/opt/abgen/shader/scene_ignore_windows"
                 "ABGEN_OUT_ROOT=/data/out"
                 "ABGEN_CACHE_DIR=/data/cache"
-                "HTTP_SERVER_HOST=0.0.0.0"
+                "ABGEN_HTTP_HOST=0.0.0.0"
                 "ABGEN_LOG_FORMAT=json"
                 "TURBOJPEG_LIB=${pkgs.libjpeg_turbo.out}/lib/libturbojpeg${sharedLibExt}"
                 "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
@@ -162,46 +153,37 @@
             };
           };
 
-          packages.abgen-compare =
-            let
-              pyEnv = pkgs.python3.withPackages (ps: with ps; [ numpy pillow ]);
-            in
-            pkgs.rustPlatform.buildRustPackage {
-              pname = "abgen-compare";
-              version = crateVersion;
-              env = buildEnv;
-              src = self;
-              cargoLock = {
-                lockFile = ./Cargo.lock;
-              };
-              nativeBuildInputs = with pkgs; [ cmake pkg-config git makeWrapper ];
-              cargoBuildFlags = [ "--bins" "--examples" ];
-
-              doCheck = false;
-              postInstall = ''
-                lib=$out/lib/abgen
-                mkdir -p $lib/result/bin $lib/crate
-                exdir=$(find target -type d -path '*/release/examples' | head -1)
-                for t in objdump texdump matdump texcmp texpng; do
-                  if [ -f "$exdir/$t" ]; then
-                    install -m755 "$exdir/$t" "$lib/result/bin/$t"
-                  else
-                    echo "missing example tool: $t" >&2; exit 1
-                  fi
-                done
-                ln -s $out/bin/abgen $lib/result/bin/abgen
-                cp -r pipeline site template $lib/
-                cp -r crate/shader $lib/crate/
-                find $lib -type d -name __pycache__ -prune -exec rm -rf {} +
-                makeWrapper ${pyEnv}/bin/python3 $out/bin/abgen-compare \
-                  --add-flags "$lib/pipeline/abgen-compare" \
-                  --set-default TURBOJPEG_LIB ${pkgs.libjpeg_turbo.out}/lib/libturbojpeg${sharedLibExt}
-              '';
+          packages.lambdaImage = pkgs.dockerTools.buildLayeredImage {
+            name = "abgen-lambda";
+            tag = repoVersion;
+            contents = [ abgenConsumersPkg pkgs.cacert pkgs.libjpeg_turbo runtimeData ];
+            config = {
+              Entrypoint = [ "${abgenConsumersPkg}/bin/abgen-lambda" ];
+              Env = [
+                "ABGEN_ROOT=/opt/abgen"
+                "ABGEN_CACHE_DIR=/tmp/abgen-cache"
+                "OUT_ROOT=/tmp/abgen-out"
+                # The binary is fail-open when this is unset; the image is
+                # where the guard is armed. A Lambda function env var with
+                # the same name overrides this list.
+                "ALLOWED_CONTENT_SERVER_HOSTS=peer.decentraland.org"
+                "TURBOJPEG_LIB=${pkgs.libjpeg_turbo.out}/lib/libturbojpeg${sharedLibExt}"
+                "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+              ];
+              User = "10001:10001";
             };
+          };
+
+          checks = import ./nix/checks.nix {
+            inherit lib system pkgs craneLib wasmCheck;
+            inherit (build) commonArgs cargoArtifacts abgenConsumersPkg;
+          };
+
         });
     in
     {
       packages = nixpkgs.lib.mapAttrs (_: v: v.packages) perSystem;
       devShells = nixpkgs.lib.mapAttrs (_: v: v.devShells) perSystem;
+      checks = nixpkgs.lib.mapAttrs (_: v: v.checks) perSystem;
     };
 }

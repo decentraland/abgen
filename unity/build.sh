@@ -54,9 +54,6 @@ Linux)  if command -v ldd >/dev/null; then
         fi ;;
 esac
 
-# Windows resolves a DLL's imports through the standard search order, never the
-# directory the DLL sits in, so a MinGW runtime import cannot be satisfied by
-# shipping the runtime beside the plugin. It has to not be an import at all.
 if [[ "$target" == *-pc-windows-gnu ]] && command -v x86_64-w64-mingw32-objdump >/dev/null; then
     if x86_64-w64-mingw32-objdump -p "$dest/$built" \
         | sed -n 's/^\tDLL Name: //p' \

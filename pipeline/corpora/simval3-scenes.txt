@@ -1,4 +1,0 @@
-# simval-2026-07 scene subset (Tier B + M0a determinism)
-bafkreieb6izdbhadi6vyjniq3hhpb363i44rf676wpjygyjrlhzsfp7eoa
-bafkreiegrofix7hdlrdpo44oyy5qmtcoqxle3n6imyy4urbl2d2khb3c6m
-bafkreieh2rht3iyw74sik67dsvnslbnybytg46cipiriov77jpxyxd7txq

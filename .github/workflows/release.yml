@@ -3,8 +3,13 @@ name: release
 on:
   push:
     tags: ["v*"]
+    branches: [main]
   workflow_dispatch:
     inputs:
+      dry_run:
+        description: "Build and verify everything, publish nothing"
+        type: boolean
+        default: true
       record_hashes:
         description: "Record artifact hashes instead of verifying them"
         type: boolean
@@ -21,6 +26,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
@@ -33,12 +42,22 @@ jobs:
   build-id:
     name: build id
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
     outputs:
       value: ${{ steps.eval.outputs.value }}
       matrix: ${{ steps.matrix.outputs.value }}
+      has_build: ${{ steps.matrix.outputs.has_build }}
+      promote: ${{ steps.matrix.outputs.promote }}
+      has_promote: ${{ steps.matrix.outputs.has_promote }}
+      napi_promote: ${{ steps.matrix.outputs.napi_promote }}
+      napi_ids: ${{ steps.matrix.outputs.napi_ids }}
+      image_docker: ${{ steps.matrix.outputs.image_docker }}
+      image_lambda: ${{ steps.matrix.outputs.image_lambda }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
       - name: evaluate .#buildId
         id: eval
         run: |
@@ -59,14 +78,13 @@ jobs:
           echo "ABGEN_BUILD_ID=$value"
           echo "value=$value" >> "$GITHUB_OUTPUT"
 
-      # The full matrix is what a tag builds, always. `targets` only narrows a
-      # manual dispatch, so iterating on one lane costs one lane instead of six
-      # — it cannot narrow a tag, because a tag has no inputs.
-      - name: select targets
+      - name: select targets and locate promotable artifacts
         id: matrix
         env:
+          GH_TOKEN: ${{ github.token }}
           WANT: ${{ inputs.targets }}
           RECORDING: ${{ inputs.record_hashes }}
+          BUILD_ID: ${{ steps.eval.outputs.value }}
         run: |
           set -eu
           # buildId is global: any source change moves every target's artifacts.
@@ -83,24 +101,85 @@ jobs:
             {"target":"x86_64-pc-windows-gnu","runner":"ubuntu-24.04","builder":"rustup","bin":"abgen.exe"},
             {"target":"aarch64-pc-windows-gnullvm","runner":"ubuntu-24.04","builder":"rustup","bin":"abgen.exe"},
             {"target":"aarch64-apple-darwin","runner":"macos-15","builder":"rustup","bin":"abgen"},
-            {"target":"x86_64-apple-darwin","runner":"macos-15-intel","builder":"rustup","bin":"abgen"}
+            {"target":"x86_64-apple-darwin","runner":"macos-15","builder":"rustup","bin":"abgen"}
           ]'
           if [ -z "${WANT:-}" ]; then
-            out=$(echo "$all" | jq -c '{include: .}')
+            sel=$(echo "$all" | jq -c .)
           else
-            out=$(echo "$all" | jq -c --arg w "$WANT" \
+            sel=$(echo "$all" | jq -c --arg w "$WANT" \
               '($w | split(",") | map(gsub("^\\s+|\\s+$";""))) as $want
                | map(select(.target as $t | $want | index($t))) as $sel
                | if ($sel | length) == 0
                  then error("no target matched: \($w)")
-                 else {include: $sel} end')
+                 else $sel end')
           fi
-          echo "$out" | jq .
-          echo "value=$out" >> "$GITHUB_OUTPUT"
+
+          # Input-addressed lookup: buildId is a content hash of everything
+          # that reaches the compiler, so an unexpired artifact named
+          # <kind>-<buildId>-<target> from a finished main run holds
+          # byte-identical outputs for THIS tree. Promotion re-proves that
+          # against the committed hash manifests before shipping a byte.
+          # The current ref is also accepted so rehearsals on a branch can
+          # promote their own previous build. Only this repo's own runs
+          # count: a fork-PR run executes the fork's workflow files, can
+          # upload arbitrary bytes under a precomputable name, and reports
+          # the fork's branch name (often "main") as head_branch — but its
+          # head_repository_id differs. Recording always builds.
+          lookup() {
+            [ "${RECORDING:-false}" = "true" ] && { echo ""; return; }
+            gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$1&per_page=10" \
+              --jq '[.artifacts[]
+                     | select(.expired == false)
+                     | select(.workflow_run.head_repository_id == .workflow_run.repository_id)
+                     | select(.workflow_run.head_branch == "main"
+                              or .workflow_run.head_branch == env.GITHUB_REF_NAME)
+                     | select((.workflow_run.id | tostring) != env.GITHUB_RUN_ID)]
+                    | sort_by(.created_at) | reverse
+                    | if length == 0 then "" else (.[0].id | tostring) end' \
+              || echo ""
+          }
+
+          build_inc='[]'
+          promote='[]'
+          while read -r entry; do
+            t=$(echo "$entry" | jq -r .target)
+            id=$(lookup "archives-$BUILD_ID-$t")
+            if [ -n "$id" ]; then
+              promote=$(echo "$promote" | jq -c --argjson e "$entry" --arg id "$id" \
+                '. + [$e + {artifact_id: $id}]')
+            else
+              build_inc=$(echo "$build_inc" | jq -c --argjson e "$entry" '. + [$e]')
+            fi
+          done < <(echo "$sel" | jq -c '.[]')
+
+          napi_ids='[]'
+          napi_promote=true
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+                   aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc; do
+            id=$(lookup "napi-$BUILD_ID-$t")
+            if [ -z "$id" ]; then napi_promote=false; break; fi
+            napi_ids=$(echo "$napi_ids" | jq -c --arg id "$id" '. + [$id]')
+          done
+          [ "$napi_promote" = "true" ] || napi_ids='[]'
+
+          image_docker=$(lookup "image-$BUILD_ID-dockerImage")
+          image_lambda=$(lookup "image-$BUILD_ID-lambdaImage")
+
+          {
+            echo "value=$(jq -cn --argjson b "$build_inc" '{include: $b}')"
+            echo "has_build=$(echo "$build_inc" | jq 'length > 0')"
+            echo "promote=$promote"
+            echo "has_promote=$(echo "$promote" | jq 'length > 0')"
+            echo "napi_promote=$napi_promote"
+            echo "napi_ids=$napi_ids"
+            echo "image_docker=$image_docker"
+            echo "image_lambda=$image_lambda"
+          } | tee -a "$GITHUB_OUTPUT"
 
   build:
     name: ${{ matrix.target }}
     needs: build-id
+    if: needs.build-id.outputs.has_build == 'true'
     runs-on: ${{ matrix.runner }}
     env:
       ABGEN_BUILD_ID: ${{ needs.build-id.outputs.value }}
@@ -109,9 +188,6 @@ jobs:
       matrix: ${{ fromJSON(needs.build-id.outputs.matrix) }}
 
     steps:
-      - if: matrix.builder == 'nix'
-        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-
       - name: setup (checkout + toolchains)
         run: |
           git init -q .
@@ -265,13 +341,10 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - if: matrix.builder == 'nix'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: /tmp/nix-deps-cache
-          key: nix-deps-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crate/Cargo.toml', 'flake.lock', 'flake.nix', 'rust-toolchain.toml') }}
+        uses: ./.github/actions/nix-store-cache
 
       - if: matrix.builder == 'rustup'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
             ~/.cargo/registry
@@ -285,16 +358,24 @@ jobs:
           if [ "${{ matrix.builder }}" = "nix" ]; then
             flags=(--extra-experimental-features nix-command
                    --extra-experimental-features flakes)
-            if [ -d /tmp/nix-deps-cache ]; then
-              nix copy "${flags[@]}" --from file:///tmp/nix-deps-cache --all --no-check-sigs || true
-            fi
             # All four artifacts build in one sandboxed derivation — splitting
             # them across `nix build` and `nix develop --command cargo build`
             # breaks hermeticity, since SOURCE_DATE_EPOCH only applies inside
             # the sandbox.
-            nix build .#abgen-native --print-build-logs "${flags[@]}"
-            deps=$(nix build .#abgen-native.cargoArtifacts --print-out-paths --no-link "${flags[@]}")
-            nix copy "${flags[@]}" --to file:///tmp/nix-deps-cache "$deps"
+            # Quiet unless it fails; the retry rebuilds only the failed
+            # derivation with its full log.
+            nix build .#abgen-native "${flags[@]}" \
+              || nix build .#abgen-native --print-build-logs "${flags[@]}"
+
+            if ! [[ "$GITHUB_REF" =~ ^refs/tags/ ]]; then
+              case "${{ matrix.target }}" in
+                x86_64-unknown-linux-gnu) image=dockerImage ;;
+                aarch64-unknown-linux-gnu) image=lambdaImage ;;
+              esac
+              nix build ".#$image" --out-link image-result "${flags[@]}" \
+                || nix build ".#$image" --out-link image-result --print-build-logs "${flags[@]}"
+              cp -L image-result "$image.tar.gz"
+            fi
 
             # crane's installFromCargoBuildLog puts executables in bin/ and
             # cdylib/staticlib in lib/. Stage them where every later step
@@ -311,12 +392,6 @@ jobs:
             cargo build --release --locked --target ${{ matrix.target }} -p abgen-native
           fi
 
-      # An embedder cannot satisfy a MinGW runtime import by shipping the DLLs
-      # beside the library: Windows resolves a DLL's own imports through the
-      # standard search order, never the directory it sits in. So this is a
-      # gate, not a report. It also catches a new C++ dependency quietly
-      # reintroducing the import — three build scripts already emit -lstdc++,
-      # and a fourth would otherwise go unnoticed.
       - name: windows self-containment
         if: matrix.target == 'x86_64-pc-windows-gnu'
         run: |
@@ -338,6 +413,7 @@ jobs:
       - name: verify artifact hashes
         env:
           ABGEN_RECORD_HASHES: ${{ inputs.record_hashes && '1' || '0' }}
+          ABGEN_HASH_SOFT: ${{ (startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main') && '0' || '1' }}
         run: |
           set -eu
           # One artifact list for all six legs; nothing here is lane-specific.
@@ -351,22 +427,24 @@ jobs:
 
       - name: upload recorded hashes
         if: ${{ inputs.record_hashes }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: hashes-${{ matrix.target }}
           path: ci/artifact-hashes/${{ matrix.target }}.sha256
           if-no-files-found: error
 
-      - name: package, smoke test, publish
+      - name: package and smoke test
         env:
           GH_TOKEN: ${{ github.token }}
           ABGEN_RELEASE: ${{ github.ref_name }}
         run: |
-          # mkdir is explicit: GITHUB_REF_NAME can be a branch name on
-          # workflow_dispatch (e.g. feat/embeddable-exports), so $dist may
-          # contain a slash and nest two levels deep. Tags never have one, so
-          # only manual runs hit this.
-          dist="abgen-${GITHUB_REF_NAME:-dev}-${{ matrix.target }}"
+          # Slashes in branch names are flattened: a nested archive path would
+          # dodge the root-level upload glob below, and the input-addressed
+          # artifact store would silently hold nothing (exactly what happened
+          # to every branch dispatch under the old `mkdir -p` approach). Tags
+          # never contain a slash, so their names are unchanged.
+          refsafe="${GITHUB_REF_NAME:-dev}"; refsafe="${refsafe//\//-}"
+          dist="abgen-${refsafe}-${{ matrix.target }}"
           mkdir -p "$dist"
           # No template/ or shader/ in the archive: those assets are compiled
           # into the binary. ABGEN_ROOT is a hard error when unreadable, so
@@ -414,7 +492,23 @@ jobs:
           shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
           bash ci/verify-reproducible.sh "$dist" "$dist.tar.gz" "$SOURCE_DATE_EPOCH"
 
-          if ! echo "${{ matrix.target }}" | grep -q windows; then
+          # Cross-compiled legs (windows from linux, x86_64-apple-darwin from
+          # the arm64 macos-15 runner) cannot exec their own output; smoke
+          # only when the target matches the runner's arch. Rosetta would make
+          # the x86_64 darwin binary "work" here, but only incidentally.
+          case "${{ matrix.target }}" in
+            x86_64-*)  want_arch=x86_64 ;;
+            aarch64-*) want_arch=arm64 ;;
+            *)         want_arch=none ;;
+          esac
+          run_arch="$(uname -m)"
+          [ "$run_arch" = aarch64 ] && run_arch=arm64
+          can_smoke=false
+          if [ "$run_arch" = "$want_arch" ] && ! echo "${{ matrix.target }}" | grep -q windows; then
+            can_smoke=true
+          fi
+
+          if [ "$can_smoke" = true ]; then
             rm -rf /tmp/smoke && mkdir /tmp/smoke
             tar -xzf "$dist.tar.gz" -C /tmp/smoke
             (
@@ -431,7 +525,7 @@ jobs:
             )
           fi
 
-          nat="abgen-native-${GITHUB_REF_NAME:-dev}-${{ matrix.target }}"
+          nat="abgen-native-${refsafe}-${{ matrix.target }}"
           mkdir -p "$nat/lib" "$nat/include"
           cp crate/abgen-native/include/abgen.h "$nat/include/"
           cp LICENSE "$nat/"
@@ -507,10 +601,10 @@ jobs:
           shasum -a 256 "$nat.tar.gz" > "$nat.tar.gz.sha256"
           bash ci/verify-reproducible.sh "$nat" "$nat.tar.gz" "$SOURCE_DATE_EPOCH"
 
-          # Every non-Windows leg builds on its own architecture, so the
-          # helper can just be run here; Windows legs cross-compile from
-          # Linux and are covered by the windows CI job instead.
-          if ! echo "${{ matrix.target }}" | grep -q windows; then
+          # Windows legs cross-compile from Linux and are covered by the
+          # windows CI job instead; cross-arch legs are skipped by the same
+          # can_smoke computed above.
+          if [ "$can_smoke" = true ]; then
             rm -rf /tmp/natsmoke && mkdir /tmp/natsmoke
             tar -xzf "$nat.tar.gz" -C /tmp/natsmoke
             got=$("/tmp/natsmoke/$nat/abgen-host" --version)
@@ -562,8 +656,13 @@ jobs:
             fi
           fi
 
-
-          case "$GITHUB_REF" in refs/tags/v*) ;; *) exit 0 ;; esac
+      - name: publish archives to draft release
+        if: startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dist="abgen-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          nat="abgen-native-${GITHUB_REF_NAME}-${{ matrix.target }}"
           # Created as a DRAFT and published only once every asset is in
           # place, because immutable releases freeze assets at publication:
           # after that only the title and notes can change. Published here,
@@ -577,23 +676,75 @@ jobs:
             "$dist.tar.gz" "$dist.tar.gz.sha256" \
             "$nat.tar.gz" "$nat.tar.gz.sha256"
 
-      # Uploads per-build archives so a branch is testable on a real machine
-      # before a tag is cut — otherwise the archives exist only on a tagged
-      # release.
-      - name: upload archives for testing
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - name: upload archives (input-addressed)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: archives-${{ matrix.target }}
+          name: archives-${{ needs.build-id.outputs.value }}-${{ matrix.target }}
           path: |
             abgen-*.tar.gz
             abgen-native-*.tar.gz
-          if-no-files-found: ignore
+          if-no-files-found: error
+
+      - name: upload Docker image (input-addressed)
+        if: matrix.target == 'x86_64-unknown-linux-gnu' && !startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: image-${{ needs.build-id.outputs.value }}-dockerImage
+          path: dockerImage.tar.gz
+          if-no-files-found: error
+
+      - name: upload Lambda image (input-addressed)
+        if: matrix.target == 'aarch64-unknown-linux-gnu' && !startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: image-${{ needs.build-id.outputs.value }}-lambdaImage
+          path: lambdaImage.tar.gz
+          if-no-files-found: error
+
+  promote:
+    name: promote prebuilt targets
+    needs: build-id
+    if: needs.build-id.outputs.has_promote == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    env:
+      ABGEN_BUILD_ID: ${{ needs.build-id.outputs.value }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - name: fetch, verify and repack
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROMOTE: ${{ needs.build-id.outputs.promote }}
+        run: |
+          set -eu
+          mkdir -p out
+          while read -r entry; do
+            t=$(echo "$entry" | jq -r .target)
+            id=$(echo "$entry" | jq -r .artifact_id)
+            echo "::group::promote $t (artifact $id)"
+            gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "a-$t.zip"
+            bash ci/promote-target.sh "$t" "a-$t.zip" out
+            echo "::endgroup::"
+          done < <(echo "$PROMOTE" | jq -c '.[]')
+          ls -l out
+
+      - name: publish archives to draft release
+        if: startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft \
+                 --title "$GITHUB_REF_NAME" --notes-file .github/release-notes.md \
+            || gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber out/*
 
   napi:
     name: abgen-node ${{ matrix.target }}
     needs: build-id
-    if: ${{ !inputs.skip_napi }}
+    if: ${{ !inputs.skip_napi && needs.build-id.outputs.napi_promote != 'true' }}
     runs-on: ${{ matrix.runner }}
     env:
       ABGEN_BUILD_ID: ${{ needs.build-id.outputs.value }}
@@ -604,15 +755,15 @@ jobs:
           - { target: x86_64-unknown-linux-gnu,  runner: ubuntu-24.04 }
           - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
           - { target: aarch64-apple-darwin,      runner: macos-15 }
-          - { target: x86_64-apple-darwin,       runner: macos-15-intel }
+          - { target: x86_64-apple-darwin,       runner: macos-15 }
           - { target: x86_64-pc-windows-msvc,    runner: windows-2025 }
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable @ 2026-07-08
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: ./.github/actions/rust-setup
         with:
-          toolchain: "1.97.1"
           targets: ${{ matrix.target }}
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+          cache: "false"
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: 24
       - name: install addon deps
@@ -629,31 +780,240 @@ jobs:
         if: endsWith(matrix.target, '-unknown-linux-gnu')
         working-directory: crate/abgen-node
         run: bash ../../ci/check-glibc-floor.sh 2.34 ./*.node
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: napi-${{ matrix.target }}
+          name: napi-${{ needs.build-id.outputs.value }}-${{ matrix.target }}
           path: crate/abgen-node/*.node
           if-no-files-found: error
 
+  image:
+    name: ghcr image
+    needs: build-id
+    # Tags always run (they push); otherwise only when no prebuilt artifact
+    # exists yet — a non-tag run with a prebuilt would skip every step and
+    # burn a runner fetching an artifact it discards.
+    if: startsWith(github.ref, 'refs/tags/') || needs.build-id.outputs.image_docker == ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      actions: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - if: needs.build-id.outputs.image_docker == ''
+        uses: ./.github/actions/nix-store-cache
+      - name: build image
+        if: needs.build-id.outputs.image_docker == ''
+        run: |
+          ref="${GITHUB_REF_NAME:-dev}"
+          # Quiet unless it fails; the retry rebuilds only the failed
+          # derivation with its full log.
+          nix build .#dockerImage || nix build .#dockerImage --print-build-logs
+          echo "store path : $(readlink -f result)"
+          echo "compressed : $(ls -lLh result | awk '{print $5}')"
+          cp -L result image.tar.gz
+          {
+            echo "REF=${ref}"
+            echo "IMG_SIZE=$(ls -lLh result | awk '{print $5}')"
+          } >> "$GITHUB_ENV"
+      - name: upload image artifact (input-addressed)
+        if: needs.build-id.outputs.image_docker == ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: image-${{ needs.build-id.outputs.value }}-dockerImage
+          path: image.tar.gz
+          if-no-files-found: error
+      - name: fetch prebuilt image
+        if: needs.build-id.outputs.image_docker != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.build-id.outputs.image_docker }}
+        run: |
+          gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > i.zip
+          unzip -q i.zip
+          # The nix legs upload the tarball as <package>.tar.gz; normalize.
+          [ -f dockerImage.tar.gz ] && mv dockerImage.tar.gz image.tar.gz
+          test -f image.tar.gz || { echo "no image tarball in artifact $ARTIFACT_ID" >&2; ls -l >&2; exit 1; }
+          {
+            echo "REF=${GITHUB_REF_NAME:-dev}"
+            echo "IMG_SIZE=$(ls -lh image.tar.gz | awk '{print $5}')"
+          } >> "$GITHUB_ENV"
+      - if: needs.build-id.outputs.image_docker != '' && startsWith(github.ref, 'refs/tags/')
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
+      - name: push to ghcr
+        if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
+        run: |
+          repo="${GITHUB_REPOSITORY,,}"
+          conf="$(mktemp)"
+          echo 'unqualified-search-registries = []' > "$conf"
+          for tag in "${REF}" latest; do
+            # --inputs-from .: skopeo comes from the flake's locked nixpkgs,
+            # not whatever the flake registry resolves to today.
+            nix run --inputs-from . nixpkgs#skopeo -- --registries-conf "$conf" --insecure-policy copy \
+              --dest-creds "${{ github.actor }}:${{ github.token }}" \
+              "docker-archive:$PWD/image.tar.gz" \
+              "docker://ghcr.io/${repo}:${tag}"
+          done
+          {
+            echo "### abgen container image"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| image | \`ghcr.io/${repo}:${REF}\` (and \`:latest\`) |"
+            echo "| size | ${IMG_SIZE} compressed, no base OS |"
+            echo "| build | \`nix build .#dockerImage\` — deterministic, pinned \`flake.lock\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  lambda-image:
+    name: ECR lambda image
+    needs: build-id
+    # Same gate as the ghcr image: tags push, non-tag runs only build.
+    if: startsWith(github.ref, 'refs/tags/') || needs.build-id.outputs.image_lambda == ''
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - if: needs.build-id.outputs.image_lambda == ''
+        uses: ./.github/actions/nix-store-cache
+      - name: build image
+        if: needs.build-id.outputs.image_lambda == ''
+        run: |
+          ref="${GITHUB_REF_NAME:-dev}"
+          nix build .#lambdaImage || nix build .#lambdaImage --print-build-logs
+          echo "store path : $(readlink -f result)"
+          echo "compressed : $(ls -lLh result | awk '{print $5}')"
+          cp -L result image.tar.gz
+          {
+            echo "REF=${ref}"
+            echo "IMG_SIZE=$(ls -lLh result | awk '{print $5}')"
+          } >> "$GITHUB_ENV"
+      - name: upload image artifact (input-addressed)
+        if: needs.build-id.outputs.image_lambda == ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: image-${{ needs.build-id.outputs.value }}-lambdaImage
+          path: image.tar.gz
+          if-no-files-found: error
+      - name: fetch prebuilt image
+        if: needs.build-id.outputs.image_lambda != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.build-id.outputs.image_lambda }}
+        run: |
+          gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > i.zip
+          unzip -q i.zip
+          # The nix legs upload the tarball as <package>.tar.gz; normalize.
+          [ -f lambdaImage.tar.gz ] && mv lambdaImage.tar.gz image.tar.gz
+          test -f image.tar.gz || { echo "no image tarball in artifact $ARTIFACT_ID" >&2; ls -l >&2; exit 1; }
+          {
+            echo "REF=${GITHUB_REF_NAME:-dev}"
+            echo "IMG_SIZE=$(ls -lh image.tar.gz | awk '{print $5}')"
+          } >> "$GITHUB_ENV"
+      - if: needs.build-id.outputs.image_lambda != '' && startsWith(github.ref, 'refs/tags/')
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
+      - name: assume ECR push role (OIDC)
+        if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
+        run: |
+          role="${{ vars.ABGEN_LAMBDA_ECR_ROLE_ARN }}"
+          region="${{ vars.ABGEN_LAMBDA_AWS_REGION }}"
+          if [ -z "$role" ] || [ -z "$region" ]; then
+            echo "::error::ABGEN_LAMBDA_ECR_ROLE_ARN / ABGEN_LAMBDA_AWS_REGION repository variables are not set"
+            exit 1
+          fi
+          token="$(curl -sS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r .value)"
+          creds="$(aws sts assume-role-with-web-identity \
+            --role-arn "$role" \
+            --role-session-name "abgen-lambda-ci-${GITHUB_RUN_ID}" \
+            --web-identity-token "$token" \
+            --duration-seconds 3600 \
+            --query Credentials --output json)"
+          {
+            echo "AWS_ACCESS_KEY_ID=$(echo "$creds" | jq -r .AccessKeyId)"
+            echo "AWS_SECRET_ACCESS_KEY=$(echo "$creds" | jq -r .SecretAccessKey)"
+            echo "AWS_SESSION_TOKEN=$(echo "$creds" | jq -r .SessionToken)"
+            echo "AWS_REGION=${region}"
+          } >> "$GITHUB_ENV"
+      - name: push to ECR
+        if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
+        run: |
+          repo="${{ vars.ABGEN_LAMBDA_ECR_REPOSITORY }}"
+          registry="${repo%%/*}"
+          password="$(aws ecr get-login-password)"
+          conf="$(mktemp)"
+          echo 'unqualified-search-registries = []' > "$conf"
+          for tag in "${REF}" latest; do
+            nix run --inputs-from . nixpkgs#skopeo -- \
+              --registries-conf "$conf" --insecure-policy copy \
+              --dest-creds "AWS:${password}" \
+              "docker-archive:$PWD/image.tar.gz" \
+              "docker://${repo}:${tag}"
+          done
+          digest="$(nix run --inputs-from . nixpkgs#skopeo -- \
+            --registries-conf "$conf" --insecure-policy inspect \
+            --creds "AWS:${password}" --format '{{.Digest}}' \
+            "docker://${repo}:${REF}")"
+          {
+            echo "### abgen-lambda container image"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| image | \`${repo}:${REF}\` (and \`:latest\`) |"
+            echo "| digest | \`${digest}\` |"
+            echo "| size | ${IMG_SIZE} compressed, no base OS |"
+            echo "| arch | arm64 (Graviton Lambda) |"
+            echo "| build | \`nix build .#lambdaImage\` — deterministic, pinned \`flake.lock\` |"
+            echo "| roll out | update the Lambda function to \`${repo}:${REF}\` — see lambda/README.md |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   napi-publish:
     name: publish @dcl/abgen-node
-    needs: [napi, build]
+    needs: [build-id, napi]
     runs-on: ubuntu-24.04
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      !cancelled() &&
+      startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true &&
+      (needs.napi.result == 'success' ||
+       (needs.napi.result == 'skipped' && needs.build-id.outputs.napi_promote == 'true'))
     permissions:
       contents: write
       id-token: write
+      actions: read
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: 24
 
       - run: npm install -g npm@^11.5.1
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - if: needs.napi.result == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
+          pattern: napi-*
           path: crate/abgen-node/artifacts
+
+      - name: fetch promoted napi artifacts
+        if: needs.napi.result == 'skipped'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAPI_IDS: ${{ needs.build-id.outputs.napi_ids }}
+        working-directory: crate/abgen-node
+        run: |
+          set -eu
+          mkdir -p artifacts
+          i=0
+          while read -r id; do
+            gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "napi-$i.zip"
+            unzip -q "napi-$i.zip" -d "artifacts/promoted-$i"
+            i=$((i + 1))
+          done < <(echo "$NAPI_IDS" | jq -r '.[]')
+          test "$i" -eq 5
+          find artifacts -name '*.node' | sed 's/^/promoted: /'
+          test "$(find artifacts -name '*.node' | wc -l)" -eq 5
       - name: publish
         working-directory: crate/abgen-node
         env:
@@ -677,15 +1037,19 @@ jobs:
           npm publish --access public
 
   publish:
-    needs: build
+    needs: [build, promote]
     runs-on: ubuntu-24.04
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      !cancelled() &&
+      startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true &&
+      needs.build.result != 'failure' && needs.build.result != 'cancelled' &&
+      needs.promote.result != 'failure' && needs.promote.result != 'cancelled'
     permissions:
       contents: write
       id-token: write
       attestations: write
     steps:
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: 24
 
@@ -731,13 +1095,10 @@ jobs:
           bash npm/publish.sh "${GITHUB_REF_NAME#v}" dist
 
       - name: attest build provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
         with:
           subject-path: "dist/*.tar.gz,native/*.tar.gz"
 
-      # Last, and only once: this is the step that makes the release
-      # immutable. Everything that mutates assets — the per-target uploads,
-      # SHA256SUMS.txt, the delete-asset sweep — has to have finished.
       - name: publish the release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -1,11 +1,5 @@
 use super::*;
 
-/// Dev-mode content revalidation (`ABGEN_JIT_CONTENT_DIGEST`). Runs on
-/// manifest requests before local dispatch so content servers that key hashes
-/// by file path (the sdk-commands preview server) cannot keep serving stale
-/// conversions after a file edit. The heavy lifting lives in
-/// [`crate::live::Proxy::refresh_entity_content`]; this wrapper debounces per
-/// entity and clears the server-side caches when content actually changed.
 pub(super) async fn revalidate_if_stale(state: &AppState, path: &str) {
     if !state.jit_content_digest {
         return;

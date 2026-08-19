@@ -5,10 +5,11 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # The sanitizer job is the only thing this triggers, and it is far too slow
-    # to sit in front of a PR.
     - cron: "23 4 * * *"
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -22,90 +23,42 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  fmt:
-    name: rustfmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable @ 2026-07-08
-        with:
-          toolchain: "1.97.1"
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  # Runs the existing test suite under ASan to check the unsafe FFI/CUDA/SIMD
-  # code; only sees inputs the tests already exercise. miri is not an
-  # alternative: it can't execute the C/C++ deps (draco, libjpeg, crunch).
   sanitizers:
     name: address sanitizer
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    # Bounds a nightly job that could otherwise wedge on the CUDA or SIMD
-    # paths and burn the default six-hour timeout unattended.
     timeout-minutes: 90
     env:
-      # -D warnings from the top-level env would fail the build on lints the
-      # instrumentation itself provokes, and the sanitizer flags have to reach
-      # the C deps too or their allocations stay invisible.
+      RUSTUP_TOOLCHAIN: nightly
       RUSTFLAGS: -Zsanitizer=address
       CFLAGS: -fsanitize=address -fno-omit-frame-pointer
       CXXFLAGS: -fsanitize=address -fno-omit-frame-pointer
-      # detect_leaks stays off: rayon's pool and the CUDA runtime hold
-      # allocations for the process lifetime by design, and reporting those as
-      # leaks would bury a real finding.
       ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable @ 2026-07-08
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: ./.github/actions/rust-setup
         with:
-          # Sanitizers are nightly-only. This is the one place the pinned 1.97.0
-          # does not apply; nothing built here ships.
           toolchain: nightly
           components: rust-src
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      # --target is load-bearing: without it the build scripts are instrumented
-      # too and run under a sanitizer they were never linked against.
       - name: cargo test under ASan
         run: |
           ABGEN_ROOT="$GITHUB_WORKSPACE" cargo test --locked --workspace --lib \
             --target x86_64-unknown-linux-gnu -- --test-threads=1
 
-  check:
-    name: clippy + test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable @ 2026-07-08
-        with:
-          toolchain: "1.97.1"
-          components: clippy
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: forbid node spawns
-        run: |
-          ! grep -rn 'Command::new("npm\|Command::new("node' crate/src
-      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - run: ABGEN_ROOT="$GITHUB_WORKSPACE" cargo test --locked --workspace --lib -- --test-threads=1
-      - run: ABGEN_ROOT="$GITHUB_WORKSPACE" cargo test --locked -p abgen-native --tests
-      - name: C ABI smoke test
-        run: ABGEN_ROOT="$GITHUB_WORKSPACE" crate/abgen-native/tests/run-smoke.sh
-
-      - name: glibc floor
-        run: bash ci/check-glibc-floor.sh 2.34 target/release/libabgen.so target/release/libabgen.a
-
   windows:
-    name: windows lib tests
+    name: windows tests + smoke
     runs-on: windows-2025
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable @ 2026-07-08
-        with:
-          toolchain: "1.97.1"
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: ./.github/actions/rust-setup
+      - name: install cargo-nextest
+        shell: pwsh
+        run: curl.exe -LsSf https://get.nexte.st/0.9.143/windows-tar | tar -xzf - -C $env:USERPROFILE\.cargo\bin
       - name: lib tests
         shell: pwsh
         run: |
           $env:ABGEN_ROOT = $env:GITHUB_WORKSPACE
-          cargo test --locked --workspace --lib -- --test-threads=1
+          cargo nextest run --locked --workspace
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p abgen-native --tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -117,20 +70,13 @@ jobs:
           pwsh -NoProfile -ExecutionPolicy Bypass -File ci/abgen-smoke.ps1 -Tree $env:GITHUB_WORKSPACE
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-  excluded-hosts:
-    name: excluded hosts
+  node-addon:
+    name: node addon
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable @ 2026-07-08
-        with:
-          toolchain: "1.97.1"
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      # Built through napi, not cargo, so index.js/index.d.ts are regenerated
-      # and diffed against what's committed. Those files are also the
-      # package's entry point, so a #[napi] export added without
-      # regenerating them compiles into the binary but stays unreachable
-      # from JavaScript.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: ./.github/actions/rust-setup
       - name: abgen-node (build + smoke)
         working-directory: crate/abgen-node
         run: |
@@ -144,10 +90,26 @@ jobs:
           # crate/abgen-node now that the step runs there.
           bash ../../ci/check-glibc-floor.sh 2.34 \
             target/release/libabgen_node.so
-      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-      - name: abgen-wasm (wasm32)
+
+  nix-ci:
+    name: nix checks
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
+      - uses: ./.github/actions/nix-store-cache
+        with:
+          family: build
+      - name: build flake checks
         run: |
-          cd crate/abgen-wasm
-          nix develop "path:$PWD/toolchain" --command \
-            env RUSTFLAGS='-C target-feature=+simd128' \
-            cargo check --locked --release --target wasm32-unknown-unknown
+          case "$(uname -m)" in
+            x86_64)  system=x86_64-linux ;;
+            aarch64) system=aarch64-linux ;;
+            *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
+          esac
+          bash ci/nix-checks.sh "$system"
+

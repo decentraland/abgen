@@ -1,0 +1,158 @@
+name: lambda-e2e
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lambda-e2e
+  cancel-in-progress: true
+
+jobs:
+  lambda-e2e:
+    name: lambda image E2E
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: ./.github/actions/nix-store-cache
+
+      - name: build image
+        run: |
+          nix build .#lambdaImage || nix build .#lambdaImage --print-build-logs
+          echo "store path : $(readlink -f result)"
+          echo "compressed : $(ls -lLh result | awk '{print $5}')"
+
+      - name: load image
+        run: |
+          out="$(docker load -i "$(readlink -f result)")"
+          echo "$out"
+          image="$(echo "$out" | sed -n 's/^Loaded image: //p' | head -1)"
+          [ -n "$image" ] || { echo "::error::could not parse loaded image name"; exit 1; }
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          docker image inspect "$image" --format 'arch={{.Architecture}} entrypoint={{.Config.Entrypoint}}'
+
+      - name: prepare mock catalyst
+        run: |
+          set -euxo pipefail
+          mkdir -p mock
+          cp crate/abgen-wasm/test/fixtures/jpeg-quad.glb mock/h-glb
+          printf '%s' '{"main":"bin/game.js","scene":{"base":"0,0","parcels":["0,0"]}}' > mock/h-scenejson
+          printf '%s' '// noop' > mock/h-gamejs
+          python3 - <<'EOF'
+          import json
+          scene = json.load(open("mock/h-scenejson"))
+          entity = {
+              "id": "bafkreitestlambdae2e",
+              "type": "scene",
+              "content": [
+                  {"file": "scene.json", "hash": "h-scenejson"},
+                  {"file": "bin/game.js", "hash": "h-gamejs"},
+                  {"file": "models/quad.glb", "hash": "h-glb"},
+              ],
+              "metadata": scene,
+          }
+          json.dump(entity, open("mock/bafkreitestlambdae2e", "w"))
+          EOF
+          cat > serve.py <<'EOF'
+          import http.server, os, sys
+
+          ROOT = "mock"
+
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path.startswith("/contents/"):
+                      name = os.path.basename(self.path.split("/contents/", 1)[1].split("?")[0])
+                      p = os.path.join(ROOT, name)
+                      if os.path.isfile(p):
+                          data = open(p, "rb").read()
+                          self.send_response(200)
+                          self.send_header("Content-Length", str(len(data)))
+                          self.end_headers()
+                          self.wfile.write(data)
+                          return
+                  self.send_response(404)
+                  self.end_headers()
+
+              def do_POST(self):
+                  n = int(self.headers.get("Content-Length", "0") or "0")
+                  self.rfile.read(n)
+                  if self.path == "/entities/active":
+                      body = b"[]"
+                      self.send_response(200)
+                      self.send_header("Content-Type", "application/json")
+                      self.send_header("Content-Length", str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+                      return
+                  self.send_response(404)
+                  self.end_headers()
+
+              def log_message(self, fmt, *args):
+                  sys.stderr.write("mock: %s\n" % (fmt % args))
+
+          http.server.ThreadingHTTPServer(("127.0.0.1", 8123), H).serve_forever()
+          EOF
+          python3 serve.py > mock-server.log 2>&1 &
+          echo $! > mock.pid
+          for i in $(seq 1 50); do
+            curl -sf http://127.0.0.1:8123/contents/bafkreitestlambdae2e > /dev/null && break
+            sleep 0.2
+          done
+          curl -sf http://127.0.0.1:8123/contents/bafkreitestlambdae2e | jq .
+          curl -sf -o /dev/null -w 'h-glb: %{http_code} %{size_download} bytes\n' http://127.0.0.1:8123/contents/h-glb
+
+      - name: run conversion
+        run: |
+          set -euo pipefail
+          printf '%s' '{"entityId":"bafkreitestlambdae2e","contentServerUrl":"http://127.0.0.1:8123"}' > event.json
+          mkdir -p tmp
+          chmod 777 tmp
+          set +e
+          docker run --rm --network host \
+            -v "$PWD/tmp:/tmp" \
+            -v "$PWD/event.json:/event.json:ro" \
+            "$IMAGE" --once /event.json > summary.json
+          rc=$?
+          set -e
+          echo "container exit code: $rc"
+          echo "--- summary.json ---"
+          cat summary.json || true
+          echo "--- mock server log (tail) ---"
+          tail -20 mock-server.log || true
+          [ "$rc" -eq 0 ] || { echo "::error::container exited with $rc"; exit 1; }
+
+      - name: assert outputs
+        run: |
+          set -euo pipefail
+          eid=bafkreitestlambdae2e
+          echo "=== summary assertions ==="
+          jq -e '.jobs[0].exitCode == 0' summary.json > /dev/null \
+            || { echo "::error::summary exitCode != 0"; jq . summary.json; exit 1; }
+          jq -e '[.jobs[0].platforms[] | select(.exitCode != 0)] | length == 0' summary.json > /dev/null \
+            || { echo "::error::a platform reported non-zero exitCode"; jq . summary.json; exit 1; }
+          jq -e '[.jobs[0].platforms[] | select(.bundles < 1)] | length == 0' summary.json > /dev/null \
+            || { echo "::error::a platform reported zero bundles"; jq . summary.json; exit 1; }
+          jq '.jobs[0] | {entityId, exitCode, platforms, texEncodeCache, upload}' summary.json
+
+          echo "=== output tree ==="
+          sudo find "tmp/abgen-out/$eid" -type f -printf '%10s  %p\n' | sort -k2 \
+            || { echo "::error::no output tree at tmp/abgen-out/$eid"; sudo find tmp -maxdepth 3 || true; exit 1; }
+
+          for platform in windows mac; do
+            m="tmp/abgen-out/$eid/$platform.manifest.json"
+            sudo test -s "$m" || { echo "::error::missing/empty manifest $m"; exit 1; }
+            echo "=== $platform.manifest.json ==="
+            sudo jq '{version, exitCode, files: (.files | if type == "array" then length else . end)}' "$m" || sudo head -c 1000 "$m"
+            sudo jq -e '.exitCode == 0' "$m" > /dev/null || { echo "::error::$m exitCode != 0"; exit 1; }
+            nbundles=$(sudo find "tmp/abgen-out/$eid/$platform" -type f -size +0c | wc -l)
+            echo "$platform: $nbundles non-empty bundle file(s)"
+            [ "$nbundles" -ge 1 ] || { echo "::error::no non-empty bundles for $platform"; exit 1; }
+          done
+          echo "E2E PASSED"
+
+      - name: stop mock
+        if: always()
+        run: |
+          [ -f mock.pid ] && kill "$(cat mock.pid)" 2>/dev/null || true

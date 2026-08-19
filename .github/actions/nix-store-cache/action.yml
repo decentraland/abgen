@@ -1,0 +1,43 @@
+name: nix + store cache
+description: >
+  Install nix and restore/save the repo's nix store cache. Single source of
+  the key scheme: every workflow that touches a nix store goes through this
+  action, so the "these blocks must stay identical" coupling between
+  cache-warm and its consumers is structural instead of a comment.
+  runner.arch is part of the key so x86_64 and aarch64 stores never cross.
+
+inputs:
+  family:
+    description: >
+      Key family. "build" hashes everything crane's deps derivation depends
+      on ('**/Cargo.toml': every member manifest feeds dummy-src; a manifest
+      missing from the hash would produce a stale exact hit that never
+      re-saves). "wasm" is its own family holding only the wasm toolchain
+      closure — sharing a family would let the image caches' purge rotation
+      evict it (and vice versa).
+    default: build
+
+runs:
+  using: composite
+  steps:
+    - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
+      with:
+        extra-conf: |
+          max-jobs = auto
+          cores = 0
+
+    # The family token is unconditional (and versioned) so no family's
+    # restore/purge prefix is a string prefix of another family's keys:
+    # the old scheme let "build" restore and purge "wasm" caches.
+    - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569
+      with:
+        primary-key: nix-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.family }}-${{ inputs.family == 'wasm' && hashFiles('crate/abgen-wasm/toolchain/flake.lock', 'crate/abgen-wasm/toolchain/flake.nix') || hashFiles('flake.lock', 'Cargo.lock', '**/Cargo.toml', 'flake.nix', 'rust-toolchain.toml', 'nix/*.nix') }}
+        restore-prefixes-first-match: nix-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.family }}-
+        # 6 GiB budget: the shared deps closure plus toolchain plus check
+        # derivations have to fit under GitHub's 10 GB/repo cache quota
+        # across two arch families.
+        gc-max-store-size-linux: 6442450944
+        purge: true
+        purge-prefixes: nix-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.family }}-
+        purge-last-accessed: 604800
+        purge-primary-key: never

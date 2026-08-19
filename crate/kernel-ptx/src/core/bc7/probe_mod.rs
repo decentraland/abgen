@@ -591,11 +591,6 @@ pub mod probe {
         sol_list(&out[0])
     }
 
-    /// Multi-lane form of `estimate_partition_list`: the 2-subset checkerboard
-    /// early-out couples lanes (the scan past partition 34 stops only when ALL
-    /// lanes are done), so a group of blocks estimated together can produce
-    /// different lists than each block alone. Mirrors of the grouped plan
-    /// passes must use this, not the single-lane probe.
     pub fn estimate_partition_list_lanes(
         mode: usize,
         cp: &super::Params,

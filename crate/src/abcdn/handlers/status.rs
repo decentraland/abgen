@@ -4,9 +4,6 @@ pub async fn ping() -> &'static str {
     "ok"
 }
 
-/// Live corpus-build progress for one entity. Purely informational (clients
-/// poll it to render progress while a JIT conversion holds their manifest
-/// request); 404 whenever no build for that entity is in flight.
 pub async fn get_build_progress(
     State(state): State<AppState>,
     axum::extract::Path(entity): axum::extract::Path<String>,

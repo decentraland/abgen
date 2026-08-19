@@ -116,15 +116,35 @@ fn main() {
         std::fs::create_dir_all(&draco_build).unwrap();
     }
 
+    let aarch64_linux = target.starts_with("aarch64") && target.contains("linux");
+
+    let mut cfg_args: Vec<String> = vec![
+        draco_src.clone(),
+        "-DBUILD_SHARED_LIBS=OFF".into(),
+        "-DCMAKE_BUILD_TYPE=Release".into(),
+        "-DDRACO_TESTS=OFF".into(),
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".into(),
+        format!("-DCMAKE_INSTALL_PREFIX={draco_build}/install"),
+    ];
+    if aarch64_linux {
+        // ISA floor is Armv8.2+dotprod on purpose: aarch64-linux artifacts
+        // only run on Graviton (>= 2 == Neoverse-N1). See libjpeg9c/build.rs.
+        cfg_args.push("-DCMAKE_C_FLAGS=-mcpu=neoverse-n1".into());
+        cfg_args.push("-DCMAKE_CXX_FLAGS=-mcpu=neoverse-n1".into());
+    }
+    if target.contains("apple-darwin") {
+        // Cross-compiling mac-on-mac (x86_64 leg builds on the arm runner):
+        // cmake defaults to the HOST arch, and arm64 draco objects fail the
+        // x86_64 link with "symbol(s) not found for architecture x86_64".
+        let arch = if target.starts_with("aarch64") {
+            "arm64"
+        } else {
+            "x86_64"
+        };
+        cfg_args.push(format!("-DCMAKE_OSX_ARCHITECTURES={arch}"));
+    }
     let status = Command::new("cmake")
-        .args([
-            &draco_src,
-            "-DBUILD_SHARED_LIBS=OFF",
-            "-DCMAKE_BUILD_TYPE=Release",
-            "-DDRACO_TESTS=OFF",
-            "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
-            &format!("-DCMAKE_INSTALL_PREFIX={draco_build}/install"),
-        ])
+        .args(&cfg_args)
         .current_dir(&draco_build)
         .status()
         .expect("Failed to run CMake");
@@ -160,6 +180,9 @@ fn main() {
 
     if is_apple {
         build.flag("-mmacosx-version-min=15.5");
+    }
+    if aarch64_linux {
+        build.flag_if_supported("-mcpu=neoverse-n1");
     }
 
     build.compile("decoder_api");

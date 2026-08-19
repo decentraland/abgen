@@ -6,8 +6,8 @@
 /crate/abgen-node/target/
 .cargo-home/
 
-# wasm lab build artifact — crate/abgen-wasm/build.sh regenerates it
-/site/wasm/abgen_wasm.wasm
+# wasm build artifact — crate/abgen-wasm/build.sh regenerates it
+/crate/abgen-wasm/dist/
 
 # Generated C/C++ build artifacts (cmake out-of-source builds in the vendored
 # third_party crates). Must never be committed: the cmake cache bakes an
@@ -20,12 +20,7 @@ crate/third_party/**/build/
 *.a
 *.o
 
-# Per-checkout tool config (machine-local unity paths; see
-# pipeline/abgencompare/toolconfig.py)
-/abgen-compare.json
-
 # Runtime caches / output / env
-/lod-parity
 /abgen-serve-cache
 /data
 /runs
@@ -45,11 +40,9 @@ __pycache__/
 .DS_Store
 *.swp
 node_modules/
-npm/local/
 
 # wasm WebGPU module build artifacts — crate/abgen-wasm/build.sh regenerates
 /crate/wasm-gpu/target/
-/site/wasm/gpu/
 
 # Unity plugin binaries: built by unity/build.sh or pulled from a release.
 # The .meta files beside them are committed — the importer settings are source.

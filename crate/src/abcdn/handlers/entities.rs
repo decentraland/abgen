@@ -339,7 +339,6 @@ fn eager_build_index(state: &AppState, entities: &[ResolvedEntity]) {
     });
 }
 
-/// versions/bundles/status for one entity, ready to embed in a registry response.
 type AbRecordJson = (serde_json::Value, serde_json::Value, serde_json::Value);
 
 fn is_parcel_pointer(p: &str) -> bool {
@@ -373,14 +372,6 @@ fn upstream_registry_fetch(
         .ok_or_else(|| anyhow::anyhow!("{url}: response is not an array"))
 }
 
-/// Resolves the asset-bundle record for each entity: locally built bundles
-/// win; entities without local bundles are answered with the upstream
-/// registry's record (the versions the production CDN actually serves) when
-/// one is configured; only entities the upstream does not know — and every
-/// entity when no upstream registry is configured — fall back to this
-/// server's own version, the promise that a request will JIT-build them.
-/// Entities absent from the map get no record, mirroring how the production
-/// registry omits unconverted entities.
 async fn ab_records_for(
     state: &AppState,
     ents: &[ResolvedEntity],
@@ -392,7 +383,6 @@ async fn ab_records_for(
         .iter()
         .map(|e| (e.entity_id.clone(), entity_buildable(&e.content)))
         .collect();
-    // (local bundles present?, record with the JIT-promise fabrication)
     let local: HashMap<String, (bool, Option<AbRecordJson>)> =
         tokio::task::spawn_blocking(move || {
             probe
@@ -425,8 +415,6 @@ async fn ab_records_for(
     let registry = state.upstream_ab_registry.clone();
     let mut out: HashMap<String, AbRecordJson> = HashMap::new();
     let mut ask_upstream: Vec<&ResolvedEntity> = Vec::new();
-    // Entities the upstream registry authoritatively does not know keep no
-    // record at all; `true` here means "decided, possibly with no record".
     let mut decided: HashMap<String, bool> = HashMap::new();
 
     for e in ents {
@@ -441,7 +429,6 @@ async fn ab_records_for(
             decided.insert(e.entity_id.clone(), true);
             continue;
         }
-        // The local corpus (preview-server entities) can never exist upstream.
         if registry.is_none() || e.entity_id.starts_with("b64-") {
             if let Some(rec) = fab {
                 out.insert(e.entity_id.clone(), rec);
@@ -493,8 +480,6 @@ async fn ab_records_for(
                         })
                     });
                     if !asked && rec.is_none() {
-                        // none of its pointers were forwarded — not an
-                        // authoritative absence, keep today's behavior
                         continue;
                     }
                     state
@@ -513,7 +498,6 @@ async fn ab_records_for(
         }
     }
 
-    // Anything left undecided (upstream fetch failed) keeps today's behavior.
     for e in ents {
         if decided.contains_key(&e.entity_id) {
             continue;

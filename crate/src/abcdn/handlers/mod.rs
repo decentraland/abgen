@@ -4,9 +4,10 @@ use axum::response::{IntoResponse, Json, Response};
 
 use super::index;
 use super::lodjit;
-use super::resolver;
+use super::routes;
 use super::serve;
 use super::state::AppState;
+use crate::resolver;
 
 mod bvpk;
 mod dispatch;

@@ -1,17 +1,3 @@
-//! Process-wide memo cache for compressed-texture encode results.
-//!
-//! Texture encoding (BC7 in particular) dominates conversion CPU time and is
-//! fully platform-independent: building the same entity for `windows` and
-//! `mac` encodes identical pixels into identical blocks twice. With this
-//! cache enabled, the second target reuses the first target's encodes, so a
-//! dual-target build costs roughly one target plus serialization.
-//!
-//! Disabled by default: a long-running server would grow without bound and
-//! single-target builds gain nothing. Opt in with `ABGEN_TEX_ENCODE_CACHE=1`
-//! or [`enable`]. Callers that loop over entities should [`clear`] between
-//! entities. Inserts stop once resident encoded bytes would exceed
-//! `ABGEN_TEX_ENCODE_CACHE_MAX_MB` (default 4096); lookups keep working.
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -73,6 +59,10 @@ fn store() -> &'static Mutex<Store> {
     })
 }
 
+fn lock() -> std::sync::MutexGuard<'static, Store> {
+    store().lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn key(kind: Kind, pixels: &[u8], width: u32, height: u32, params: &[i64]) -> [u8; 32] {
     let mut h = crate::hashes::Sha256::new();
     h.update(&[kind as u8]);
@@ -85,10 +75,6 @@ fn key(kind: Kind, pixels: &[u8], width: u32, height: u32, params: &[i64]) -> [u
     h.finalize()
 }
 
-/// Returns the cached encode for `(kind, pixels, dims, params)` or runs `f`
-/// and caches its result. `None` results are never cached. The lock is not
-/// held while `f` runs, so two threads racing on the same texture may both
-/// encode it; the winner's insert stands.
 pub fn get_or_encode(
     kind: Kind,
     pixels: &[u8],
@@ -102,7 +88,7 @@ pub fn get_or_encode(
     }
     let k = key(kind, pixels, width, height, params);
     {
-        let mut s = store().lock().unwrap();
+        let mut s = lock();
         if let Some((data, mips)) = s.map.get(&k) {
             let out = (data.clone(), *mips);
             s.hits += 1;
@@ -112,7 +98,7 @@ pub fn get_or_encode(
     }
     let result = f()?;
     let len = result.0.len();
-    let mut s = store().lock().unwrap();
+    let mut s = lock();
     if s.bytes + len <= max_bytes() {
         if let std::collections::hash_map::Entry::Vacant(e) = s.map.entry(k) {
             e.insert((result.0.clone(), result.1));
@@ -122,14 +108,13 @@ pub fn get_or_encode(
     Some(result)
 }
 
-/// `(hits, misses, resident bytes, entries)`
 pub fn stats() -> (u64, u64, usize, usize) {
-    let s = store().lock().unwrap();
+    let s = lock();
     (s.hits, s.misses, s.bytes, s.map.len())
 }
 
 pub fn clear() {
-    let mut s = store().lock().unwrap();
+    let mut s = lock();
     s.map.clear();
     s.bytes = 0;
 }
@@ -194,5 +179,19 @@ mod tests {
         assert_eq!(a, b);
         let (h1, _, _, _) = stats();
         assert!(h1 > h0);
+    }
+
+    #[test]
+    fn poisoned_lock_does_not_cascade() {
+        enable();
+        let _ = std::thread::spawn(|| {
+            let _g = lock();
+            panic!("poison the mutex on purpose");
+        })
+        .join();
+        let pixels = vec![0u8; 8 * 8 * 4];
+        let r = get_or_encode(Kind::Bc3, &pixels, 8, 8, &[99], || Some((vec![1, 2], 3))).unwrap();
+        assert_eq!(r, (vec![1, 2], 3), "cache must survive a poisoned lock");
+        let _ = stats();
     }
 }

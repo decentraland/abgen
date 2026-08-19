@@ -36,16 +36,23 @@ fn main() {
     let mut build = cc::Build::new();
     build
         .include(src)
-        .flag_if_supported("-O2")
+        .flag_if_supported("-O3")
         .flag_if_supported("-fno-strict-aliasing")
         .flag_if_supported("-Wno-main")
         .flag_if_supported("-Wno-unused-parameter")
         .flag_if_supported("-Wno-shift-negative-value")
         .warnings(false);
 
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64")
+        && std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+    {
+        // -mcpu (unlike -mtune) raises the ISA floor to Neoverse-N1's
+        // Armv8.2+dotprod. Deliberate: every aarch64-linux consumer of these
+        // artifacts is Graviton (>= 2 == N1). Pre-v8.2 boards will SIGILL.
+        build.flag_if_supported("-mcpu=neoverse-n1");
+    }
+
     if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
-        // wasi-libc's setjmp.h requires the Wasm-SjLj transform (wasm EH);
-        // scoped here so the other vendored C libraries compile unchanged.
         build
             .flag("-mexception-handling")
             .flag("-mllvm")

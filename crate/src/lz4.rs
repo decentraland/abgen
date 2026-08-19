@@ -336,9 +336,30 @@ fn hash_batch_8(buf: &[u8], pos0: usize, out: &mut [u32; 8]) {
         let hashed = _mm256_srli_epi32::<SHR>(prod);
         _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, hashed);
     }
-    #[cfg(not(all(
-        any(target_arch = "x86_64", target_arch = "x86"),
-        target_feature = "avx2"
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        debug_assert!(pos0 + 12 <= buf.len());
+        const SHR: i32 = (MINMATCH * 8) - LZ4HC_HASH_LOG as i32;
+        let lo = vld1_u8(buf.as_ptr().add(pos0));
+        let hi = vld1_u8(buf.as_ptr().add(pos0 + 4));
+        let bytes = vcombine_u8(lo, hi);
+        const IDX_LO: [u8; 16] = [0, 1, 2, 3, 1, 2, 3, 4, 2, 3, 4, 5, 3, 4, 5, 6];
+        const IDX_HI: [u8; 16] = [4, 5, 6, 7, 5, 6, 7, 12, 6, 7, 12, 13, 7, 12, 13, 14];
+        let vlo = vreinterpretq_u32_u8(vqtbl1q_u8(bytes, vld1q_u8(IDX_LO.as_ptr())));
+        let vhi = vreinterpretq_u32_u8(vqtbl1q_u8(bytes, vld1q_u8(IDX_HI.as_ptr())));
+        let prime = vdupq_n_u32(2654435761);
+        let h0 = vshrq_n_u32::<SHR>(vmulq_u32(vlo, prime));
+        let h1 = vshrq_n_u32::<SHR>(vmulq_u32(vhi, prime));
+        vst1q_u32(out.as_mut_ptr(), h0);
+        vst1q_u32(out.as_mut_ptr().add(4), h1);
+    }
+    #[cfg(not(any(
+        all(
+            any(target_arch = "x86_64", target_arch = "x86"),
+            target_feature = "avx2"
+        ),
+        target_arch = "aarch64"
     )))]
     {
         for k in 0..8 {
@@ -1160,4 +1181,74 @@ fn emit_last_literals(buf: &[u8], op: &mut Vec<u8>, anchor: usize, iend: usize) 
 
 pub fn compress_hc(src: &[u8]) -> Vec<u8> {
     compress_optimal(src)
+}
+
+#[cfg(test)]
+mod hc_kernel_tests {
+    use super::*;
+
+    fn xorshift_fill(buf: &mut [u8], mut x: u64) {
+        for b in buf.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x >> 32) as u8;
+        }
+    }
+
+    /// The batch hasher must agree with `hash_ptr` at every position and
+    /// alignment: `insert` mixes both paths, so any divergence changes match
+    /// discovery and therefore compressed bytes.
+    #[test]
+    fn hash_batch_8_matches_hash_ptr() {
+        let mut buf = vec![0u8; 4096];
+        xorshift_fill(&mut buf, 0x9E3779B97F4A7C15);
+        for pos0 in 0..buf.len() - 12 {
+            let mut out = [0u32; 8];
+            hash_batch_8(&buf, pos0, &mut out);
+            for (k, &h) in out.iter().enumerate() {
+                assert_eq!(h, hash_ptr(&buf, pos0 + k), "pos0={pos0} k={k}");
+            }
+        }
+    }
+
+    /// Digest of compress_hc over a deterministic mixed corpus. Run once on
+    /// the unmodified build to capture the digest, then export
+    /// ABGEN_LZ4_CORPUS_DIGEST=<hex> when running on a modified build to
+    /// assert bit-identical output.
+    #[test]
+    fn compress_hc_corpus_digest() {
+        let mut cases: Vec<Vec<u8>> = vec![Vec::new(), b"short".to_vec()];
+        let mut rnd = vec![0u8; 1 << 20];
+        xorshift_fill(&mut rnd, 0x0123456789ABCDEF);
+        cases.push(rnd.clone());
+        let mut rep = Vec::new();
+        for _ in 0..64 {
+            rep.extend_from_slice(&rnd[..8192]);
+        }
+        cases.push(rep);
+        let mut mixed = vec![0u8; 1 << 20];
+        for (i, b) in mixed.iter_mut().enumerate() {
+            *b = ((i / 977) % 251) as u8;
+        }
+        cases.push(mixed);
+        let mut pat = vec![0xABu8; 1 << 16];
+        pat[12345] = 0x01;
+        cases.push(pat);
+
+        let mut h = crate::hashes::Sha256::new();
+        for case in &cases {
+            let comp = compress_hc(case);
+            let back = decompress(&comp, case.len()).expect("round trip");
+            assert_eq!(&back, case);
+            h.update(&(comp.len() as u64).to_le_bytes());
+            h.update(&comp);
+        }
+        let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        if let Ok(want) = std::env::var("ABGEN_LZ4_CORPUS_DIGEST") {
+            assert_eq!(hex, want, "compress_hc output changed");
+        } else {
+            eprintln!("lz4 corpus digest: {hex}");
+        }
+    }
 }

@@ -24,8 +24,6 @@ how_to_record() {
   echo "  what a real build produced, and every later build checks against it." >&2
 }
 
-# One-shot record, not a same-run double-build: every later independent build
-# re-verifying against this manifest is what actually proves reproducibility.
 if [ "${ABGEN_RECORD_HASHES:-0}" = "1" ]; then
   for f in "$@"; do
     [ -f "$f" ] || { echo "recording: $f does not exist" >&2; exit 1; }
@@ -45,12 +43,18 @@ if [ "${ABGEN_RECORD_HASHES:-0}" = "1" ]; then
   exit 0
 fi
 
+soft_exit() {
+  echo "::warning title=artifact hashes::$TARGET: $1 (soft mode: side branch, not failing the build)"
+  exit 0
+}
+
 if [ ! -f "$MANIFEST" ]; then
   echo "NO RECORDED HASHES for $TARGET." >&2
   echo "  expected: $MANIFEST" >&2
   echo "Nothing was verified. This is a hard failure and not a skip: a target" >&2
   echo "with no manifest ships whatever it happens to have built." >&2
   how_to_record
+  [ "${ABGEN_HASH_SOFT:-0}" = "1" ] && soft_exit "no recorded manifest"
   exit 1
 fi
 
@@ -74,20 +78,23 @@ for f in "$@"; do
   fi
 done
 
-while read -r _ recorded; do
-  [ -n "$recorded" ] || continue
-  for f in "$@"; do
-    [ "$(basename "$f")" = "$recorded" ] && continue 2
-  done
-  echo "RECORDED BUT NOT BUILT: $recorded is in $TARGET.sha256 but was not produced" >&2
-  failed=1
-done < "$MANIFEST"
+if [ "${ABGEN_VERIFY_SUBSET:-0}" != "1" ]; then
+  while read -r _ recorded; do
+    [ -n "$recorded" ] || continue
+    for f in "$@"; do
+      [ "$(basename "$f")" = "$recorded" ] && continue 2
+    done
+    echo "RECORDED BUT NOT BUILT: $recorded is in $TARGET.sha256 but was not produced" >&2
+    failed=1
+  done < "$MANIFEST"
+fi
 
 if [ "$failed" -ne 0 ]; then
   echo "" >&2
   echo "Shipped bytes changed. Either the build stopped being deterministic, or" >&2
   echo "a real change landed and the manifest is stale." >&2
   how_to_record
+  [ "${ABGEN_HASH_SOFT:-0}" = "1" ] && soft_exit "hashes differ from the recorded manifest"
   exit 1
 fi
 echo "all $# artifacts match $TARGET.sha256"

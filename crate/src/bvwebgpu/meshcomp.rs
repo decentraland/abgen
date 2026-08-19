@@ -39,8 +39,6 @@ fn codec_vertex(data: &[u8], count: usize, stride: usize) -> Option<Vec<u8>> {
     }
     let bound = unsafe { meshopt::ffi::meshopt_encodeVertexBufferBound(count, stride) };
     let mut out = vec![0u8; bound];
-    // version pinned to 0 so the artifact stays decodable and byte-stable
-    // across meshoptimizer releases
     let n = unsafe {
         meshopt::ffi::meshopt_encodeVertexBufferLevel(
             out.as_mut_ptr(),
@@ -300,8 +298,6 @@ pub(super) fn plan(root: &Root, bin: &[u8]) -> Option<Plan> {
     let mut eligible: BTreeSet<(usize, usize)> = BTreeSet::new();
     for (mi, m) in root.meshes.iter().enumerate() {
         for (pi, p) in m.primitives.iter().enumerate() {
-            // custom semantics and sparse accessors must keep the stock loader
-            // path: the client decode handler does not carry them
             let plain = p.attributes.iter().all(|(sem, idx)| {
                 matches!(
                     sem,
