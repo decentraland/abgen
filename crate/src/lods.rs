@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_LODS_BUCKET: &str = "https://lods-bucket-ed4300a.s3.amazonaws.com";
+pub const DEFAULT_LODS_BUCKET: &str = "https://lod-generator-unity-cdn-decentraland-org-contentbucket-4bd1977.s3.amazonaws.com/lods-unity/fbx-deprecated-sources";
 
 /// LOD comparisons only target reference builds from the v49 converter era
 /// onward; older asset-bundle versions (v36 classic LODs, the webgl-era v7,

@@ -35,7 +35,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DEFAULT_GLB="https://lod-unity-bucket-dev-0871c25.s3.us-east-1.amazonaws.com/lods-unity/lods/bafkreiecbcziuwjcqrs2zbe7ncy2pssefgd4cg7vj5o4ywrn5umt6nobi4_1.glb"
+DEFAULT_GLB="https://lod-generator-unity-cdn.decentraland.zone/lods-unity/lods/bafkreia2e5w5bn5wczslyluppjiy4jqqkzr7dsmhnniynrwmcodtju6u6a_1.glb"
 
 ABC_REPO="${ABC_REPO:-$REPO/../asset-bundle-converter}"
 DEFAULT_UNITY="/Applications/Unity/Hub/Editor/6000.2.6f2/Unity.app/Contents/MacOS/Unity"
