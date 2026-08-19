@@ -9,6 +9,7 @@ pub struct Config {
     pub keep_output: bool,
     pub registry_queue_url: Option<String>,
     pub allowed_content_server_hosts: Option<Vec<String>>,
+    pub http_secret: Option<String>,
 }
 
 impl Config {
@@ -47,6 +48,9 @@ impl Config {
                         .filter(|h| !h.is_empty())
                         .collect::<Vec<_>>()
                 })
+                .filter(|v| !v.is_empty()),
+            http_secret: std::env::var("ABGEN_HTTP_SECRET")
+                .ok()
                 .filter(|v| !v.is_empty()),
         }
     }

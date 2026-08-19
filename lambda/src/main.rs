@@ -2,6 +2,7 @@ mod catalyst;
 mod config;
 mod convert;
 mod event;
+mod http;
 mod notify;
 mod output;
 mod runtime;
@@ -22,6 +23,9 @@ fn main() {
             match run_once(&cfg, path) {
                 Ok(v) => {
                     println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                    if v["statusCode"].as_u64().unwrap_or(200) >= 400 {
+                        std::process::exit(1);
+                    }
                 }
                 Err(e) => {
                     eprintln!("error: {e:#}");
@@ -40,7 +44,8 @@ fn main() {
                  env: PLATFORMS (windows,mac), AB_VERSION (v49), ABGEN_CACHE_DIR,\n\
                  \x20    CONTENT_SERVER_URL, OUT_ROOT, KEEP_OUTPUT, REGISTRY_QUEUE_URL,\n\
                  \x20    ABGEN_S3_ENDPOINT, ABGEN_S3_BUCKET, ABGEN_S3_REGION,\n\
-                 \x20    ABGEN_S3_PATH_STYLE, ABGEN_S3_READ_ONLY (+ AWS credentials)"
+                 \x20    ABGEN_S3_PATH_STYLE, ABGEN_S3_READ_ONLY (+ AWS credentials),\n\
+                 \x20    ABGEN_HTTP_SECRET (required by the Function URL POST path)"
             );
         }
         Some(other) => {
@@ -75,6 +80,29 @@ fn run_once(cfg: &config::Config, path: &str) -> Result<serde_json::Value> {
 }
 
 fn handle(cfg: &config::Config, event: &serde_json::Value) -> Result<serde_json::Value> {
+    match http::Request::from_event(event) {
+        Some(req) => Ok(handle_http(cfg, &req)),
+        None => run_jobs(cfg, event),
+    }
+}
+
+/// Function URL invocations answer in-band: every outcome, including refusals
+/// and handler errors, is an HTTP response rather than a Lambda error.
+fn handle_http(cfg: &config::Config, req: &http::Request) -> serde_json::Value {
+    let payload = match http::accept(cfg.http_secret.as_deref(), req) {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    match run_jobs(cfg, &payload) {
+        Ok(v) => http::respond(200, v),
+        Err(e) => {
+            eprintln!("http: handler error: {e:#}");
+            http::respond(500, serde_json::json!({"error": format!("{e:#}")}))
+        }
+    }
+}
+
+fn run_jobs(cfg: &config::Config, event: &serde_json::Value) -> Result<serde_json::Value> {
     let jobs = event::jobs_from_event(event)?;
     let mut summaries = Vec::with_capacity(jobs.len());
     for job in &jobs {
