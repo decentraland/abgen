@@ -62,6 +62,7 @@ all hits.
 | `ABGEN_SNS_ENDPOINT` | `sns.{region}.amazonaws.com` | endpoint override (localstack); region comes from the ARN |
 | `ABGEN_REDIS_URL` | — (off) | `redis://host[:port]` (or `rediss://…` for TLS) — enables the shared hit-cache in front of S3 existence probes (see below) |
 | `ABGEN_REDIS_TTL_SECONDS` | `86400` | TTL on cached positive probes |
+| `ABGEN_HTTP_SECRET` | — (**fail-closed**) | shared secret the Function URL POST path requires in `x-abgen-secret`; unset means every HTTP invocation is refused with `503` |
 | `ALLOWED_CONTENT_SERVER_HOSTS` | — (**fail-open**) | comma-separated allowlist of hosts an event's `contentServerUrl` may name; **unset means any https host is accepted**, so every deployment should set it. The `lambdaImage` bakes in `peer.decentraland.org`; a function env var overrides it. |
 
 S3 is abgen's built-in "space" client (SigV4, ureq). Credentials come from
@@ -189,6 +190,7 @@ Recommended function config:
 | ephemeral storage | 10240 MB | `/tmp` holds the content cache + corpus |
 | SQS trigger | batch size 1, `ReportBatchItemFailures`, visibility timeout ≥ 900 s, DLQ after ~3 receives | one entity per invocation; whales land in the DLQ |
 | reserved concurrency | ~20 | politeness cap on catalyst downloads |
+| Function URL | auth `AWS_IAM`, or `NONE` with `ABGEN_HTTP_SECRET` set | ad-hoc POST-to-convert (see below) |
 
 **Shader bundles:** none need seeding for unity-explorer — it resolves the
 shared shader dependencies (`COMMON_SHADERS`) from its own embedded
@@ -239,6 +241,51 @@ invocation on error. Per-record summaries of an SQS batch go to the log.
 
 Batch size is 1 today, which makes the two behaviours equivalent; the format
 is implemented so raising it does not need a code change.
+
+## POST-to-convert (Lambda Function URL)
+
+An event carrying `requestContext.http.method` — the Function URL / API
+Gateway payload format 2.0 shape — is handled as an HTTP request: the body
+is the *same* JSON either shape above uses, and the reply is the same
+summary, synchronously, inside an HTTP response envelope. This replaces
+hand-crafting an SQS message for a one-off conversion.
+
+```bash
+curl -sS "$FUNCTION_URL" \
+  -H 'content-type: application/json' \
+  -H "x-abgen-secret: $ABGEN_HTTP_SECRET" \
+  -d '{"entityId":"bafk…","contentServerUrl":"https://peer.decentraland.org/content","force":true}'
+```
+
+| status | when |
+|--------|------|
+| `200` | conversion finished; body is the usual `{"jobs":[…]}` summary |
+| `400` | body is not JSON, or is not a recognized event shape |
+| `401` | missing or wrong `x-abgen-secret` |
+| `405` | method other than POST |
+| `500` | the conversion itself failed (message in `error`) |
+| `503` | `ABGEN_HTTP_SECRET` is unset — the POST path is disabled |
+
+The conversion runs inline, so the caller waits for it and the function
+timeout (900 s) is the request timeout; anything longer belongs on the queue.
+Only the HTTP path answers in-band — SQS invocations still fail the
+invocation on error so the queue can retry.
+
+**Auth.** The Function URL itself should be `AWS_IAM` where the caller can
+SigV4-sign (ops tooling, CI with a role); `NONE` is what makes an ad-hoc
+`curl` possible at all, and then the shared secret is the *only* thing
+between the internet and the converter. The secret check runs on every HTTP
+invocation either way, is constant-time, and fails closed when unset, so
+`NONE` + secret is a deliberate second factor rather than a substitute for
+IAM. Set `ABGEN_HTTP_SECRET` from a secrets store, never in the image —
+`lambdaImage` bakes `ALLOWED_CONTENT_SERVER_HOSTS` but must never bake this.
+Rotate by setting a new value; there is no grace window for the old one.
+
+Infra: one `aws.lambda.FunctionUrl` on the abgen function in the ops-lambdas
+stack (that repo, not this one) plus the `ABGEN_HTTP_SECRET` env var.
+
+Locally, `--once lambda/examples/event-function-url.json` exercises the whole
+path (and exits non-zero when the envelope status is ≥ 400).
 
 ## Already-converted skip
 
