@@ -17,6 +17,18 @@ inputs:
   cache:
     description: Restore/save the cargo cache (Swatinem/rust-cache)
     default: "true"
+  workspaces:
+    description: rust-cache workspaces ("path" or "path -> target", one per line)
+    default: "."
+  shared-key:
+    description: >
+      rust-cache shared-key. Set the SAME value in jobs that must share a
+      cache (rust-cache otherwise scopes keys by job id, so a producer job's
+      save is invisible to a consumer job without this).
+    default: ""
+  save-if:
+    description: rust-cache save-if (set false for pure cache consumers)
+    default: "true"
 
 runs:
   using: composite
@@ -30,3 +42,6 @@ runs:
       uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7
       with:
         prefix-key: v0-rust
+        workspaces: ${{ inputs.workspaces }}
+        shared-key: ${{ inputs.shared-key }}
+        save-if: ${{ inputs.save-if }}

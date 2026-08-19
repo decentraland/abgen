@@ -132,6 +132,13 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       - uses: ./.github/actions/rust-setup
+        with:
+          # Pure consumer of the cache the release napi linux leg saves from
+          # main pushes (same shared-key); this job is PR-only, so its own
+          # saves would be PR-scoped quota waste.
+          workspaces: crate/abgen-node
+          shared-key: abgen-node
+          save-if: "false"
       - name: abgen-node (build + smoke)
         working-directory: crate/abgen-node
         run: |
