@@ -46,6 +46,19 @@ fn is_convertible(file: &str) -> (bool, bool) {
     (is_glb, is_image)
 }
 
+fn fetch_jobs() -> usize {
+    static JOBS: OnceLock<usize> = OnceLock::new();
+    *JOBS.get_or_init(|| {
+        match std::env::var("ABGEN_FETCH_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(n) if n > 0 => n,
+            _ => 8,
+        }
+    })
+}
+
 fn corpus_file_jobs() -> usize {
     static JOBS: OnceLock<usize> = OnceLock::new();
     *JOBS.get_or_init(|| {
@@ -243,17 +256,39 @@ impl Proxy {
             .resolve_scene(cid)
             .with_context(|| format!("resolve entity {cid}"))?;
 
+        let dl_started = std::time::Instant::now();
+        let mut to_fetch: Vec<(&str, &str)> = Vec::new();
+        let mut seen_hashes = std::collections::HashSet::new();
         for c in &scene.content {
             if CONVERTIBLE_EXTS
                 .iter()
                 .chain(DEPENDENCY_EXTS.iter())
                 .any(|e| c.file.to_lowercase().ends_with(*e))
+                && seen_hashes.insert(c.hash.as_str())
             {
-                if let Err(e) = self.ensure_content(&c.hash) {
-                    eprintln!("warn: {cid}: content {} ({}): {e}", c.hash, c.file);
-                }
+                to_fetch.push((c.hash.as_str(), c.file.as_str()));
             }
         }
+        let dl_files = to_fetch.len();
+        let workers = fetch_jobs().min(dl_files.max(1));
+        let next_fetch = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| loop {
+                    let i = next_fetch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((hash, file)) = to_fetch.get(i) else {
+                        break;
+                    };
+                    if let Err(e) = self.ensure_content(hash) {
+                        eprintln!("warn: {cid}: content {hash} ({file}): {e}");
+                    }
+                });
+            }
+        });
+        eprintln!(
+            "download: {cid}: {dl_files} file(s) ensured in {:.1}s ({workers} worker(s))",
+            dl_started.elapsed().as_secs_f64()
+        );
 
         let content_by_file = scene.content_by_file();
         let scan = scan_entity(&self.content, &content_by_file, &self.uri_cache);
