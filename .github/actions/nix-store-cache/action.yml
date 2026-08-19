@@ -26,12 +26,18 @@ runs:
           max-jobs = auto
           cores = 0
 
+    # The family token is unconditional (and versioned) so no family's
+    # restore/purge prefix is a string prefix of another family's keys:
+    # the old scheme let "build" restore and purge "wasm" caches.
     - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569
       with:
-        primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ inputs.family == 'wasm' && 'wasm-' || '' }}${{ inputs.family == 'wasm' && hashFiles('crate/abgen-wasm/toolchain/flake.lock', 'crate/abgen-wasm/toolchain/flake.nix') || hashFiles('flake.lock', 'Cargo.lock', '**/Cargo.toml', 'flake.nix', 'rust-toolchain.toml') }}
-        restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-${{ inputs.family == 'wasm' && 'wasm-' || '' }}
-        gc-max-store-size-linux: 4294967296
+        primary-key: nix-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.family }}-${{ inputs.family == 'wasm' && hashFiles('crate/abgen-wasm/toolchain/flake.lock', 'crate/abgen-wasm/toolchain/flake.nix') || hashFiles('flake.lock', 'Cargo.lock', '**/Cargo.toml', 'flake.nix', 'rust-toolchain.toml', 'nix/*.nix') }}
+        restore-prefixes-first-match: nix-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.family }}-
+        # 6 GiB budget: the shared deps closure plus toolchain plus check
+        # derivations have to fit under GitHub's 10 GB/repo cache quota
+        # across two arch families.
+        gc-max-store-size-linux: 6442450944
         purge: true
-        purge-prefixes: nix-${{ runner.os }}-${{ runner.arch }}-${{ inputs.family == 'wasm' && 'wasm-' || '' }}
+        purge-prefixes: nix-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.family }}-
         purge-last-accessed: 604800
         purge-primary-key: never
