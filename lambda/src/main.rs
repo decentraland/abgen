@@ -174,6 +174,18 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
     }
     let (upload, notified) = published?;
 
+    if job.force {
+        // A concurrent non-force redelivery may have re-marked from the old
+        // manifest while this force job ran; drop the markers again now that
+        // the (possibly downgraded) result is published. A re-mark landing
+        // after this point is the residual race documented in the README.
+        for platform in &cfg.platforms {
+            if let Some(key) = output::converted_marker_key(&proxy, cfg, &job.entity_id, platform) {
+                abgen::rediscache::forget(&key);
+            }
+        }
+    }
+
     eprintln!(
         "done: {} platforms={} exitCode={} texcache hits={} misses={}",
         outcome.entity_id,

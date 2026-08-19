@@ -120,8 +120,23 @@ Semantics (mirrors consumer-server's asset-reuse cache):
   no cache at all.
 - keys are scoped to bucket (and version for entity markers), so caches for
   different CDNs can never cross-contaminate; a `force` job deletes the
-  entity markers it bypasses, since a reconversion can downgrade a manifest.
+  entity markers it bypasses — both before converting and again after its
+  result is published — since a reconversion can downgrade a manifest.
 - 24 h TTL bounds the keyspace across `AB_VERSION` bumps.
+
+Caveats on the entity markers specifically: unlike the content-addressed
+per-file probe keys (immutable — a positive can never go stale), an entity
+marker caches a *mutable* artifact, the manifest verdict. Two consequences:
+
+- **residual force race** — a concurrent non-force redelivery that read the
+  old `exitCode: 0` manifest between the force job's final publish and its
+  marker delete can re-mark the entity, masking a downgraded force result for
+  up to the TTL. The window is milliseconds and requires a concurrent
+  redelivery of the same entity during a force reconversion; a second `force`
+  clears it.
+- **out-of-band reconversions** — force or manual reconversions done outside
+  abgen (anything that rewrites `manifest/…` without going through this
+  handler) leave the markers stale for up to the TTL.
 
 Unset `ABGEN_REDIS_URL` and none of this exists — behavior is identical to
 today's S3-only path.
