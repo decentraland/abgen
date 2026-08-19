@@ -59,7 +59,7 @@ pub fn accept(secret: Option<&str>, req: &Request) -> Result<Value, Value> {
         ));
     };
     let presented = req.header(SECRET_HEADER).unwrap_or("");
-    if !constant_time_eq(presented.as_bytes(), secret.as_bytes()) {
+    if !secret_matches(presented, secret) {
         eprintln!("http: rejected — bad or missing {SECRET_HEADER}");
         return Err(respond(401, json!({"error": "unauthorized"})));
     }
@@ -83,6 +83,18 @@ pub fn respond(status: u16, body: Value) -> Value {
         "isBase64Encoded": false,
         "body": body.to_string(),
     })
+}
+
+/// Hash-then-compare: the byte comparison always runs over two equal-length
+/// SHA-256 digests, so neither its duration nor an early length check can
+/// leak how long the configured secret is.
+fn secret_matches(presented: &str, secret: &str) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    let a = abgen::hashes::sha256_hex(presented.as_bytes());
+    let b = abgen::hashes::sha256_hex(secret.as_bytes());
+    constant_time_eq(a.as_bytes(), b.as_bytes())
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -163,13 +175,29 @@ mod tests {
 
     #[test]
     fn rejects_bad_or_missing_secret() {
-        let cases = [None, Some(""), Some("wrong"), Some("s3cre")];
+        let cases = [
+            None,
+            Some(""),
+            Some("wrong"),
+            Some("s3cre"),
+            Some("s3cret-and-more"),
+        ];
         for presented in cases {
             let e = post("{}", presented);
             let req = Request::from_event(&e).unwrap();
             let err = accept(Some("s3cret"), &req).unwrap_err();
             assert_eq!(status(&err), 401, "presented {presented:?}");
         }
+    }
+
+    #[test]
+    fn secret_comparison_handles_any_length_pair() {
+        assert!(secret_matches("s3cret", "s3cret"));
+        assert!(!secret_matches("", "s3cret"));
+        assert!(!secret_matches("s3cret", ""));
+        assert!(!secret_matches("", ""));
+        assert!(!secret_matches("short", "a-much-longer-secret"));
+        assert!(!secret_matches("a-much-longer-secret", "short"));
     }
 
     #[test]

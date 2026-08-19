@@ -94,7 +94,11 @@ fn validated_entity_id(id: &str) -> Result<String> {
     Ok(id.to_string())
 }
 
-pub fn ensure_allowed_content_server(url: &str, allowed: &[String]) -> Result<()> {
+/// Scheme/shape validation (https, no userinfo, non-empty host) runs
+/// unconditionally — an event-supplied URL is attacker-adjacent input and must
+/// never point the handler at plaintext or internal targets, allowlist or not.
+/// The host allowlist additionally applies when configured.
+pub fn validate_content_server(url: &str, allowed: Option<&[String]>) -> Result<()> {
     let Some(rest) = url.strip_prefix("https://") else {
         bail!("content server {url:?} rejected: https required");
     };
@@ -104,8 +108,13 @@ pub fn ensure_allowed_content_server(url: &str, allowed: &[String]) -> Result<()
         .unwrap_or("")
         .to_ascii_lowercase();
     let host = authority.split(':').next().unwrap_or("");
-    if authority.contains('@') || host.is_empty() || !allowed.iter().any(|a| a == host) {
-        bail!("content server host {host:?} is not in ALLOWED_CONTENT_SERVER_HOSTS");
+    if authority.contains('@') || host.is_empty() {
+        bail!("content server {url:?} rejected: bad authority");
+    }
+    if let Some(allowed) = allowed {
+        if !allowed.iter().any(|a| a == host) {
+            bail!("content server host {host:?} is not in ALLOWED_CONTENT_SERVER_HOSTS");
+        }
     }
     Ok(())
 }
@@ -217,7 +226,7 @@ mod tests {
     #[test]
     fn content_server_allowlist() {
         let allowed = vec!["peer.decentraland.org".to_string()];
-        let ok = |u: &str| ensure_allowed_content_server(u, &allowed).is_ok();
+        let ok = |u: &str| validate_content_server(u, Some(&allowed)).is_ok();
         assert!(ok("https://peer.decentraland.org/content"));
         assert!(ok("https://PEER.decentraland.org"));
         assert!(ok("https://peer.decentraland.org:443/content"));
@@ -226,5 +235,19 @@ mod tests {
         assert!(!ok("https://peer.decentraland.org.evil.com/content"));
         assert!(!ok("https://peer.decentraland.org@evil.com/content"));
         assert!(!ok("https://sub.peer.decentraland.org/content"));
+    }
+
+    #[test]
+    fn content_server_shape_checks_apply_without_an_allowlist() {
+        let ok = |u: &str| validate_content_server(u, None).is_ok();
+        // No allowlist: any https host passes (documented fail-open)…
+        assert!(ok("https://peer.decentraland.org/content"));
+        assert!(ok("https://anything.example.com"));
+        // …but scheme/shape validation still applies unconditionally.
+        assert!(!ok("http://10.0.3.7:8500"));
+        assert!(!ok("http://169.254.169.254/latest/meta-data"));
+        assert!(!ok("https://user:pass@evil.example.com/content"));
+        assert!(!ok("https://"));
+        assert!(!ok("ftp://host"));
     }
 }

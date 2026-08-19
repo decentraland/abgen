@@ -29,12 +29,35 @@ struct Target {
     tls: bool,
 }
 
+/// `ABGEN_REDIS_URL` may embed an AUTH password; parse errors are logged, so
+/// they must never echo the raw URL. Keeps scheme and host, drops userinfo.
+fn redact_url(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = match rest.split_once('/') {
+                Some((a, p)) => (a, Some(p)),
+                None => (rest, None),
+            };
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            match path {
+                Some(p) => format!("{scheme}://{host}/{p}"),
+                None => format!("{scheme}://{host}"),
+            }
+        }
+        None => "<redacted: no scheme>".to_string(),
+    }
+}
+
 fn parse_url(url: &str) -> Result<Target, String> {
     let (rest, tls) = match url.strip_prefix("rediss://") {
         Some(rest) => (rest, true),
         None => (
-            url.strip_prefix("redis://")
-                .ok_or_else(|| format!("unsupported scheme in {url:?} (expected redis(s)://)"))?,
+            url.strip_prefix("redis://").ok_or_else(|| {
+                format!(
+                    "unsupported scheme in {} (expected redis(s)://)",
+                    redact_url(url)
+                )
+            })?,
             false,
         ),
     };
@@ -63,7 +86,7 @@ fn parse_url(url: &str) -> Result<Target, String> {
         None => (hostport, 6379),
     };
     if host.is_empty() {
-        return Err(format!("no host in {url:?}"));
+        return Err(format!("no host in {}", redact_url(url)));
     }
     Ok(Target {
         host: host.to_string(),
@@ -489,6 +512,29 @@ mod tests {
         assert!(parse_url("redis://host:notaport").is_err());
         assert!(parse_url("redis://:pass@").is_err());
         assert!(parse_url("redis://host/notadb").is_err());
+    }
+
+    /// Parse errors are logged by `state()`, so an embedded AUTH password must
+    /// never survive into them (it would land verbatim in CloudWatch Logs).
+    #[test]
+    fn parse_errors_never_echo_credentials() {
+        for url in [
+            "rediss//user:sekret@cache:6379", // scheme typo
+            "redis://:sekret@",               // empty host
+            "sekret@cache",                   // no scheme at all
+        ] {
+            let err = parse_url(url).unwrap_err();
+            assert!(!err.contains("sekret"), "{url:?} leaked into {err:?}");
+        }
+        // The redacted form still names scheme and host for triage.
+        assert_eq!(
+            redact_url("redis://user:sekret@cache.internal:6380/1"),
+            "redis://cache.internal:6380/1"
+        );
+        assert_eq!(
+            redact_url("rediss://cache.internal"),
+            "rediss://cache.internal"
+        );
     }
 
     #[test]

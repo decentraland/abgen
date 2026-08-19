@@ -154,12 +154,32 @@ fn run_jobs(cfg: &config::Config, event: event::Event) -> Result<serde_json::Val
 /// until the DLQ must show up as `outcome="error"`, not only in stderr).
 fn instrumented_job(cfg: &config::Config, job: Result<event::Job>) -> Result<serde_json::Value> {
     let started = std::time::Instant::now();
-    let summary = job.and_then(|job| handle_job(cfg, &job));
+    let summary = job.and_then(|job| catch_job_panic(|| handle_job(cfg, &job)));
     let outcome = job_outcome(&summary);
     metrics::histogram!("abgen_lambda_job_duration_seconds", "outcome" => outcome)
         .record(started.elapsed().as_secs_f64());
     metrics::counter!("abgen_lambda_jobs_total", "outcome" => outcome).increment(1);
     summary
+}
+
+/// A panic anywhere in a conversion must not unwind past the runtime loop: the
+/// process would abort before `emf::flush`, no response would be posted, and
+/// the whole SQS batch would redeliver (re-running and re-notifying records
+/// that already succeeded). Converted to an `Err`, it becomes a plain
+/// batchItemFailure / handler error instead.
+fn catch_job_panic(f: impl FnOnce() -> Result<serde_json::Value>) -> Result<serde_json::Value> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(summary) => summary,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .map(str::to_string)
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            Err(anyhow::anyhow!("job panicked: {msg}"))
+        }
+    }
 }
 
 /// Runs an SQS batch and answers in the `ReportBatchItemFailures` format: a
@@ -217,9 +237,10 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
         .content_server_url
         .as_deref()
         .unwrap_or(&cfg.default_content_server);
-    if let Some(allowed) = &cfg.allowed_content_server_hosts {
-        event::ensure_allowed_content_server(content_server, allowed)?;
-    }
+    // Scheme/shape validation is unconditional — an event-supplied URL must
+    // never make the handler fetch plaintext/internal targets even on a
+    // deployment that (fail-open) never set ALLOWED_CONTENT_SERVER_HOSTS.
+    event::validate_content_server(content_server, cfg.allowed_content_server_hosts.as_deref())?;
     let proxy = convert::make_proxy(cfg, content_server);
 
     if job.is_lods {
@@ -512,6 +533,46 @@ mod tests {
         let text = resp["body"].as_str().unwrap();
         assert!(!text.contains("evil.example.com"), "{text}");
         assert!(text.contains("see function logs"), "{text}");
+    }
+
+    #[test]
+    fn content_server_scheme_validation_applies_without_an_allowlist() {
+        let cfg = test_cfg();
+        assert!(cfg.allowed_content_server_hosts.is_none());
+        let e = json!({"entityId": "bafkabc123", "contentServerUrl": "http://10.0.3.7:8500"});
+        let err = handle(&cfg, &e).unwrap_err();
+        assert!(format!("{err:#}").contains("https required"), "{err:#}");
+    }
+
+    #[test]
+    fn catch_job_panic_converts_panics_to_errors() {
+        assert_eq!(catch_job_panic(|| Ok(json!(1))).unwrap(), json!(1));
+        let err = catch_job_panic(|| panic!("boom {}", 1)).unwrap_err();
+        assert!(format!("{err}").contains("job panicked: boom 1"), "{err}");
+        let err = catch_job_panic(|| anyhow::bail!("plain error")).unwrap_err();
+        assert_eq!(format!("{err}"), "plain error");
+    }
+
+    #[test]
+    fn a_panicking_record_becomes_a_batch_item_failure() {
+        let batch = vec![
+            record(Some("m-1"), "bafkboom"),
+            record(Some("m-2"), "bafkok"),
+        ];
+        let out = run_batch(batch, |job| {
+            catch_job_panic(|| {
+                let job = job?;
+                if job.entity_id == "bafkboom" {
+                    panic!("unwrap oops");
+                }
+                Ok(json!({"entityId": job.entity_id, "exitCode": 0}))
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            out,
+            json!({"batchItemFailures": [{"itemIdentifier": "m-1"}]})
+        );
     }
 
     #[test]
