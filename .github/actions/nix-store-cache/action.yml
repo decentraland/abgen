@@ -1,25 +1,29 @@
-name: nix + store cache
+name: nix + binary cache
 description: >
-  Install nix and restore/save the repo's nix store cache. Single source of
-  the key scheme: every workflow that touches a nix store goes through this
-  action, so the "these blocks must stay identical" coupling between
-  cache-warm and its consumers is structural instead of a comment.
-  runner.arch is part of the key so x86_64 and aarch64 stores never cross.
-
-inputs:
-  family:
-    description: >
-      Key family. "build" hashes everything crane's deps derivation depends
-      on ('**/Cargo.toml': every member manifest feeds dummy-src; a manifest
-      missing from the hash would produce a stale exact hit that never
-      re-saves). "wasm" is its own family holding only the wasm toolchain
-      closure — sharing a family would let the image caches' purge rotation
-      evict it (and vice versa).
-    default: build
+  Install nix and wire a content-addressed file:// binary cache, restored
+  from the Actions cache, as a substituter. Unlike the old /nix snapshot,
+  nothing here is trusted: nix hash-verifies every path it pulls from the
+  cache and rebuilds anything missing or corrupt, so a damaged, torn or
+  stale entry can cost minutes — never a red job. There is no store DB and
+  no eval cache in the artifact, which removes every past poisoning mode at
+  the design level. Jobs that should publish the cache end with the sibling
+  save action. runner.arch is part of the key so x86_64 and aarch64 stores
+  never cross.
 
 runs:
   using: composite
   steps:
+    - name: prepare empty binary cache
+      shell: bash
+      run: |
+        mkdir -p /var/tmp/abgen-nixcache
+        # A dir without nix-cache-info is not a valid binary cache; Priority
+        # 10 beats cache.nixos.org (40) so local nars win the substituter
+        # race.
+        [ -f /var/tmp/abgen-nixcache/nix-cache-info ] ||
+          printf 'StoreDir: /nix/store\nPriority: 10\n' \
+            > /var/tmp/abgen-nixcache/nix-cache-info
+
     - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
       with:
         # No FlakeHub: with determinate left on, jobs holding an OIDC token
@@ -28,29 +32,30 @@ runs:
         extra-conf: |
           max-jobs = auto
           cores = 0
-          # The store snapshot is GC-trimmed at save; a cached eval cache can
-          # then reference .drv files the trim deleted ("store path ... does
-          # not exist" at evaluation). Never trust it.
-          eval-cache = false
+          extra-substituters = file:///var/tmp/abgen-nixcache
+          # Our nars are unsigned (produced by this repo's own CI, the same
+          # trust domain as the code). Integrity still holds: nix checks
+          # every NAR against its narinfo hash before use.
+          require-sigs = false
 
-    # The family token is unconditional (and versioned) so no family's
-    # restore/purge prefix is a string prefix of another family's keys:
-    # the old scheme let "build" restore and purge "wasm" caches.
-    - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569
+    - name: record installer store baseline
+      shell: bash
+      # Everything present now came from the installer; the save action
+      # publishes only the delta beyond this, so the nix closure itself is
+      # never cached.
+      run: nix path-info --all | LC_ALL=C sort > /var/tmp/abgen-nix-base.txt
+
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      id: restore
       with:
-        primary-key: nix-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.family }}-${{ inputs.family == 'wasm' && hashFiles('crate/abgen-wasm/toolchain/flake.lock', 'crate/abgen-wasm/toolchain/flake.nix') || hashFiles('flake.lock', 'Cargo.lock', '**/Cargo.toml', 'flake.nix', 'rust-toolchain.toml', 'nix/*.nix') }}
-        restore-prefixes-first-match: nix-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.family }}-
-        # 6 GiB budget: the shared deps closure plus toolchain plus check
-        # derivations have to fit under GitHub's 10 GB/repo cache quota
-        # across two arch families.
-        gc-max-store-size-linux: 6442450944
-        # Snapshots save only from main/tags: branch-scoped PR saves still
-        # consume the shared 10 GB repo quota, and every key rotation parked
-        # a superseded ~2.3 GB snapshot per arch for a week — which is what
-        # kept evicting the darwin/windows cargo caches. PRs restore main's
-        # snapshot via the prefix and never save.
-        save: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
-        purge: true
-        purge-prefixes: nix-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.family }}-
-        purge-last-accessed: 259200
-        purge-primary-key: never
+        path: /var/tmp/abgen-nixcache
+        key: nix-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'Cargo.lock', '**/Cargo.toml', 'flake.nix', 'rust-toolchain.toml', 'nix/*.nix', 'crate/abgen-wasm/toolchain/flake.lock', 'crate/abgen-wasm/toolchain/flake.nix') }}
+        restore-keys: nix-v3-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: expose cache facts to the save action
+      shell: bash
+      run: |
+        {
+          echo "ABGEN_NIXCACHE_KEY=${{ steps.restore.outputs.cache-primary-key }}"
+          echo "ABGEN_NIXCACHE_EXACT=${{ steps.restore.outputs.cache-hit }}"
+        } >> "$GITHUB_ENV"
