@@ -247,7 +247,9 @@ Bundles and manifests are written through to S3 by the build itself
 (abgen's space); scene sources are published by the handler afterwards.
 Every object carries the same Content-Type / Cache-Control the production
 consumer-server writes, derived from the key by `space::object_headers`:
-bundles are `application/wasm` + `public, max-age=31536000, immutable`,
+bundles are `application/wasm` + `public,max-age=31536000,immutable`
+(cdn-uploader's comma-joined spelling), scene sources (`.js`/`.json`/`.crdt`)
+the direct-upload spelling `public, max-age=31536000, immutable`,
 manifests (`manifest/…`, `lods-unity/manifests/…`) are `application/json`
 + `private, max-age=0, no-cache`. That is origin-level defense in depth —
 **cache policy still must live on the CDN distribution**: long/immutable

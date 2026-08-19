@@ -124,8 +124,15 @@ pub struct ObjectHeaders {
 /// Verbatim from what the production consumer-server writes on ab-cdn objects:
 /// content-addressed keys are immutable forever, manifests are rewritten in
 /// place on every rebuild so the origin must never let them be cached.
-const IMMUTABLE: &str = "public, max-age=31536000, immutable";
-const IMMUTABLE_BR: &str = "public, no-transform, max-age=31536000, immutable";
+///
+/// Two immutable spellings exist upstream, byte for byte: bundle-style keys go
+/// through `@dcl/cdn-uploader`, whose `cacheHeader()` joins directives with a
+/// bare comma, while scene source files are uploaded directly by
+/// `scenes/component.ts` with a comma-space string. The `.br` variant adds
+/// `no-transform` exactly where cdn-uploader does (it sets a Content-Encoding).
+const IMMUTABLE_BUNDLE: &str = "public,max-age=31536000,immutable";
+const IMMUTABLE_BUNDLE_BR: &str = "public,no-transform,max-age=31536000,immutable";
+const IMMUTABLE_SOURCE: &str = "public, max-age=31536000, immutable";
 const NO_CACHE: &str = "private, max-age=0, no-cache";
 
 /// Single source of truth for the metadata every upload carries; mirrors what
@@ -146,10 +153,15 @@ pub fn object_headers(key: &str) -> ObjectHeaders {
         "application/wasm"
     };
     let is_manifest = key.starts_with("manifest/") || key.starts_with("lods-unity/manifests/");
-    let cache_control = match (is_manifest, is_br) {
-        (true, _) => NO_CACHE,
-        (false, true) => IMMUTABLE_BR,
-        (false, false) => IMMUTABLE,
+    // cdn-uploader lane = the bundle output dir (wasm + .manifest files) and
+    // every `.br` sibling; the direct-upload lane is scene sources (.js/.json/
+    // .crdt) which upstream never brotli-compresses.
+    let uploader_lane = matches!(content_type, "application/wasm" | "text/cache-manifest");
+    let cache_control = match (is_manifest, is_br, uploader_lane) {
+        (true, _, _) => NO_CACHE,
+        (false, true, _) => IMMUTABLE_BUNDLE_BR,
+        (false, false, true) => IMMUTABLE_BUNDLE,
+        (false, false, false) => IMMUTABLE_SOURCE,
     };
     ObjectHeaders {
         content_type,
@@ -609,19 +621,19 @@ mod tests {
             (
                 "v41/bafkScene/Qmhash_windows",
                 "application/wasm",
-                IMMUTABLE,
+                IMMUTABLE_BUNDLE,
             ),
-            ("v41/assets/Qmhash_mac", "application/wasm", IMMUTABLE),
+            ("v41/assets/Qmhash_mac", "application/wasm", IMMUTABLE_BUNDLE),
             (
                 "v41/dcl/scene_ignore_windows",
                 "application/wasm",
-                IMMUTABLE,
+                IMMUTABLE_BUNDLE,
             ),
-            ("LOD/1/bafkscene_1_windows", "application/wasm", IMMUTABLE),
+            ("LOD/1/bafkscene_1_windows", "application/wasm", IMMUTABLE_BUNDLE),
             (
                 "v41/bafkScene/Qmhash_windows.br",
                 "application/wasm",
-                IMMUTABLE_BR,
+                IMMUTABLE_BUNDLE_BR,
             ),
             (
                 "manifest/bafkEntity_windows.json",
@@ -638,31 +650,31 @@ mod tests {
                 "application/json",
                 NO_CACHE,
             ),
-            ("v41/bafkScene/scene.json", "application/json", IMMUTABLE),
+            ("v41/bafkScene/scene.json", "application/json", IMMUTABLE_SOURCE),
             (
                 "v41/bafkScene/bin/game.js",
                 "application/javascript",
-                IMMUTABLE,
+                IMMUTABLE_SOURCE,
             ),
             (
                 "v41/bafkScene/main.crdt",
                 "application/octet-stream",
-                IMMUTABLE,
+                IMMUTABLE_SOURCE,
             ),
             (
                 "bvwebgpu/p0/bafkScene.pack",
                 "application/octet-stream",
-                IMMUTABLE,
+                IMMUTABLE_SOURCE,
             ),
             (
                 "bvwebgpu/p0/bafkScene.pack.br",
                 "application/octet-stream",
-                IMMUTABLE_BR,
+                IMMUTABLE_BUNDLE_BR,
             ),
             (
                 "v41/bafkScene/Qmhash_windows.manifest",
                 "text/cache-manifest",
-                IMMUTABLE,
+                IMMUTABLE_BUNDLE,
             ),
         ] {
             let h = object_headers(key);
@@ -674,7 +686,7 @@ mod tests {
     #[test]
     fn put_sends_key_derived_content_type_and_cache_control() {
         for (key, ct, cc) in [
-            ("v41/cid/Qmhash_windows", "application/wasm", IMMUTABLE),
+            ("v41/cid/Qmhash_windows", "application/wasm", IMMUTABLE_BUNDLE),
             ("manifest/cid_windows.json", "application/json", NO_CACHE),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
