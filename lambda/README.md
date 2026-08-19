@@ -348,11 +348,11 @@ curl -sS "$FUNCTION_URL" \
 
 | status | when |
 |--------|------|
-| `200` | conversion finished; body is the usual `{"jobs":[…]}` summary |
+| `200` | every job converted; body is the usual `{"jobs":[…]}` summary (or `{"batchItemFailures":[]}` for a `Records`-shaped body) |
 | `400` | body is not JSON, or is not a recognized event shape |
 | `401` | missing or wrong `x-abgen-secret` |
 | `405` | method other than POST |
-| `500` | the conversion itself failed (message in `error`) |
+| `500` | the conversion failed. The body is a generic `error` — the failure chain goes to the function log, not over the wire. For a `Records`-shaped body, *any* failing record is a `500` whose body is the `batchItemFailures` summary: there is no queue on this path to redeliver them, so a non-2xx is the only signal the job was lost |
 | `503` | `ABGEN_HTTP_SECRET` is unset — the POST path is disabled |
 
 The conversion runs inline, so the caller waits for it and the function

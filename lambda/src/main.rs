@@ -99,28 +99,48 @@ fn run_once(cfg: &config::Config, path: &str) -> Result<serde_json::Value> {
 fn handle(cfg: &config::Config, event: &serde_json::Value) -> Result<serde_json::Value> {
     match http::Request::from_event(event) {
         Some(req) => Ok(handle_http(cfg, &req)),
-        None => run_jobs(cfg, event),
+        None => run_jobs(cfg, event::parse_event(event)?),
     }
 }
 
 /// Function URL invocations answer in-band: every outcome, including refusals
 /// and handler errors, is an HTTP response rather than a Lambda error.
+/// Client mistakes (unrecognized event shape) are `400`; handler errors are a
+/// `500` with a generic body — the error chain names internal paths, upstream
+/// URLs and ARNs, so it goes to the log only, never over the wire.
 fn handle_http(cfg: &config::Config, req: &http::Request) -> serde_json::Value {
     let payload = match http::accept(cfg.http_secret.as_deref(), req) {
         Ok(v) => v,
         Err(response) => return response,
     };
-    match run_jobs(cfg, &payload) {
-        Ok(v) => http::respond(200, v),
+    let parsed = match event::parse_event(&payload) {
+        Ok(parsed) => parsed,
+        Err(e) => return http::respond(400, serde_json::json!({"error": format!("{e:#}")})),
+    };
+    match run_jobs(cfg, parsed) {
+        Ok(v) => {
+            // A Records-shaped body reports per-record failures instead of
+            // erroring, and no queue exists on this path to redeliver them:
+            // surface any failure as a 500 so callers keying on the status
+            // code cannot mistake a lost job for success.
+            let failed = v
+                .get("batchItemFailures")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|a| !a.is_empty());
+            http::respond(if failed { 500 } else { 200 }, v)
+        }
         Err(e) => {
             eprintln!("http: handler error: {e:#}");
-            http::respond(500, serde_json::json!({"error": format!("{e:#}")}))
+            http::respond(
+                500,
+                serde_json::json!({"error": "conversion failed (see function logs)"}),
+            )
         }
     }
 }
 
-fn run_jobs(cfg: &config::Config, event: &serde_json::Value) -> Result<serde_json::Value> {
-    match event::parse_event(event)? {
+fn run_jobs(cfg: &config::Config, event: event::Event) -> Result<serde_json::Value> {
+    match event {
         event::Event::Direct(job) => Ok(serde_json::json!({
             "jobs": [instrumented_job(cfg, Ok(job))?]
         })),
@@ -344,6 +364,16 @@ mod tests {
         }
     }
 
+    fn http_post(body: &serde_json::Value, secret: &str) -> serde_json::Value {
+        json!({
+            "version": "2.0",
+            "requestContext": {"http": {"method": "POST", "path": "/"}},
+            "headers": {"x-abgen-secret": secret},
+            "body": body.to_string(),
+            "isBase64Encoded": false,
+        })
+    }
+
     fn record(message_id: Option<&str>, entity_id: &str) -> event::Record {
         event::Record {
             message_id: message_id.map(str::to_string),
@@ -426,6 +456,62 @@ mod tests {
         let body = json!({"entity": {"entityId": "bafklod789"}, "lods": ["https://x/lod0.glb"]});
         let e = json!({"Records": [{"messageId": "m-1", "body": body.to_string()}]});
         assert_eq!(handle(&cfg, &e).unwrap(), json!({"batchItemFailures": []}));
+    }
+
+    #[test]
+    fn http_unrecognized_shape_is_a_400() {
+        let mut cfg = test_cfg();
+        cfg.http_secret = Some("s3cret".to_string());
+        let resp = handle(&cfg, &http_post(&json!({"foo": 1}), "s3cret")).unwrap();
+        assert_eq!(resp["statusCode"], 400);
+        assert!(
+            resp["body"]
+                .as_str()
+                .unwrap()
+                .contains("unrecognized event shape"),
+            "{resp}"
+        );
+    }
+
+    #[test]
+    fn http_records_body_with_a_failing_record_is_a_500() {
+        let mut cfg = test_cfg();
+        cfg.http_secret = Some("s3cret".to_string());
+        let body = json!({"Records": [{"messageId": "m-1", "body": "not json"}]});
+        let resp = handle(&cfg, &http_post(&body, "s3cret")).unwrap();
+        assert_eq!(resp["statusCode"], 500);
+        let inner: serde_json::Value =
+            serde_json::from_str(resp["body"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            inner["batchItemFailures"],
+            json!([{"itemIdentifier": "m-1"}])
+        );
+    }
+
+    #[test]
+    fn http_records_body_with_only_skips_is_a_200() {
+        let mut cfg = test_cfg();
+        cfg.http_secret = Some("s3cret".to_string());
+        let record = json!({"entity": {"entityId": "bafklod789"}, "lods": ["https://x/lod0.glb"]});
+        let body = json!({"Records": [{"messageId": "m-1", "body": record.to_string()}]});
+        let resp = handle(&cfg, &http_post(&body, "s3cret")).unwrap();
+        assert_eq!(resp["statusCode"], 200);
+    }
+
+    #[test]
+    fn http_500_body_is_generic_not_the_error_chain() {
+        let mut cfg = test_cfg();
+        cfg.http_secret = Some("s3cret".to_string());
+        cfg.allowed_content_server_hosts = Some(vec!["peer.decentraland.org".to_string()]);
+        let body = json!({
+            "entityId": "bafkabc123",
+            "contentServerUrl": "https://evil.example.com/content"
+        });
+        let resp = handle(&cfg, &http_post(&body, "s3cret")).unwrap();
+        assert_eq!(resp["statusCode"], 500);
+        let text = resp["body"].as_str().unwrap();
+        assert!(!text.contains("evil.example.com"), "{text}");
+        assert!(text.contains("see function logs"), "{text}");
     }
 
     #[test]
