@@ -149,6 +149,11 @@ marker caches a *mutable* artifact, the manifest verdict. Two consequences:
 Unset `ABGEN_REDIS_URL` and none of this exists — behavior is identical to
 today's S3-only path.
 
+Upstream equivalents, for anyone porting a deployment: the consumer-server
+reads the same two knobs as `REDIS_URL` (`components.ts`) and
+`REDIS_CACHE_TTL_SECONDS` (`scenes/component.ts`); the `ABGEN_` names follow
+this repo's env var convention deliberately.
+
 ## CDN key layout (mirrors prod exactly)
 
 | what | key |
