@@ -13,9 +13,57 @@ mod compare;
 use compare::cmd_compare;
 
 const BIN_NAME: &str = "abgen-lod";
+const CATALYST: &str = "https://peer.decentraland.org/content";
 
 fn usage() -> ! {
     abgen::clihelp::usage_error(usage_text());
+}
+
+/// Flag-cursor over argv: `next()` yields the current token, `val()` the
+/// value of the flag just yielded (erroring exactly like the old inline
+/// `need` closures: "<flag> needs a value").
+struct Args<'a> {
+    argv: &'a [String],
+    i: usize,
+}
+
+impl<'a> Args<'a> {
+    fn new(argv: &'a [String]) -> Self {
+        Self { argv, i: 0 }
+    }
+    fn next(&mut self) -> Option<&'a String> {
+        let a = self.argv.get(self.i);
+        self.i += 1;
+        a
+    }
+    fn val(&mut self) -> Result<&'a String> {
+        let flag = &self.argv[self.i - 1];
+        let v = self
+            .argv
+            .get(self.i)
+            .ok_or_else(|| anyhow!("{flag} needs a value"))?;
+        self.i += 1;
+        Ok(v)
+    }
+}
+
+fn atlas_mode(fixed: bool, adaptive: bool) -> abgen::lodgen::atlas::AtlasMode {
+    if fixed {
+        abgen::lodgen::atlas::AtlasMode::FullBleed
+    } else if adaptive {
+        abgen::lodgen::atlas::AtlasMode::Adaptive
+    } else {
+        abgen::lodgen::atlas::AtlasMode::Native
+    }
+}
+
+fn ensure_parent(path: &std::path::Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(())
 }
 
 fn usage_text() -> &'static str {
@@ -243,14 +291,12 @@ fn main() {
 use abgen::lodgen::parse_parcel;
 
 fn parse_parcels(s: &str) -> Result<Vec<(i32, i32)>> {
-    let mut out = Vec::new();
-    for tok in s.split(';') {
-        let tok = tok.trim();
-        if tok.is_empty() {
-            continue;
-        }
-        out.push(parse_parcel(tok)?);
-    }
+    let out = s
+        .split(';')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(parse_parcel)
+        .collect::<Result<Vec<_>>>()?;
     if out.is_empty() {
         bail!("--parcels {s:?} has no parcels");
     }
@@ -270,59 +316,26 @@ fn cmd_bundle(argv: &[String]) -> Result<i32> {
     let mut level: u32 = 1;
     let mut platform = "windows".to_string();
     let mut out = "lodgen-out".to_string();
-    let mut catalyst = "https://peer.decentraland.org/content".to_string();
+    let mut catalyst = CATALYST.to_string();
     let mut base: Option<String> = None;
     let mut parcels: Option<String> = None;
     let mut timestamp: Option<i64> = None;
     let mut vertical_clip: Option<f64> = None;
 
-    let mut i = 0usize;
-    while i < argv.len() {
-        let need = |i: usize| -> Result<&String> {
-            argv.get(i + 1)
-                .ok_or_else(|| anyhow!("{} needs a value", argv[i]))
-        };
-        match argv[i].as_str() {
-            "--entity" => {
-                entity = Some(need(i)?.clone());
-                i += 1;
-            }
-            "--level" => {
-                level = need(i)?.parse().context("--level")?;
-                i += 1;
-            }
-            "--platform" => {
-                platform = need(i)?.clone();
-                i += 1;
-            }
-            "--out" => {
-                out = need(i)?.clone();
-                i += 1;
-            }
-            "--catalyst" => {
-                catalyst = need(i)?.clone();
-                i += 1;
-            }
-            "--base" => {
-                base = Some(need(i)?.clone());
-                i += 1;
-            }
-            "--parcels" => {
-                parcels = Some(need(i)?.clone());
-                i += 1;
-            }
-            "--timestamp" => {
-                timestamp = Some(need(i)?.parse().context("--timestamp")?);
-                i += 1;
-            }
-            "--vertical-clip" => {
-                vertical_clip = Some(need(i)?.parse().context("--vertical-clip")?);
-                i += 1;
-            }
+    let mut a = Args::new(argv);
+    while let Some(arg) = a.next() {
+        match arg.as_str() {
+            "--entity" => entity = Some(a.val()?.clone()),
+            "--level" => level = a.val()?.parse().context("--level")?,
+            "--platform" => platform = a.val()?.clone(),
+            "--out" => out = a.val()?.clone(),
+            "--catalyst" => catalyst = a.val()?.clone(),
+            "--base" => base = Some(a.val()?.clone()),
+            "--parcels" => parcels = Some(a.val()?.clone()),
+            "--timestamp" => timestamp = Some(a.val()?.parse().context("--timestamp")?),
+            "--vertical-clip" => vertical_clip = Some(a.val()?.parse().context("--vertical-clip")?),
             "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
-            other if other.starts_with("--") => {
-                bail!("unknown flag {other:?}");
-            }
+            other if other.starts_with("--") => bail!("unknown flag {other:?}"),
             other => {
                 if src.is_some() {
                     bail!("unexpected positional {other:?}");
@@ -330,7 +343,6 @@ fn cmd_bundle(argv: &[String]) -> Result<i32> {
                 src = Some(other.to_string());
             }
         }
-        i += 1;
     }
     let src = src.ok_or_else(|| anyhow!("bundle needs a <src.glb> positional"))?;
     let entity = entity.ok_or_else(|| anyhow!("bundle needs --entity"))?;
@@ -420,40 +432,22 @@ fn cmd_placements(argv: &[String]) -> Result<i32> {
     let mut coords: Option<String> = None;
     let mut scene: Option<String> = None;
     let mut iss = "auto".to_string();
-    let mut catalyst = "https://peer.decentraland.org/content".to_string();
+    let mut catalyst = CATALYST.to_string();
 
-    let mut i = 0usize;
-    while i < argv.len() {
-        let need = |i: usize| -> Result<&String> {
-            argv.get(i + 1)
-                .ok_or_else(|| anyhow!("{} needs a value", argv[i]))
-        };
-        match argv[i].as_str() {
-            "--coords" => {
-                coords = Some(need(i)?.clone());
-                i += 1;
-            }
-            "--scene" => {
-                scene = Some(need(i)?.clone());
-                i += 1;
-            }
-            "--iss" => {
-                iss = need(i)?.clone();
-                i += 1;
-            }
-            "--catalyst" => {
-                catalyst = need(i)?.clone();
-                i += 1;
-            }
+    let mut a = Args::new(argv);
+    while let Some(arg) = a.next() {
+        match arg.as_str() {
+            "--coords" => coords = Some(a.val()?.clone()),
+            "--scene" => scene = Some(a.val()?.clone()),
+            "--iss" => iss = a.val()?.clone(),
+            "--catalyst" => catalyst = a.val()?.clone(),
             "--manifest-builder" => {
-                need(i)?;
+                a.val()?;
                 warn_manifest_builder_ignored();
-                i += 1;
             }
             "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
             other => bail!("unknown placements arg {other:?}"),
         }
-        i += 1;
     }
     let target = match (&coords, &scene) {
         (Some(c), None) => {
@@ -478,23 +472,13 @@ fn cmd_placements(argv: &[String]) -> Result<i32> {
 fn cmd_parse_manifest(argv: &[String]) -> Result<i32> {
     let mut manifest: Option<String> = None;
     let mut scene: Option<String> = None;
-    let mut catalyst = "https://peer.decentraland.org/content".to_string();
+    let mut catalyst = CATALYST.to_string();
 
-    let mut i = 0usize;
-    while i < argv.len() {
-        let need = |i: usize| -> Result<&String> {
-            argv.get(i + 1)
-                .ok_or_else(|| anyhow!("{} needs a value", argv[i]))
-        };
-        match argv[i].as_str() {
-            "--scene" => {
-                scene = Some(need(i)?.clone());
-                i += 1;
-            }
-            "--catalyst" => {
-                catalyst = need(i)?.clone();
-                i += 1;
-            }
+    let mut a = Args::new(argv);
+    while let Some(arg) = a.next() {
+        match arg.as_str() {
+            "--scene" => scene = Some(a.val()?.clone()),
+            "--catalyst" => catalyst = a.val()?.clone(),
             "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
             other if other.starts_with("--") => bail!("unknown parse-manifest flag {other:?}"),
             other => {
@@ -504,7 +488,6 @@ fn cmd_parse_manifest(argv: &[String]) -> Result<i32> {
                 manifest = Some(other.to_string());
             }
         }
-        i += 1;
     }
     let manifest =
         manifest.ok_or_else(|| anyhow!("parse-manifest needs a <manifest.json> positional"))?;
@@ -532,7 +515,7 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
     let mut entity_json: Option<String> = None;
     let mut out: Option<String> = None;
     let mut iss = "auto".to_string();
-    let mut catalyst = "https://peer.decentraland.org/content".to_string();
+    let mut catalyst = CATALYST.to_string();
     let mut cache: Option<String> = None;
     let mut level: u32 = 1;
     let mut no_crop = false;
@@ -543,73 +526,30 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
     let mut atlas_fixed = false;
     let mut atlas_adaptive = false;
 
-    let mut i = 0usize;
-    while i < argv.len() {
-        let need = |i: usize| -> Result<&String> {
-            argv.get(i + 1)
-                .ok_or_else(|| anyhow!("{} needs a value", argv[i]))
-        };
-        match argv[i].as_str() {
-            "--scene" => {
-                scene = Some(need(i)?.clone());
-                i += 1;
-            }
-            "--entity-json" => {
-                entity_json = Some(need(i)?.clone());
-                i += 1;
-            }
-            "-o" | "--out" => {
-                out = Some(need(i)?.clone());
-                i += 1;
-            }
-            "--iss" => {
-                iss = need(i)?.clone();
-                i += 1;
-            }
-            "--catalyst" => {
-                catalyst = need(i)?.clone();
-                i += 1;
-            }
+    let mut a = Args::new(argv);
+    while let Some(arg) = a.next() {
+        match arg.as_str() {
+            "--scene" => scene = Some(a.val()?.clone()),
+            "--entity-json" => entity_json = Some(a.val()?.clone()),
+            "-o" | "--out" => out = Some(a.val()?.clone()),
+            "--iss" => iss = a.val()?.clone(),
+            "--catalyst" => catalyst = a.val()?.clone(),
             "--manifest-builder" => {
-                need(i)?;
+                a.val()?;
                 warn_manifest_builder_ignored();
-                i += 1;
             }
-            "--cache" => {
-                cache = Some(need(i)?.clone());
-                i += 1;
-            }
-            "--level" => {
-                level = need(i)?.parse().context("--level")?;
-                i += 1;
-            }
-            "--no-crop" => {
-                no_crop = true;
-            }
-            "--no-atlas" => {
-                no_atlas = true;
-            }
-            "--raw-materials" => {
-                raw_materials = true;
-            }
-            "--max-size" => {
-                max_size = need(i)?.parse().context("--max-size")?;
-                i += 1;
-            }
-            "--padding" => {
-                padding = need(i)?.parse().context("--padding")?;
-                i += 1;
-            }
-            "--atlas-fixed" => {
-                atlas_fixed = true;
-            }
-            "--atlas-adaptive" => {
-                atlas_adaptive = true;
-            }
+            "--cache" => cache = Some(a.val()?.clone()),
+            "--level" => level = a.val()?.parse().context("--level")?,
+            "--no-crop" => no_crop = true,
+            "--no-atlas" => no_atlas = true,
+            "--raw-materials" => raw_materials = true,
+            "--max-size" => max_size = a.val()?.parse().context("--max-size")?,
+            "--padding" => padding = a.val()?.parse().context("--padding")?,
+            "--atlas-fixed" => atlas_fixed = true,
+            "--atlas-adaptive" => atlas_adaptive = true,
             "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
             other => bail!("unknown assemble arg {other:?}"),
         }
-        i += 1;
     }
     let out = out.ok_or_else(|| anyhow!("assemble needs -o <out.glb>"))?;
     if raw_materials && !no_atlas {
@@ -662,13 +602,7 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
     let model = if no_atlas {
         model
     } else {
-        let mode = if atlas_fixed {
-            abgen::lodgen::atlas::AtlasMode::FullBleed
-        } else if atlas_adaptive {
-            abgen::lodgen::atlas::AtlasMode::Adaptive
-        } else {
-            abgen::lodgen::atlas::AtlasMode::Native
-        };
+        let mode = atlas_mode(atlas_fixed, atlas_adaptive);
         abgen::lodgen::atlas::atlas_with(&model, max_size, padding, mode, false)?
     };
     for line in &model.log {
@@ -679,11 +613,7 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
     }
 
     let glb = abgen::lodgen::emit::emit_glb(&model)?;
-    if let Some(parent) = std::path::Path::new(&out).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
+    ensure_parent(std::path::Path::new(&out))?;
     std::fs::write(&out, &glb).with_context(|| format!("write {out}"))?;
 
     let summary = model
@@ -744,47 +674,20 @@ fn cmd_atlas(argv: &[String]) -> Result<i32> {
     let mut crop_base: Option<String> = None;
     let mut crop_parcels: Option<String> = None;
 
-    let mut i = 0usize;
-    while i < argv.len() {
-        let need = |i: usize| -> Result<&String> {
-            argv.get(i + 1)
-                .ok_or_else(|| anyhow!("{} needs a value", argv[i]))
-        };
-        match argv[i].as_str() {
-            "-i" | "--in" => {
-                input = Some(need(i)?.clone());
-                i += 1;
-            }
-            "-o" | "--out" => {
-                out = Some(need(i)?.clone());
-                i += 1;
-            }
-            "--max-size" => {
-                max_size = need(i)?.parse().context("--max-size")?;
-                i += 1;
-            }
-            "--padding" => {
-                padding = need(i)?.parse().context("--padding")?;
-                i += 1;
-            }
-            "--atlas-fixed" => {
-                atlas_fixed = true;
-            }
-            "--atlas-adaptive" => {
-                atlas_adaptive = true;
-            }
-            "--crop-base" => {
-                crop_base = Some(need(i)?.clone());
-                i += 1;
-            }
-            "--crop-parcels" => {
-                crop_parcels = Some(need(i)?.clone());
-                i += 1;
-            }
+    let mut a = Args::new(argv);
+    while let Some(arg) = a.next() {
+        match arg.as_str() {
+            "-i" | "--in" => input = Some(a.val()?.clone()),
+            "-o" | "--out" => out = Some(a.val()?.clone()),
+            "--max-size" => max_size = a.val()?.parse().context("--max-size")?,
+            "--padding" => padding = a.val()?.parse().context("--padding")?,
+            "--atlas-fixed" => atlas_fixed = true,
+            "--atlas-adaptive" => atlas_adaptive = true,
+            "--crop-base" => crop_base = Some(a.val()?.clone()),
+            "--crop-parcels" => crop_parcels = Some(a.val()?.clone()),
             "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
             other => bail!("unknown atlas arg {other:?}"),
         }
-        i += 1;
     }
     let input = input.ok_or_else(|| anyhow!("atlas needs -i <in.glb>"))?;
     let out = out.ok_or_else(|| anyhow!("atlas needs -o <out.glb>"))?;
@@ -808,23 +711,13 @@ fn cmd_atlas(argv: &[String]) -> Result<i32> {
         (None, None) => {}
         _ => bail!("--crop-base and --crop-parcels must be given together"),
     }
-    let mode = if atlas_fixed {
-        abgen::lodgen::atlas::AtlasMode::FullBleed
-    } else if atlas_adaptive {
-        abgen::lodgen::atlas::AtlasMode::Adaptive
-    } else {
-        abgen::lodgen::atlas::AtlasMode::Native
-    };
+    let mode = atlas_mode(atlas_fixed, atlas_adaptive);
     let atlased = abgen::lodgen::atlas::atlas_with(&model, max_size, padding, mode, false)?;
     for line in atlased.log.iter().filter(|l| l.starts_with("atlas:")) {
         println!("{line}");
     }
     let glb = abgen::lodgen::emit::emit_glb(&atlased)?;
-    if let Some(parent) = std::path::Path::new(&out).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
+    ensure_parent(std::path::Path::new(&out))?;
     std::fs::write(&out, &glb).with_context(|| format!("write {out}"))?;
     println!(
         "tris_in={} tris_out={} materials={} images={} bytes={}",
@@ -854,52 +747,23 @@ fn cmd_simplify(argv: &[String]) -> Result<i32> {
     let mut gltfpack: Option<String> = None;
     let mut allow_unsimplified = false;
 
-    let mut i = 0usize;
-    while i < argv.len() {
-        let need = |i: usize| -> Result<&String> {
-            argv.get(i + 1)
-                .ok_or_else(|| anyhow!("{} needs a value", argv[i]))
-        };
-        match argv[i].as_str() {
-            "-i" | "--in" => {
-                input = Some(need(i)?.clone());
-                i += 1;
-            }
-            "-o" | "--out" => {
-                out = Some(need(i)?.clone());
-                i += 1;
-            }
-            "--ratio" => {
-                ratio = need(i)?.parse().context("--ratio")?;
-                i += 1;
-            }
-            "--tri-cap" => {
-                tri_cap = Some(need(i)?.parse().context("--tri-cap")?);
-                i += 1;
-            }
-            "--simplifier" => {
-                backend = simplify::SimplifierBackend::parse(need(i)?)?;
-                i += 1;
-            }
-            "--gltfpack" => {
-                gltfpack = Some(need(i)?.clone());
-                i += 1;
-            }
-            "--allow-unsimplified" => {
-                allow_unsimplified = true;
-            }
+    let mut a = Args::new(argv);
+    while let Some(arg) = a.next() {
+        match arg.as_str() {
+            "-i" | "--in" => input = Some(a.val()?.clone()),
+            "-o" | "--out" => out = Some(a.val()?.clone()),
+            "--ratio" => ratio = a.val()?.parse().context("--ratio")?,
+            "--tri-cap" => tri_cap = Some(a.val()?.parse().context("--tri-cap")?),
+            "--simplifier" => backend = simplify::SimplifierBackend::parse(a.val()?)?,
+            "--gltfpack" => gltfpack = Some(a.val()?.clone()),
+            "--allow-unsimplified" => allow_unsimplified = true,
             "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
             other => bail!("unknown simplify arg {other:?}"),
         }
-        i += 1;
     }
     let input = PathBuf::from(input.ok_or_else(|| anyhow!("simplify needs -i <in.glb>"))?);
     let out = PathBuf::from(out.ok_or_else(|| anyhow!("simplify needs -o <out.glb>"))?);
-    if let Some(parent) = out.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
+    ensure_parent(&out)?;
 
     let report = match backend {
         simplify::SimplifierBackend::Meshopt => {
@@ -949,23 +813,14 @@ fn cmd_generate(argv: &[String]) -> Result<i32> {
     let mut out: Option<String> = None;
     let mut gpu_flag = false;
 
-    let mut i = 0usize;
-    while i < argv.len() {
-        let need = |i: usize| -> Result<&String> {
-            argv.get(i + 1)
-                .ok_or_else(|| anyhow!("{} needs a value", argv[i]))
-        };
-        match argv[i].as_str() {
-            "--scene" => {
-                scene = Some(need(i)?.clone());
-                i += 1;
-            }
-            "--out" => {
-                out = Some(need(i)?.clone());
-                i += 1;
-            }
+    let mut a = Args::new(argv);
+    while let Some(arg) = a.next() {
+        match arg.as_str() {
+            "--scene" => scene = Some(a.val()?.clone()),
+            "--out" => out = Some(a.val()?.clone()),
             "--platform" => {
-                let mut list: Vec<String> = need(i)?
+                let mut list: Vec<String> = a
+                    .val()?
                     .split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
@@ -980,11 +835,10 @@ fn cmd_generate(argv: &[String]) -> Result<i32> {
                 }
                 params.platform = list[0].clone();
                 params.platforms = list;
-                i += 1;
             }
             "--level" => {
                 let mut list: Vec<u32> = Vec::new();
-                for tok in need(i)?.split(',') {
+                for tok in a.val()?.split(',') {
                     let tok = tok.trim();
                     if tok.is_empty() {
                         continue;
@@ -992,102 +846,50 @@ fn cmd_generate(argv: &[String]) -> Result<i32> {
                     list.push(tok.parse().context("--level")?);
                 }
                 params.levels = abgen::lodgen::normalize_levels(&list)?;
-                i += 1;
             }
-            "--ratio" => {
-                params.ratio = need(i)?.parse().context("--ratio")?;
-                i += 1;
-            }
-            "--tri-cap" => {
-                let v = need(i)?;
-                match v.as_str() {
-                    "auto" => {
-                        params.tri_cap = None;
-                        params.tri_cap_auto = true;
-                    }
-                    "off" => {
-                        params.tri_cap = None;
-                        params.tri_cap_auto = false;
-                    }
-                    _ => {
-                        params.tri_cap = Some(v.parse().context("--tri-cap")?);
-                        params.tri_cap_auto = false;
-                    }
+            "--ratio" => params.ratio = a.val()?.parse().context("--ratio")?,
+            "--tri-cap" => match a.val()?.as_str() {
+                "auto" => {
+                    params.tri_cap = None;
+                    params.tri_cap_auto = true;
                 }
-                i += 1;
-            }
-            "--atlas-max" => {
-                params.atlas_max = need(i)?.parse().context("--atlas-max")?;
-                i += 1;
-            }
-            "--atlas-fixed" => {
-                params.atlas_fixed = true;
-            }
-            "--atlas-adaptive" => {
-                params.atlas_adaptive = true;
-            }
-            "--bake-order" => {
-                match need(i)?.as_str() {
-                    "pre" => params.bake_after_simplify = false,
-                    "post" => params.bake_after_simplify = true,
-                    other => bail!("--bake-order must be pre|post, got {other:?}"),
+                "off" => {
+                    params.tri_cap = None;
+                    params.tri_cap_auto = false;
                 }
-                i += 1;
-            }
-            "--no-crop" => {
-                params.crop = false;
-            }
-            "--catalyst" => {
-                params.catalyst = need(i)?.clone();
-                i += 1;
-            }
-            "--iss" => {
-                params.iss = need(i)?.clone();
-                i += 1;
-            }
+                v => {
+                    params.tri_cap = Some(v.parse().context("--tri-cap")?);
+                    params.tri_cap_auto = false;
+                }
+            },
+            "--atlas-max" => params.atlas_max = a.val()?.parse().context("--atlas-max")?,
+            "--atlas-fixed" => params.atlas_fixed = true,
+            "--atlas-adaptive" => params.atlas_adaptive = true,
+            "--bake-order" => match a.val()?.as_str() {
+                "pre" => params.bake_after_simplify = false,
+                "post" => params.bake_after_simplify = true,
+                other => bail!("--bake-order must be pre|post, got {other:?}"),
+            },
+            "--no-crop" => params.crop = false,
+            "--catalyst" => params.catalyst = a.val()?.clone(),
+            "--iss" => params.iss = a.val()?.clone(),
             "--manifest-builder" => {
-                need(i)?;
+                a.val()?;
                 warn_manifest_builder_ignored();
-                i += 1;
             }
-            "--workdir" => {
-                params.workdir = Some(PathBuf::from(need(i)?));
-                i += 1;
-            }
-            "--cache" => {
-                params.cache = Some(PathBuf::from(need(i)?));
-                i += 1;
-            }
-            "--simplifier" => {
-                params.simplifier = simplify::SimplifierBackend::parse(need(i)?)?;
-                i += 1;
-            }
-            "--gltfpack" => {
-                params.gltfpack = Some(PathBuf::from(need(i)?));
-                i += 1;
-            }
-            "--allow-unsimplified" => {
-                params.allow_unsimplified = true;
-            }
-            "--keep-glb" => {
-                params.keep_glb = true;
-            }
-            "--no-uv-reclamp" => {
-                params.uv_reclamp = false;
-            }
-            "--emissive" => {
-                params.emissive_channel = true;
-            }
-            "--fidelity" => {
-                params.fidelity = true;
-            }
-            "--gpu" => {
-                gpu_flag = true;
-            }
+            "--workdir" => params.workdir = Some(PathBuf::from(a.val()?)),
+            "--cache" => params.cache = Some(PathBuf::from(a.val()?)),
+            "--simplifier" => params.simplifier = simplify::SimplifierBackend::parse(a.val()?)?,
+            "--gltfpack" => params.gltfpack = Some(PathBuf::from(a.val()?)),
+            "--allow-unsimplified" => params.allow_unsimplified = true,
+            "--keep-glb" => params.keep_glb = true,
+            "--no-uv-reclamp" => params.uv_reclamp = false,
+            "--emissive" => params.emissive_channel = true,
+            "--fidelity" => params.fidelity = true,
+            "--gpu" => gpu_flag = true,
             "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
             other => bail!("unknown generate arg {other:?}"),
         }
-        i += 1;
     }
     if gpu_flag {
         abgen::arm_gpu_explicit();

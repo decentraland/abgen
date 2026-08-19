@@ -106,22 +106,17 @@ pub fn run_with_deadline(
         cmd.process_group(0);
     }
     let mut child = cmd.spawn().with_context(|| format!("spawn {label}"))?;
-    let mut out_pipe = child.stdout.take();
-    let mut err_pipe = child.stderr.take();
-    let out_h = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        if let Some(p) = out_pipe.as_mut() {
-            let _ = p.read_to_end(&mut b);
-        }
-        b
-    });
-    let err_h = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        if let Some(p) = err_pipe.as_mut() {
-            let _ = p.read_to_end(&mut b);
-        }
-        b
-    });
+    fn drain<R: Read + Send + 'static>(mut pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            if let Some(p) = pipe.as_mut() {
+                let _ = p.read_to_end(&mut b);
+            }
+            b
+        })
+    }
+    let out_h = drain(child.stdout.take());
+    let err_h = drain(child.stderr.take());
     let started = std::time::Instant::now();
     let status = loop {
         if let Some(st) = child.try_wait().with_context(|| format!("wait {label}"))? {
@@ -350,17 +345,16 @@ fn merge_model(out_model: &mut LodModel, rescued: &LodModel) {
                     mr_image: None,
                     ..mat.clone()
                 };
-                if let Some(img) = mat.image {
-                    out_model.images.push(rescued.images[img].clone());
-                    m.image = Some(out_model.images.len() - 1);
-                }
-                if let Some(img) = mat.emissive_image {
-                    out_model.images.push(rescued.images[img].clone());
-                    m.emissive_image = Some(out_model.images.len() - 1);
-                }
-                if let Some(img) = mat.mr_image {
-                    out_model.images.push(rescued.images[img].clone());
-                    m.mr_image = Some(out_model.images.len() - 1);
+                let slots = [
+                    (&mut m.image, mat.image),
+                    (&mut m.emissive_image, mat.emissive_image),
+                    (&mut m.mr_image, mat.mr_image),
+                ];
+                for (slot, src) in slots {
+                    if let Some(img) = src {
+                        out_model.images.push(rescued.images[img].clone());
+                        *slot = Some(out_model.images.len() - 1);
+                    }
                 }
                 out_model.materials.push(m);
                 out_model.materials.len() - 1
@@ -496,13 +490,7 @@ pub fn simplify_with(
     let tris_before = glb_tris(input)?;
     let under_cap = |tris: usize| tri_cap.is_none_or(|c| tris as u64 <= c);
     if ratio >= 1.0 && under_cap(tris_before) {
-        copy_through(input, output)?;
-        return Ok(SimplifyReport {
-            tris_before,
-            tris_after: tris_before,
-            passthrough: true,
-            ..Default::default()
-        });
+        return passthrough(input, output);
     }
     let mut report = SimplifyReport {
         tris_before,
@@ -645,6 +633,40 @@ mod tests {
         dir
     }
 
+    fn io_paths(tag: &str, glb: &[u8]) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = temp_dir(tag);
+        let input = dir.join("in.glb");
+        let output = dir.join("out.glb");
+        std::fs::write(&input, glb).unwrap();
+        (dir, input, output)
+    }
+
+    fn model_of(
+        name: &str,
+        primitives: Vec<LodPrimitive>,
+        materials: Vec<LodMaterial>,
+    ) -> LodModel {
+        LodModel {
+            root_name: name.to_string(),
+            primitives,
+            materials,
+            images: Vec::new(),
+            log: Vec::new(),
+        }
+    }
+
+    macro_rules! need_gltfpack {
+        () => {
+            match resolve_gltfpack(None) {
+                Ok(b) => b,
+                Err(_) => {
+                    eprintln!("SKIP: gltfpack not resolvable ({GLTFPACK_NIX_RECIPE})");
+                    return;
+                }
+            }
+        };
+    }
+
     fn grid_primitive(n: u32) -> LodPrimitive {
         let mut positions = Vec::new();
         let mut normals = Vec::new();
@@ -694,13 +716,11 @@ mod tests {
     }
 
     fn grid_glb(n: u32) -> Vec<u8> {
-        emit_glb(&LodModel {
-            root_name: "grid".to_string(),
-            primitives: vec![grid_primitive(n)],
-            materials: vec![material("m", AlphaClass::Opaque)],
-            images: Vec::new(),
-            log: Vec::new(),
-        })
+        emit_glb(&model_of(
+            "grid",
+            vec![grid_primitive(n)],
+            vec![material("m", AlphaClass::Opaque)],
+        ))
         .unwrap()
     }
 
@@ -738,6 +758,10 @@ mod tests {
     }
 
     fn scattered_quads(material: usize, count: u32, size: f32) -> LodPrimitive {
+        quad_cards(material, count, size, false)
+    }
+
+    fn quad_cards(material: usize, count: u32, size: f32, strip_uv: bool) -> LodPrimitive {
         let mut prim = LodPrimitive {
             material,
             ..Default::default()
@@ -745,11 +769,21 @@ mod tests {
         for k in 0..count {
             let x = (k % 12) as f32 * 0.8;
             let z = (k / 12) as f32 * 0.8;
+            let (u0, u1) = if strip_uv {
+                (k as f32 / count as f32, (k + 1) as f32 / count as f32)
+            } else {
+                (0.0, 1.0)
+            };
             let base = prim.positions.len() as u32;
-            for (dx, dy) in [(0.0, 0.0), (size, 0.0), (0.0, size), (size, size)] {
+            for (dx, dy, u, v) in [
+                (0.0, 0.0, u0, 0.0),
+                (size, 0.0, u1, 0.0),
+                (0.0, size, u0, 1.0),
+                (size, size, u1, 1.0),
+            ] {
                 prim.positions.push([x + dx, 1.0 + dy, z]);
                 prim.normals.push([0.0, 0.0, 1.0]);
-                prim.uvs.push([dx / size, dy / size]);
+                prim.uvs.push([u, v]);
             }
             prim.indices.extend_from_slice(&[
                 base,
@@ -838,11 +872,8 @@ mod tests {
 
     #[test]
     fn ratio_one_under_cap_is_byte_passthrough() {
-        let dir = temp_dir("passthrough");
         let glb = grid_glb(8);
-        let input = dir.join("in.glb");
-        let output = dir.join("out.glb");
-        std::fs::write(&input, &glb).unwrap();
+        let (_dir, input, output) = io_paths("passthrough", &glb);
         let report = simplify(
             &input,
             &output,
@@ -871,11 +902,8 @@ mod tests {
 
     #[test]
     fn passthrough_copies_byte_identical_without_gltfpack() {
-        let dir = temp_dir("purepass");
         let glb = grid_glb(6);
-        let input = dir.join("in.glb");
-        let output = dir.join("out.glb");
-        std::fs::write(&input, &glb).unwrap();
+        let (_dir, input, output) = io_paths("purepass", &glb);
         let report = passthrough(&input, &output).unwrap();
         assert!(report.passthrough);
         assert!(!report.unsimplified);
@@ -888,11 +916,8 @@ mod tests {
 
     #[test]
     fn allow_unsimplified_copies_verbatim() {
-        let dir = temp_dir("unsimplified");
         let glb = grid_glb(4);
-        let input = dir.join("in.glb");
-        let output = dir.join("out.glb");
-        std::fs::write(&input, &glb).unwrap();
+        let (_dir, input, output) = io_paths("unsimplified", &glb);
         let report = copy_unsimplified(&input, &output).unwrap();
         assert!(report.unsimplified);
         assert!(report.passthrough);
@@ -904,15 +929,8 @@ mod tests {
 
     #[test]
     fn gltfpack_reduces_grid_and_output_reparses() {
-        let Ok(bin) = resolve_gltfpack(None) else {
-            eprintln!("SKIP: gltfpack not resolvable ({GLTFPACK_NIX_RECIPE})");
-            return;
-        };
-        let dir = temp_dir("reduce");
-        let glb = grid_glb(32);
-        let input = dir.join("in.glb");
-        let output = dir.join("out.glb");
-        std::fs::write(&input, &glb).unwrap();
+        let bin = need_gltfpack!();
+        let (_dir, input, output) = io_paths("reduce", &grid_glb(32));
 
         let report = simplify(&input, &output, 0.25, None, &bin).unwrap();
         assert_eq!(report.tris_before, 2048);
@@ -961,24 +979,16 @@ mod tests {
 
     #[test]
     fn tall_thin_feature_survives_ratio_simplify() {
-        let Ok(bin) = resolve_gltfpack(None) else {
-            eprintln!("SKIP: gltfpack not resolvable ({GLTFPACK_NIX_RECIPE})");
-            return;
-        };
-        let dir = temp_dir("spire");
+        let bin = need_gltfpack!();
         let mut prim = grid_primitive(32);
         append_spire(&mut prim, 5.0, 5.0, 17.0, 40);
-        let glb = emit_glb(&LodModel {
-            root_name: "spire".to_string(),
-            primitives: vec![prim],
-            materials: vec![material("m", AlphaClass::Opaque)],
-            images: Vec::new(),
-            log: Vec::new(),
-        })
+        let glb = emit_glb(&model_of(
+            "spire",
+            vec![prim],
+            vec![material("m", AlphaClass::Opaque)],
+        ))
         .unwrap();
-        let input = dir.join("in.glb");
-        let output = dir.join("out.glb");
-        std::fs::write(&input, &glb).unwrap();
+        let (dir, input, output) = io_paths("spire", &glb);
 
         let report = simplify(&input, &output, 0.1, None, &bin).unwrap();
         assert!(report.tris_after < report.tris_before);
@@ -996,32 +1006,18 @@ mod tests {
 
     #[test]
     fn vanished_material_class_is_rescued() {
-        let Ok(bin) = resolve_gltfpack(None) else {
-            eprintln!("SKIP: gltfpack not resolvable ({GLTFPACK_NIX_RECIPE})");
-            return;
-        };
-        let dir = temp_dir("rescue");
+        let bin = need_gltfpack!();
         let materials = vec![
             material("op", AlphaClass::Opaque),
             material("bl", AlphaClass::Blend),
         ];
-        let full = LodModel {
-            root_name: "rescue".to_string(),
-            primitives: vec![grid_primitive(32), scattered_quads(1, 150, 0.5)],
-            materials: materials.clone(),
-            images: Vec::new(),
-            log: Vec::new(),
-        };
-        let lost = LodModel {
-            root_name: "rescue".to_string(),
-            primitives: vec![grid_primitive(8)],
-            materials,
-            images: Vec::new(),
-            log: Vec::new(),
-        };
-        let input = dir.join("in.glb");
-        let output = dir.join("out.glb");
-        std::fs::write(&input, emit_glb(&full).unwrap()).unwrap();
+        let full = model_of(
+            "rescue",
+            vec![grid_primitive(32), scattered_quads(1, 150, 0.5)],
+            materials.clone(),
+        );
+        let lost = model_of("rescue", vec![grid_primitive(8)], materials);
+        let (dir, input, output) = io_paths("rescue", &emit_glb(&full).unwrap());
         std::fs::write(&output, emit_glb(&lost).unwrap()).unwrap();
 
         let mut report = SimplifyReport::default();
@@ -1045,37 +1041,23 @@ mod tests {
 
     #[test]
     fn alpha_granularity_rescues_lost_class_not_lost_materials() {
-        let Ok(bin) = resolve_gltfpack(None) else {
-            eprintln!("SKIP: gltfpack not resolvable ({GLTFPACK_NIX_RECIPE})");
-            return;
-        };
-        let dir = temp_dir("alpharescue");
+        let bin = need_gltfpack!();
         let materials = vec![
             material("op-big", AlphaClass::Opaque),
             material("bl", AlphaClass::Blend),
             material("op-small", AlphaClass::Opaque),
         ];
-        let full = LodModel {
-            root_name: "alpharescue".to_string(),
-            primitives: vec![
+        let full = model_of(
+            "alpharescue",
+            vec![
                 grid_primitive(32),
                 scattered_quads(1, 150, 0.5),
                 scattered_quads(2, 150, 0.5),
             ],
-            materials: materials.clone(),
-            images: Vec::new(),
-            log: Vec::new(),
-        };
-        let lost = LodModel {
-            root_name: "alpharescue".to_string(),
-            primitives: vec![grid_primitive(8)],
-            materials,
-            images: Vec::new(),
-            log: Vec::new(),
-        };
-        let input = dir.join("in.glb");
-        let output = dir.join("out.glb");
-        std::fs::write(&input, emit_glb(&full).unwrap()).unwrap();
+            materials.clone(),
+        );
+        let lost = model_of("alpharescue", vec![grid_primitive(8)], materials);
+        let (dir, input, output) = io_paths("alpharescue", &emit_glb(&full).unwrap());
         std::fs::write(&output, emit_glb(&lost).unwrap()).unwrap();
 
         let mut report = SimplifyReport::default();
@@ -1096,39 +1078,6 @@ mod tests {
         assert!(by_mat.get("bl").copied().unwrap_or(0) > 0, "{by_mat:?}");
         assert_eq!(report.tris_after, out.total_tris());
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn strip_uv_cards(material: usize, count: u32, size: f32) -> LodPrimitive {
-        let mut prim = LodPrimitive {
-            material,
-            ..Default::default()
-        };
-        for k in 0..count {
-            let x = (k % 12) as f32 * 0.8;
-            let z = (k / 12) as f32 * 0.8;
-            let u0 = k as f32 / count as f32;
-            let u1 = (k + 1) as f32 / count as f32;
-            let base = prim.positions.len() as u32;
-            for (dx, dy, u, v) in [
-                (0.0, 0.0, u0, 0.0),
-                (size, 0.0, u1, 0.0),
-                (0.0, size, u0, 1.0),
-                (size, size, u1, 1.0),
-            ] {
-                prim.positions.push([x + dx, 1.0 + dy, z]);
-                prim.normals.push([0.0, 0.0, 1.0]);
-                prim.uvs.push([u, v]);
-            }
-            prim.indices.extend_from_slice(&[
-                base,
-                base + 2,
-                base + 1,
-                base + 1,
-                base + 2,
-                base + 3,
-            ]);
-        }
-        prim
     }
 
     fn leaf_stats(model: &LodModel) -> (usize, f32) {
@@ -1154,25 +1103,17 @@ mod tests {
 
     #[test]
     fn capped_ladder_keeps_cutout_foliage_present_and_unsmeared() {
-        let Ok(bin) = resolve_gltfpack(None) else {
-            eprintln!("SKIP: gltfpack not resolvable ({GLTFPACK_NIX_RECIPE})");
-            return;
-        };
-        let dir = temp_dir("foliage");
+        let bin = need_gltfpack!();
         let cards = 150u32;
-        let full = LodModel {
-            root_name: "foliage".to_string(),
-            primitives: vec![grid_primitive(48), strip_uv_cards(1, cards, 0.5)],
-            materials: vec![
+        let full = model_of(
+            "foliage",
+            vec![grid_primitive(48), quad_cards(1, cards, 0.5, true)],
+            vec![
                 material("op", AlphaClass::Opaque),
                 material("leaf", AlphaClass::Blend),
             ],
-            images: Vec::new(),
-            log: Vec::new(),
-        };
-        let input = dir.join("in.glb");
-        let output = dir.join("out.glb");
-        std::fs::write(&input, emit_glb(&full).unwrap()).unwrap();
+        );
+        let (dir, input, output) = io_paths("foliage", &emit_glb(&full).unwrap());
 
         let report = simplify_with(
             &input,
