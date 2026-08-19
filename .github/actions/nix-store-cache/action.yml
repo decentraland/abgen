@@ -40,7 +40,13 @@ runs:
         # derivations have to fit under GitHub's 10 GB/repo cache quota
         # across two arch families.
         gc-max-store-size-linux: 6442450944
+        # Snapshots save only from main/tags: branch-scoped PR saves still
+        # consume the shared 10 GB repo quota, and every key rotation parked
+        # a superseded ~2.3 GB snapshot per arch for a week — which is what
+        # kept evicting the darwin/windows cargo caches. PRs restore main's
+        # snapshot via the prefix and never save.
+        save: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
         purge: true
         purge-prefixes: nix-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.family }}-
-        purge-last-accessed: 604800
+        purge-last-accessed: 259200
         purge-primary-key: never
