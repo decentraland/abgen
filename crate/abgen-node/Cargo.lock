@@ -34,6 +34,7 @@ dependencies = [
  "psd",
  "rayon",
  "rquickjs",
+ "rustls",
  "serde",
  "serde_json",
  "sha1",
@@ -48,6 +49,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "webpki-roots",
  "wgpu",
 ]
 

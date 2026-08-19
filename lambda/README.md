@@ -59,7 +59,7 @@ all hits.
 | `ABGEN_S3_READ_ONLY` | off | probe/reuse without writing (dry runs) |
 | `KEEP_OUTPUT` | off (`--once` forces on) | keep the local corpus after the run |
 | `REGISTRY_QUEUE_URL` | — | registry queue (step 4, deferred) |
-| `ABGEN_REDIS_URL` | — (off) | `redis://host[:port]` — enables the shared hit-cache in front of S3 existence probes (see below) |
+| `ABGEN_REDIS_URL` | — (off) | `redis://host[:port]` (or `rediss://…` for TLS) — enables the shared hit-cache in front of S3 existence probes (see below) |
 | `ABGEN_REDIS_TTL_SECONDS` | `86400` | TTL on cached positive probes |
 | `ALLOWED_CONTENT_SERVER_HOSTS` | — (**fail-open**) | comma-separated allowlist of hosts an event's `contentServerUrl` may name; **unset means any https host is accepted**, so every deployment should set it. The `lambdaImage` bakes in `peer.decentraland.org`; a function env var overrides it. |
 
@@ -99,6 +99,14 @@ Semantics (mirrors consumer-server's asset-reuse cache):
   different CDNs can never cross-contaminate; a `force` job deletes the
   entity markers it bypasses, since a reconversion can downgrade a manifest.
 - 24 h TTL bounds the keyspace across `AB_VERSION` bumps.
+
+URL scheme picks the transport: `redis://` is plain TCP, `rediss://` wraps the
+same RESP session in TLS (rustls) for clusters where ElastiCache in-transit
+encryption is required. Certificates are verified against the webpki root
+bundle — the Amazon-issued ElastiCache certificate chains to it, and there is no
+opt-out for self-signed or hostname-mismatched certs. `user:password@` in either
+scheme becomes an `AUTH`, so a cluster with an auth token or a Redis ACL user
+works the same way over TLS.
 
 Unset `ABGEN_REDIS_URL` and none of this exists — behavior is identical to
 today's S3-only path.
