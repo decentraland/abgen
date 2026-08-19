@@ -46,9 +46,18 @@ let
       AR_wasm32_unknown_unknown = "${wasiCC.bintools}/bin/${wasiPrefix}ar";
       CFLAGS_wasm32_unknown_unknown = "--target=${wasiTriple}";
       CXXFLAGS_wasm32_unknown_unknown = "--target=${wasiTriple}";
-      WASI_LIBC_LIB = "${wasiCC.libc}/lib";
-      WASI_LIBCXX_LIB = "${wasi.llvmPackages.libcxx}/lib";
     };
+    # wasi-libc's archive layout moved across nixpkgs (lib -> lib/<triple>),
+    # which broke the link with "unable to find library -lsetjmp/-lc" when
+    # these were hardcoded /lib. Locate the archives instead of guessing.
+    preBuild = ''
+      WASI_LIBC_LIB="$(dirname "$(find ${wasiCC.libc} -name libc.a -print -quit)")"
+      WASI_LIBCXX_LIB="$(dirname "$(find ${wasi.llvmPackages.libcxx} -name 'libc++.a' -print -quit)")"
+      [ -n "$WASI_LIBC_LIB" ] && [ -n "$WASI_LIBCXX_LIB" ] || {
+        echo "wasi libc/libc++ archives not found" >&2; exit 1
+      }
+      export WASI_LIBC_LIB WASI_LIBCXX_LIB
+    '';
   };
 
   cargoArtifacts = craneWasm.buildDepsOnly (commonArgs // {
