@@ -40,7 +40,8 @@ fn main() {
                  env: PLATFORMS (windows,mac), AB_VERSION (v49), ABGEN_CACHE_DIR,\n\
                  \x20    CONTENT_SERVER_URL, OUT_ROOT, KEEP_OUTPUT, REGISTRY_QUEUE_URL,\n\
                  \x20    ABGEN_S3_ENDPOINT, ABGEN_S3_BUCKET, ABGEN_S3_REGION,\n\
-                 \x20    ABGEN_S3_PATH_STYLE, ABGEN_S3_READ_ONLY (+ AWS credentials)"
+                 \x20    ABGEN_S3_PATH_STYLE, ABGEN_S3_READ_ONLY (+ AWS credentials),\n\
+                 \x20    ABGEN_REDIS_URL, ABGEN_REDIS_TTL_SECONDS"
             );
         }
         Some(other) => {
@@ -65,6 +66,9 @@ fn init() {
     });
     abgen::arm_gpu_default();
     abgen::texencode_cache::enable();
+    if abgen::rediscache::enabled() {
+        eprintln!("init: redis hit-cache enabled (ABGEN_REDIS_URL)");
+    }
 }
 
 fn run_once(cfg: &config::Config, path: &str) -> Result<serde_json::Value> {
@@ -116,6 +120,14 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
             return Ok(serde_json::json!({
                 "entityId": job.entity_id, "skipped": "already-converted"
             }));
+        }
+    } else {
+        // A force reconversion can downgrade a previously-ok manifest, so a
+        // stale converted-ok marker must not outlive it.
+        for platform in &cfg.platforms {
+            if let Some(key) = output::converted_marker_key(&proxy, cfg, &job.entity_id, platform) {
+                abgen::rediscache::forget(&key);
+            }
         }
     }
 

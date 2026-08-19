@@ -59,12 +59,49 @@ all hits.
 | `ABGEN_S3_READ_ONLY` | off | probe/reuse without writing (dry runs) |
 | `KEEP_OUTPUT` | off (`--once` forces on) | keep the local corpus after the run |
 | `REGISTRY_QUEUE_URL` | — | registry queue (step 4, deferred) |
+| `ABGEN_REDIS_URL` | — (off) | `redis://host[:port]` — enables the shared hit-cache in front of S3 existence probes (see below) |
+| `ABGEN_REDIS_TTL_SECONDS` | `86400` | TTL on cached positive probes |
 | `ALLOWED_CONTENT_SERVER_HOSTS` | — (**fail-open**) | comma-separated allowlist of hosts an event's `contentServerUrl` may name; **unset means any https host is accepted**, so every deployment should set it. The `lambdaImage` bakes in `peer.decentraland.org`; a function env var overrides it. |
 
 S3 is abgen's built-in "space" client (SigV4, ureq). Credentials come from
 the standard env (`AWS_ACCESS_KEY_ID`/`SECRET`/`SESSION_TOKEN`) or the
 container credential endpoint — on Lambda/ECS the execution role provides
 them automatically.
+
+## Redis hit-cache (optional)
+
+The same optimization production's consumer-server runs: Redis in front of
+the S3 existence probes, with S3 staying the source of truth. Two probe kinds
+get memoized, both only after an S3-confirmed positive:
+
+- **per-file reuse probes** — before building a digest-named glb bundle, the
+  build HEADs `{AB_VERSION}/assets/{name}`; a hit skips the build. On warm
+  content that's one HEAD (~5–20 ms) per file, ~1000+ per large scene.
+- **entity already-converted checks** — one manifest GET per platform per
+  event, replayed on every redelivery of an already-converted entity.
+
+Why it matters on Lambda specifically: invocations are billed as
+memory × wall-time, and this function books 10 GB, so every second spent
+waiting on S3 round-trips costs the same as a second of 6-vCPU encoding.
+`batchSize: 1` also means no in-process memo survives across entities except
+within a warm container, and up to 20 containers each re-learn the same
+answers — Redis shares them across all of them, like consumer-server shares
+probe hits across pods.
+
+Semantics (mirrors consumer-server's asset-reuse cache):
+
+- **positives only** — a missing object is never cached; a concurrent
+  invocation may upload it at any moment.
+- **fail-open** — any Redis error is a miss, the S3 probe runs as before, and
+  the client backs off for 30 s so an outage can't make probes slower than
+  no cache at all.
+- keys are scoped to bucket (and version for entity markers), so caches for
+  different CDNs can never cross-contaminate; a `force` job deletes the
+  entity markers it bypasses, since a reconversion can downgrade a manifest.
+- 24 h TTL bounds the keyspace across `AB_VERSION` bumps.
+
+Unset `ABGEN_REDIS_URL` and none of this exists — behavior is identical to
+today's S3-only path.
 
 ## CDN key layout (mirrors prod exactly)
 
