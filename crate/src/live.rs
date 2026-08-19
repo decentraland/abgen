@@ -600,14 +600,9 @@ impl Proxy {
         r
     }
 
-    fn space_put_timed(
-        space: &crate::space::Space,
-        key: &str,
-        bytes: &[u8],
-        content_type: &str,
-    ) -> crate::Result<()> {
+    fn space_put_timed(space: &crate::space::Space, key: &str, bytes: &[u8]) -> crate::Result<()> {
         let t = std::time::Instant::now();
-        let r = space.put(key, bytes, content_type);
+        let r = space.put(key, bytes);
         let result = if r.is_ok() { "ok" } else { "error" };
         metrics::histogram!("abgen_space_request_duration_seconds", "op" => "put", "result" => result)
             .record(t.elapsed().as_secs_f64());
@@ -699,14 +694,14 @@ impl Proxy {
         }
     }
 
-    pub fn space_put_key(&self, key: &str, bytes: &[u8], content_type: &str) {
+    pub fn space_put_key(&self, key: &str, bytes: &[u8]) {
         let Some(space) = self.space.as_ref() else {
             return;
         };
         if space.read_only {
             return;
         }
-        match Self::space_put_timed(space, key, bytes, content_type) {
+        match Self::space_put_timed(space, key, bytes) {
             Ok(()) => tracing::info!(key = %key, bytes = bytes.len(), "space put"),
             Err(e) => tracing::warn!(key = %key, error = %format!("{e:#}"), "space put failed"),
         }
@@ -732,11 +727,11 @@ impl Proxy {
         } else {
             Self::bundle_key(&self.version, cid, file)
         };
-        self.space_put_key(&key, bytes, "application/octet-stream");
+        self.space_put_key(&key, bytes);
     }
 
     pub fn space_put_manifest(&self, stem: &str, bytes: &[u8]) {
-        self.space_put_key(&format!("manifest/{stem}.json"), bytes, "application/json");
+        self.space_put_key(&format!("manifest/{stem}.json"), bytes);
     }
 
     pub fn date(&self) -> &str {
@@ -1448,7 +1443,7 @@ mod tests {
             Some(&b"LODBYTES"[..])
         );
         assert_eq!(proxy.space_get_key("LOD/1/other_1_windows"), None);
-        proxy.space_put_key("v41/flatalias_windows", b"X", "application/octet-stream");
+        proxy.space_put_key("v41/flatalias_windows", b"X");
         let log = seen.lock().unwrap().clone();
         assert!(
             log.contains(&"PUT /v41/flatalias_windows".to_string()),
@@ -1457,7 +1452,7 @@ mod tests {
 
         let (host_ro, seen_ro) = super::stub::serve(vec![]);
         let ro = stub_proxy(&host_ro, true, "keys-ro");
-        ro.space_put_key("v41/never_windows", b"X", "application/octet-stream");
+        ro.space_put_key("v41/never_windows", b"X");
         assert!(seen_ro.lock().unwrap().is_empty());
     }
 

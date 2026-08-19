@@ -162,15 +162,8 @@ fn upload_scene_sources(
                 continue;
             }
         };
-        let content_type = if file.ends_with(".js") {
-            "application/javascript"
-        } else if file.ends_with(".json") {
-            "application/json"
-        } else {
-            "application/octet-stream"
-        };
         let key = format!("{}/{}/{file}", cfg.version, outcome.entity_id);
-        proxy.space_put_key(&key, &bytes, content_type);
+        proxy.space_put_key(&key, &bytes);
         count += 1;
     }
     count
