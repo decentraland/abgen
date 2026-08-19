@@ -111,10 +111,16 @@ surface as `404`s in the CloudFront logs.
 
 Bundles and manifests are written through to S3 by the build itself
 (abgen's space); scene sources are published by the handler afterwards.
-The space sets plain content types and no Cache-Control — **cache policy
-must live on the CDN distribution**: long/immutable TTLs for
-`{AB_VERSION}/…` (keys are content-addressed) and TTL 0 for `manifest/…`.
-No `.br` siblings (see step 3 note above).
+Every object carries the same Content-Type / Cache-Control the production
+consumer-server writes, derived from the key by `space::object_headers`:
+bundles are `application/wasm` + `public, max-age=31536000, immutable`,
+manifests (`manifest/…`, `lods-unity/manifests/…`) are `application/json`
++ `private, max-age=0, no-cache`. That is origin-level defense in depth —
+**cache policy still must live on the CDN distribution**: long/immutable
+TTLs for `{AB_VERSION}/…` (keys are content-addressed) and TTL 0 for
+`manifest/…`. No `.br` siblings (see step 3 note above), and no
+`Content-Encoding` is set on the `.br` objects the LOD/bvwebgpu lanes do
+write.
 
 ## Per-file asset reuse
 
