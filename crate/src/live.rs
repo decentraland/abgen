@@ -566,6 +566,19 @@ impl Proxy {
         self.space.is_some()
     }
 
+    pub fn space_bucket(&self) -> Option<&str> {
+        self.space.as_ref()?.bucket.as_deref()
+    }
+
+    /// Bucket-scoped: a hit in one CDN bucket says nothing about another.
+    fn reuse_cache_key(&self, key: &str) -> Option<String> {
+        if !crate::rediscache::enabled() {
+            return None;
+        }
+        let bucket = self.space.as_ref()?.bucket.as_deref().unwrap_or("-");
+        Some(format!("abgen:hit:{bucket}:{key}"))
+    }
+
     fn space_get_timed(space: &crate::space::Space, key: &str) -> crate::Result<Option<Vec<u8>>> {
         let t = std::time::Instant::now();
         let r = space.get(key);
@@ -641,6 +654,13 @@ impl Proxy {
             return false;
         };
         let key = Self::asset_bundle_key(&self.version, file);
+        // Only S3-confirmed hits are written back; misses/errors fall through.
+        let cache_key = self.reuse_cache_key(&key);
+        if let Some(ck) = &cache_key {
+            if crate::rediscache::hit(ck) {
+                return true;
+            }
+        }
         let t = std::time::Instant::now();
         let r = space.head(&key);
         let result = match &r {
@@ -651,7 +671,14 @@ impl Proxy {
         metrics::histogram!("abgen_space_request_duration_seconds", "op" => "head", "result" => result)
             .record(t.elapsed().as_secs_f64());
         match r {
-            Ok(hit) => hit,
+            Ok(hit) => {
+                if hit {
+                    if let Some(ck) = &cache_key {
+                        crate::rediscache::mark(ck);
+                    }
+                }
+                hit
+            }
             Err(e) => {
                 metrics::counter!("abgen_space_errors_total", "op" => "head").increment(1);
                 tracing::warn!(key = %key, error = %format!("{e:#}"), "space probe failed; building locally");
