@@ -22,6 +22,9 @@ runs:
   steps:
     - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
       with:
+        # No FlakeHub: with determinate left on, jobs holding an OIDC token
+        # (the ECR image job) try a FlakeHub login and warn on every run.
+        determinate: false
         extra-conf: |
           max-jobs = auto
           cores = 0

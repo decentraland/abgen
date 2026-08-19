@@ -427,7 +427,7 @@ jobs:
 
       - name: upload recorded hashes
         if: ${{ inputs.record_hashes }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: hashes-${{ matrix.target }}
           path: ci/artifact-hashes/${{ matrix.target }}.sha256
@@ -677,7 +677,7 @@ jobs:
             "$nat.tar.gz" "$nat.tar.gz.sha256"
 
       - name: upload archives (input-addressed)
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: archives-${{ needs.build-id.outputs.value }}-${{ matrix.target }}
           path: |
@@ -687,7 +687,7 @@ jobs:
 
       - name: upload Docker image (input-addressed)
         if: matrix.target == 'x86_64-unknown-linux-gnu' && !startsWith(github.ref, 'refs/tags/')
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: image-${{ needs.build-id.outputs.value }}-dockerImage
           path: dockerImage.tar.gz
@@ -695,7 +695,7 @@ jobs:
 
       - name: upload Lambda image (input-addressed)
         if: matrix.target == 'aarch64-unknown-linux-gnu' && !startsWith(github.ref, 'refs/tags/')
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: image-${{ needs.build-id.outputs.value }}-lambdaImage
           path: lambdaImage.tar.gz
@@ -780,7 +780,7 @@ jobs:
         if: endsWith(matrix.target, '-unknown-linux-gnu')
         working-directory: crate/abgen-node
         run: bash ../../ci/check-glibc-floor.sh 2.34 ./*.node
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: napi-${{ needs.build-id.outputs.value }}-${{ matrix.target }}
           path: crate/abgen-node/*.node
@@ -818,7 +818,7 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: upload image artifact (input-addressed)
         if: needs.build-id.outputs.image_docker == ''
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: image-${{ needs.build-id.outputs.value }}-dockerImage
           path: image.tar.gz
@@ -892,7 +892,7 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: upload image artifact (input-addressed)
         if: needs.build-id.outputs.image_lambda == ''
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: image-${{ needs.build-id.outputs.value }}-lambdaImage
           path: image.tar.gz
@@ -991,7 +991,7 @@ jobs:
       - run: npm install -g npm@^11.5.1
 
       - if: needs.napi.result == 'success'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: napi-*
           path: crate/abgen-node/artifacts

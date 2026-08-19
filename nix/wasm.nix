@@ -13,6 +13,11 @@ let
 
   wasi = pkgs.pkgsCross.wasi32;
   wasiCC = wasi.stdenv.cc;
+  # Derived, not hardcoded: nixpkgs renamed the wasi target (wasm32-unknown-
+  # wasi -> wasm32-unknown-wasip1), and hardcoded tool names broke the check
+  # with ToolNotFound the moment this moved off the subflake's older pin.
+  wasiPrefix = wasiCC.targetPrefix;
+  wasiTriple = pkgs.lib.removeSuffix "-" wasiPrefix;
 
   commonArgs = {
     pname = "abgen-wasm-check";
@@ -36,11 +41,11 @@ let
       # The vendored C deps (libjpeg9c/crunch/draco) compile against wasi
       # headers even for the unknown-unknown target; abgen-wasm's build.rs
       # links the wasi static libs via WASI_*_LIB.
-      CC_wasm32_unknown_unknown = "${wasiCC}/bin/wasm32-unknown-wasi-cc";
-      CXX_wasm32_unknown_unknown = "${wasiCC}/bin/wasm32-unknown-wasi-c++";
-      AR_wasm32_unknown_unknown = "${wasiCC}/bin/wasm32-unknown-wasi-ar";
-      CFLAGS_wasm32_unknown_unknown = "--target=wasm32-unknown-wasi";
-      CXXFLAGS_wasm32_unknown_unknown = "--target=wasm32-unknown-wasi";
+      CC_wasm32_unknown_unknown = "${wasiCC}/bin/${wasiPrefix}cc";
+      CXX_wasm32_unknown_unknown = "${wasiCC}/bin/${wasiPrefix}c++";
+      AR_wasm32_unknown_unknown = "${wasiCC.bintools}/bin/${wasiPrefix}ar";
+      CFLAGS_wasm32_unknown_unknown = "--target=${wasiTriple}";
+      CXXFLAGS_wasm32_unknown_unknown = "--target=${wasiTriple}";
       WASI_LIBC_LIB = "${wasiCC.libc}/lib";
       WASI_LIBCXX_LIB = "${wasi.llvmPackages.libcxx}/lib";
     };

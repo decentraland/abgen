@@ -1,13 +1,14 @@
-#   pwsh ci/abgen-smoke.ps1 [-Tree <repo root>]
+#   pwsh ci/abgen-smoke.ps1 [-Tree <repo root>] [-Profile <cargo profile dir>]
 
 param(
-    [string]$Tree = "."
+    [string]$Tree = ".",
+    [string]$Profile = "release"
 )
 
 $ErrorActionPreference = "Stop"
 
-$host_exe = Join-Path $Tree "target\release\abgen-host.exe"
-$dll      = Join-Path $Tree "target\release\abgen.dll"
+$host_exe = Join-Path $Tree "target\$Profile\abgen-host.exe"
+$dll      = Join-Path $Tree "target\$Profile\abgen.dll"
 $glb      = Join-Path $Tree "crate\abgen-wasm\test\fixtures\normal-quad.glb"
 
 $script:failures = 0
