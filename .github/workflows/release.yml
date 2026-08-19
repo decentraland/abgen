@@ -427,7 +427,7 @@ jobs:
 
       - name: upload recorded hashes
         if: ${{ inputs.record_hashes }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: hashes-${{ matrix.target }}
           path: ci/artifact-hashes/${{ matrix.target }}.sha256
@@ -677,7 +677,7 @@ jobs:
             "$nat.tar.gz" "$nat.tar.gz.sha256"
 
       - name: upload archives (input-addressed)
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: archives-${{ needs.build-id.outputs.value }}-${{ matrix.target }}
           path: |
@@ -687,7 +687,7 @@ jobs:
 
       - name: upload Docker image (input-addressed)
         if: matrix.target == 'x86_64-unknown-linux-gnu' && !startsWith(github.ref, 'refs/tags/')
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: image-${{ needs.build-id.outputs.value }}-dockerImage
           path: dockerImage.tar.gz
@@ -695,7 +695,7 @@ jobs:
 
       - name: upload Lambda image (input-addressed)
         if: matrix.target == 'aarch64-unknown-linux-gnu' && !startsWith(github.ref, 'refs/tags/')
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: image-${{ needs.build-id.outputs.value }}-lambdaImage
           path: lambdaImage.tar.gz
@@ -752,8 +752,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: x86_64-unknown-linux-gnu,  runner: ubuntu-24.04 }
-          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+          # cache on the linux legs only: x86 primes ci's node-addon job
+          # (same shared-key) and each linux leg warms its successor across
+          # main pushes; mac/windows stay uncached (quota over win).
+          - { target: x86_64-unknown-linux-gnu,  runner: ubuntu-24.04, cache: "true" }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, cache: "true" }
           - { target: aarch64-apple-darwin,      runner: macos-15 }
           - { target: x86_64-apple-darwin,       runner: macos-15 }
           - { target: x86_64-pc-windows-msvc,    runner: windows-2025 }
@@ -762,7 +765,13 @@ jobs:
       - uses: ./.github/actions/rust-setup
         with:
           targets: ${{ matrix.target }}
-          cache: "false"
+          cache: ${{ matrix.cache || 'false' }}
+          workspaces: crate/abgen-node
+          shared-key: abgen-node
+          # saves only from main pushes: shareable by every PR and the next
+          # merge build; branch/dispatch rehearsal saves would be scoped
+          # quota waste.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: 24
@@ -780,7 +789,7 @@ jobs:
         if: endsWith(matrix.target, '-unknown-linux-gnu')
         working-directory: crate/abgen-node
         run: bash ../../ci/check-glibc-floor.sh 2.34 ./*.node
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: napi-${{ needs.build-id.outputs.value }}-${{ matrix.target }}
           path: crate/abgen-node/*.node
@@ -818,7 +827,7 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: upload image artifact (input-addressed)
         if: needs.build-id.outputs.image_docker == ''
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: image-${{ needs.build-id.outputs.value }}-dockerImage
           path: image.tar.gz
@@ -892,7 +901,7 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: upload image artifact (input-addressed)
         if: needs.build-id.outputs.image_lambda == ''
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: image-${{ needs.build-id.outputs.value }}-lambdaImage
           path: image.tar.gz
@@ -991,7 +1000,7 @@ jobs:
       - run: npm install -g npm@^11.5.1
 
       - if: needs.napi.result == 'success'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: napi-*
           path: crate/abgen-node/artifacts

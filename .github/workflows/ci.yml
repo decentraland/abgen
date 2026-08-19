@@ -45,38 +45,100 @@ jobs:
           ABGEN_ROOT="$GITHUB_WORKSPACE" cargo test --locked --workspace --lib \
             --target x86_64-unknown-linux-gnu -- --test-threads=1
 
-  windows:
-    name: windows tests + smoke
-    runs-on: windows-2025
+  windows-gate:
+    name: windows gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.decide.outputs.mode }}
+      hash: ${{ steps.hash.outputs.h }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+      - id: hash
+        run: echo "h=${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.github/workflows/ci.yml', '.github/actions/rust-setup/**', 'ci/abgen-smoke.ps1', '.config/nextest.toml', 'crate/Cargo.toml', 'crate/build.rs', 'crate/third_party/**', 'crate/abgen-native/**', 'crate/dcl-contents/**', 'crate/src/abcdn/**', 'crate/src/builder/**', 'crate/src/export/**', 'crate/src/lodgen/**', 'crate/src/gpu/**', 'crate/src/live.rs', 'crate/src/jitcache.rs', 'crate/src/local_store.rs', 'crate/src/texencode_cache.rs', 'crate/src/tmppath.rs', 'crate/src/clihelp.rs', 'crate/src/ffi.rs', 'crate/src/worlds.rs', 'crate/src/lods.rs', 'crate/src/lz4.rs', 'crate/src/manifest.rs', 'crate/src/space.rs', 'crate/src/shader.rs', 'crate/src/lib.rs', 'crate/src/gltf/scene_build.rs', 'crate/src/unity/bundle_file.rs', 'crate/abgen-wasm/test/fixtures/normal-quad.glb') }}" >> "$GITHUB_OUTPUT"
+      - id: memo
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .win-green-marker
+          key: windows-green-${{ steps.hash.outputs.h }}
+          lookup-only: true
+      - id: decide
+        run: |
+          if [ "${{ steps.memo.outputs.cache-hit }}" = "true" ]; then mode=skip
+          elif [ "${{ github.event_name }}" != "pull_request" ]; then mode=full
+          elif ! git diff --quiet ${{ github.event.pull_request.base.sha }}...HEAD -- 'Cargo.lock' 'Cargo.toml' 'rust-toolchain.toml' '.github/workflows/ci.yml' '.github/actions/rust-setup' 'ci/abgen-smoke.ps1' '.config/nextest.toml' 'crate/Cargo.toml' 'crate/build.rs' 'crate/third_party' 'crate/abgen-native' 'crate/dcl-contents' 'crate/src/abcdn' 'crate/src/builder' 'crate/src/export' 'crate/src/lodgen' 'crate/src/gpu' 'crate/src/live.rs' 'crate/src/jitcache.rs' 'crate/src/local_store.rs' 'crate/src/texencode_cache.rs' 'crate/src/tmppath.rs' 'crate/src/clihelp.rs' 'crate/src/ffi.rs' 'crate/src/worlds.rs' 'crate/src/lods.rs' 'crate/src/lz4.rs' 'crate/src/manifest.rs' 'crate/src/space.rs' 'crate/src/shader.rs' 'crate/src/lib.rs' 'crate/src/gltf/scene_build.rs' 'crate/src/unity/bundle_file.rs' 'crate/abgen-wasm/test/fixtures/normal-quad.glb'; then mode=full
+          elif ! git diff --quiet ${{ github.event.pull_request.base.sha }}...HEAD -- '**/*.rs' 'Cargo.*' '**/Cargo.toml'; then mode=quick
+          else mode=quick; fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: windows tests + smoke
+    needs: windows-gate
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        if: needs.windows-gate.outputs.mode != 'skip'
       - uses: ./.github/actions/rust-setup
+        if: needs.windows-gate.outputs.mode != 'skip'
       - name: install cargo-nextest
+        if: needs.windows-gate.outputs.mode != 'skip'
         shell: pwsh
         run: curl.exe -LsSf https://get.nexte.st/0.9.143/windows-tar | tar -xzf - -C $env:USERPROFILE\.cargo\bin
-      - name: lib tests
+      - name: skip notice
+        if: needs.windows-gate.outputs.mode == 'skip'
+        run: echo "windows suite already green for input hash ${{ needs.windows-gate.outputs.hash }} (memoized marker); skipping."
+      - name: quick tests + smoke
+        if: needs.windows-gate.outputs.mode == 'quick'
+        shell: pwsh
+        run: |
+          $env:ABGEN_ROOT = $env:GITHUB_WORKSPACE
+          cargo nextest run --locked -P windows-quick -p abgen -p dcl-contents -p abgen-native
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build -p abgen-native
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -NoProfile -ExecutionPolicy Bypass -File ci/abgen-smoke.ps1 -Tree $env:GITHUB_WORKSPACE -Profile debug
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: full tests + smoke
+        if: needs.windows-gate.outputs.mode == 'full'
         shell: pwsh
         run: |
           $env:ABGEN_ROOT = $env:GITHUB_WORKSPACE
           cargo nextest run --locked --workspace
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p abgen-native --tests
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: native host smoke
-        shell: pwsh
-        run: |
           cargo build --release -p abgen-native
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pwsh -NoProfile -ExecutionPolicy Bypass -File ci/abgen-smoke.ps1 -Tree $env:GITHUB_WORKSPACE
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: write green marker
+        if: needs.windows-gate.outputs.mode == 'full'
+        shell: pwsh
+        run: Set-Content -Path .win-green-marker -Value green
+      # Cache saves from PR branches are scoped to that branch; the
+      # globally visible marker is minted by full runs on main pushes.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        if: needs.windows-gate.outputs.mode == 'full'
+        with:
+          path: .win-green-marker
+          key: windows-green-${{ needs.windows-gate.outputs.hash }}
 
   node-addon:
     name: node addon
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       - uses: ./.github/actions/rust-setup
+        with:
+          # Pure consumer of the cache the release napi linux leg saves from
+          # main pushes (same shared-key); this job is PR-only, so its own
+          # saves would be PR-scoped quota waste.
+          workspaces: crate/abgen-node
+          shared-key: abgen-node
+          save-if: "false"
       - name: abgen-node (build + smoke)
         working-directory: crate/abgen-node
         run: |
@@ -98,9 +160,12 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
+      # No standalone nix installer: the composite runs it with the
+      # extra-conf this job needs; a prior bare install made that conf
+      # silently a no-op.
       - uses: ./.github/actions/nix-store-cache
         with:
           family: build
