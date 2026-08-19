@@ -136,7 +136,11 @@ fn main() {
         // Cross-compiling mac-on-mac (x86_64 leg builds on the arm runner):
         // cmake defaults to the HOST arch, and arm64 draco objects fail the
         // x86_64 link with "symbol(s) not found for architecture x86_64".
-        let arch = if target.starts_with("aarch64") { "arm64" } else { "x86_64" };
+        let arch = if target.starts_with("aarch64") {
+            "arm64"
+        } else {
+            "x86_64"
+        };
         cfg_args.push(format!("-DCMAKE_OSX_ARCHITECTURES={arch}"));
     }
     let status = Command::new("cmake")

@@ -123,6 +123,8 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64")
         && std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
     {
+        // ISA floor is Armv8.2+dotprod on purpose: aarch64-linux artifacts
+        // only run on Graviton (>= 2 == Neoverse-N1). See libjpeg9c/build.rs.
         build.flag_if_supported("-mcpu=neoverse-n1");
     }
 

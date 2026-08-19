@@ -69,8 +69,8 @@ unconditionally - byte-neutral vs glibc libm on real bundles.
 ## Remaining gaps vs the native fleet
 
 - Encode is CPU: SIMD128 in the BC7 partition estimator (runtime
-  self-qualified against scalar) on a pool of workers; native uses AVX-512 or
-  the bit-exact GPU lane. The `+simd128` build flag raises the module floor
+  self-qualified against scalar) on a pool of workers; native uses AVX-512,
+  NEON on aarch64 (Apple Silicon / Graviton), or the bit-exact GPU lane. The `+simd128` build flag raises the module floor
   to engines with wasm SIMD — older engines reject the module at validation.
 - WebGPU encode is wired via a bridge that keeps `poc_convert` synchronous:
   a separate wasm-bindgen module (`crate/wasm-gpu`, the native GPU lane's

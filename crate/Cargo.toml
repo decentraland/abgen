@@ -132,8 +132,6 @@ rquickjs = { version = "0.12", default-features = false, features = ["bindgen"] 
 [target.'cfg(all(not(target_os = "windows"), not(target_arch = "wasm32")))'.dependencies]
 mimalloc = { version = "0.1.52", default-features = false }
 
-[target.'cfg(not(any(target_arch = "wasm32", all(target_os = "windows", target_env = "gnu"))))'.dependencies]
-
 [[bench]]
 name = "kernels"
 path = "benches/kernels.rs"
@@ -164,6 +162,3 @@ path = "tests/crn_parity.rs"
 name = "dxt1_corpus_hash"
 path = "tests/dxt1_corpus_hash.rs"
 harness = true
-[[test]]
-name = "dxt1_hash"
-path = "tests/dxt1_hash.rs"

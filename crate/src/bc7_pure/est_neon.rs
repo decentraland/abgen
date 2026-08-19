@@ -717,16 +717,15 @@ pub(super) fn est_partition_list_lane_neon(
     num_solutions: &mut i32,
     max_solutions: i32,
 ) -> i32 {
+    enum Pre {
+        Rgb(PreRgbNeon),
+        Rgba(PreRgbaNeon),
+    }
     unsafe {
-        let pre_rgb = if mode != 7 {
-            Some(pre_rgb_neon(mode, p, lf))
+        let pre = if mode == 7 {
+            Pre::Rgba(pre_rgba_neon(p, lf))
         } else {
-            None
-        };
-        let pre_rgba = if mode == 7 {
-            Some(pre_rgba_neon(p, lf))
-        } else {
-            None
+            Pre::Rgb(pre_rgb_neon(mode, p, lf))
         };
         let mut i_at = 0i32;
         for partition in part_lo..part_hi {
@@ -740,14 +739,9 @@ pub(super) fn est_partition_list_lane_neon(
             let mut total_subset_err = 0u64;
             let mut pruned = false;
             for subset in 0..total_subsets {
-                let err = if let Some(pre) = &pre_rgba {
-                    subset_err_rgba_pre(pre, &si.idx[subset], si.total[subset])
-                } else {
-                    subset_err_rgb_pre(
-                        pre_rgb.as_ref().unwrap_unchecked(),
-                        &si.idx[subset],
-                        si.total[subset],
-                    )
+                let err = match &pre {
+                    Pre::Rgba(pre) => subset_err_rgba_pre(pre, &si.idx[subset], si.total[subset]),
+                    Pre::Rgb(pre) => subset_err_rgb_pre(pre, &si.idx[subset], si.total[subset]),
                 };
                 total_subset_err += err;
                 if total_subset_err >= thresh {
@@ -788,5 +782,167 @@ pub(super) fn est_partition_list_lane_neon(
             i_at = i;
         }
         i_at
+    }
+}
+
+#[cfg(test)]
+mod neon_parity_tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next_u32(&mut self) -> u32 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            (x >> 32) as u32
+        }
+    }
+
+    const WEIGHT_SETS: [([u32; 4], bool); 4] = [
+        ([1, 1, 1, 1], false),
+        ([128, 64, 16, 256], true),
+        ([128, 64, 16, 256], false),
+        ([2, 3, 5, 7], false),
+    ];
+
+    fn params(rng: &mut Rng) -> CCParams {
+        let (weights, perceptual) = WEIGHT_SETS[(rng.next_u32() % 4) as usize];
+        let mut p = CCParams::clear();
+        p.weights = weights;
+        p.perceptual = perceptual;
+        p
+    }
+
+    fn gen_pixels(rng: &mut Rng) -> [ColorI; 16] {
+        let mut pixels = [ColorI::default(); 16];
+        match rng.next_u32() % 4 {
+            0 => {
+                let c = [
+                    (rng.next_u32() % 256) as i32,
+                    (rng.next_u32() % 256) as i32,
+                    (rng.next_u32() % 256) as i32,
+                    (rng.next_u32() % 256) as i32,
+                ];
+                pixels = [ColorI { c }; 16];
+            }
+            1 => {
+                for px in pixels.iter_mut() {
+                    for v in px.c.iter_mut() {
+                        *v = if rng.next_u32().is_multiple_of(2) {
+                            0
+                        } else {
+                            255
+                        };
+                    }
+                }
+            }
+            _ => {
+                for px in pixels.iter_mut() {
+                    for v in px.c.iter_mut() {
+                        *v = (rng.next_u32() % 256) as i32;
+                    }
+                }
+            }
+        }
+        pixels
+    }
+
+    fn gen_idxs(rng: &mut Rng) -> [i32; 16] {
+        let mut idxs = [0i32; 16];
+        for (i, v) in idxs.iter_mut().enumerate() {
+            *v = i as i32;
+        }
+        for i in (1..16usize).rev() {
+            let j = (rng.next_u32() as usize) % (i + 1);
+            idxs.swap(i, j);
+        }
+        idxs
+    }
+
+    #[test]
+    fn est_idx_neon_matches_scalar() {
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        for case in 0..4000usize {
+            let mode = (rng.next_u32() % 4) as usize;
+            let num_pixels = case % 16 + 1;
+            let p = params(&mut rng);
+            let pixels = gen_pixels(&mut rng);
+            let idxs = gen_idxs(&mut rng);
+            let lf = LaneF32::new(&pixels);
+            assert_eq!(
+                est_idx_neon(mode, &p, &idxs, num_pixels, &lf),
+                ccc_est_idx_scalar(mode, &p, &idxs, num_pixels, &pixels),
+                "mode={mode} n={num_pixels} w={:?} pixels={:?} idxs={idxs:?}",
+                p.weights,
+                pixels.map(|px| px.c)
+            );
+        }
+    }
+
+    #[test]
+    fn est_mode7_idx_neon_matches_scalar() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for case in 0..4000usize {
+            let num_pixels = case % 16 + 1;
+            let p = params(&mut rng);
+            let pixels = gen_pixels(&mut rng);
+            let idxs = gen_idxs(&mut rng);
+            let lf = LaneF32::new(&pixels);
+            assert_eq!(
+                est_mode7_idx_neon(&p, &idxs, num_pixels, &lf),
+                ccc_est_mode7_idx_scalar(&p, &idxs, num_pixels, &pixels),
+                "n={num_pixels} w={:?} perceptual={} pixels={:?} idxs={idxs:?}",
+                p.weights,
+                p.perceptual,
+                pixels.map(|px| px.c)
+            );
+        }
+    }
+
+    #[test]
+    fn subset_err_rgb_pre_matches_scalar() {
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+        for _ in 0..500usize {
+            let mode = (rng.next_u32() % 4) as usize;
+            let p = params(&mut rng);
+            let pixels = gen_pixels(&mut rng);
+            let lf = LaneF32::new(&pixels);
+            let pre = unsafe { pre_rgb_neon(mode, &p, &lf) };
+            for num_pixels in 1..=16usize {
+                let idxs = gen_idxs(&mut rng);
+                assert_eq!(
+                    unsafe { subset_err_rgb_pre(&pre, &idxs, num_pixels) },
+                    ccc_est_idx_scalar(mode, &p, &idxs, num_pixels, &pixels),
+                    "mode={mode} n={num_pixels} w={:?} pixels={:?} idxs={idxs:?}",
+                    p.weights,
+                    pixels.map(|px| px.c)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn subset_err_rgba_pre_matches_scalar() {
+        let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
+        for _ in 0..500usize {
+            let p = params(&mut rng);
+            let pixels = gen_pixels(&mut rng);
+            let lf = LaneF32::new(&pixels);
+            let pre = unsafe { pre_rgba_neon(&p, &lf) };
+            for num_pixels in 1..=16usize {
+                let idxs = gen_idxs(&mut rng);
+                assert_eq!(
+                    unsafe { subset_err_rgba_pre(&pre, &idxs, num_pixels) },
+                    ccc_est_mode7_idx_scalar(&p, &idxs, num_pixels, &pixels),
+                    "n={num_pixels} w={:?} perceptual={} pixels={:?} idxs={idxs:?}",
+                    p.weights,
+                    p.perceptual,
+                    pixels.map(|px| px.c)
+                );
+            }
+        }
     }
 }

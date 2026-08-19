@@ -230,6 +230,13 @@ fn pad_to_block_size(rgba: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize)
 
 #[doc(hidden)]
 pub fn box_halve(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
+    // A short slice must stay a panic here: the NEON path reads through raw
+    // pointers and would otherwise turn it into out-of-bounds UB.
+    assert!(
+        arr.len() >= w * h * 4,
+        "box_halve: {} f32s for {w}x{h}x4",
+        arr.len()
+    );
     #[cfg(target_arch = "aarch64")]
     if w > 1 && h > 1 {
         return box_halve_neon(arr, w, h);
@@ -239,8 +246,8 @@ pub fn box_halve(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
 
 /// NEON 2x2 box filter for the common (w>1, h>1) case. One output pixel is
 /// one f32x4 lane group; the adds run in the same ((p00+p01)+p10)+p11 order
-/// and the same divide as the scalar loop, so every lane is the identical
-/// IEEE operation sequence and the result is bit-identical.
+/// as the scalar loop, and multiplying by 0.25 (an exact power-of-two
+/// reciprocal) is bit-identical to the scalar divide by 4.0.
 #[cfg(target_arch = "aarch64")]
 fn box_halve_neon(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
     use std::arch::aarch64::*;
@@ -250,8 +257,10 @@ fn box_halve_neon(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
     let mut out = vec![0f32; nh * nw * c];
     let row_stride = w * c;
     // SAFETY: NEON is baseline on aarch64. For ny<nh, nx<nw the reads touch
+    // at most row 2*ny+1 <= h-1 and column floats nx*8+8 <= 4*w, all inside
+    // arr.len() >= w*h*4 (asserted by box_halve, the only caller).
     unsafe {
-        let denom = vdupq_n_f32(4.0);
+        let quarter = vdupq_n_f32(0.25);
         for ny in 0..nh {
             let r0 = arr.as_ptr().add(2 * ny * row_stride);
             let r1 = arr.as_ptr().add((2 * ny + 1) * row_stride);
@@ -262,7 +271,7 @@ fn box_halve_neon(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
                 let p10 = vld1q_f32(r1.add(nx * 8));
                 let p11 = vld1q_f32(r1.add(nx * 8 + 4));
                 let acc = vaddq_f32(vaddq_f32(vaddq_f32(p00, p01), p10), p11);
-                vst1q_f32(dst.add(nx * 4), vdivq_f32(acc, denom));
+                vst1q_f32(dst.add(nx * 4), vmulq_f32(acc, quarter));
             }
         }
     }

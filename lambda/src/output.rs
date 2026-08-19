@@ -64,6 +64,17 @@ pub fn publish(
     }))
 }
 
+/// Entity-supplied file names end up in S3 object keys, and `uri_encode_key`
+/// preserves '/' and '.', so a hostile name could escape the
+/// `{version}/{entityId}/` prefix.
+fn valid_key_component(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('/')
+        && !name.contains('\\')
+        && !name.bytes().any(|b| b.is_ascii_control())
+        && !name.split('/').any(|seg| seg == "..")
+}
+
 fn upload_scene_sources(
     cfg: &Config,
     agent: &ureq::Agent,
@@ -92,8 +103,20 @@ fn upload_scene_sources(
         })
     };
 
+    if !valid_key_component(&outcome.entity_id) {
+        eprintln!(
+            "output: unsafe entity id {:?}, skipping scene-source upload",
+            outcome.entity_id
+        );
+        return 0;
+    }
+
     let mut count = 0usize;
     for file in &wanted {
+        if !valid_key_component(file) {
+            eprintln!("output: unsafe scene-source name {file:?}, skipping");
+            continue;
+        }
         let Some(hash) = hash_for(file) else {
             eprintln!("output: {file} not in entity content, skipping scene-source upload");
             continue;
@@ -121,4 +144,45 @@ fn upload_scene_sources(
         count += 1;
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_key_component;
+
+    #[test]
+    fn accepts_ordinary_names() {
+        for name in [
+            "main.crdt",
+            "scene.json",
+            "bin/game.js",
+            "assets/models/tree.glb",
+            "bafkreia1b2c3",
+            "file with spaces.png",
+            "trailing/",
+            "a..b/c",
+            "...three-dots",
+        ] {
+            assert!(valid_key_component(name), "should accept {name:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_escaping_names() {
+        for name in [
+            "",
+            "..",
+            "../secret",
+            "a/../../b",
+            "bin/..",
+            "/etc/passwd",
+            "a\\b",
+            "..\\up",
+            "a\nb",
+            "a\0b",
+            "\x1b[2Jclear",
+        ] {
+            assert!(!valid_key_component(name), "should reject {name:?}");
+        }
+    }
 }

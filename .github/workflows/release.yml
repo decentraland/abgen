@@ -14,10 +14,6 @@ on:
         description: "Record artifact hashes instead of verifying them"
         type: boolean
         default: false
-      images:
-        description: "Also build the container images (ghcr + ECR lambda)"
-        type: boolean
-        default: true
       targets:
         description: "Comma-separated target triples to build (empty = all). Iterating on one lane should not build six."
         type: string
@@ -124,12 +120,17 @@ jobs:
           # byte-identical outputs for THIS tree. Promotion re-proves that
           # against the committed hash manifests before shipping a byte.
           # The current ref is also accepted so rehearsals on a branch can
-          # promote their own previous build. Recording always builds.
+          # promote their own previous build. Only this repo's own runs
+          # count: a fork-PR run executes the fork's workflow files, can
+          # upload arbitrary bytes under a precomputable name, and reports
+          # the fork's branch name (often "main") as head_branch — but its
+          # head_repository_id differs. Recording always builds.
           lookup() {
             [ "${RECORDING:-false}" = "true" ] && { echo ""; return; }
             gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$1&per_page=10" \
               --jq '[.artifacts[]
                      | select(.expired == false)
+                     | select(.workflow_run.head_repository_id == .workflow_run.repository_id)
                      | select(.workflow_run.head_branch == "main"
                               or .workflow_run.head_branch == env.GITHUB_REF_NAME)
                      | select((.workflow_run.id | tostring) != env.GITHUB_RUN_ID)]
@@ -491,7 +492,23 @@ jobs:
           shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
           bash ci/verify-reproducible.sh "$dist" "$dist.tar.gz" "$SOURCE_DATE_EPOCH"
 
-          if ! echo "${{ matrix.target }}" | grep -q windows; then
+          # Cross-compiled legs (windows from linux, x86_64-apple-darwin from
+          # the arm64 macos-15 runner) cannot exec their own output; smoke
+          # only when the target matches the runner's arch. Rosetta would make
+          # the x86_64 darwin binary "work" here, but only incidentally.
+          case "${{ matrix.target }}" in
+            x86_64-*)  want_arch=x86_64 ;;
+            aarch64-*) want_arch=arm64 ;;
+            *)         want_arch=none ;;
+          esac
+          run_arch="$(uname -m)"
+          [ "$run_arch" = aarch64 ] && run_arch=arm64
+          can_smoke=false
+          if [ "$run_arch" = "$want_arch" ] && ! echo "${{ matrix.target }}" | grep -q windows; then
+            can_smoke=true
+          fi
+
+          if [ "$can_smoke" = true ]; then
             rm -rf /tmp/smoke && mkdir /tmp/smoke
             tar -xzf "$dist.tar.gz" -C /tmp/smoke
             (
@@ -584,10 +601,10 @@ jobs:
           shasum -a 256 "$nat.tar.gz" > "$nat.tar.gz.sha256"
           bash ci/verify-reproducible.sh "$nat" "$nat.tar.gz" "$SOURCE_DATE_EPOCH"
 
-          # Every non-Windows leg builds on its own architecture, so the
-          # helper can just be run here; Windows legs cross-compile from
-          # Linux and are covered by the windows CI job instead.
-          if ! echo "${{ matrix.target }}" | grep -q windows; then
+          # Windows legs cross-compile from Linux and are covered by the
+          # windows CI job instead; cross-arch legs are skipped by the same
+          # can_smoke computed above.
+          if [ "$can_smoke" = true ]; then
             rm -rf /tmp/natsmoke && mkdir /tmp/natsmoke
             tar -xzf "$nat.tar.gz" -C /tmp/natsmoke
             got=$("/tmp/natsmoke/$nat/abgen-host" --version)
@@ -945,7 +962,7 @@ jobs:
             echo "| size | ${IMG_SIZE} compressed, no base OS |"
             echo "| arch | arm64 (Graviton Lambda) |"
             echo "| build | \`nix build .#lambdaImage\` — deterministic, pinned \`flake.lock\` |"
-            echo "| roll out | \`pulumi config set imageTag ${REF} && pulumi up\` in abgen-pipeline |"
+            echo "| roll out | update the Lambda function to \`${repo}:${REF}\` — see lambda/README.md |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   napi-publish:

@@ -38,6 +38,15 @@ pub fn make_proxy(cfg: &Config, content_server: &str) -> std::sync::Arc<abgen::l
     })
 }
 
+// Clears on drop so an early error return can't leak cache bytes into the next warm invocation.
+struct TexCacheClearGuard;
+
+impl Drop for TexCacheClearGuard {
+    fn drop(&mut self) {
+        abgen::texencode_cache::clear();
+    }
+}
+
 pub fn convert_entity(
     cfg: &Config,
     proxy: &std::sync::Arc<abgen::live::Proxy>,
@@ -46,6 +55,7 @@ pub fn convert_entity(
     platforms: &[String],
 ) -> Result<EntityOutcome> {
     let (h0, m0, _, _) = abgen::texencode_cache::stats();
+    let _clear_guard = TexCacheClearGuard;
 
     std::fs::create_dir_all(&cfg.out_root)
         .with_context(|| format!("mkdir {}", cfg.out_root.display()))?;
@@ -74,7 +84,6 @@ pub fn convert_entity(
     }
 
     let (h1, m1, _, _) = abgen::texencode_cache::stats();
-    abgen::texencode_cache::clear();
 
     Ok(EntityOutcome {
         entity_id: entity_id.to_string(),

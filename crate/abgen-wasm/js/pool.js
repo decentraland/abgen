@@ -80,11 +80,14 @@ export async function runConvert(opts, cb) {
       }
     },
     onCrash(slot, msg) {
+      // Always respawn, even with no job in flight (onerror during init or
+      // between jobs): a dead worker left in the pool swallows the next job
+      // forever — run() has no timeout.
       const cur = slot.current;
-      if (!cur) return;
       slot.current = null;
       try { slot.w.terminate(); } catch (_) {}
       slot.attach();
+      if (!cur) return;
       cb({
         type: 'event', worker: slot.id,
         data: { ev: 'file-error', file: cur.label, error: `wasm trap: ${msg}` },

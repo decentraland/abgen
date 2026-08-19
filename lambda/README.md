@@ -59,6 +59,7 @@ all hits.
 | `ABGEN_S3_READ_ONLY` | off | probe/reuse without writing (dry runs) |
 | `KEEP_OUTPUT` | off (`--once` forces on) | keep the local corpus after the run |
 | `REGISTRY_QUEUE_URL` | — | registry queue (step 4, deferred) |
+| `ALLOWED_CONTENT_SERVER_HOSTS` | — (**fail-open**) | comma-separated allowlist of hosts an event's `contentServerUrl` may name; **unset means any https host is accepted**, so every deployment should set it. The `lambdaImage` bakes in `peer.decentraland.org`; a function env var overrides it. |
 
 S3 is abgen's built-in "space" client (SigV4, ureq). Credentials come from
 the standard env (`AWS_ACCESS_KEY_ID`/`SECRET`/`SESSION_TOKEN`) or the
@@ -85,8 +86,10 @@ to ECR with skopeo (see the `lambda-image` job in
 function at the image.
 
 Release tags publish the image using GitHub OIDC. Configure repository
-variable `ABGEN_LAMBDA_ECR_ROLE_ARN` with the push role's ARN and
-`ABGEN_LAMBDA_ECR_REPOSITORY` with the ECR repository URL.
+variables `ABGEN_LAMBDA_ECR_ROLE_ARN` with the push role's ARN,
+`ABGEN_LAMBDA_AWS_REGION` with the role's AWS region, and
+`ABGEN_LAMBDA_ECR_REPOSITORY` with the ECR repository URL — the OIDC step
+in `release.yml` errors if the role ARN or region is unset.
 
 Recommended function config:
 

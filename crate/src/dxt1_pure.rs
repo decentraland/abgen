@@ -185,7 +185,7 @@ mod neon {
             for p in &pixf {
                 macc = vaddq_f32(macc, *p);
             }
-            let meanv = vdivq_f32(macc, vdupq_n_f32(16.0));
+            let meanv = vmulq_f32(macc, vdupq_n_f32(0.0625));
 
             let mut cacc0 = vdupq_n_f32(0.0);
             let mut cacc1 = vdupq_n_f32(0.0);
@@ -441,7 +441,8 @@ fn box_halve_rgba(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
 }
 
 /// 2x2 box filter, one output RGBA pixel per float32x4 lane group. Matches the
-/// scalar accumulation order exactly: ((p00 + p01) + p10) + p11, then / 4.0.
+/// scalar accumulation order exactly: ((p00 + p01) + p10) + p11; the multiply
+/// by 0.25 (an exact power-of-two reciprocal) is bit-identical to / 4.0.
 #[cfg(target_arch = "aarch64")]
 fn box_halve_rgba_neon2x2(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
     use std::arch::aarch64::*;
@@ -451,7 +452,7 @@ fn box_halve_rgba_neon2x2(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, 
     let row_stride = w * 4;
     let mut out = vec![0f32; nh * nw * 4];
     unsafe {
-        let denom = vdupq_n_f32(4.0);
+        let quarter = vdupq_n_f32(0.25);
         for ny in 0..nh {
             let r0 = (ny * 2) * row_stride;
             let r1 = r0 + row_stride;
@@ -463,7 +464,7 @@ fn box_halve_rgba_neon2x2(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, 
                 let p10 = vld1q_f32(arr.as_ptr().add(r1 + x0));
                 let p11 = vld1q_f32(arr.as_ptr().add(r1 + x0 + 4));
                 let s = vaddq_f32(vaddq_f32(vaddq_f32(p00, p01), p10), p11);
-                vst1q_f32(out.as_mut_ptr().add(ob + nx * 4), vdivq_f32(s, denom));
+                vst1q_f32(out.as_mut_ptr().add(ob + nx * 4), vmulq_f32(s, quarter));
             }
         }
     }

@@ -4,10 +4,12 @@
 Layout matches LocalContentStore: <root>/<sha1(cid)[:2 bytes]hex>/<cid>
 Writes <root>/ids-{scenes,wearables,emotes,all}.txt for abgen-bench --entity-ids.
 """
+import base64
 import concurrent.futures as cf
 import hashlib
 import json
 import os
+import re
 import sys
 import urllib.request
 
@@ -29,11 +31,31 @@ def http_json(url, body=None):
     with urllib.request.urlopen(req, timeout=60) as r:
         return json.load(r)
 
+# Catalyst content ids are bare base32/base58 hashes (bafk.../bafy.../Qm...);
+# anything else (e.g. '../', '/') could escape ROOT via os.path.join.
+CID_RE = re.compile(r"^[A-Za-z0-9]{10,128}$")
+
 def store_path(cid):
+    if not CID_RE.fullmatch(cid):
+        raise ValueError(f"refusing unsafe content id from catalyst: {cid!r}")
     prefix = hashlib.sha1(cid.encode()).hexdigest()[:4]
     d = os.path.join(ROOT, prefix)
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, cid)
+
+def cid_v1_raw_sha256(data):
+    # multibase base32 of CIDv1 (0x01), raw codec (0x55), sha2-256 multihash
+    mh = b"\x01\x55\x12\x20" + hashlib.sha256(data).digest()
+    return "b" + base64.b32encode(mh).decode().lower().rstrip("=")
+
+def verify_content(cid, data):
+    if cid.startswith("bafkrei"):
+        got = cid_v1_raw_sha256(data)
+        if got != cid:
+            raise ValueError(f"content hash mismatch: expected {cid}, got {got}")
+    # Other ids (CIDv0 Qm... / dag-pb bafybei...) hash an IPLD encoding this
+    # script does not reconstruct; those bytes are trusted as served and the
+    # CID_RE path validation is the enforced gate.
 
 def store_bytes(cid, data):
     p = store_path(cid)
@@ -50,6 +72,7 @@ def fetch_content(cid):
     req = urllib.request.Request(url, headers={"User-Agent": "abgen-bench-corpus"})
     with urllib.request.urlopen(req, timeout=300) as r:
         data = r.read()
+    verify_content(cid, data)
     store_bytes(cid, data)
     return len(data)
 

@@ -77,11 +77,13 @@ fn alpha_selectors_neon(
         let lo = vget_low_u8(best_d);
         let hi = vget_high_u8(best_d);
         let sum = vaddlvq_u16(vmull_u8(lo, lo)) + vaddlvq_u16(vmull_u8(hi, hi));
-        let mut sb = [0u8; 16];
-        vst1q_u8(sb.as_mut_ptr(), best_s);
-        for i in 0..16 {
-            selectors[i] = sb[i] as i32;
-        }
+        let s16_lo = vmovl_u8(vget_low_u8(best_s));
+        let s16_hi = vmovl_u8(vget_high_u8(best_s));
+        let dst = selectors.as_mut_ptr() as *mut u32;
+        vst1q_u32(dst, vmovl_u16(vget_low_u16(s16_lo)));
+        vst1q_u32(dst.add(4), vmovl_u16(vget_high_u16(s16_lo)));
+        vst1q_u32(dst.add(8), vmovl_u16(vget_low_u16(s16_hi)));
+        vst1q_u32(dst.add(12), vmovl_u16(vget_high_u16(s16_hi)));
         sum as u64 * weight
     }
 }

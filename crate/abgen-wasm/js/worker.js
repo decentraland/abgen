@@ -19,8 +19,15 @@ const SAB_HDR = 16;
 function hostEncodeBc7(reqPtr, reqLen, outPtr, outCap) {
   if (!sabI32) return 0;
   if (reqLen > sabU8.length - SAB_HDR) return 0;
-  while (Atomics.compareExchange(sabI32, 0, 0, 1) !== 0) Atomics.wait(sabI32, 0, 1);
+  // Timed acquire: an abandoned request (below) keeps the lock held until
+  // the GPU worker reclaims it, so with the GPU worker gone the lock never
+  // frees — callers must degrade to the CPU path, not queue behind it.
+  for (;;) {
+    if (Atomics.compareExchange(sabI32, 0, 0, 1) === 0) break;
+    if (Atomics.wait(sabI32, 0, 1, 20000) === 'timed-out') return 0;
+  }
   let n = 0;
+  let abandoned = false;
   try {
     sabU8.set(new Uint8Array(exports.memory.buffer, reqPtr, reqLen), SAB_HDR);
     sabI32[2] = reqLen;
@@ -29,9 +36,17 @@ function hostEncodeBc7(reqPtr, reqLen, outPtr, outCap) {
     let s;
     for (;;) {
       const r = Atomics.wait(sabI32, 1, 1, 20000);
-      s = Atomics.load(sabI32, 1);
+      if (r === 'timed-out') {
+        // Abandon atomically: either 1 -> 5 wins and the GPU worker discards
+        // its late result (a late result consumed by the NEXT request would
+        // be silent wrong bytes), or the result landed in the window and is
+        // used normally. The lock stays held; the GPU worker releases it.
+        s = Atomics.compareExchange(sabI32, 1, 1, 5);
+        if (s === 1) { abandoned = true; s = 3; }
+      } else {
+        s = Atomics.load(sabI32, 1);
+      }
       if (s !== 1) break;
-      if (r === 'timed-out') { s = 3; break; } // gpu worker gone; fail to CPU
     }
     if (s === 2) {
       const outLen = sabI32[3];
@@ -41,11 +56,15 @@ function hostEncodeBc7(reqPtr, reqLen, outPtr, outCap) {
         n = outLen;
       }
     }
-    Atomics.store(sabI32, 1, 0);
-    Atomics.notify(sabI32, 1);
+    if (!abandoned) {
+      Atomics.store(sabI32, 1, 0);
+      Atomics.notify(sabI32, 1);
+    }
   } finally {
-    Atomics.store(sabI32, 0, 0);
-    Atomics.notify(sabI32, 0);
+    if (!abandoned) {
+      Atomics.store(sabI32, 0, 0);
+      Atomics.notify(sabI32, 0);
+    }
   }
   return n;
 }

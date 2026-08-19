@@ -27,6 +27,7 @@ There is also a wasm build: `crate/abgen-wasm/` compiles the converter to wasm32
 | `abgen-corpus` | batch corpus builder: manifest / `--entity-ids` (add `--fetch-missing` to pull content from a catalyst) / `--world <name>[,...]` (resolve + fetch + convert a world; upstream via `--worlds-url` or `ABGEN_WORLDS_URL`) / `--live-mode` / `--collection-urn` / `--from-reference`; full-corpus runbook in [docs/BATCH.md](docs/BATCH.md) |
 | `abgen-verify` | parity differ (ours vs reference bundles, ppm-bits, `--tolerant`) |
 | `abgen-lod` | LOD lane CLI: `bundle`, `compare`, `placements`, `assemble`, `atlas`, `simplify`, `generate` |
+| `abgen-lambda` | AWS Lambda handler (deployment event in, bundles + manifests to S3; from the `lambda/` workspace member) - see [lambda/README.md](lambda/README.md) |
 
 Plus bundle-inspection examples (`texdump`, `matdump`, `objdump`, `texcmp`, `texpng`) under
 `target/release/examples/`.
@@ -70,9 +71,13 @@ template paths in `crate/src/builder/templates.rs` assume the source layout wher
 the crate — an in-repo wasm32 build needs those relative paths bumped one level (`../../template/` ->
 `../../../template/`). No workspace target compiles for wasm32, so the divergence never touches CI.
 ## Features
-There are no compile-time feature flags. Every capability below builds into every native binary;
-`wasm32` builds target-gate the server, content-DB, and GPU code off automatically. Each capability
-is activated at runtime, not at build time.
+One compile-time feature flag: `server` (on by default) gates the abcdn HTTP server + registry stack
+(axum/tokio/sqlx and the `dcl-contents` crate); the `abgen` bin has `required-features = ["server"]`.
+Library consumers - `lambda/`, `crate/abgen-native/`, `crate/abgen-wasm/` - build with
+`default-features = false` and get the converter without the server stack. Under the default
+features every capability below builds into every native binary; `wasm32` builds target-gate the
+server, content-DB, and GPU code off automatically. Each capability is activated at runtime, not at
+build time.
 
 | Capability | Built | Enable at runtime |
 |---|---|---|
@@ -177,8 +182,11 @@ output is promoted into the serving root, so rejected bundles are never servable
 The container image is built straight from the pinned Nix flake - `nix build .#dockerImage`
 (`dockerTools.buildLayeredImage`, `tini` init, no base OS) - producing an image that runs `abgen` as an
 unprivileged user on `:5147` with `template/` and `shader/` baked in and `ABGEN_ROOT`/`ABGEN_OUT_ROOT`
-preset. The [`.github/workflows/image.yml`](.github/workflows/image.yml) workflow builds that image and
-pushes it to `ghcr.io/decentraland/abgen:<tag>` (and `:latest`) on every `v*` tag. The org
+preset. The `image` job in [`.github/workflows/release.yml`](.github/workflows/release.yml) builds
+that image and pushes it to `ghcr.io/decentraland/abgen:<tag>` (and `:latest`) on every `v*` tag.
+The workspace also ships an AWS Lambda consumer in `lambda/` (the `abgen-lambda` bin);
+`nix build .#lambdaImage` produces its container image, which the `lambda-image` job pushes to ECR
+on the same tags - see [lambda/README.md](lambda/README.md). The org
 services-pipeline that publishes the same service to quay (service-name `abgen`) is configured
 externally in the private `decentraland/definitions` repo, not in this tree. Cutting a release -
 tagging, what the pipeline does, and what to check afterwards: [DEVELOPMENT.md](DEVELOPMENT.md).

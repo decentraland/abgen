@@ -33,12 +33,15 @@
         fileset = buildFileset;
       };
 
+      # nix/checks.nix stays out of this list: check edits must not move
+      # buildId.
       buildId = builtins.substring 0 12 (builtins.hashString "sha256"
         (builtins.concatStringsSep "\n" [
           (baseNameOf (builtins.unsafeDiscardStringContext buildSource.outPath))
           (builtins.hashFile "sha256" ./rust-toolchain.toml)
           (builtins.hashFile "sha256" ./flake.lock)
           (builtins.hashFile "sha256" ./flake.nix)
+          (builtins.hashFile "sha256" ./nix/build.nix)
         ]));
 
       buildEnv = {
@@ -48,6 +51,8 @@
 
       rustChannel = (builtins.fromTOML
         (builtins.readFile ./rust-toolchain.toml)).toolchain.channel;
+
+      repoVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
       perSystem = lib.genAttrs systems (system:
         let
@@ -74,34 +79,10 @@
           ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ gcc ];
           sharedLibExt = pkgs.stdenv.hostPlatform.extensions.sharedLibrary;
 
-          repoVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
-
-          commonArgs = {
-            pname = "abgen";
-            version = repoVersion;
-            src = buildSource;
-            nativeBuildInputs = with pkgs; [ cmake pkg-config git ];
-            doCheck = false;
-            env.SOURCE_DATE_EPOCH = sourceDateEpoch;
+          build = import ./nix/build.nix {
+            inherit pkgs craneLib buildSource buildEnv sourceDateEpoch repoVersion;
           };
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-
-          abgenPkg = craneLib.buildPackage (commonArgs // {
-            inherit cargoArtifacts;
-            env = buildEnv;
-            cargoExtraArgs = "--locked --bin abgen";
-          });
-
-          consumerCargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
-            pname = "abgen-consumers";
-            cargoExtraArgs = "--locked -p abgen-native -p abgen-lambda";
-          });
-          abgenConsumersPkg = craneLib.buildPackage (commonArgs // {
-            cargoArtifacts = consumerCargoArtifacts;
-            pname = "abgen-consumers";
-            env = buildEnv;
-            cargoExtraArgs = "--locked -p abgen-native -p abgen-lambda";
-          });
+          inherit (build) abgenPkg abgenConsumersPkg;
 
           abgenNativePkg = pkgs.runCommand "abgen-native-${repoVersion}" { } ''
             mkdir -p $out/bin $out/lib
@@ -135,12 +116,7 @@
 
           packages.abgen-native = abgenNativePkg;
 
-          packages.abgen-corpus = craneLib.buildPackage (commonArgs // {
-            inherit cargoArtifacts;
-            pname = "abgen-corpus";
-            env = buildEnv;
-            cargoExtraArgs = "--locked --bin abgen-corpus";
-          });
+          packages.abgen-corpus = build.abgenCorpusPkg;
 
           packages.dockerImage = pkgs.dockerTools.buildLayeredImage {
             name = "abgen";
@@ -178,6 +154,10 @@
                 "ABGEN_ROOT=/opt/abgen"
                 "ABGEN_CACHE_DIR=/tmp/abgen-cache"
                 "OUT_ROOT=/tmp/abgen-out"
+                # The binary is fail-open when this is unset; the image is
+                # where the guard is armed. A Lambda function env var with
+                # the same name overrides this list.
+                "ALLOWED_CONTENT_SERVER_HOSTS=peer.decentraland.org"
                 "TURBOJPEG_LIB=${pkgs.libjpeg_turbo.out}/lib/libturbojpeg${sharedLibExt}"
                 "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
               ];
@@ -185,46 +165,16 @@
             };
           };
 
-          packages.abgen-compare =
-            let
-              pyEnv = pkgs.python3.withPackages (ps: with ps; [ numpy pillow ]);
-            in
-            pkgs.rustPlatform.buildRustPackage {
-              pname = "abgen-compare";
-              version = repoVersion;
-              env = buildEnv;
-              src = self;
-              cargoLock = {
-                lockFile = ./Cargo.lock;
-              };
-              nativeBuildInputs = with pkgs; [ cmake pkg-config git makeWrapper ];
-              cargoBuildFlags = [ "--bins" "--examples" ];
+          checks = import ./nix/checks.nix {
+            inherit lib system pkgs craneLib;
+            inherit (build) commonArgs cargoArtifacts abgenConsumersPkg;
+          };
 
-              doCheck = false;
-              postInstall = ''
-                lib=$out/lib/abgen
-                mkdir -p $lib/result/bin $lib/crate
-                exdir=$(find target -type d -path '*/release/examples' | head -1)
-                for t in objdump texdump matdump texcmp texpng; do
-                  if [ -f "$exdir/$t" ]; then
-                    install -m755 "$exdir/$t" "$lib/result/bin/$t"
-                  else
-                    echo "missing example tool: $t" >&2; exit 1
-                  fi
-                done
-                ln -s $out/bin/abgen $lib/result/bin/abgen
-                cp -r harness pipeline site template $lib/
-                cp -r crate/shader $lib/crate/
-                find $lib -type d -name __pycache__ -prune -exec rm -rf {} +
-                makeWrapper ${pyEnv}/bin/python3 $out/bin/abgen-compare \
-                  --add-flags "$lib/pipeline/abgen-compare" \
-                  --set-default TURBOJPEG_LIB ${pkgs.libjpeg_turbo.out}/lib/libturbojpeg${sharedLibExt}
-              '';
-            };
         });
     in
     {
       packages = nixpkgs.lib.mapAttrs (_: v: v.packages) perSystem;
       devShells = nixpkgs.lib.mapAttrs (_: v: v.devShells) perSystem;
+      checks = nixpkgs.lib.mapAttrs (_: v: v.checks) perSystem;
     };
 }

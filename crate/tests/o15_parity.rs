@@ -131,4 +131,5 @@ fn o15_corpus_hash() {
         fnv1a(&mut h, &count.to_le_bytes());
     }
     println!("O15_CORPUS_HASH {h:016x}");
+    assert_eq!(h, 0x4dfc_8f8b_0e7d_7be4, "O15 corpus hash moved");
 }

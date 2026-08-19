@@ -21,6 +21,12 @@ gates:
 Every byte-path transcendental is routed through a single pure-Rust math implementation on both
 targets, so the two cannot drift.
 
+The SIMD lanes are part of the same contract. On aarch64, NEON implementations (DXT1, BC5, the BC7
+estimator/evaluator/color/alpha/mip paths, resize, the LZ4 hash batch) are bit-identical to the
+scalar/x86 lanes, enforced by in-module NEON-vs-scalar parity tests plus pinned corpus hashes
+(`crate/tests/bc7_parity.rs`, `o15_parity.rs`, `dxt1_corpus_hash.rs`), which run on the arm64 CI
+lane.
+
 ## The native default trades bytes for fidelity on GLB-embedded JPEG
 
 Native default JPEG decode uses turbojpeg: measurably closer to the upstream oracle but not

@@ -1158,3 +1158,402 @@ mod neon {
         total_errf
     }
 }
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod neon_parity_tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next_u32(&mut self) -> u32 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            (x >> 32) as u32
+        }
+    }
+
+    const WEIGHT_SETS: [[f32; 4]; 3] = [
+        [1.0, 1.0, 1.0, 1.0],
+        [2.0, 3.0, 5.0, 7.0],
+        [128.0, 64.0, 16.0, 256.0],
+    ];
+
+    fn endpoints(rng: &mut Rng, case: usize) -> (ColorI, ColorI) {
+        let mut lo = ColorI::default();
+        let mut hi = ColorI::default();
+        for j in 0..4 {
+            lo.c[j] = match rng.next_u32() % 4 {
+                0 => 0,
+                1 => 255,
+                _ => (rng.next_u32() % 256) as i32,
+            };
+            hi.c[j] = match rng.next_u32() % 4 {
+                0 => 0,
+                1 => 255,
+                _ => (rng.next_u32() % 256) as i32,
+            };
+        }
+        if case.is_multiple_of(9) {
+            hi = lo;
+        }
+        (lo, hi)
+    }
+
+    fn build_wc_scalar(wc: &mut [[f32; 4]; 16], psel: &[u32], n: usize, nc: usize) {
+        for i in 1..(n - 1) {
+            for j in 0..nc {
+                wc[i][j] =
+                    ((wc[0][j] * (64.0 - psel[i] as f32) + wc[n - 1][j] * psel[i] as f32 + 32.0)
+                        * (1.0 / 64.0))
+                        .floor();
+            }
+        }
+    }
+
+    fn make_wc(lo: &ColorI, hi: &ColorI, psel: &[u32], n: usize, nc: usize) -> [[f32; 4]; 16] {
+        let mut wc = [[0f32; 4]; 16];
+        for j in 0..4 {
+            wc[0][j] = lo.c[j] as f32;
+            wc[n - 1][j] = hi.c[j] as f32;
+        }
+        build_wc_scalar(&mut wc, psel, n, nc);
+        wc
+    }
+
+    /// Kind 2 places pixels on/between palette rows to stress min/argmin ties.
+    fn gen_pixels(rng: &mut Rng, wc: &[[f32; 4]; 16], n: usize) -> [ColorI; 16] {
+        let mut pixels = [ColorI::default(); 16];
+        match rng.next_u32() % 5 {
+            0 => {
+                let c = [
+                    (rng.next_u32() % 256) as i32,
+                    (rng.next_u32() % 256) as i32,
+                    (rng.next_u32() % 256) as i32,
+                    (rng.next_u32() % 256) as i32,
+                ];
+                pixels = [ColorI { c }; 16];
+            }
+            1 => {
+                for px in pixels.iter_mut() {
+                    for v in px.c.iter_mut() {
+                        *v = if rng.next_u32().is_multiple_of(2) {
+                            0
+                        } else {
+                            255
+                        };
+                    }
+                }
+            }
+            2 => {
+                for px in pixels.iter_mut() {
+                    let r0 = (rng.next_u32() as usize) % n;
+                    let r1 = (rng.next_u32() as usize) % n;
+                    for (j, v) in px.c.iter_mut().enumerate() {
+                        *v = ((wc[r0][j] + wc[r1][j]) * 0.5) as i32;
+                    }
+                }
+            }
+            _ => {
+                for px in pixels.iter_mut() {
+                    for v in px.c.iter_mut() {
+                        *v = (rng.next_u32() % 256) as i32;
+                    }
+                }
+            }
+        }
+        pixels
+    }
+
+    #[test]
+    fn build_wc_table_neon_matches_scalar() {
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        let tabs: [(usize, &[u32]); 3] = [(4, &G_WEIGHTS2), (8, &G_WEIGHTS3), (16, &G_WEIGHTS4)];
+        for case in 0..3000usize {
+            let (n, psel) = tabs[case % 3];
+            let nc = 3 + case % 2;
+            let (lo, hi) = endpoints(&mut rng, case);
+            let mut wc_s = [[0f32; 4]; 16];
+            for j in 0..4 {
+                wc_s[0][j] = lo.c[j] as f32;
+                wc_s[n - 1][j] = hi.c[j] as f32;
+            }
+            let mut wc_n = wc_s;
+            build_wc_scalar(&mut wc_s, psel, n, nc);
+            unsafe { neon::build_wc_table_neon(&mut wc_n, psel, n, nc) };
+            for i in 0..n {
+                for j in 0..4 {
+                    assert_eq!(
+                        wc_s[i][j].to_bits(),
+                        wc_n[i][j].to_bits(),
+                        "row {i} comp {j} n={n} nc={nc} lo={:?} hi={:?}",
+                        lo.c,
+                        hi.c
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn eval_solution_n16_rgb_neon_matches_scalar() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let n = 16usize;
+        for case in 0..3000usize {
+            let (lo, hi) = endpoints(&mut rng, case);
+            let wc = make_wc(&lo, &hi, &G_WEIGHTS4, n, 3);
+            let lr = lo.c[0] as f32;
+            let lg = lo.c[1] as f32;
+            let lb = lo.c[2] as f32;
+            let dr = hi.c[0] as f32 - lr;
+            let dg = hi.c[1] as f32 - lg;
+            let db = hi.c[2] as f32 - lb;
+            let f = n as f32 / (dr * dr + dg * dg + db * db);
+            let (lr, lg, lb) = (lr * -dr, lg * -dg, lb * -db);
+            let [wr, wg, wb, _] = WEIGHT_SETS[case % 3];
+            let num_pixels = case % 16 + 1;
+            let pixels = gen_pixels(&mut rng, &wc, n);
+            let mut sel_s = [0i32; 16];
+            let mut sel_n = [0i32; 16];
+            let err_s = eval_solution_n16_rgb_scalar(
+                num_pixels, &pixels, &wc, wr, wg, wb, dr, dg, db, lr, lg, lb, f, n, &mut sel_s,
+            );
+            let err_n = unsafe {
+                neon::eval_solution_n16_rgb_neon(
+                    num_pixels, &pixels, &wc, wr, wg, wb, dr, dg, db, lr, lg, lb, f, n, &mut sel_n,
+                )
+            };
+            assert_eq!(
+                err_s.to_bits(),
+                err_n.to_bits(),
+                "err mismatch lo={:?} hi={:?} pixels={:?}",
+                lo.c,
+                hi.c,
+                pixels.map(|px| px.c)
+            );
+            assert_eq!(
+                sel_s,
+                sel_n,
+                "selector mismatch lo={:?} hi={:?} pixels={:?}",
+                lo.c,
+                hi.c,
+                pixels.map(|px| px.c)
+            );
+        }
+    }
+
+    fn eval_solution_n16_rgba_ref(
+        num_pixels: usize,
+        pixels: &[ColorI],
+        wc: &[[f32; 4]; 16],
+        wr: f32,
+        wg: f32,
+        wb: f32,
+        wa: f32,
+        dr: f32,
+        dg: f32,
+        db: f32,
+        da: f32,
+        lr: f32,
+        lg: f32,
+        lb: f32,
+        la: f32,
+        f: f32,
+        n: usize,
+        selectors_temp: &mut [i32; 16],
+    ) -> f32 {
+        let mut total_errf = 0f32;
+        for i in 0..num_pixels {
+            let r = pixels[i].c[0] as f32;
+            let g = pixels[i].c[1] as f32;
+            let b = pixels[i].c[2] as f32;
+            let a = pixels[i].c[3] as f32;
+            let mut best_sel =
+                ((((r * dr + lr) + (g * dg + lg) + (b * db + lb) + (a * da + la)) * f) + 0.5)
+                    .floor();
+            best_sel = best_sel.clamp(1.0, (n - 1) as f32);
+            let best_sel0 = best_sel - 1.0;
+            let i0 = best_sel0 as i32 as usize;
+            let i1 = best_sel as i32 as usize;
+            let dr0 = wc[i0][0] - r;
+            let dg0 = wc[i0][1] - g;
+            let db0 = wc[i0][2] - b;
+            let da0 = wc[i0][3] - a;
+            let err0 = wr * dr0 * dr0 + wg * dg0 * dg0 + wb * db0 * db0 + wa * da0 * da0;
+            let dr1 = wc[i1][0] - r;
+            let dg1 = wc[i1][1] - g;
+            let db1 = wc[i1][2] - b;
+            let da1 = wc[i1][3] - a;
+            let err1 = wr * dr1 * dr1 + wg * dg1 * dg1 + wb * db1 * db1 + wa * da1 * da1;
+            let min_err = err0.min(err1);
+            total_errf += min_err;
+            selectors_temp[i] = if min_err == err0 { best_sel0 } else { best_sel } as i32;
+        }
+        total_errf
+    }
+
+    #[test]
+    fn eval_solution_n16_rgba_neon_matches_scalar() {
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+        let n = 16usize;
+        for case in 0..3000usize {
+            let (lo, hi) = endpoints(&mut rng, case);
+            let wc = make_wc(&lo, &hi, &G_WEIGHTS4, n, 4);
+            let lr = lo.c[0] as f32;
+            let lg = lo.c[1] as f32;
+            let lb = lo.c[2] as f32;
+            let la = lo.c[3] as f32;
+            let dr = hi.c[0] as f32 - lr;
+            let dg = hi.c[1] as f32 - lg;
+            let db = hi.c[2] as f32 - lb;
+            let da = hi.c[3] as f32 - la;
+            let f = n as f32 / (dr * dr + dg * dg + db * db + da * da);
+            let (lr, lg, lb, la) = (lr * -dr, lg * -dg, lb * -db, la * -da);
+            let [wr, wg, wb, wa] = WEIGHT_SETS[case % 3];
+            let num_pixels = case % 16 + 1;
+            let pixels = gen_pixels(&mut rng, &wc, n);
+            let mut sel_s = [0i32; 16];
+            let mut sel_n = [0i32; 16];
+            let err_s = eval_solution_n16_rgba_ref(
+                num_pixels, &pixels, &wc, wr, wg, wb, wa, dr, dg, db, da, lr, lg, lb, la, f, n,
+                &mut sel_s,
+            );
+            let err_n = unsafe {
+                neon::eval_solution_n16_rgba_neon(
+                    num_pixels, &pixels, &wc, wr, wg, wb, wa, dr, dg, db, da, lr, lg, lb, la, f, n,
+                    &mut sel_n,
+                )
+            };
+            assert_eq!(
+                err_s.to_bits(),
+                err_n.to_bits(),
+                "err mismatch lo={:?} hi={:?} pixels={:?}",
+                lo.c,
+                hi.c,
+                pixels.map(|px| px.c)
+            );
+            assert_eq!(
+                sel_s,
+                sel_n,
+                "selector mismatch lo={:?} hi={:?} pixels={:?}",
+                lo.c,
+                hi.c,
+                pixels.map(|px| px.c)
+            );
+        }
+    }
+
+    fn eval_discrete_rgba_ref(
+        num_pixels: usize,
+        pixels: &[ColorI],
+        wc: &[[f32; 4]; 16],
+        wr: f32,
+        wg: f32,
+        wb: f32,
+        wa: f32,
+        n: usize,
+        selectors_temp: &mut [i32; 16],
+    ) -> f32 {
+        let mut total_errf = 0f32;
+        for i in 0..num_pixels {
+            let pr = pixels[i].c[0] as f32;
+            let pg = pixels[i].c[1] as f32;
+            let pb = pixels[i].c[2] as f32;
+            let pa = pixels[i].c[3] as f32;
+            let mut errs = [0f32; 4];
+            for k in 0..4usize {
+                let d0 = wc[k][0] - pr;
+                let d1 = wc[k][1] - pg;
+                let d2 = wc[k][2] - pb;
+                let d3 = wc[k][3] - pa;
+                errs[k] = wr * d0 * d0 + wg * d1 * d1 + wb * d2 * d2 + wa * d3 * d3;
+            }
+            let mut best_err = errs[0].min(errs[1]).min(errs[2]).min(errs[3]);
+            let mut best_sel = if best_err == errs[1] { 1 } else { 0 };
+            if best_err == errs[2] {
+                best_sel = 2;
+            }
+            if best_err == errs[3] {
+                best_sel = 3;
+            }
+            if n == 8 {
+                let mut e2 = [0f32; 4];
+                for k in 0..4usize {
+                    let d0 = wc[4 + k][0] - pr;
+                    let d1 = wc[4 + k][1] - pg;
+                    let d2 = wc[4 + k][2] - pb;
+                    let d3 = wc[4 + k][3] - pa;
+                    e2[k] = wr * d0 * d0 + wg * d1 * d1 + wb * d2 * d2 + wa * d3 * d3;
+                }
+                best_err = best_err.min(e2[0].min(e2[1]).min(e2[2]).min(e2[3]));
+                if best_err == e2[0] {
+                    best_sel = 4;
+                }
+                if best_err == e2[1] {
+                    best_sel = 5;
+                }
+                if best_err == e2[2] {
+                    best_sel = 6;
+                }
+                if best_err == e2[3] {
+                    best_sel = 7;
+                }
+            }
+            total_errf += best_err;
+            selectors_temp[i] = best_sel;
+        }
+        total_errf
+    }
+
+    #[test]
+    fn eval_discrete_neon_matches_scalar() {
+        let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
+        let tabs: [(usize, &[u32]); 2] = [(4, &G_WEIGHTS2), (8, &G_WEIGHTS3)];
+        for case in 0..3000usize {
+            let (n, psel) = tabs[case % 2];
+            let has_alpha = case % 4 >= 2;
+            let nc = if has_alpha { 4 } else { 3 };
+            let (lo, hi) = endpoints(&mut rng, case);
+            let wc = make_wc(&lo, &hi, psel, n, nc);
+            let [wr, wg, wb, wa] = WEIGHT_SETS[case % 3];
+            let num_pixels = case % 16 + 1;
+            let pixels = gen_pixels(&mut rng, &wc, n);
+            let mut sel_s = [0i32; 16];
+            let mut sel_n = [0i32; 16];
+            let err_s = if has_alpha {
+                eval_discrete_rgba_ref(num_pixels, &pixels, &wc, wr, wg, wb, wa, n, &mut sel_s)
+            } else if wr == 1.0 && wg == 1.0 && wb == 1.0 {
+                eval_discrete_rgb_scalar::<false>(
+                    num_pixels, &pixels, &wc, wr, wg, wb, n, &mut sel_s,
+                )
+            } else {
+                eval_discrete_rgb_scalar::<true>(
+                    num_pixels, &pixels, &wc, wr, wg, wb, n, &mut sel_s,
+                )
+            };
+            let err_n = unsafe {
+                neon::eval_discrete_neon(
+                    num_pixels, &pixels, &wc, wr, wg, wb, wa, has_alpha, n, &mut sel_n,
+                )
+            };
+            assert_eq!(
+                err_s.to_bits(),
+                err_n.to_bits(),
+                "err mismatch n={n} alpha={has_alpha} lo={:?} hi={:?} pixels={:?}",
+                lo.c,
+                hi.c,
+                pixels.map(|px| px.c)
+            );
+            assert_eq!(
+                sel_s,
+                sel_n,
+                "selector mismatch n={n} alpha={has_alpha} lo={:?} hi={:?} pixels={:?}",
+                lo.c,
+                hi.c,
+                pixels.map(|px| px.c)
+            );
+        }
+    }
+}

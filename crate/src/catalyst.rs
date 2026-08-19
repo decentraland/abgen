@@ -86,8 +86,13 @@ pub struct CatalystClient {
 
 impl CatalystClient {
     pub fn new(base_url: &str) -> Self {
+        // No redirects: a host allowlist (ALLOWED_CONTENT_SERVER_HOSTS in
+        // the lambda) only pins the first hop, so a 302 from an allowed
+        // catalyst would re-point the fetch anywhere. Catalysts serve
+        // /contents directly; a redirect is a loud error, not a hop.
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(HTTP_TIMEOUT_SECS)))
+            .max_redirects(0)
             .build()
             .into();
         CatalystClient {
