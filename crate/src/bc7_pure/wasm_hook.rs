@@ -1,14 +1,3 @@
-//! Host-encode hook for wasm embedders (wasm32 twin of `gpu_dispatch`).
-//!
-//! `poc_convert` is synchronous while browser WebGPU readback is async-only,
-//! so the module itself cannot drive the GPU. An embedder that CAN — a worker
-//! bridging to a WebGPU sibling over SharedArrayBuffer + Atomics.wait —
-//! registers a hook here; every BC7 mip-chain encode is offered to it first
-//! and falls through to the scalar/SIMD CPU path whenever the hook is unset,
-//! declines (no GPU, oversized payload) or fails. Output bytes are the
-//! embedder's contract: the WebGPU lane must be the same bit-exact WGSL
-//! kernels the native wgpu backend qualifies.
-
 use super::Bc7Profile;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

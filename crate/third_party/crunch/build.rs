@@ -120,6 +120,12 @@ fn main() {
         .flag_if_supported("-Wno-nonnull")
         .warnings(false);
 
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64")
+        && std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+    {
+        build.flag_if_supported("-mcpu=neoverse-n1");
+    }
+
     let is_wasm = std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32");
     if is_wasm {
         build.flag("-fno-exceptions");
@@ -127,9 +133,6 @@ fn main() {
         build.cpp_link_stdlib(None::<&str>);
     }
 
-    // windows-gnu links the C++ runtime statically (the lane passes -static),
-    // so nothing here may emit a dynamic -lstdc++ on top of it. draco_decoder
-    // suppresses the same cc-rs default unconditionally.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
         && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu")
     {

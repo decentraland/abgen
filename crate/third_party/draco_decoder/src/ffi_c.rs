@@ -1,6 +1,3 @@
-// Plain-C FFI to cpp/decoder_api_c.cc — the wasm32 replacement for the cxx
-// bridge in ffi.rs. Produces the same MeshDecodeResult layout.
-
 use crate::utils::AttributeDataType;
 
 const ATTRS_CAP: usize = 32;

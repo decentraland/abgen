@@ -495,6 +495,17 @@ pub(super) fn has_avx512vl() -> bool {
     false
 }
 
+/// NEON is baseline on aarch64, so this only exists to honor the
+/// `ABGEN_BC7_SCALAR` escape hatch the x86 detectors support; every call site
+/// is already inside a `#[cfg(target_arch = "aarch64")]` block.
+#[cfg(target_arch = "aarch64")]
+static HAS_NEON: OnceLock<bool> = OnceLock::new();
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(super) fn has_neon() -> bool {
+    *HAS_NEON.get_or_init(|| std::env::var_os("ABGEN_BC7_SCALAR").is_none())
+}
+
 #[cfg(test)]
 mod opt_table_tests {
     use super::*;

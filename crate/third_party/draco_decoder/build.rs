@@ -116,15 +116,22 @@ fn main() {
         std::fs::create_dir_all(&draco_build).unwrap();
     }
 
+    let aarch64_linux = target.starts_with("aarch64") && target.contains("linux");
+
+    let mut cfg_args: Vec<String> = vec![
+        draco_src.clone(),
+        "-DBUILD_SHARED_LIBS=OFF".into(),
+        "-DCMAKE_BUILD_TYPE=Release".into(),
+        "-DDRACO_TESTS=OFF".into(),
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".into(),
+        format!("-DCMAKE_INSTALL_PREFIX={draco_build}/install"),
+    ];
+    if aarch64_linux {
+        cfg_args.push("-DCMAKE_C_FLAGS=-mcpu=neoverse-n1".into());
+        cfg_args.push("-DCMAKE_CXX_FLAGS=-mcpu=neoverse-n1".into());
+    }
     let status = Command::new("cmake")
-        .args([
-            &draco_src,
-            "-DBUILD_SHARED_LIBS=OFF",
-            "-DCMAKE_BUILD_TYPE=Release",
-            "-DDRACO_TESTS=OFF",
-            "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
-            &format!("-DCMAKE_INSTALL_PREFIX={draco_build}/install"),
-        ])
+        .args(&cfg_args)
         .current_dir(&draco_build)
         .status()
         .expect("Failed to run CMake");
@@ -160,6 +167,9 @@ fn main() {
 
     if is_apple {
         build.flag("-mmacosx-version-min=15.5");
+    }
+    if aarch64_linux {
+        build.flag_if_supported("-mcpu=neoverse-n1");
     }
 
     build.compile("decoder_api");

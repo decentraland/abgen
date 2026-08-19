@@ -1,5 +1,118 @@
 use super::*;
 
+/// Reconstructed alpha ramp for mode 4 given 6-bit endpoints. 8 entries for
+/// the 3-bit index selector, 4 for the 2-bit one (upper half unused).
+#[inline]
+fn mode4_alpha_vals(la: i32, ha: i32, index_selector: usize) -> [i32; 8] {
+    let mut vals = [0i32; 8];
+    if index_selector == 0 {
+        vals[0] = (la << 2) | (la >> 4);
+        vals[7] = (ha << 2) | (ha >> 4);
+        for i in 1..7 {
+            vals[i] =
+                (vals[0] * (64 - G_WEIGHTS3[i] as i32) + vals[7] * G_WEIGHTS3[i] as i32 + 32) >> 6;
+        }
+    } else {
+        vals[0] = (la << 2) | (la >> 4);
+        vals[3] = (ha << 2) | (ha >> 4);
+        let (w1, w2) = (21, 43);
+        vals[1] = (vals[0] * (64 - w1) + vals[3] * w1 + 32) >> 6;
+        vals[2] = (vals[0] * (64 - w2) + vals[3] * w2 + 32) >> 6;
+    }
+    vals
+}
+
+/// For each pixel pick the ramp entry with the smallest absolute alpha error
+/// (ties to the lowest index), returning the weighted squared error total.
+/// `alphas` and `vals` are always in 0..=255, `num_vals` is 4 or 8.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+fn alpha_selectors_scalar(
+    alphas: &[u8; 16],
+    vals: &[i32; 8],
+    num_vals: usize,
+    weight: u64,
+    selectors: &mut [i32; 16],
+) -> u64 {
+    let mut err = 0u64;
+    for i in 0..16 {
+        let a = alphas[i] as i32;
+        let mut s = 0i32;
+        let mut be = iabs32(a - vals[0]);
+        for (j, &v) in vals.iter().enumerate().take(num_vals).skip(1) {
+            let e = iabs32(a - v);
+            if e < be {
+                be = e;
+                s = j as i32;
+            }
+        }
+        err += (be * be) as u64 * weight;
+        selectors[i] = s;
+    }
+    err
+}
+
+/// NEON version of `alpha_selectors_scalar`; bit-identical by construction:
+/// every lane runs the same strictly-less argmin over the same u8 distances,
+/// and the error sum is the exact integer `weight * sum(be^2)`.
+#[cfg(target_arch = "aarch64")]
+fn alpha_selectors_neon(
+    alphas: &[u8; 16],
+    vals: &[i32; 8],
+    num_vals: usize,
+    weight: u64,
+    selectors: &mut [i32; 16],
+) -> u64 {
+    use std::arch::aarch64::*;
+    // SAFETY: NEON is baseline on aarch64; all loads/stores use in-bounds
+    unsafe {
+        let av = vld1q_u8(alphas.as_ptr());
+        let mut best_d = vabdq_u8(av, vdupq_n_u8(vals[0] as u8));
+        let mut best_s = vdupq_n_u8(0);
+        for (j, &v) in vals.iter().enumerate().take(num_vals).skip(1) {
+            let d = vabdq_u8(av, vdupq_n_u8(v as u8));
+            let lt = vcltq_u8(d, best_d);
+            best_d = vbslq_u8(lt, d, best_d);
+            best_s = vbslq_u8(lt, vdupq_n_u8(j as u8), best_s);
+        }
+        let lo = vget_low_u8(best_d);
+        let hi = vget_high_u8(best_d);
+        let sum = vaddlvq_u16(vmull_u8(lo, lo)) + vaddlvq_u16(vmull_u8(hi, hi));
+        let mut sb = [0u8; 16];
+        vst1q_u8(sb.as_mut_ptr(), best_s);
+        for i in 0..16 {
+            selectors[i] = sb[i] as i32;
+        }
+        sum as u64 * weight
+    }
+}
+
+#[inline]
+fn alpha_selectors(
+    alphas: &[u8; 16],
+    vals: &[i32; 8],
+    num_vals: usize,
+    weight: u64,
+    selectors: &mut [i32; 16],
+) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        alpha_selectors_neon(alphas, vals, num_vals, weight, selectors)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        alpha_selectors_scalar(alphas, vals, num_vals, weight, selectors)
+    }
+}
+
+#[inline]
+fn alpha_lane(pixels: &[ColorI; 16]) -> [u8; 16] {
+    let mut a = [0u8; 16];
+    for i in 0..16 {
+        a[i] = pixels[i].c[3] as u8;
+    }
+    a
+}
+
 pub(super) fn handle_alpha_block_mode4(
     pixels: &[ColorI; 16],
     cp: &Params,
@@ -15,6 +128,9 @@ pub(super) fn handle_alpha_block_mode4(
     params.endpoints_share_pbit = false;
     params.perceptual = cp.perceptual;
 
+    let alphas = alpha_lane(pixels);
+    let weight = params.weights[3] as u64;
+
     for index_selector in 0..2usize {
         if cp.mode4_index_mask & (1 << index_selector) == 0 {
             continue;
@@ -28,6 +144,7 @@ pub(super) fn handle_alpha_block_mode4(
             params.psel_weightsx = &G_WEIGHTS2X;
             params.num_selector_weights = 4;
         }
+        let num_vals = if index_selector == 0 { 8 } else { 4 };
         let mut results = CCResults::new();
         let trial_err_color = color_cell_compression(4, params, &mut results, cp, 16, pixels, true);
 
@@ -47,69 +164,10 @@ pub(super) fn handle_alpha_block_mode4(
         let mut best_alpha_selectors = [0i32; 16];
 
         for pass in 0..2 {
-            let mut vals = [0i32; 8];
-            if index_selector == 0 {
-                vals[0] = (la << 2) | (la >> 4);
-                vals[7] = (ha << 2) | (ha >> 4);
-                for i in 1..7 {
-                    vals[i] = (vals[0] * (64 - G_WEIGHTS3[i] as i32)
-                        + vals[7] * G_WEIGHTS3[i] as i32
-                        + 32)
-                        >> 6;
-                }
-            } else {
-                vals[0] = (la << 2) | (la >> 4);
-                vals[3] = (ha << 2) | (ha >> 4);
-                let (w1, w2) = (21, 43);
-                vals[1] = (vals[0] * (64 - w1) + vals[3] * w1 + 32) >> 6;
-                vals[2] = (vals[0] * (64 - w2) + vals[3] * w2 + 32) >> 6;
-            }
-            let mut trial_alpha_err = 0u64;
+            let vals = mode4_alpha_vals(la, ha, index_selector);
             let mut trial_alpha_selectors = [0i32; 16];
-            for i in 0..16 {
-                let a = pixels[i].c[3];
-                let mut s = 0i32;
-                let mut be = iabs32(a - vals[0]);
-                let mut e = iabs32(a - vals[1]);
-                if e < be {
-                    be = e;
-                    s = 1;
-                }
-                e = iabs32(a - vals[2]);
-                if e < be {
-                    be = e;
-                    s = 2;
-                }
-                e = iabs32(a - vals[3]);
-                if e < be {
-                    be = e;
-                    s = 3;
-                }
-                if index_selector == 0 {
-                    e = iabs32(a - vals[4]);
-                    if e < be {
-                        be = e;
-                        s = 4;
-                    }
-                    e = iabs32(a - vals[5]);
-                    if e < be {
-                        be = e;
-                        s = 5;
-                    }
-                    e = iabs32(a - vals[6]);
-                    if e < be {
-                        be = e;
-                        s = 6;
-                    }
-                    e = iabs32(a - vals[7]);
-                    if e < be {
-                        be = e;
-                        s = 7;
-                    }
-                }
-                trial_alpha_err += (be * be) as u64 * params.weights[3] as u64;
-                trial_alpha_selectors[i] = s;
-            }
+            let trial_alpha_err =
+                alpha_selectors(&alphas, &vals, num_vals, weight, &mut trial_alpha_selectors);
             if trial_alpha_err < best_alpha_err {
                 best_alpha_err = trial_alpha_err;
                 best_la = la;
@@ -139,69 +197,15 @@ pub(super) fn handle_alpha_block_mode4(
                 for hd in -d..=d {
                     la = (best_la + ld).clamp(0, 63);
                     ha = (best_ha + hd).clamp(0, 63);
-                    let mut vals = [0i32; 8];
-                    if index_selector == 0 {
-                        vals[0] = (la << 2) | (la >> 4);
-                        vals[7] = (ha << 2) | (ha >> 4);
-                        for i in 1..7 {
-                            vals[i] = (vals[0] * (64 - G_WEIGHTS3[i] as i32)
-                                + vals[7] * G_WEIGHTS3[i] as i32
-                                + 32)
-                                >> 6;
-                        }
-                    } else {
-                        vals[0] = (la << 2) | (la >> 4);
-                        vals[3] = (ha << 2) | (ha >> 4);
-                        let (w1, w2) = (21, 43);
-                        vals[1] = (vals[0] * (64 - w1) + vals[3] * w1 + 32) >> 6;
-                        vals[2] = (vals[0] * (64 - w2) + vals[3] * w2 + 32) >> 6;
-                    }
-                    let mut trial_alpha_err = 0u64;
+                    let vals = mode4_alpha_vals(la, ha, index_selector);
                     let mut trial_alpha_selectors = [0i32; 16];
-                    for i in 0..16 {
-                        let a = pixels[i].c[3];
-                        let mut s = 0i32;
-                        let mut be = iabs32(a - vals[0]);
-                        let mut e = iabs32(a - vals[1]);
-                        if e < be {
-                            be = e;
-                            s = 1;
-                        }
-                        e = iabs32(a - vals[2]);
-                        if e < be {
-                            be = e;
-                            s = 2;
-                        }
-                        e = iabs32(a - vals[3]);
-                        if e < be {
-                            be = e;
-                            s = 3;
-                        }
-                        if index_selector == 0 {
-                            e = iabs32(a - vals[4]);
-                            if e < be {
-                                be = e;
-                                s = 4;
-                            }
-                            e = iabs32(a - vals[5]);
-                            if e < be {
-                                be = e;
-                                s = 5;
-                            }
-                            e = iabs32(a - vals[6]);
-                            if e < be {
-                                be = e;
-                                s = 6;
-                            }
-                            e = iabs32(a - vals[7]);
-                            if e < be {
-                                be = e;
-                                s = 7;
-                            }
-                        }
-                        trial_alpha_err += (be * be) as u64 * params.weights[3] as u64;
-                        trial_alpha_selectors[i] = s;
-                    }
+                    let trial_alpha_err = alpha_selectors(
+                        &alphas,
+                        &vals,
+                        num_vals,
+                        weight,
+                        &mut trial_alpha_selectors,
+                    );
                     if trial_alpha_err < best_alpha_err {
                         best_alpha_err = trial_alpha_err;
                         best_la = la;
@@ -227,6 +231,18 @@ pub(super) fn handle_alpha_block_mode4(
             opt4.alpha_selectors = best_alpha_selectors;
         }
     }
+}
+
+/// 4-entry alpha ramp for modes 5: endpoints are full 8-bit.
+#[inline]
+fn mode5_alpha_vals(lo_a: i32, hi_a: i32) -> [i32; 8] {
+    let mut vals = [0i32; 8];
+    vals[0] = lo_a;
+    vals[3] = hi_a;
+    let (w1, w2) = (21, 43);
+    vals[1] = (vals[0] * (64 - w1) + vals[3] * w1 + 32) >> 6;
+    vals[2] = (vals[0] * (64 - w2) + vals[3] * w2 + 32) >> 6;
+    vals
 }
 
 pub(super) fn handle_alpha_block_mode5(
@@ -258,38 +274,14 @@ pub(super) fn handle_alpha_block_mode5(
         opt5.high[0].c[3] = hi_a;
         opt5.alpha_selectors = [0; 16];
     } else {
+        let alphas = alpha_lane(pixels);
+        let weight = params.weights[3] as u64;
         let mut mode5_alpha_err = u64::MAX;
         for pass in 0..2 {
-            let mut vals = [0i32; 4];
-            vals[0] = lo_a;
-            vals[3] = hi_a;
-            let (w1, w2) = (21, 43);
-            vals[1] = (vals[0] * (64 - w1) + vals[3] * w1 + 32) >> 6;
-            vals[2] = (vals[0] * (64 - w2) + vals[3] * w2 + 32) >> 6;
+            let vals = mode5_alpha_vals(lo_a, hi_a);
             let mut trial_alpha_selectors = [0i32; 16];
-            let mut trial_alpha_err = 0u64;
-            for i in 0..16 {
-                let a = pixels[i].c[3];
-                let mut s = 0i32;
-                let mut be = iabs32(a - vals[0]);
-                let mut e = iabs32(a - vals[1]);
-                if e < be {
-                    be = e;
-                    s = 1;
-                }
-                e = iabs32(a - vals[2]);
-                if e < be {
-                    be = e;
-                    s = 2;
-                }
-                e = iabs32(a - vals[3]);
-                if e < be {
-                    be = e;
-                    s = 3;
-                }
-                trial_alpha_selectors[i] = s;
-                trial_alpha_err += (be * be) as u64 * params.weights[3] as u64;
-            }
+            let trial_alpha_err =
+                alpha_selectors(&alphas, &vals, 4, weight, &mut trial_alpha_selectors);
             if trial_alpha_err < mode5_alpha_err {
                 mode5_alpha_err = trial_alpha_err;
                 opt5.low[0].c[3] = lo_a;
@@ -325,36 +317,10 @@ pub(super) fn handle_alpha_block_mode5(
                 for hd in -d..=d {
                     lo_a = (opt5.low[0].c[3] + ld).clamp(0, 255);
                     hi_a = (opt5.high[0].c[3] + hd).clamp(0, 255);
-                    let mut vals = [0i32; 4];
-                    vals[0] = lo_a;
-                    vals[3] = hi_a;
-                    let (w1, w2) = (21, 43);
-                    vals[1] = (vals[0] * (64 - w1) + vals[3] * w1 + 32) >> 6;
-                    vals[2] = (vals[0] * (64 - w2) + vals[3] * w2 + 32) >> 6;
+                    let vals = mode5_alpha_vals(lo_a, hi_a);
                     let mut trial_alpha_selectors = [0i32; 16];
-                    let mut trial_alpha_err = 0u64;
-                    for i in 0..16 {
-                        let a = pixels[i].c[3];
-                        let mut s = 0i32;
-                        let mut be = iabs32(a - vals[0]);
-                        let mut e = iabs32(a - vals[1]);
-                        if e < be {
-                            be = e;
-                            s = 1;
-                        }
-                        e = iabs32(a - vals[2]);
-                        if e < be {
-                            be = e;
-                            s = 2;
-                        }
-                        e = iabs32(a - vals[3]);
-                        if e < be {
-                            be = e;
-                            s = 3;
-                        }
-                        trial_alpha_selectors[i] = s;
-                        trial_alpha_err += (be * be) as u64 * params.weights[3] as u64;
-                    }
+                    let trial_alpha_err =
+                        alpha_selectors(&alphas, &vals, 4, weight, &mut trial_alpha_selectors);
                     if trial_alpha_err < mode5_alpha_err {
                         mode5_alpha_err = trial_alpha_err;
                         opt5.low[0].c[3] = lo_a;
@@ -599,4 +565,59 @@ pub(super) fn handle_alpha_block(
     }
 
     encode_bc7_block_bits(&opt_results)
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next_u32(&mut self) -> u32 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            (x >> 32) as u32
+        }
+    }
+
+    #[test]
+    fn neon_alpha_selectors_match_scalar() {
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        let mut cases: Vec<([u8; 16], [i32; 8], usize, u64)> = Vec::new();
+        cases.push(([0u8; 16], [0; 8], 8, 1));
+        cases.push(([255u8; 16], [255; 8], 8, 1));
+        let ramp = mode4_alpha_vals(0, 63, 0);
+        cases.push(([0u8; 16], ramp, 8, 3));
+        let mut edge = [0u8; 16];
+        for (i, e) in edge.iter_mut().enumerate() {
+            *e = if i % 2 == 0 { 0 } else { 255 };
+        }
+        cases.push((edge, mode4_alpha_vals(31, 32, 1), 4, 7));
+        for _ in 0..2000 {
+            let mut alphas = [0u8; 16];
+            for a in alphas.iter_mut() {
+                *a = rng.next_u32() as u8;
+            }
+            let la = (rng.next_u32() % 64) as i32;
+            let ha = (rng.next_u32() % 64) as i32;
+            let sel = (rng.next_u32() % 2) as usize;
+            let vals = mode4_alpha_vals(la, ha, sel);
+            let num_vals = if sel == 0 { 8 } else { 4 };
+            cases.push((alphas, vals, num_vals, (rng.next_u32() % 128 + 1) as u64));
+            let vals5 =
+                mode5_alpha_vals((rng.next_u32() % 256) as i32, (rng.next_u32() % 256) as i32);
+            cases.push((alphas, vals5, 4, (rng.next_u32() % 128 + 1) as u64));
+        }
+        for (alphas, vals, num_vals, weight) in cases {
+            let mut sel_s = [0i32; 16];
+            let mut sel_n = [0i32; 16];
+            let err_s = alpha_selectors_scalar(&alphas, &vals, num_vals, weight, &mut sel_s);
+            let err_n = alpha_selectors_neon(&alphas, &vals, num_vals, weight, &mut sel_n);
+            assert_eq!(err_s, err_n, "err mismatch for {alphas:?} {vals:?}");
+            assert_eq!(sel_s, sel_n, "selector mismatch for {alphas:?} {vals:?}");
+        }
+    }
 }

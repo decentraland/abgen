@@ -10,7 +10,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Native platform checks and tests
   check:
     name: Check (native)
     runs-on: ${{ matrix.os }}
@@ -69,7 +68,6 @@ jobs:
       - name: Run cargo check
         run: cargo check --all-targets
 
-  # Test native platforms
   test-native:
     name: Test (native)
     needs: check
@@ -123,7 +121,6 @@ jobs:
       - name: Run tests
         run: cargo test --lib
 
-  # Test WASM platform
   test-wasm:
     name: Test (wasm32)
     runs-on: ubuntu-latest
@@ -198,7 +195,6 @@ jobs:
       - name: Build WASM package
         run: wasm-pack build --dev --target web
 
-  # Build release
   build-release:
     name: Build release
     needs: [check, test-native]

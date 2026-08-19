@@ -230,6 +230,46 @@ fn pad_to_block_size(rgba: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize)
 
 #[doc(hidden)]
 pub fn box_halve(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
+    #[cfg(target_arch = "aarch64")]
+    if w > 1 && h > 1 {
+        return box_halve_neon(arr, w, h);
+    }
+    box_halve_scalar(arr, w, h)
+}
+
+/// NEON 2x2 box filter for the common (w>1, h>1) case. One output pixel is
+/// one f32x4 lane group; the adds run in the same ((p00+p01)+p10)+p11 order
+/// and the same divide as the scalar loop, so every lane is the identical
+/// IEEE operation sequence and the result is bit-identical.
+#[cfg(target_arch = "aarch64")]
+fn box_halve_neon(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
+    use std::arch::aarch64::*;
+    let c = 4usize;
+    let nh = h / 2;
+    let nw = w / 2;
+    let mut out = vec![0f32; nh * nw * c];
+    let row_stride = w * c;
+    // SAFETY: NEON is baseline on aarch64. For ny<nh, nx<nw the reads touch
+    unsafe {
+        let denom = vdupq_n_f32(4.0);
+        for ny in 0..nh {
+            let r0 = arr.as_ptr().add(2 * ny * row_stride);
+            let r1 = arr.as_ptr().add((2 * ny + 1) * row_stride);
+            let dst = out.as_mut_ptr().add(ny * nw * c);
+            for nx in 0..nw {
+                let p00 = vld1q_f32(r0.add(nx * 8));
+                let p01 = vld1q_f32(r0.add(nx * 8 + 4));
+                let p10 = vld1q_f32(r1.add(nx * 8));
+                let p11 = vld1q_f32(r1.add(nx * 8 + 4));
+                let acc = vaddq_f32(vaddq_f32(vaddq_f32(p00, p01), p10), p11);
+                vst1q_f32(dst.add(nx * 4), vdivq_f32(acc, denom));
+            }
+        }
+    }
+    (out, nw, nh)
+}
+
+fn box_halve_scalar(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
     let c = 4usize;
     let nh = (h / 2).max(1);
     let nw = (w / 2).max(1);
@@ -396,4 +436,57 @@ fn encode_bc7_mip_chain_with_profile_uncached(
         }
     }
     (parts, mip_count)
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next_u32(&mut self) -> u32 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            (x >> 32) as u32
+        }
+    }
+
+    #[test]
+    fn neon_box_halve_matches_scalar() {
+        let mut rng = Rng(0xdead_beef_cafe_f00d);
+        for &(w, h) in &[
+            (2usize, 2usize),
+            (4, 4),
+            (5, 3),
+            (7, 7),
+            (16, 2),
+            (2, 16),
+            (33, 17),
+            (64, 64),
+        ] {
+            let mut arr = vec![0f32; w * h * 4];
+            for v in arr.iter_mut() {
+                *v = match rng.next_u32() % 4 {
+                    0 => (rng.next_u32() % 256) as f32,
+                    1 => f32::from_bits(0x3f80_0000 | (rng.next_u32() & 0x007f_ffff)) - 1.0,
+                    2 => 255.0,
+                    _ => 0.0,
+                };
+            }
+            let (a, aw, ah) = box_halve_scalar(&arr, w, h);
+            let (b, bw, bh) = box_halve_neon(&arr, w, h);
+            assert_eq!((aw, ah), (bw, bh));
+            assert_eq!(a.len(), b.len());
+            for i in 0..a.len() {
+                assert_eq!(
+                    a[i].to_bits(),
+                    b[i].to_bits(),
+                    "lane {i} differs for {w}x{h}"
+                );
+            }
+        }
+    }
 }

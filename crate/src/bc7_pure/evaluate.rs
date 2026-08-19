@@ -1,5 +1,18 @@
 use super::*;
 
+#[cfg(target_arch = "aarch64")]
+static HAS_NEON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn has_neon() -> bool {
+    *HAS_NEON.get_or_init(|| std::env::var_os("ABGEN_BC7_SCALAR").is_none())
+}
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn has_neon() -> bool {
+    false
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn build_wc_table_sse(wc: &mut [[f32; 4]; 16], psel: &[u32], n: usize, nc: usize) {
@@ -68,6 +81,11 @@ pub(super) fn evaluate_solution(
     #[cfg(target_arch = "x86_64")]
     if has_avx2() {
         unsafe { build_wc_table_sse(&mut wc, p.psel_weights, n, nc) };
+        wc_built = true;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if has_neon() {
+        unsafe { neon::build_wc_table_neon(&mut wc, p.psel_weights, n, nc) };
         wc_built = true;
     }
     if !wc_built {
@@ -139,25 +157,52 @@ pub(super) fn evaluate_solution(
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 {
-                    total_errf = eval_solution_n16_rgb_scalar(
-                        num_pixels,
-                        pixels,
-                        &wc,
-                        wr,
-                        wg,
-                        wb,
-                        dr,
-                        dg,
-                        db,
-                        lr,
-                        lg,
-                        lb,
-                        f,
-                        n,
-                        &mut res.selectors_temp,
-                    );
+                    #[allow(unused_mut)]
+                    let mut simd_done = false;
+                    #[cfg(target_arch = "aarch64")]
+                    if has_neon() {
+                        total_errf = unsafe {
+                            neon::eval_solution_n16_rgb_neon(
+                                num_pixels,
+                                pixels,
+                                &wc,
+                                wr,
+                                wg,
+                                wb,
+                                dr,
+                                dg,
+                                db,
+                                lr,
+                                lg,
+                                lb,
+                                f,
+                                n,
+                                &mut res.selectors_temp,
+                            )
+                        };
+                        simd_done = true;
+                    }
+                    if !simd_done {
+                        total_errf = eval_solution_n16_rgb_scalar(
+                            num_pixels,
+                            pixels,
+                            &wc,
+                            wr,
+                            wg,
+                            wb,
+                            dr,
+                            dg,
+                            db,
+                            lr,
+                            lg,
+                            lb,
+                            f,
+                            n,
+                            &mut res.selectors_temp,
+                        );
+                    }
                 }
-            } else if has_avx2() && (n == 4 || n == 8) {
+            } else if (has_avx2() || has_neon()) && (n == 4 || n == 8) {
                 #[cfg(target_arch = "x86_64")]
                 {
                     total_errf = unsafe {
@@ -175,52 +220,47 @@ pub(super) fn evaluate_solution(
                         )
                     };
                 }
-            } else {
-                for i in 0..num_pixels {
-                    let pr = pixels[i].c[0] as f32;
-                    let pg = pixels[i].c[1] as f32;
-                    let pb = pixels[i].c[2] as f32;
-
-                    let mut errs = [0f32; 4];
-                    for k in 0..4usize {
-                        let d0 = wc[k][0] - pr;
-                        let d1 = wc[k][1] - pg;
-                        let d2 = wc[k][2] - pb;
-                        errs[k] = wr * d0 * d0 + wg * d1 * d1 + wb * d2 * d2;
-                    }
-                    let mut best_err = errs[0].min(errs[1]).min(errs[2]).min(errs[3]);
-                    let mut best_sel = if best_err == errs[1] { 1 } else { 0 };
-                    if best_err == errs[2] {
-                        best_sel = 2;
-                    }
-                    if best_err == errs[3] {
-                        best_sel = 3;
-                    }
-                    if n == 8 {
-                        let mut e2 = [0f32; 4];
-                        for k in 0..4usize {
-                            let d0 = wc[4 + k][0] - pr;
-                            let d1 = wc[4 + k][1] - pg;
-                            let d2 = wc[4 + k][2] - pb;
-                            e2[k] = wr * d0 * d0 + wg * d1 * d1 + wb * d2 * d2;
-                        }
-                        best_err = best_err.min(e2[0].min(e2[1]).min(e2[2]).min(e2[3]));
-                        if best_err == e2[0] {
-                            best_sel = 4;
-                        }
-                        if best_err == e2[1] {
-                            best_sel = 5;
-                        }
-                        if best_err == e2[2] {
-                            best_sel = 6;
-                        }
-                        if best_err == e2[3] {
-                            best_sel = 7;
-                        }
-                    }
-                    total_errf += best_err;
-                    res.selectors_temp[i] = best_sel;
+                #[cfg(target_arch = "aarch64")]
+                {
+                    total_errf = unsafe {
+                        neon::eval_discrete_neon(
+                            num_pixels,
+                            pixels,
+                            &wc,
+                            wr,
+                            wg,
+                            wb,
+                            wa,
+                            false,
+                            n,
+                            &mut res.selectors_temp,
+                        )
+                    };
                 }
+            } else {
+                total_errf = if wr == 1.0 && wg == 1.0 && wb == 1.0 {
+                    eval_discrete_rgb_scalar::<false>(
+                        num_pixels,
+                        pixels,
+                        &wc,
+                        wr,
+                        wg,
+                        wb,
+                        n,
+                        &mut res.selectors_temp,
+                    )
+                } else {
+                    eval_discrete_rgb_scalar::<true>(
+                        num_pixels,
+                        pixels,
+                        &wc,
+                        wr,
+                        wg,
+                        wb,
+                        n,
+                        &mut res.selectors_temp,
+                    )
+                };
             }
         } else {
             if n == 16 {
@@ -237,39 +277,88 @@ pub(super) fn evaluate_solution(
                 let lg = lg * -dg;
                 let lb = lb * -db;
                 let la = la * -da;
-                for i in 0..num_pixels {
-                    let r = pixels[i].c[0] as f32;
-                    let g = pixels[i].c[1] as f32;
-                    let b = pixels[i].c[2] as f32;
-                    let a = pixels[i].c[3] as f32;
-                    let mut best_sel =
-                        ((((r * dr + lr) + (g * dg + lg) + (b * db + lb) + (a * da + la)) * f)
-                            + 0.5)
-                            .floor();
-                    best_sel = best_sel.clamp(1.0, (n - 1) as f32);
-                    let best_sel0 = best_sel - 1.0;
-                    let i0 = best_sel0 as i32 as usize;
-                    let i1 = best_sel as i32 as usize;
-                    let dr0 = wc[i0][0] - r;
-                    let dg0 = wc[i0][1] - g;
-                    let db0 = wc[i0][2] - b;
-                    let da0 = wc[i0][3] - a;
-                    let err0 = wr * dr0 * dr0 + wg * dg0 * dg0 + wb * db0 * db0 + wa * da0 * da0;
-                    let dr1 = wc[i1][0] - r;
-                    let dg1 = wc[i1][1] - g;
-                    let db1 = wc[i1][2] - b;
-                    let da1 = wc[i1][3] - a;
-                    let err1 = wr * dr1 * dr1 + wg * dg1 * dg1 + wb * db1 * db1 + wa * da1 * da1;
-                    let min_err = err0.min(err1);
-                    total_errf += min_err;
-                    res.selectors_temp[i] =
-                        if min_err == err0 { best_sel0 } else { best_sel } as i32;
+                #[allow(unused_mut)]
+                let mut simd_done = false;
+                #[cfg(target_arch = "aarch64")]
+                if has_neon() {
+                    total_errf = unsafe {
+                        neon::eval_solution_n16_rgba_neon(
+                            num_pixels,
+                            pixels,
+                            &wc,
+                            wr,
+                            wg,
+                            wb,
+                            wa,
+                            dr,
+                            dg,
+                            db,
+                            da,
+                            lr,
+                            lg,
+                            lb,
+                            la,
+                            f,
+                            n,
+                            &mut res.selectors_temp,
+                        )
+                    };
+                    simd_done = true;
                 }
-            } else if has_avx2() && (n == 4 || n == 8) {
+                if !simd_done {
+                    for i in 0..num_pixels {
+                        let r = pixels[i].c[0] as f32;
+                        let g = pixels[i].c[1] as f32;
+                        let b = pixels[i].c[2] as f32;
+                        let a = pixels[i].c[3] as f32;
+                        let mut best_sel =
+                            ((((r * dr + lr) + (g * dg + lg) + (b * db + lb) + (a * da + la)) * f)
+                                + 0.5)
+                                .floor();
+                        best_sel = best_sel.clamp(1.0, (n - 1) as f32);
+                        let best_sel0 = best_sel - 1.0;
+                        let i0 = best_sel0 as i32 as usize;
+                        let i1 = best_sel as i32 as usize;
+                        let dr0 = wc[i0][0] - r;
+                        let dg0 = wc[i0][1] - g;
+                        let db0 = wc[i0][2] - b;
+                        let da0 = wc[i0][3] - a;
+                        let err0 =
+                            wr * dr0 * dr0 + wg * dg0 * dg0 + wb * db0 * db0 + wa * da0 * da0;
+                        let dr1 = wc[i1][0] - r;
+                        let dg1 = wc[i1][1] - g;
+                        let db1 = wc[i1][2] - b;
+                        let da1 = wc[i1][3] - a;
+                        let err1 =
+                            wr * dr1 * dr1 + wg * dg1 * dg1 + wb * db1 * db1 + wa * da1 * da1;
+                        let min_err = err0.min(err1);
+                        total_errf += min_err;
+                        res.selectors_temp[i] =
+                            if min_err == err0 { best_sel0 } else { best_sel } as i32;
+                    }
+                }
+            } else if (has_avx2() || has_neon()) && (n == 4 || n == 8) {
                 #[cfg(target_arch = "x86_64")]
                 {
                     total_errf = unsafe {
                         eval_discrete_avx2(
+                            num_pixels,
+                            pixels,
+                            &wc,
+                            wr,
+                            wg,
+                            wb,
+                            wa,
+                            true,
+                            n,
+                            &mut res.selectors_temp,
+                        )
+                    };
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    total_errf = unsafe {
+                        neon::eval_discrete_neon(
                             num_pixels,
                             pixels,
                             &wc,
@@ -443,6 +532,74 @@ pub(super) fn evaluate_solution(
         }
     }
     total_err
+}
+
+#[inline]
+fn eval_discrete_rgb_scalar<const WEIGHTED: bool>(
+    num_pixels: usize,
+    pixels: &[ColorI],
+    wc: &[[f32; 4]; 16],
+    wr: f32,
+    wg: f32,
+    wb: f32,
+    n: usize,
+    selectors_temp: &mut [i32; 16],
+) -> f32 {
+    let mut total_errf = 0f32;
+    for i in 0..num_pixels {
+        let pr = pixels[i].c[0] as f32;
+        let pg = pixels[i].c[1] as f32;
+        let pb = pixels[i].c[2] as f32;
+
+        let mut errs = [0f32; 4];
+        for k in 0..4usize {
+            let d0 = wc[k][0] - pr;
+            let d1 = wc[k][1] - pg;
+            let d2 = wc[k][2] - pb;
+            errs[k] = if WEIGHTED {
+                wr * d0 * d0 + wg * d1 * d1 + wb * d2 * d2
+            } else {
+                d0 * d0 + d1 * d1 + d2 * d2
+            };
+        }
+        let mut best_err = errs[0].min(errs[1]).min(errs[2]).min(errs[3]);
+        let mut best_sel = if best_err == errs[1] { 1 } else { 0 };
+        if best_err == errs[2] {
+            best_sel = 2;
+        }
+        if best_err == errs[3] {
+            best_sel = 3;
+        }
+        if n == 8 {
+            let mut e2 = [0f32; 4];
+            for k in 0..4usize {
+                let d0 = wc[4 + k][0] - pr;
+                let d1 = wc[4 + k][1] - pg;
+                let d2 = wc[4 + k][2] - pb;
+                e2[k] = if WEIGHTED {
+                    wr * d0 * d0 + wg * d1 * d1 + wb * d2 * d2
+                } else {
+                    d0 * d0 + d1 * d1 + d2 * d2
+                };
+            }
+            best_err = best_err.min(e2[0].min(e2[1]).min(e2[2]).min(e2[3]));
+            if best_err == e2[0] {
+                best_sel = 4;
+            }
+            if best_err == e2[1] {
+                best_sel = 5;
+            }
+            if best_err == e2[2] {
+                best_sel = 6;
+            }
+            if best_err == e2[3] {
+                best_sel = 7;
+            }
+        }
+        total_errf += best_err;
+        selectors_temp[i] = best_sel;
+    }
+    total_errf
 }
 
 #[inline]
@@ -756,4 +913,248 @@ unsafe fn eval_perceptual_avx2(
         }
     }
     total_errf
+}
+
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use super::ColorI;
+    use std::arch::aarch64::*;
+
+    #[inline]
+    pub(super) unsafe fn build_wc_table_neon(
+        wc: &mut [[f32; 4]; 16],
+        psel: &[u32],
+        n: usize,
+        nc: usize,
+    ) {
+        let a = vld1q_f32(wc[0].as_ptr());
+        let b = vld1q_f32(wc[n - 1].as_ptr());
+        let v64 = vdupq_n_f32(64.0);
+        let v32 = vdupq_n_f32(32.0);
+        let inv64 = vdupq_n_f32(1.0 / 64.0);
+        for i in 1..(n - 1) {
+            let wv = vdupq_n_f32(psel[i] as f32);
+            let iwv = vsubq_f32(v64, wv);
+            let t = vaddq_f32(vaddq_f32(vmulq_f32(a, iwv), vmulq_f32(b, wv)), v32);
+            let mut t = vrndmq_f32(vmulq_f32(t, inv64));
+            if nc == 3 {
+                t = vsetq_lane_f32::<3>(0.0, t);
+            }
+            vst1q_f32(wc[i].as_mut_ptr(), t);
+        }
+    }
+
+    #[inline]
+    pub(super) unsafe fn eval_solution_n16_rgb_neon(
+        num_pixels: usize,
+        pixels: &[ColorI],
+        wc: &[[f32; 4]; 16],
+        wr: f32,
+        wg: f32,
+        wb: f32,
+        dr: f32,
+        dg: f32,
+        db: f32,
+        lr: f32,
+        lg: f32,
+        lb: f32,
+        f: f32,
+        n: usize,
+        selectors_temp: &mut [i32; 16],
+    ) -> f32 {
+        let warr = [wr, wg, wb, 0.0f32];
+        let w_v = vld1q_f32(warr.as_ptr());
+        let mut total_errf = 0f32;
+        let n_minus_1 = (n - 1) as f32;
+        for i in 0..num_pixels {
+            let r = pixels[i].c[0] as f32;
+            let g = pixels[i].c[1] as f32;
+            let b = pixels[i].c[2] as f32;
+            let mut best_sel =
+                ((((r * dr + lr) + (g * dg + lg) + (b * db + lb)) * f) + 0.5).floor();
+            best_sel = best_sel.clamp(1.0, n_minus_1);
+            let best_sel0 = best_sel - 1.0;
+            let i0 = best_sel0 as i32 as usize;
+            let i1 = best_sel as i32 as usize;
+
+            let pi_v = vcvtq_f32_s32(vld1q_s32(pixels[i].c.as_ptr()));
+            let d0_v = vsubq_f32(vld1q_f32(wc[i0].as_ptr()), pi_v);
+            let d1_v = vsubq_f32(vld1q_f32(wc[i1].as_ptr()), pi_v);
+            let t0 = vmulq_f32(vmulq_f32(w_v, d0_v), d0_v);
+            let t1 = vmulq_f32(vmulq_f32(w_v, d1_v), d1_v);
+            let err0 =
+                (vgetq_lane_f32::<0>(t0) + vgetq_lane_f32::<1>(t0)) + vgetq_lane_f32::<2>(t0);
+            let err1 =
+                (vgetq_lane_f32::<0>(t1) + vgetq_lane_f32::<1>(t1)) + vgetq_lane_f32::<2>(t1);
+            let min_err = err0.min(err1);
+            total_errf += min_err;
+            selectors_temp[i] = if min_err == err0 { best_sel0 } else { best_sel } as i32;
+        }
+        total_errf
+    }
+
+    #[inline]
+    pub(super) unsafe fn eval_solution_n16_rgba_neon(
+        num_pixels: usize,
+        pixels: &[ColorI],
+        wc: &[[f32; 4]; 16],
+        wr: f32,
+        wg: f32,
+        wb: f32,
+        wa: f32,
+        dr: f32,
+        dg: f32,
+        db: f32,
+        da: f32,
+        lr: f32,
+        lg: f32,
+        lb: f32,
+        la: f32,
+        f: f32,
+        n: usize,
+        selectors_temp: &mut [i32; 16],
+    ) -> f32 {
+        let warr = [wr, wg, wb, wa];
+        let w_v = vld1q_f32(warr.as_ptr());
+        let mut total_errf = 0f32;
+        let n_minus_1 = (n - 1) as f32;
+        for i in 0..num_pixels {
+            let r = pixels[i].c[0] as f32;
+            let g = pixels[i].c[1] as f32;
+            let b = pixels[i].c[2] as f32;
+            let a = pixels[i].c[3] as f32;
+            let mut best_sel =
+                ((((r * dr + lr) + (g * dg + lg) + (b * db + lb) + (a * da + la)) * f) + 0.5)
+                    .floor();
+            best_sel = best_sel.clamp(1.0, n_minus_1);
+            let best_sel0 = best_sel - 1.0;
+            let i0 = best_sel0 as i32 as usize;
+            let i1 = best_sel as i32 as usize;
+
+            let pi_v = vcvtq_f32_s32(vld1q_s32(pixels[i].c.as_ptr()));
+            let d0_v = vsubq_f32(vld1q_f32(wc[i0].as_ptr()), pi_v);
+            let d1_v = vsubq_f32(vld1q_f32(wc[i1].as_ptr()), pi_v);
+            let t0 = vmulq_f32(vmulq_f32(w_v, d0_v), d0_v);
+            let t1 = vmulq_f32(vmulq_f32(w_v, d1_v), d1_v);
+            let err0 = ((vgetq_lane_f32::<0>(t0) + vgetq_lane_f32::<1>(t0))
+                + vgetq_lane_f32::<2>(t0))
+                + vgetq_lane_f32::<3>(t0);
+            let err1 = ((vgetq_lane_f32::<0>(t1) + vgetq_lane_f32::<1>(t1))
+                + vgetq_lane_f32::<2>(t1))
+                + vgetq_lane_f32::<3>(t1);
+            let min_err = err0.min(err1);
+            total_errf += min_err;
+            selectors_temp[i] = if min_err == err0 { best_sel0 } else { best_sel } as i32;
+        }
+        total_errf
+    }
+
+    #[inline]
+    pub(super) unsafe fn eval_discrete_neon(
+        num_pixels: usize,
+        pixels: &[ColorI],
+        wc: &[[f32; 4]; 16],
+        wr: f32,
+        wg: f32,
+        wb: f32,
+        wa: f32,
+        has_alpha: bool,
+        n: usize,
+        selectors_temp: &mut [i32; 16],
+    ) -> f32 {
+        let mut wc0 = [0f32; 8];
+        let mut wc1 = [0f32; 8];
+        let mut wc2 = [0f32; 8];
+        let mut wc3 = [0f32; 8];
+        for k in 0..n {
+            wc0[k] = wc[k][0];
+            wc1[k] = wc[k][1];
+            wc2[k] = wc[k][2];
+            wc3[k] = wc[k][3];
+        }
+        let wrv = vdupq_n_f32(wr);
+        let wgv = vdupq_n_f32(wg);
+        let wbv = vdupq_n_f32(wb);
+        let wav = vdupq_n_f32(wa);
+        let bits_lo_arr: [u32; 4] = [1, 2, 4, 8];
+        let bits_hi_arr: [u32; 4] = [16, 32, 64, 128];
+        let bits_lo = vld1q_u32(bits_lo_arr.as_ptr());
+        let bits_hi = vld1q_u32(bits_hi_arr.as_ptr());
+        let mut total_errf = 0f32;
+        if n == 4 {
+            let w0 = vld1q_f32(wc0.as_ptr());
+            let w1 = vld1q_f32(wc1.as_ptr());
+            let w2 = vld1q_f32(wc2.as_ptr());
+            let w3 = vld1q_f32(wc3.as_ptr());
+            for i in 0..num_pixels {
+                let d0 = vsubq_f32(w0, vdupq_n_f32(pixels[i].c[0] as f32));
+                let d1 = vsubq_f32(w1, vdupq_n_f32(pixels[i].c[1] as f32));
+                let d2 = vsubq_f32(w2, vdupq_n_f32(pixels[i].c[2] as f32));
+                let mut err = vaddq_f32(
+                    vaddq_f32(
+                        vmulq_f32(vmulq_f32(wrv, d0), d0),
+                        vmulq_f32(vmulq_f32(wgv, d1), d1),
+                    ),
+                    vmulq_f32(vmulq_f32(wbv, d2), d2),
+                );
+                if has_alpha {
+                    let d3 = vsubq_f32(w3, vdupq_n_f32(pixels[i].c[3] as f32));
+                    err = vaddq_f32(err, vmulq_f32(vmulq_f32(wav, d3), d3));
+                }
+                let best = vminvq_f32(err);
+                let eq = vceqq_f32(err, vdupq_n_f32(best));
+                let mask = vaddvq_u32(vandq_u32(eq, bits_lo));
+                total_errf += best;
+                selectors_temp[i] = (31 - mask.leading_zeros()) as i32;
+            }
+        } else {
+            let w0l = vld1q_f32(wc0.as_ptr());
+            let w0h = vld1q_f32(wc0.as_ptr().add(4));
+            let w1l = vld1q_f32(wc1.as_ptr());
+            let w1h = vld1q_f32(wc1.as_ptr().add(4));
+            let w2l = vld1q_f32(wc2.as_ptr());
+            let w2h = vld1q_f32(wc2.as_ptr().add(4));
+            let w3l = vld1q_f32(wc3.as_ptr());
+            let w3h = vld1q_f32(wc3.as_ptr().add(4));
+            for i in 0..num_pixels {
+                let p0 = vdupq_n_f32(pixels[i].c[0] as f32);
+                let p1 = vdupq_n_f32(pixels[i].c[1] as f32);
+                let p2 = vdupq_n_f32(pixels[i].c[2] as f32);
+                let d0l = vsubq_f32(w0l, p0);
+                let d0h = vsubq_f32(w0h, p0);
+                let d1l = vsubq_f32(w1l, p1);
+                let d1h = vsubq_f32(w1h, p1);
+                let d2l = vsubq_f32(w2l, p2);
+                let d2h = vsubq_f32(w2h, p2);
+                let mut errl = vaddq_f32(
+                    vaddq_f32(
+                        vmulq_f32(vmulq_f32(wrv, d0l), d0l),
+                        vmulq_f32(vmulq_f32(wgv, d1l), d1l),
+                    ),
+                    vmulq_f32(vmulq_f32(wbv, d2l), d2l),
+                );
+                let mut errh = vaddq_f32(
+                    vaddq_f32(
+                        vmulq_f32(vmulq_f32(wrv, d0h), d0h),
+                        vmulq_f32(vmulq_f32(wgv, d1h), d1h),
+                    ),
+                    vmulq_f32(vmulq_f32(wbv, d2h), d2h),
+                );
+                if has_alpha {
+                    let p3 = vdupq_n_f32(pixels[i].c[3] as f32);
+                    let d3l = vsubq_f32(w3l, p3);
+                    let d3h = vsubq_f32(w3h, p3);
+                    errl = vaddq_f32(errl, vmulq_f32(vmulq_f32(wav, d3l), d3l));
+                    errh = vaddq_f32(errh, vmulq_f32(vmulq_f32(wav, d3h), d3h));
+                }
+                let best = vminvq_f32(vminq_f32(errl, errh));
+                let bv = vdupq_n_f32(best);
+                let mask = vaddvq_u32(vandq_u32(vceqq_f32(errl, bv), bits_lo))
+                    | vaddvq_u32(vandq_u32(vceqq_f32(errh, bv), bits_hi));
+                total_errf += best;
+                selectors_temp[i] = (31 - mask.leading_zeros()) as i32;
+            }
+        }
+        total_errf
+    }
 }
