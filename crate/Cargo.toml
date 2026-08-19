@@ -1,6 +1,6 @@
 [package]
 name = "abgen"
-version = "0.16.2"
+version.workspace = true
 edition = "2021"
 description = "Decentraland asset-bundle converter + ab-cdn-compatible JIT server — clean-room reimplementation of asset-bundle-converter."
 license = "Apache-2.0"
@@ -10,6 +10,20 @@ autoexamples = false
 autotests = false
 autobenches = false
 
+[features]
+default = ["server"]
+server = [
+    "dep:axum",
+    "dep:dcl-contents",
+    "dep:ethers-core",
+    "dep:metrics-exporter-prometheus",
+    "dep:moka",
+    "dep:sqlx",
+    "dep:tokio",
+    "dep:tokio-util",
+    "dep:tower-http",
+]
+
 [lib]
 name = "abgen"
 path = "src/lib.rs"
@@ -17,6 +31,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "abgen"
 path = "src/bin/abgen.rs"
+required-features = ["server"]
 
 [[bin]]
 name = "abgen-build"
@@ -25,15 +40,6 @@ path = "src/bin/abgen-build.rs"
 [[bin]]
 name = "abgen-corpus"
 path = "src/bin/abgen-corpus/main.rs"
-
-[[bench]]
-name = "kernels"
-path = "benches/kernels.rs"
-harness = false
-
-[[bin]]
-name = "abgen-bench"
-path = "src/bin/abgen-bench.rs"
 
 [[bin]]
 name = "abgen-verify"
@@ -52,10 +58,6 @@ name = "matdump"
 path = "examples/matdump.rs"
 
 [[example]]
-name = "crndump"
-path = "examples/crndump.rs"
-
-[[example]]
 name = "objdump"
 path = "examples/objdump.rs"
 
@@ -64,40 +66,14 @@ name = "texcmp"
 path = "examples/texcmp.rs"
 
 [[example]]
-name = "texcmp2"
-path = "examples/texcmp2.rs"
-
-[[example]]
 name = "texpng"
 path = "examples/texpng.rs"
-
-[[example]]
-name = "jpegprobe"
-path = "examples/jpegprobe.rs"
-
-[[example]]
-name = "loddump"
-path = "examples/loddump.rs"
-
-[[example]]
-name = "lodaabb"
-path = "examples/lodaabb.rs"
-
-[[example]]
-name = "ressdump"
-path = "examples/ressdump.rs"
 
 [[example]]
 name = "atlasprobe"
 path = "examples/atlasprobe.rs"
 
-[features]
-engine-v8 = ["dep:v8"]
-
 [build-dependencies]
-# Compiles compat/isoc23_shim.c on linux-gnu — see crate/build.rs. Already in
-# the lock file via crunch_ffi/libmimalloc-sys, so this adds an edge, not a
-# package.
 cc = "1"
 
 [dependencies]
@@ -129,17 +105,17 @@ image = "0.25"
 ureq = "3"
 memmap2 = "0.9"
 meshopt = "=0.6.2"
-tokio = { version = "1", features = ["full"] }
-axum = "0.8"
+tokio = { version = "1", features = ["full"], optional = true }
+axum = { version = "0.8", optional = true }
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.18", default-features = false }
-tower-http = { version = "0.7", features = ["trace"] }
-tokio-util = { version = "0.7", features = ["io"] }
+metrics-exporter-prometheus = { version = "0.18", default-features = false, optional = true }
+tower-http = { version = "0.7", features = ["trace"], optional = true }
+tokio-util = { version = "0.7", features = ["io"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-moka = { version = "0.12", features = ["future"] }
-sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "json"] }
-dcl-contents = { path = "dcl-contents" }
-ethers-core = "2.0.14"
+moka = { version = "0.12", features = ["future"], optional = true }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "json", "macros", "migrate"], optional = true }
+dcl-contents = { path = "dcl-contents", optional = true }
+ethers-core = { version = "2.0.14", optional = true }
 hex = "0.4"
 thiserror = "2"
 wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12"] }
@@ -151,20 +127,43 @@ meshopt = "=0.6.2"
 wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "webgpu"] }
 
 [target.'cfg(all(target_os = "windows", target_arch = "aarch64", target_env = "gnu"))'.dependencies]
-# rquickjs-sys picks bindings by exact triple and ships none for gnullvm (msvc
-# and x86_64-gnu both have one), so they must be generated. A target dep rather
-# than a `--features` flag because abgen-native depends on abgen, not rquickjs,
-# and so cannot forward the flag.
 rquickjs = { version = "0.12", default-features = false, features = ["bindgen"] }
 
 [target.'cfg(all(not(target_os = "windows"), not(target_arch = "wasm32")))'.dependencies]
 mimalloc = { version = "0.1.52", default-features = false }
 
 [target.'cfg(not(any(target_arch = "wasm32", all(target_os = "windows", target_env = "gnu"))))'.dependencies]
-v8 = { version = "=149.4.0", optional = true }
+
+[[bench]]
+name = "kernels"
+path = "benches/kernels.rs"
+harness = false
+
+[[bin]]
+name = "abgen-bench"
+path = "src/bin/abgen-bench.rs"
 
 [dev-dependencies]
-# Benches only. `cargo bench` is not part of any release lane, so this never
-# reaches a shipped artifact — but it does move Cargo.lock, and the recorded
-# reproducibility hashes derive from that.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[example]]
+name = "bc7-parity-o08"
+path = "examples/bc7_parity_o08.rs"
+
+[[test]]
+name = "o15_parity"
+path = "tests/o15_parity.rs"
+[[test]]
+name = "bc7_parity"
+path = "tests/bc7_parity.rs"
+harness = true
+[[test]]
+name = "crn_parity"
+path = "tests/crn_parity.rs"
+[[test]]
+name = "dxt1_corpus_hash"
+path = "tests/dxt1_corpus_hash.rs"
+harness = true
+[[test]]
+name = "dxt1_hash"
+path = "tests/dxt1_hash.rs"

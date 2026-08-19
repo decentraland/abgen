@@ -29,16 +29,10 @@ async fn dispatch_with_fallbacks(
         return local;
     }
 
-    if let Some(target) = resolver::shader_target(path) {
+    if let Some(target) = routes::shader_target(path) {
         return shader_fallback(state, path, &target, method, headers, local).await;
     }
 
-    // Upstream before any build lane: when a production ab-cdn is configured,
-    // entities it already serves (wearables, emotes, remote scenes) should
-    // stream from it rather than be probed with a local JIT build — against a
-    // preview content server that build can only fail its entity resolve and
-    // log a write-back warning per entity. Local-corpus ids (b64-) and
-    // upstream misses fall through to the build lanes as before.
     let local = if state.upstream_ab_cdn.is_some() {
         let up = upstream_fallback(state, path, method, headers, local).await;
         if up.status() != StatusCode::NOT_FOUND {

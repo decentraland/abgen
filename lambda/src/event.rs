@@ -1,29 +1,13 @@
-//! Event parsing: SQS record batches, catalyst `DeploymentToSqs` bodies, and
-//! plain manual payloads all normalize into [`Job`]s.
-
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 pub struct Job {
     pub entity_id: String,
-    /// Content server root from the event (`contentServerUrls[0]`), normalized
-    /// to strip a trailing `/` and a `/contents` suffix. `None` for manual
-    /// payloads that omit it — the configured default applies.
     pub content_server_url: Option<String>,
-    /// `DeploymentToSqs.lods` was present: a LOD-generation job, not an
-    /// entity conversion.
     pub is_lods: bool,
-    /// `"force": true` in the payload — convert even when the CDN already
-    /// has a current manifest (manual requeues).
     pub force: bool,
 }
 
-/// Accepts, in order of detection:
-/// * an SQS event: `{"Records": [{"body": "<json string>"}, …]}` where each
-///   body is one of the shapes below,
-/// * a `DeploymentToSqs`: `{"entity": {"entityId": "…"},
-///   "contentServerUrls": ["…"], "lods"?: […]}`,
-/// * a manual payload: `{"entityId": "…", "contentServerUrl"?: "…"}`.
 pub fn jobs_from_event(event: &Value) -> Result<Vec<Job>> {
     if let Some(records) = event.get("Records").and_then(Value::as_array) {
         let mut jobs = Vec::with_capacity(records.len());
@@ -44,7 +28,6 @@ pub fn jobs_from_event(event: &Value) -> Result<Vec<Job>> {
 fn job_from_value(v: &Value) -> Result<Job> {
     let force = v.get("force").and_then(Value::as_bool).unwrap_or(false);
 
-    // Manual payload.
     if let Some(id) = v.get("entityId").and_then(Value::as_str) {
         return Ok(Job {
             entity_id: validated_entity_id(id)?,
@@ -56,7 +39,6 @@ fn job_from_value(v: &Value) -> Result<Job> {
             force,
         });
     }
-    // DeploymentToSqs.
     if let Some(id) = v.pointer("/entity/entityId").and_then(Value::as_str) {
         let is_lods = v.get("lods").map(|l| !l.is_null()).unwrap_or(false);
         let content_server_url = v
@@ -78,9 +60,6 @@ fn job_from_value(v: &Value) -> Result<Job> {
     bail!("unrecognized event shape: expected entityId or entity.entityId")
 }
 
-/// Mirrors the consumer-server's guard: content-addressed ids are strictly
-/// alphanumeric, and the id ends up in shell-adjacent contexts (paths, URLs),
-/// so reject anything else outright.
 fn validated_entity_id(id: &str) -> Result<String> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
         bail!(
@@ -91,12 +70,6 @@ fn validated_entity_id(id: &str) -> Result<String> {
     Ok(id.to_string())
 }
 
-/// Strict SSRF guard, mirroring the consumer-server's
-/// `isAllowedContentServerUrl`: the content-server URL travels in the
-/// attacker-influenced SQS payload, so when an allowlist is configured the
-/// URL must be https and its host must EXACTLY match an allowed catalyst
-/// host (exact, not suffix — the whole point of an allowlist). Ports and
-/// userinfo tricks fail closed: the authority must be a bare allowed host.
 pub fn ensure_allowed_content_server(url: &str, allowed: &[String]) -> Result<()> {
     let Some(rest) = url.strip_prefix("https://") else {
         bail!("content server {url:?} rejected: https required");
@@ -113,8 +86,6 @@ pub fn ensure_allowed_content_server(url: &str, allowed: &[String]) -> Result<()
     Ok(())
 }
 
-/// abgen's catalyst client wants the content root (`…/content`) and appends
-/// `/contents/{hash}` itself; events sometimes carry the `/contents` form.
 fn normalize_content_server(url: &str) -> String {
     let trimmed = url.trim_end_matches('/');
     trimmed
@@ -193,10 +164,10 @@ mod tests {
         assert!(ok("https://peer.decentraland.org/content"));
         assert!(ok("https://PEER.decentraland.org"));
         assert!(ok("https://peer.decentraland.org:443/content"));
-        assert!(!ok("http://peer.decentraland.org/content")); // https only
+        assert!(!ok("http://peer.decentraland.org/content"));
         assert!(!ok("https://evil.example.com/content"));
-        assert!(!ok("https://peer.decentraland.org.evil.com/content")); // exact, not suffix
-        assert!(!ok("https://peer.decentraland.org@evil.com/content")); // userinfo trick
+        assert!(!ok("https://peer.decentraland.org.evil.com/content"));
+        assert!(!ok("https://peer.decentraland.org@evil.com/content"));
         assert!(!ok("https://sub.peer.decentraland.org/content"));
     }
 }

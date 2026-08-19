@@ -8,8 +8,8 @@ use axum::response::{IntoResponse, Response};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
-use super::resolver::resolve_with_casing;
 use super::state::AppState;
+use crate::resolver::resolve_with_casing;
 
 fn binary_content_type(etag_source: &str) -> &'static str {
     if etag_source.ends_with(".manifest") {

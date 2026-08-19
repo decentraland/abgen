@@ -14,7 +14,11 @@ All configured platforms (default `windows,mac`) are built in one invocation.
 Texture encoding — the dominant CPU cost — is platform-independent and cached
 process-wide (`abgen::texencode_cache`), so the second platform reuses the
 first platform's BC7/DXT encodes and costs roughly serialization only. The
-per-entity hit/miss counts are logged and returned in the response.
+per-entity hit/miss counts are logged and returned in the response. The cache
+is otherwise opt-in (`ABGEN_TEX_ENCODE_CACHE=1` or
+`abgen::texencode_cache::enable()`), stops inserting at
+`ABGEN_TEX_ENCODE_CACHE_MAX_MB` (default 4096), and must be cleared between
+entities. The Lambda handler enables it once and clears it after each entity.
 
 ## Status
 
@@ -25,7 +29,7 @@ per-entity hit/miss counts are logged and returned in the response.
 | 3 | S3 publishing — abgen's native "space" writes bundles + manifests through during the build; no `.br` variants (no client of this pipeline fetches them) | done |
 | 4 | registry SQS notification | deferred (registry duplicate is a follow-up) |
 | 5 | already-converted skip (entity-level manifest check) **and** per-file asset reuse (space probe per digest-named glb) | done |
-| 6 | container image (`Dockerfile.lambda`) | done |
+| 6 | container image (`nix build .#lambdaImage`) | done |
 
 ## Local run (no AWS)
 
@@ -72,10 +76,17 @@ them automatically.
 
 ## Container image & Lambda settings
 
-`Dockerfile.lambda` at the repo root (build with `--platform linux/arm64` —
-Graviton is ~20% cheaper and abgen is CPU-portable). The binary implements
-the Lambda runtime API itself, so no AWS base image is needed; push to ECR
-and point the function at the image.
+`nix build .#lambdaImage` (`packages.lambdaImage` in the root flake — build
+it on an aarch64-linux machine: Graviton is ~20% cheaper and abgen is
+CPU-portable). The binary implements the Lambda runtime API itself, so no
+AWS base image is needed; the result is a `docker-archive` tarball — push it
+to ECR with skopeo (see the `lambda-image` job in
+`.github/workflows/release.yml`) and point the
+function at the image.
+
+Release tags publish the image using GitHub OIDC. Configure repository
+variable `ABGEN_LAMBDA_ECR_ROLE_ARN` with the push role's ARN and
+`ABGEN_LAMBDA_ECR_REPOSITORY` with the ECR repository URL.
 
 Recommended function config:
 

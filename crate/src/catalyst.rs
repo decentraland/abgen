@@ -280,10 +280,6 @@ impl CatalystClient {
         })
     }
 
-    /// Resolve an entity by id via `POST /entities/active` — the route the
-    /// upstream LOD converter uses on catalyst-style hosts. Unlike
-    /// `fetch_entity` (`GET /contents/{id}`), only ACTIVE entities match:
-    /// a redeployed scene's old entity id, or a plain content CID, errors.
     pub fn fetch_active_entity_by_id(&self, entity_id: &str) -> Result<Scene> {
         let body = serde_json::json!({ "ids": [entity_id] });
         let raw = self.post_json("/entities/active", &body)?;

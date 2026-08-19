@@ -800,12 +800,12 @@ fn materialize_shader(
 pub(super) async fn shader_fallback(
     state: &AppState,
     path: &str,
-    target: &resolver::ShaderTarget,
+    target: &routes::ShaderTarget,
     method: &Method,
     headers: &HeaderMap,
     local: Response,
 ) -> Response {
-    let Some(exact) = resolver::shader_path(&state.out_root, &target.canonical) else {
+    let Some(exact) = routes::shader_path(&state.out_root, &target.canonical) else {
         return local;
     };
     let basename = target

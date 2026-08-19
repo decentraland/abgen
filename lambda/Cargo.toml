@@ -1,6 +1,6 @@
 [package]
 name = "abgen-lambda"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Single-binary asset-bundle conversion pipeline for AWS Lambda: deployment event in, converted bundles + manifest to S3, registry notification out."
 license = "Apache-2.0"
@@ -10,7 +10,7 @@ name = "abgen-lambda"
 path = "src/main.rs"
 
 [dependencies]
-abgen = { path = "../crate" }
+abgen = { path = "../crate", default-features = false }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

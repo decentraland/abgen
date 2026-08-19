@@ -261,9 +261,6 @@ pub fn self_gate_bundle_with(
         got_root == want_root,
         format!("got {got_root:?} want {want_root:?}"),
     );
-    // The upstream converter bakes the scene's world position (base*16)
-    // into the prefab root — origin only when the entity was unresolvable.
-    // The gate has no scene meta, so it checks the parcel-grid invariant.
     push_check(
         &mut checks,
         "root-position",

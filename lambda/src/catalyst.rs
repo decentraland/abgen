@@ -1,7 +1,3 @@
-//! Small catalyst fetch helpers for the pieces the Lambda needs beyond what
-//! abgen fetches internally: the entity document (for its `type`, `content`
-//! map and `metadata.main`) and scene source files re-published to the CDN.
-
 use anyhow::{bail, Result};
 use std::time::Duration;
 
@@ -37,7 +33,6 @@ pub fn get_bytes(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>> {
     bail!("GET {url} failed: {}", last.unwrap_or_default())
 }
 
-/// Fetches the entity document: `{content_server}/contents/{entity_id}`.
 pub fn fetch_entity(
     agent: &ureq::Agent,
     content_server: &str,

@@ -2,13 +2,14 @@ pub mod catalyst_source;
 pub mod config;
 pub mod handlers;
 pub mod index;
-pub mod jitcache;
 pub mod lodjit;
 pub mod metrics;
 pub mod range;
-pub mod resolver;
+pub mod routes;
 pub mod serve;
 pub mod state;
+
+use crate::{jitcache, resolver};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

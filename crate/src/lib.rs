@@ -33,6 +33,8 @@ pub mod glbscan;
 pub mod gltf;
 pub mod hashes;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod jitcache;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod live;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod local_store;
@@ -47,6 +49,8 @@ pub mod pathids;
 pub mod placeholder;
 pub mod png;
 pub mod resize;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod resolver;
 pub mod ress;
 pub mod sbp_order;
 pub mod skeleton;
@@ -79,8 +83,6 @@ pub mod bundle;
 pub mod bvwebgpu;
 
 pub mod compress;
-/// The embeddable conversion export shared by the wasm bridge, the C-ABI
-/// cdylib (`crate/abgen-native`) and the node addon (`crate/abgen-node`).
 pub mod export;
 pub mod lods;
 #[cfg(not(target_arch = "wasm32"))]
@@ -90,10 +92,10 @@ pub mod validate;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod wearables;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "server"))]
 pub mod abcdn;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "server"))]
 pub mod registry;
 
 pub use anyhow::{anyhow, bail, Context, Result};

@@ -46,10 +46,6 @@ fn is_convertible(file: &str) -> (bool, bool) {
     (is_glb, is_image)
 }
 
-/// File-level build workers per entity corpus build. Overridable via
-/// ABGEN_JIT_FILE_CONCURRENCY; the default is deliberately small — BC7 already
-/// spans every core, so workers only cover the single-threaded phases, and each
-/// in-flight file holds its decoded images in memory.
 fn corpus_file_jobs() -> usize {
     static JOBS: OnceLock<usize> = OnceLock::new();
     *JOBS.get_or_init(|| {
@@ -118,13 +114,11 @@ pub struct Proxy {
     v38_compat: bool,
     v38_timestamp: i64,
     magenta_missing: bool,
-    jit_cache: OnceLock<Arc<crate::abcdn::jitcache::JitDiskCache>>,
+    jit_cache: OnceLock<Arc<crate::jitcache::JitDiskCache>>,
     asset_reuse: bool,
     build_progress: Mutex<HashMap<String, BuildProgress>>,
 }
 
-/// Live per-entity corpus-build progress, for the /progress/{entity} route.
-/// Purely informational: nothing gates on it, and it vanishes with the build.
 #[derive(Clone)]
 pub struct BuildProgress {
     pub done: usize,
@@ -132,7 +126,6 @@ pub struct BuildProgress {
     pub file: String,
 }
 
-/// Clears an entity's progress on every exit path of a corpus build.
 struct ProgressGuard<'a> {
     proxy: &'a Proxy,
     cid: &'a str,
@@ -145,11 +138,11 @@ impl Drop for ProgressGuard<'_> {
 }
 
 impl Proxy {
-    fn jit(&self) -> Option<&Arc<crate::abcdn::jitcache::JitDiskCache>> {
+    fn jit(&self) -> Option<&Arc<crate::jitcache::JitDiskCache>> {
         self.jit_cache.get().filter(|c| c.enabled())
     }
 
-    pub fn set_jit_cache(&self, c: Arc<crate::abcdn::jitcache::JitDiskCache>) {
+    pub fn set_jit_cache(&self, c: Arc<crate::jitcache::JitDiskCache>) {
         let _ = self.jit_cache.set(c);
     }
 
@@ -176,6 +169,7 @@ impl Proxy {
         }
     }
 
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn cache_roots(&self) -> (&Path, &Path) {
         (self.content.root(), self.bundle_dir.as_path())
     }
@@ -334,7 +328,7 @@ impl Proxy {
         std::fs::write(&tmp, &data).with_context(|| format!("write {}", tmp.display()))?;
         std::fs::rename(&tmp, &cache_path).ok();
         if let Some(c) = self.jit() {
-            let bytes = crate::abcdn::jitcache::dir_size(&entity_dir);
+            let bytes = crate::jitcache::dir_size(&entity_dir);
             if bytes > 0 {
                 c.record(&format!("b:{safe_cid}"), entity_dir.clone(), bytes);
             }
@@ -911,24 +905,8 @@ impl Proxy {
         Ok(built)
     }
 
-    /// Digest-map entry recorded for a content-versioned id. Never a valid
-    /// hex digest, so an older binary that byte-digested such ids sees a
-    /// mismatch and self-heals with one ordinary revalidation pass.
     const VERSIONED_ID_DIGEST: &'static str = "id-versioned";
 
-    /// Freshness pass for content servers whose declared hashes are not
-    /// content-addressed (the sdk-commands preview server derives them from
-    /// file paths, so an edited file keeps its hash forever). Re-downloads the
-    /// entity's convertible content, digests the bytes, and when anything
-    /// differs from the digests stored on the previous pass: overwrites the
-    /// content store, drops the per-entity memory caches, prunes the affected
-    /// build-cache bundles, and removes the entity's corpus dir under
-    /// `corpus_root` so the next request rebuilds it. Unchanged assets keep
-    /// their build-cache entries, so the rebuild only reconverts what changed.
-    /// Content-versioned ids ([`naming::is_content_versioned_id`]) are judged
-    /// from the id alone — no download, no digest — keeping the pass O(1) in
-    /// scene size for corpora that use them. Returns the declared hashes whose
-    /// content changed.
     pub fn refresh_entity_content(&self, cid: &str, corpus_root: &Path) -> Result<Vec<String>> {
         let scene = self
             .catalyst
@@ -1027,10 +1005,6 @@ impl Proxy {
         self.digests_dir.join(format!("{}.json", &key[..32]))
     }
 
-    /// Storage names collapsed by fs_safe_component (xn-…) can't be parsed
-    /// back to their source hash, so the corpus build records the mapping and
-    /// revalidation uses it to prune those entries as precisely as verbatim
-    /// ones — instead of sweeping (and reconverting) the whole class per edit.
     fn names_index_path(&self, cid: &str) -> PathBuf {
         let key = crate::hashes::sha256_hex(cid.as_bytes());
         self.digests_dir.join(format!("{}.names.json", &key[..32]))
@@ -1090,7 +1064,7 @@ fn prune_stale_bundles(
                 }
             }
         } else {
-            let (_, stem) = crate::abcdn::resolver::split_platform(raw);
+            let (_, stem) = crate::resolver::split_platform(raw);
             let (hash, _) = naming::split_bundle_stem(stem);
             hash.to_lowercase()
         };
@@ -1507,7 +1481,7 @@ mod tests {
 
     #[test]
     fn content_build_cache_is_lru_bounded_and_self_heals() {
-        use crate::abcdn::jitcache::JitDiskCache;
+        use crate::jitcache::JitDiskCache;
 
         let cache_dir = temp_cache("jit-content-bound");
         let _ = std::fs::remove_dir_all(&cache_dir);
@@ -1637,10 +1611,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cache);
     }
 
-    /// Content-versioned ids (#41): the id embeds the file's mtime, so the
-    /// pass must judge freshness from the id alone — an id the previous pass
-    /// recorded is fresh, an unrecorded one is a changed file — and must
-    /// never fetch the bytes behind either.
     #[test]
     fn refresh_entity_content_trusts_content_versioned_ids() {
         let cache = temp_cache("revalidate_versioned");

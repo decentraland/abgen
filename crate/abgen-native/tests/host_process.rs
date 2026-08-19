@@ -1,9 +1,3 @@
-//! Drives the real `abgen-host` binary over its stdio protocol.
-//!
-//! The point of the out-of-process mode is that a hostile asset cannot reach
-//! the caller, so the tests that matter are the ones where the helper misuses
-//! itself and the harness survives to assert about it.
-
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
@@ -72,7 +66,6 @@ fn parse_frames(buf: &[u8]) -> Reply {
     r
 }
 
-/// Runs one request through a freshly spawned helper.
 fn run_host(request: &[u8], extra: &[&str]) -> (Reply, Option<i32>) {
     let mut child = Command::new(host_bin())
         .args(extra)
@@ -146,8 +139,6 @@ fn converts_a_glb_across_the_process_boundary() {
     assert!(manifest.contains("\"exitCode\":0"), "{manifest}");
 }
 
-/// The isolation claim, stated as a test: garbage in produces a reported
-/// failure and a live harness, not a dead one.
 #[test]
 fn a_corrupt_asset_does_not_take_the_caller_down() {
     let blob = InputBuilder::new()
@@ -172,16 +163,6 @@ fn a_malformed_request_is_rejected_not_guessed_at() {
     assert_eq!(reply.errors, vec!["malformed input blob".to_string()]);
 }
 
-/// A memory cap has to actually bind, or the process boundary is only a
-/// separation and not a bound.
-///
-/// It binds only because the helper re-executes after `setrlimit`: applied
-/// in-process, the cap arrives after mimalloc has reserved its arenas and an
-/// 8 MB limit still converts a glb.
-///
-/// Linux-gated, and the gate matters: on macOS this assertion passes for the
-/// wrong reason, because the helper exits non-zero having *refused* to apply
-/// a cap it cannot enforce.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_memory_cap_binds() {
@@ -196,10 +177,6 @@ fn a_memory_cap_binds() {
     assert_ne!(exit, Some(EXIT_PROTOCOL), "not a protocol error");
 }
 
-/// The cap must still leave a workable process at a sane size. This is the
-/// regression guard for the interaction that broke it: rayon defaults to one
-/// worker per core, and on a many-core machine their stacks alone exhaust an
-/// otherwise generous RLIMIT_AS before any conversion starts.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_generous_cap_still_converts() {
@@ -218,9 +195,6 @@ fn a_generous_cap_still_converts() {
     assert_eq!(reply.outputs.len(), 1);
 }
 
-/// macOS enforces no per-process memory rlimit (measured: RLIMIT_AS/DATA/RSS
-/// at 256 MB all let a conversion finish). The helper must therefore refuse
-/// the flag rather than accept it and cap nothing.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_memory_cap_is_refused_rather_than_silently_ignored() {
@@ -241,10 +215,6 @@ fn a_memory_cap_is_refused_rather_than_silently_ignored() {
     );
 }
 
-/// The Windows counterpart of the Linux cap tests. The thresholds differ by
-/// orders of magnitude on purpose: a job object limits *committed* memory
-/// while RLIMIT_AS limits *reserved* address space, so measured on v16 this
-/// binds at 1-4 MB and passes from 8 MB up, where Linux wants gigabytes.
 #[cfg(windows)]
 #[test]
 fn a_job_object_cap_binds_but_leaves_a_workable_process() {

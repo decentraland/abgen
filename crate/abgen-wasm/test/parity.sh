@@ -1,11 +1,4 @@
 #!/usr/bin/env bash
-# Byte-parity gate: rebuilds the wasm module and the native binaries from the
-# same tree, converts every fixture on both sides across windows/mac/webgl,
-# and sha256-compares each produced artifact. Exits nonzero on any mismatch.
-# Decoder rule: the native production default stays turbojpeg; the gate
-# exports ABGEN_JPEG_GLB_9C=1 so native decodes GLB JPEGs via the vendored
-# libjpeg9c exactly like wasm (no dlopen there, always libjpeg9c).
-# Env knobs: PARITY_SKIP_BUILD=1 reuses existing binaries, PARITY_WORK=dir.
 set -euo pipefail
 POC="$(cd "$(dirname "$0")/.." && pwd)"
 CRATE="$(cd "$POC/.." && pwd)"
@@ -96,8 +89,6 @@ for fx in $FIXTURES; do
     fi
 
     if [ "$fx" = scene-lod ] && [ "$plat" != webgl ]; then
-      # Stage the atlas input as {sid}_1.glb: the file stem becomes the lodgen
-      # root_name, which is baked into the emitted GLB and hence the bundle.
       t="$ndir/lodwork"
       mkdir -p "$t"
       cp "${files[0]}" "$t/${sid}_1.glb"
@@ -133,8 +124,6 @@ for fx in $FIXTURES; do
       row "$fx" "$plat" "$name" "$wsha" "$nsha" "$st"
     done
 
-    # The native abgen flow emits no manifest, so manifest.json is a
-    # wasm-only structural check (bundle set + "dcl"), never a byte compare.
     got="$(sed -n 's/.*"files":\[\([^]]*\)\].*/\1/p' "$wdir/manifest.json" 2>/dev/null || true)"
     want="\"$bundle\",\"dcl\""
     if [ "$got" = "$want" ]; then st=OK; else
@@ -145,9 +134,6 @@ for fx in $FIXTURES; do
   done
 done
 
-# LOD-lane + recovery fixtures: multi-file uploads with per-file native
-# equivalents; the LOD chains stage every intermediate under the {sid}_1
-# stem because from_glb_bytes takes the root name from the file stem.
 for fx in dense-decimate-lod crop-overhang-lod placements-iss-lod badjpeg-pair; do
   case "$fx" in
     dense-decimate-lod)
@@ -279,11 +265,6 @@ PYEOF
         fi
         ;;
       badjpeg-pair)
-        # The corrupt JPEG must fail per-image, not per-run: pre-recovery the
-        # 9c longjmp trapped the whole conversion here. Native degrades the
-        # failed decode to the deterministic missing-texture placeholder, so
-        # bad.glb still converts and byte-compares; the run must stay
-        # trap-free and complete both files.
         if grep -q '^FATAL' "$log"; then
           row "$fx" "$plat" "(no-trap)" n/a n/a FAIL
           fails=$((fails + 1))

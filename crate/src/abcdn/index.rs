@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use super::resolver;
+use crate::resolver;
 
 struct PlatformAb {
     version: String,

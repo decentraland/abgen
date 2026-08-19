@@ -1,12 +1,3 @@
-//! Hand-rolled AWS Lambda custom-runtime loop.
-//!
-//! The runtime API is a local HTTP long-poll — `GET …/invocation/next` blocks
-//! until an event arrives, the handler runs, and the result is POSTed back.
-//! That is the whole contract, so rather than pulling in an async stack
-//! (lambda_runtime + tokio + hyper) this speaks it directly with the same
-//! blocking ureq abgen already uses. See
-//! https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html
-
 use crate::config::Config;
 use anyhow::Result;
 
@@ -23,8 +14,6 @@ pub fn serve(
         );
         std::process::exit(1);
     });
-    // No timeouts: /invocation/next intentionally blocks until an event
-    // arrives (Lambda freezes the process in between).
     let agent: ureq::Agent = ureq::Agent::config_builder().build().into();
     let next_url = format!("http://{api}/{API_VERSION}/runtime/invocation/next");
 

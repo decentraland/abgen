@@ -1,5 +1,5 @@
-// Headless driver for site/wasm/abgen_wasm.wasm — same protocol as
-// site/wasm/worker.js, run under node for CI-style verification.
+// Headless driver for dist/abgen_wasm.wasm — same protocol as
+// js/worker.js, run under node for CI-style verification.
 // usage: node headless.mjs <out_dir> <platform> <entity|''>
 //        [--lod=0|1] [--crop=0|1] [--tri-cap=N] <file...>
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -110,7 +110,7 @@ const blob = new Uint8Array(total);
 let off = 0;
 for (const p of parts) { blob.set(p, off); off += p.byteLength; }
 
-const wasmBytes = readFileSync(new URL('../../../site/wasm/abgen_wasm.wasm', import.meta.url));
+const wasmBytes = readFileSync(new URL('../dist/abgen_wasm.wasm', import.meta.url));
 const wbindgenPlaceholder = new Proxy({}, {
   get: (_, k) => (() => { throw new Error(`wasm-bindgen placeholder called: ${String(k)}`); }),
 });

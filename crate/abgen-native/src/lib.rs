@@ -1,13 +1,3 @@
-//! abgen as a C-ABI shared library. See `include/abgen.h` for the contract.
-//! Nothing here is engine-specific; the conversion is [`abgen_core::export`],
-//! shared with the wasm and node hosts.
-//!
-//! This runs inside someone else's process on content from the network, so two
-//! rules are enforced rather than documented: no panic crosses the boundary
-//! (every entry point wraps its body in [`catch_unwind`], which needs the
-//! workspace's `panic = "unwind"`), and no implicit panic sites (the lints
-//! below).
-
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -24,23 +14,17 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use abgen_core::export::{self, HostInfo, Kind, Sink};
 
-/// Bumped whenever this ABI changes shape.
 pub const ABI_VERSION: u32 = 1;
 
-/// Identifies bundles produced through this host in the emitted manifest.
 const HOST: HostInfo = HostInfo::new("v-abgen-native", "native://embedded");
 
 pub const ABGEN_OK: i32 = 0;
 pub const ABGEN_ERR_MALFORMED_INPUT: i32 = 1;
 pub const ABGEN_ERR_CONVERT_FAILED: i32 = 2;
 pub const ABGEN_ERR_NULL_ARG: i32 = 3;
-/// Unwind caught at the boundary: host intact, run unusable.
 pub const ABGEN_ERR_PANIC: i32 = 4;
 pub const ABGEN_ERR_ALREADY_CONFIGURED: i32 = 5;
 
-/// Receives one payload, on the calling thread only. `ptr`/`len` borrow
-/// abgen-owned memory valid until the callback returns; `len` may be 0, and
-/// then `ptr` must not be dereferenced.
 pub type AbgenEmitFn =
     unsafe extern "C" fn(user_data: *mut c_void, kind: u32, ptr: *const u8, len: usize);
 
@@ -61,14 +45,11 @@ pub extern "C" fn abgen_abi_version() -> u32 {
     ABI_VERSION
 }
 
-/// Static NUL-terminated version string. Never free it.
 #[unsafe(no_mangle)]
 pub const extern "C" fn abgen_version() -> *const c_char {
     concat!(env!("CARGO_PKG_VERSION"), '\0').as_ptr().cast()
 }
 
-/// Caps the rayon pool. Left alone it takes every core and competes with the
-/// render thread. Process-wide, effective once, before [`abgen_convert`].
 #[unsafe(no_mangle)]
 pub extern "C" fn abgen_set_max_threads(threads: u32) -> i32 {
     let n = (threads as usize).max(1);
@@ -81,8 +62,6 @@ pub extern "C" fn abgen_set_max_threads(threads: u32) -> i32 {
     }
 }
 
-/// Allocates with the same allocator [`abgen_free`] releases. Only needed if
-/// abgen should own the request buffer. Null if `len` is 0 or on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn abgen_alloc(len: usize) -> *mut u8 {
     if len == 0 {
@@ -95,7 +74,6 @@ pub extern "C" fn abgen_alloc(len: usize) -> *mut u8 {
     }
 }
 
-/// Releases an [`abgen_alloc`] buffer; `len` must match. Null is a no-op.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn abgen_free(ptr: *mut u8, len: usize) {
     if ptr.is_null() || len == 0 {
@@ -107,9 +85,6 @@ pub unsafe extern "C" fn abgen_free(ptr: *mut u8, len: usize) {
     }
 }
 
-/// Converts one request blob (layout in `abgen_core::export::wire`). Results
-/// arrive through `emit` before this returns. Per-file failures are not run
-/// failures: they surface as `file-error` events in the manifest's `exitCode`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn abgen_convert(
     request: *const u8,
@@ -163,11 +138,6 @@ mod tests {
         outputs: usize,
     }
 
-    /// State reaches the callback through `user_data`, never a process global.
-    /// A global raced: cargo runs these tests on parallel threads, so one
-    /// test's reset wiped another's errors mid-run — which is exactly the
-    /// hazard `user_data` exists to remove, and the path every real embedder
-    /// takes. Testing it through a static would have left it untested.
     unsafe extern "C" fn capture(ud: *mut c_void, kind: u32, ptr: *const u8, len: usize) {
         let bytes = if len == 0 {
             &[][..]
@@ -240,8 +210,6 @@ mod tests {
         assert_eq!(cap.outputs, 0);
     }
 
-    /// Garbage where a glb should be is the realistic hostile case: it must
-    /// come back as a reported failure, not a crash and not a bundle.
     #[test]
     fn a_corrupt_model_fails_the_file_not_the_process() {
         let blob = InputBuilder::new()

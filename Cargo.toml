@@ -9,3 +9,6 @@ exclude = [
     "crate/abgen-wasm",
     "crate/abgen-node",
 ]
+
+[workspace.package]
+version = "0.16.2"

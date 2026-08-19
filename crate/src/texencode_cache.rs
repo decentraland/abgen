@@ -1,17 +1,3 @@
-//! Process-wide memo cache for compressed-texture encode results.
-//!
-//! Texture encoding (BC7 in particular) dominates conversion CPU time and is
-//! fully platform-independent: building the same entity for `windows` and
-//! `mac` encodes identical pixels into identical blocks twice. With this
-//! cache enabled, the second target reuses the first target's encodes, so a
-//! dual-target build costs roughly one target plus serialization.
-//!
-//! Disabled by default: a long-running server would grow without bound and
-//! single-target builds gain nothing. Opt in with `ABGEN_TEX_ENCODE_CACHE=1`
-//! or [`enable`]. Callers that loop over entities should [`clear`] between
-//! entities. Inserts stop once resident encoded bytes would exceed
-//! `ABGEN_TEX_ENCODE_CACHE_MAX_MB` (default 4096); lookups keep working.
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -85,10 +71,6 @@ fn key(kind: Kind, pixels: &[u8], width: u32, height: u32, params: &[i64]) -> [u
     h.finalize()
 }
 
-/// Returns the cached encode for `(kind, pixels, dims, params)` or runs `f`
-/// and caches its result. `None` results are never cached. The lock is not
-/// held while `f` runs, so two threads racing on the same texture may both
-/// encode it; the winner's insert stands.
 pub fn get_or_encode(
     kind: Kind,
     pixels: &[u8],
@@ -122,7 +104,6 @@ pub fn get_or_encode(
     Some(result)
 }
 
-/// `(hits, misses, resident bytes, entries)`
 pub fn stats() -> (u64, u64, usize, usize) {
     let s = store().lock().unwrap();
     (s.hits, s.misses, s.bytes, s.map.len())
