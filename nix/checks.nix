@@ -33,15 +33,6 @@ let
       preCheck = abgenRoot;
     });
 
-    lambda-tests = craneLib.cargoTest (withArtifacts // {
-      doCheck = true;
-      __darwinAllowLocalNetworking = true;
-      pname = "abgen-lambda-tests";
-      cargoExtraArgs = "--locked";
-      cargoTestExtraArgs = "-p abgen-lambda -p abgen-native --tests";
-      preCheck = abgenRoot;
-    });
-
     native-smoke =
       let
         libName = "libabgen${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
@@ -58,5 +49,24 @@ let
         touch $out
       '';
   };
+
+  # server-off config. The lambda binary ships and runs on aarch64 only, so
+  # its test lane follows the prod arch; the config stays covered fleet-wide
+  # (aarch64-linux in CI, darwin locally) without a second server-off
+  # workspace compile+test on the slower x86 lane. Folding it into nextest
+  # is rejected: feature unification differs, a merged compile would not
+  # test the no-server config the mac/windows legs ship.
+  lambdaTests = {
+    lambda-tests = craneLib.cargoTest (withArtifacts // {
+      doCheck = true;
+      __darwinAllowLocalNetworking = true;
+      pname = "abgen-lambda-tests";
+      cargoExtraArgs = "--locked";
+      cargoTestExtraArgs = "-p abgen-lambda -p abgen-native --tests";
+      preCheck = abgenRoot;
+    });
+  };
 in
-archDependent // lib.optionalAttrs (system == "x86_64-linux") archIndependent
+archDependent
+// lib.optionalAttrs (system != "x86_64-linux") lambdaTests
+// lib.optionalAttrs (system == "x86_64-linux") archIndependent
