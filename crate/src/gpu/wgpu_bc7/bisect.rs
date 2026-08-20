@@ -510,13 +510,13 @@ fn expected_const_words() -> Vec<u32> {
     v.extend_from_slice(probe::weights3());
     v.extend_from_slice(probe::weights4());
     for row in probe::weights2x() {
-        push_f32s(&mut v, &row);
+        push_f32s(&mut v, row);
     }
     for row in probe::weights3x() {
-        push_f32s(&mut v, &row);
+        push_f32s(&mut v, row);
     }
     for row in probe::weights4x() {
-        push_f32s(&mut v, &row);
+        push_f32s(&mut v, row);
     }
     for &b in probe::partition2().iter() {
         v.push(b as u32);
