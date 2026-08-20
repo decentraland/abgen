@@ -1,4 +1,5 @@
-{ lib, system, pkgs, craneLib, commonArgs, cargoArtifacts, abgenConsumersPkg
+{ lib, system, pkgs, craneLib, commonArgs, cargoArtifacts, lambdaCargoArtifacts
+, abgenConsumersPkg
 , wasmCheck }:
 
 let
@@ -66,7 +67,15 @@ let
   # is rejected: feature unification differs, a merged compile would not
   # test the no-server config the mac/windows legs ship.
   lambdaTests = {
-    lambda-tests = craneLib.cargoTest (withArtifacts // {
+    # The lambda-config closure as its own attr, same contract as `deps`:
+    # the pipeline's deps stage builds it, then publishes the binary cache.
+    lambda-deps = lambdaCargoArtifacts;
+
+    # lambdaCargoArtifacts, not the workspace closure: the `-p` selection
+    # resolves shared deps to narrower feature sets, so the workspace
+    # artifacts never matched and every run recompiled the deps in here.
+    lambda-tests = craneLib.cargoTest (commonArgs // {
+      cargoArtifacts = lambdaCargoArtifacts;
       doCheck = true;
       __darwinAllowLocalNetworking = true;
       pname = "abgen-lambda-tests";

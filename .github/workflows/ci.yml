@@ -200,7 +200,7 @@ jobs:
           - lane: arm lambda + smoke
             runner: ubuntu-24.04-arm
             system: aarch64-linux
-            deps: .#checks.aarch64-linux.deps
+            deps: .#checks.aarch64-linux.deps .#checks.aarch64-linux.lambda-deps
             attrs: lambda-tests native-smoke
             gate: run_lambda
           - lane: arm lints

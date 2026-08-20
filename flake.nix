@@ -176,7 +176,8 @@
 
           checks = import ./nix/checks.nix {
             inherit lib system pkgs craneLib wasmCheck;
-            inherit (build) commonArgs cargoArtifacts abgenConsumersPkg;
+            inherit (build) commonArgs cargoArtifacts lambdaCargoArtifacts
+              abgenConsumersPkg;
           };
 
         });

@@ -51,6 +51,20 @@ let
     doCheck = true;
   });
 
+  # lambda-tests selects `-p abgen-lambda -p abgen-native`, and resolver v2
+  # unifies features over the selected packages only — ~20 shared deps
+  # (serde, syn, tracing, chrono, http, ...) resolve narrower there than in
+  # the workspace-wide closure above, which cascades into a near-full dep
+  # recompile inside the check on every run. Prime that exact configuration
+  # too; like the main closure it rotates only with lockfile/toolchain.
+  lambdaCargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+    inherit dummySrc;
+    pname = "abgen-lambda";
+    version = "0";
+    doCheck = true;
+    cargoExtraArgs = "--locked -p abgen-lambda -p abgen-native";
+  });
+
   abgenAll = craneLib.buildPackage (commonArgs // {
     inherit cargoArtifacts;
     pname = "abgen-all";
@@ -77,6 +91,6 @@ let
   });
 in
 {
-  inherit commonArgs cargoArtifacts abgenAll abgenPkg abgenConsumersPkg
-    abgenCorpusPkg;
+  inherit commonArgs cargoArtifacts lambdaCargoArtifacts abgenAll abgenPkg
+    abgenConsumersPkg abgenCorpusPkg;
 }
