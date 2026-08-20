@@ -92,19 +92,17 @@ pub fn invalid_lod_reason(path: &str) -> &'static str {
     "bad-path"
 }
 
-fn env_secs(name: &str, default: u64) -> u64 {
+fn env_num<T: std::str::FromStr>(name: &str, default: T, ok: fn(&T) -> bool) -> T {
     std::env::var(name)
         .ok()
         .and_then(|s| s.trim().parse().ok())
+        .filter(ok)
         .unwrap_or(default)
 }
 
-fn env_permits(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(default)
+fn record_build(outcome: &'static str, secs: f64) {
+    metrics::counter!("abgen_lod_jit_builds_total", "outcome" => outcome).increment(1);
+    metrics::histogram!("abgen_lod_jit_build_duration_seconds", "outcome" => outcome).record(secs);
 }
 
 fn first_line(msg: &str) -> String {
@@ -152,9 +150,9 @@ impl LodJit {
             simplifier,
             probe,
             &base,
-            env_secs(TIMEOUT_ENV, 600),
-            env_secs(FAIL_TTL_ENV, 3600),
-            env_permits(BUILD_CONCURRENCY_ENV, 1),
+            env_num(TIMEOUT_ENV, 600, |_| true),
+            env_num(FAIL_TTL_ENV, 3600, |_| true),
+            env_num(BUILD_CONCURRENCY_ENV, 1usize, |n| *n > 0),
         )
     }
 
@@ -361,10 +359,7 @@ impl LodJit {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err("lod-build-failed".to_string()),
             Err(_) => {
-                metrics::counter!("abgen_lod_jit_builds_total", "outcome" => "timeout")
-                    .increment(1);
-                metrics::histogram!("abgen_lod_jit_build_duration_seconds", "outcome" => "timeout")
-                    .record(started.elapsed().as_secs_f64());
+                record_build("timeout", started.elapsed().as_secs_f64());
                 tracing::warn!(
                     sid = %sid_lower,
                     level,
@@ -427,11 +422,7 @@ impl BuildFinish {
         joined: Result<anyhow::Result<crate::lodgen::GenerateOutcome>, tokio::task::JoinError>,
     ) -> Result<(), String> {
         let secs = self.started.elapsed().as_secs_f64();
-        let record = |outcome: &'static str| {
-            metrics::counter!("abgen_lod_jit_builds_total", "outcome" => outcome).increment(1);
-            metrics::histogram!("abgen_lod_jit_build_duration_seconds", "outcome" => outcome)
-                .record(secs);
-        };
+        let record = |outcome: &'static str| record_build(outcome, secs);
         match joined {
             Err(e) => {
                 record("panic");
@@ -608,6 +599,27 @@ mod tests {
         moka::future::Cache::builder().max_capacity(100).build()
     }
 
+    async fn rb(
+        jit: &LodJit,
+        root: &Path,
+        cache: &ResolveCache,
+        path: &str,
+        sid: &str,
+        level: u32,
+    ) -> Result<(), String> {
+        jit.run_build(root, "http://127.0.0.1:9", cache, path, sid, level)
+            .await
+    }
+
+    fn write_bundle(out_dir: &str, scene: &str, lvl: u32, content: &[u8]) {
+        let dir = PathBuf::from(out_dir)
+            .join(scene)
+            .join("LOD")
+            .join(lvl.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{scene}_{lvl}_windows")), content).unwrap();
+    }
+
     #[test]
     fn target_accepts_valid_lod_paths() {
         assert_eq!(
@@ -670,11 +682,21 @@ mod tests {
 
     #[test]
     fn assemble_fails_closed_without_gltfpack() {
-        let jit = LodJit::assemble(
+        let mk =
+            |flag: bool, probe: Option<anyhow::Result<PathBuf>>, t: u64, ttl: u64, c: usize| {
+                LodJit::assemble(
+                    flag,
+                    SimplifierBackend::Gltfpack,
+                    probe,
+                    "/tmp/abgen-lodjit-assemble",
+                    t,
+                    ttl,
+                    c,
+                )
+            };
+        let jit = mk(
             true,
-            SimplifierBackend::Gltfpack,
             Some(Err(anyhow::anyhow!("gltfpack not found"))),
-            "/tmp/abgen-lodjit-assemble",
             600,
             3600,
             1,
@@ -683,28 +705,12 @@ mod tests {
         assert_eq!(jit.disabled_reasons, vec!["gltfpack".to_string()]);
         assert_eq!(jit.disabled_reason(), "gltfpack");
 
-        let jit = LodJit::assemble(
-            false,
-            SimplifierBackend::Gltfpack,
-            None,
-            "/tmp/abgen-lodjit-assemble",
-            600,
-            3600,
-            1,
-        );
+        let jit = mk(false, None, 600, 3600, 1);
         assert!(!jit.enabled);
         assert_eq!(jit.disabled_reason(), "env-off");
         assert_eq!(jit.build_sem.available_permits(), 1);
 
-        let jit = LodJit::assemble(
-            true,
-            SimplifierBackend::Gltfpack,
-            Some(Ok(PathBuf::from("/bin/true"))),
-            "/tmp/abgen-lodjit-assemble",
-            42,
-            7,
-            3,
-        );
+        let jit = mk(true, Some(Ok(PathBuf::from("/bin/true"))), 42, 7, 3);
         assert!(jit.enabled);
         assert_eq!(jit.gltfpack.as_deref(), Some(Path::new("/bin/true")));
         assert_eq!(jit.timeout, Duration::from_secs(42));
@@ -712,15 +718,7 @@ mod tests {
         assert!(jit.workdir.ends_with("lod-work"));
         assert_eq!(jit.build_sem.available_permits(), 3);
 
-        let jit = LodJit::assemble(
-            false,
-            SimplifierBackend::Gltfpack,
-            None,
-            "/tmp/abgen-lodjit-assemble",
-            600,
-            3600,
-            0,
-        );
+        let jit = mk(false, None, 600, 3600, 0);
         assert_eq!(jit.build_sem.available_permits(), 1);
     }
 
@@ -752,12 +750,7 @@ mod tests {
         let runner: LodRunner = Arc::new(move |p: crate::lodgen::GenerateParams| {
             c2.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(150));
-            let dir = PathBuf::from(&p.out_dir)
-                .join(&p.scene)
-                .join("LOD")
-                .join("1");
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join(format!("{}_1_windows", p.scene)), b"bundle").unwrap();
+            write_bundle(&p.out_dir, &p.scene, 1, b"bundle");
             assert_ne!(p.out_dir, or2.to_string_lossy());
             assert!(PathBuf::from(&p.out_dir).starts_with(or2.join("lod-work")));
             assert_eq!(p.platforms, vec!["windows", "mac", "linux"]);
@@ -777,8 +770,7 @@ mod tests {
             let out_root = out_root.clone();
             let path = path.clone();
             handles.push(tokio::spawn(async move {
-                jit.run_build(&out_root, "http://127.0.0.1:9", &cache, &path, sid, 1)
-                    .await
+                rb(&jit, &out_root, &cache, &path, sid, 1).await
             }));
         }
         for h in handles {
@@ -805,12 +797,7 @@ mod tests {
             c2.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(150));
             for lvl in LOD_LEVELS {
-                let dir = PathBuf::from(&p.out_dir)
-                    .join(&p.scene)
-                    .join("LOD")
-                    .join(lvl.to_string());
-                std::fs::create_dir_all(&dir).unwrap();
-                std::fs::write(dir.join(format!("{}_{lvl}_windows", p.scene)), b"bundle").unwrap();
+                write_bundle(&p.out_dir, &p.scene, lvl, b"bundle");
             }
             Ok(ok_outcome(&p.scene))
         });
@@ -824,8 +811,7 @@ mod tests {
             let out_root = out_root.clone();
             let path = format!("LOD/{level}/{sid}_{level}_windows");
             handles.push(tokio::spawn(async move {
-                jit.run_build(&out_root, "http://127.0.0.1:9", &cache, &path, sid, level)
-                    .await
+                rb(&jit, &out_root, &cache, &path, sid, level).await
             }));
         }
         for h in handles {
@@ -849,13 +835,9 @@ mod tests {
         let jit = test_jit(runner, true, Duration::from_secs(30), &out_root);
         let cache = new_cache();
         let path = format!("LOD/1/{sid}_1_windows");
-        let first = jit
-            .run_build(&out_root, "http://127.0.0.1:9", &cache, &path, sid, 1)
-            .await;
+        let first = rb(&jit, &out_root, &cache, &path, sid, 1).await;
         assert_eq!(first, Err("lod-build-failed".to_string()));
-        let second = jit
-            .run_build(&out_root, "http://127.0.0.1:9", &cache, &path, sid, 1)
-            .await;
+        let second = rb(&jit, &out_root, &cache, &path, sid, 1).await;
         assert_eq!(second, Err("lod-build-failed-cached".to_string()));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let stored = jit.neg_cache.get(sid).await.unwrap();
@@ -874,16 +856,7 @@ mod tests {
         });
         let jit = test_jit(runner, false, Duration::from_secs(30), &out_root);
         let cache = new_cache();
-        let got = jit
-            .run_build(
-                &out_root,
-                "http://127.0.0.1:9",
-                &cache,
-                "LOD/1/bafk_1_windows",
-                "bafk",
-                1,
-            )
-            .await;
+        let got = rb(&jit, &out_root, &cache, "LOD/1/bafk_1_windows", "bafk", 1).await;
         assert_eq!(got, Err("lod-jit-disabled:env-off".to_string()));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(&out_root);
@@ -903,9 +876,7 @@ mod tests {
         let jit = test_jit(runner, true, Duration::from_millis(60), &out_root);
         let cache = new_cache();
         let path = format!("LOD/1/{sid}_1_windows");
-        let got = jit
-            .run_build(&out_root, "http://127.0.0.1:9", &cache, &path, sid, 1)
-            .await;
+        let got = rb(&jit, &out_root, &cache, &path, sid, 1).await;
         assert_eq!(got, Err("lod-build-timeout".to_string()));
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(jit.neg_cache.get(sid).await.is_none());
@@ -937,48 +908,36 @@ mod tests {
             while !r2.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            let dir = PathBuf::from(&p.out_dir)
-                .join(&p.scene)
-                .join("LOD")
-                .join("1");
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join(format!("{}_1_windows", p.scene)), b"bundle").unwrap();
+            write_bundle(&p.out_dir, &p.scene, 1, b"bundle");
             Ok(ok_outcome(&p.scene))
         });
         let jit = test_jit(runner, true, Duration::from_millis(80), &out_root);
         let cache = new_cache();
         let path = format!("LOD/1/{sid}_1_windows");
-        let first = jit
-            .run_build(&out_root, "http://127.0.0.1:9", &cache, &path, sid, 1)
-            .await;
+        let first = rb(&jit, &out_root, &cache, &path, sid, 1).await;
         assert_eq!(first, Err("lod-build-timeout".to_string()));
         let t0 = std::time::Instant::now();
         while calls.load(Ordering::SeqCst) == 0 {
             assert!(t0.elapsed() < Duration::from_secs(10));
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        let retry = jit
-            .run_build(&out_root, "http://127.0.0.1:9", &cache, &path, sid, 1)
-            .await;
+        let retry = rb(&jit, &out_root, &cache, &path, sid, 1).await;
         assert_eq!(retry, Err("lod-build-inflight".to_string()));
-        let other = jit
-            .run_build(
-                &out_root,
-                "http://127.0.0.1:9",
-                &cache,
-                "LOD/1/bafkreiother_1_windows",
-                "bafkreiother",
-                1,
-            )
-            .await;
+        let other = rb(
+            &jit,
+            &out_root,
+            &cache,
+            "LOD/1/bafkreiother_1_windows",
+            "bafkreiother",
+            1,
+        )
+        .await;
         assert_eq!(other, Err("lod-build-inflight".to_string()));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         release.store(true, Ordering::SeqCst);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let again = jit
-                .run_build(&out_root, "http://127.0.0.1:9", &cache, &path, sid, 1)
-                .await;
+            let again = rb(&jit, &out_root, &cache, &path, sid, 1).await;
             if again == Ok(()) {
                 break;
             }
@@ -1007,9 +966,7 @@ mod tests {
         let jit = test_jit(runner, true, Duration::from_millis(60), &out_root);
         let cache = new_cache();
         let path = format!("LOD/1/{sid}_1_windows");
-        let first = jit
-            .run_build(&out_root, "http://127.0.0.1:9", &cache, &path, sid, 1)
-            .await;
+        let first = rb(&jit, &out_root, &cache, &path, sid, 1).await;
         assert_eq!(first, Err("lod-build-timeout".to_string()));
         let key = sid.to_string();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1022,9 +979,7 @@ mod tests {
         }
         let stored = jit.neg_cache.get(&key).await.unwrap();
         assert!(stored.contains("late boom"), "{stored}");
-        let second = jit
-            .run_build(&out_root, "http://127.0.0.1:9", &cache, &path, sid, 1)
-            .await;
+        let second = rb(&jit, &out_root, &cache, &path, sid, 1).await;
         assert_eq!(second, Err("lod-build-failed-cached".to_string()));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&out_root);
@@ -1036,9 +991,7 @@ mod tests {
         let sid = "bafkreigatefail";
         let runner: LodRunner = Arc::new(move |p: crate::lodgen::GenerateParams| {
             let entity_dir = PathBuf::from(&p.out_dir).join(&p.scene);
-            let dir = entity_dir.join("LOD").join("1");
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join(format!("{}_1_windows", p.scene)), b"bad").unwrap();
+            write_bundle(&p.out_dir, &p.scene, 1, b"bad");
             std::fs::write(entity_dir.join("LOD.manifest.json"), b"{}").unwrap();
             std::fs::write(
                 entity_dir.join(format!("{}_InitialSceneState.json", p.scene)),
@@ -1056,9 +1009,7 @@ mod tests {
         let jit = test_jit(runner, true, Duration::from_secs(30), &out_root);
         let cache = new_cache();
         let path = format!("LOD/1/{sid}_1_windows");
-        let got = jit
-            .run_build(&out_root, "http://127.0.0.1:9", &cache, &path, sid, 1)
-            .await;
+        let got = rb(&jit, &out_root, &cache, &path, sid, 1).await;
         assert_eq!(got, Err("lod-build-failed".to_string()));
         assert!(!out_root.join(sid).exists());
         let leftovers: Vec<_> = std::fs::read_dir(out_root.join("lod-work"))
@@ -1076,10 +1027,14 @@ mod tests {
         let sid = "bafkreipromote";
         let runner: LodRunner = Arc::new(move |p: crate::lodgen::GenerateParams| {
             let entity_dir = PathBuf::from(&p.out_dir).join(&p.scene);
-            let dir = entity_dir.join("LOD").join("1");
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join(format!("{}_1_windows", p.scene)), b"bundle").unwrap();
-            std::fs::write(dir.join(format!("{}_1_windows.br", p.scene)), b"br").unwrap();
+            write_bundle(&p.out_dir, &p.scene, 1, b"bundle");
+            std::fs::write(
+                entity_dir
+                    .join("LOD/1")
+                    .join(format!("{}_1_windows.br", p.scene)),
+                b"br",
+            )
+            .unwrap();
             std::fs::write(entity_dir.join("LOD.manifest.json"), b"{}").unwrap();
             std::fs::write(
                 entity_dir.join(format!("{}_InitialSceneState.json", p.scene)),
@@ -1091,9 +1046,7 @@ mod tests {
         let jit = test_jit(runner, true, Duration::from_secs(30), &out_root);
         let cache = new_cache();
         let path = format!("LOD/1/{sid}_1_windows");
-        let got = jit
-            .run_build(&out_root, "http://127.0.0.1:9", &cache, &path, sid, 1)
-            .await;
+        let got = rb(&jit, &out_root, &cache, &path, sid, 1).await;
         assert_eq!(got, Ok(()));
         let entity_dir = out_root.join(sid);
         for rel in [
