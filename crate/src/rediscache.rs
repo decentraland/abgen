@@ -232,8 +232,6 @@ fn tls_handshake(host: &str, sock: TcpStream) -> std::io::Result<Stream> {
     let session = rustls::ClientConnection::new(tls_config(), server)
         .map_err(|e| io_err(format!("TLS setup failed: {e}")))?;
     let mut stream = rustls::StreamOwned::new(session, sock);
-    // Drives the handshake to completion, so a bad peer/cert fails here rather
-    // than inside the first command.
     stream.flush()?;
     Ok(Stream::Tls(Box::new(stream)))
 }
@@ -505,15 +503,12 @@ mod tests {
                 tls: false,
             }
         );
-        // Userinfo without a colon is treated as the password.
         let t = parse_url("redis://sekret@host").unwrap();
         assert_eq!(t.user, None);
         assert_eq!(t.password, Some("sekret".to_string()));
-        // A user:password pair keeps both (2-arg AUTH for ACL users).
         let t = parse_url("redis://app:sekret@host").unwrap();
         assert_eq!(t.user, Some("app".to_string()));
         assert_eq!(t.password, Some("sekret".to_string()));
-        // Trailing slash without a db index is tolerated.
         assert_eq!(parse_url("redis://host/").unwrap().db, None);
     }
 
@@ -531,14 +526,13 @@ mod tests {
     #[test]
     fn parse_errors_never_echo_credentials() {
         for url in [
-            "rediss//user:sekret@cache:6379", // scheme typo
-            "redis://:sekret@",               // empty host
-            "sekret@cache",                   // no scheme at all
+            "rediss//user:sekret@cache:6379",
+            "redis://:sekret@",
+            "sekret@cache",
         ] {
             let err = parse_url(url).unwrap_err();
             assert!(!err.contains("sekret"), "{url:?} leaked into {err:?}");
         }
-        // The redacted form still names scheme and host for triage.
         assert_eq!(
             redact_url("redis://user:sekret@cache.internal:6380/1"),
             "redis://cache.internal:6380/1"
@@ -581,8 +575,6 @@ mod tests {
         let mut r = Cursor::new(b"$5\r\nab\r\n".to_vec());
         assert!(read_reply(&mut r).is_err());
     }
-
-    // ---- loopback fake-RESP server (same pattern as sns.rs's capture test) ----
 
     use std::sync::Arc;
 
@@ -655,12 +647,8 @@ mod tests {
 
     #[test]
     fn auth_select_order_and_set_ex_over_loopback() {
-        let (mut target, commands, server) = fake_redis(vec![vec![
-            b"+OK\r\n", // AUTH
-            b"+OK\r\n", // SELECT
-            b":1\r\n",  // EXISTS
-            b"+OK\r\n", // SET
-        ]]);
+        let (mut target, commands, server) =
+            fake_redis(vec![vec![b"+OK\r\n", b"+OK\r\n", b":1\r\n", b"+OK\r\n"]]);
         target.password = Some("sekret".to_string());
         target.db = Some(2);
         let st = test_state(target, 60);
@@ -689,10 +677,7 @@ mod tests {
 
     #[test]
     fn acl_user_sends_two_arg_auth() {
-        let (mut target, commands, server) = fake_redis(vec![vec![
-            b"+OK\r\n", // AUTH user pass
-            b":0\r\n",  // EXISTS
-        ]]);
+        let (mut target, commands, server) = fake_redis(vec![vec![b"+OK\r\n", b":0\r\n"]]);
         target.user = Some("app".to_string());
         target.password = Some("sekret".to_string());
         let st = test_state(target, 60);
@@ -708,13 +693,10 @@ mod tests {
 
     #[test]
     fn err_reply_fails_open_and_backs_off() {
-        // Connection 1: EXISTS answered with -ERR (fail open, start backoff).
-        // Connection 2: only reached after the backoff is rewound.
         let (target, commands, server) = fake_redis(vec![vec![b"-ERR nope\r\n"], vec![b":1\r\n"]]);
         let st = test_state(target, 60);
 
         assert!(!st.hit("k"), "-ERR must be a miss, never a hit");
-        // Backoff active: no reconnect, still a miss, server sees nothing new.
         assert!(!st.hit("k"));
         assert_eq!(
             commands.lock().unwrap().len(),
@@ -722,7 +704,6 @@ mod tests {
             "backoff must not reconnect"
         );
 
-        // Rewind the backoff window; the next probe reconnects and hits.
         st.slot.lock().unwrap().last_failure = Instant::now().checked_sub(FAILURE_BACKOFF);
         assert!(st.hit("k"));
         server.join().expect("server");
@@ -731,9 +712,6 @@ mod tests {
 
     #[test]
     fn forget_reports_whether_the_del_ran() {
-        // Connection 1: DEL answered OK -> true. Connection 2 is never opened:
-        // the -ERR on the next DEL tears the conn down and starts the backoff,
-        // during which forget must return false without reconnecting.
         let (target, commands, server) =
             fake_redis(vec![vec![b":1\r\n", b"-ERR readonly\r\n"], vec![b":1\r\n"]]);
         let st = test_state(target, 60);

@@ -5,8 +5,6 @@ set -euo pipefail
 system="${1:?usage: nix-checks.sh <system> [attr...]}"
 shift || true
 
-# With attr names, build only that subset (lanes split the check set across
-# parallel jobs); without, build every attr the system carries.
 if [ $# -gt 0 ]; then
   names="$(printf '%s\n' "$@")"
 else

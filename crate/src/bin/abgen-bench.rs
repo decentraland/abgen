@@ -377,8 +377,6 @@ fn main() {
         report.push((target.clone(), input_bytes, best));
     }
 
-    // Bundle names repeat across entities, so pairs carry the entity prefix;
-    // sorting makes the digest independent of emission order across threads.
     let out_hash_hex = out_hash.then(|| {
         out_pairs.sort();
         let mut cat = String::new();

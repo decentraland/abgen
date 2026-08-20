@@ -165,7 +165,6 @@ mod tests {
             s.bytes += i.as_raw().len();
             s.map.insert([seed; 32], (i, s.stamp));
         }
-        // Touch entry 0 so entry 1 becomes the LRU victim.
         s.stamp += 1;
         let stamp = s.stamp;
         s.map.get_mut(&[0u8; 32]).unwrap().1 = stamp;

@@ -385,8 +385,6 @@ impl Proxy {
         let content_by_file = scene.content_by_file();
         let scan = scan_entity(&self.content, &content_by_file, &self.uri_cache);
 
-        // Every digest parses its whole GLB; done serially this was most of
-        // the gap between fetch and the first build on large scenes.
         let digest_items: Vec<(String, String)> = scene
             .content
             .iter()
@@ -759,7 +757,6 @@ impl Proxy {
             return false;
         };
         let key = Self::asset_bundle_key(&self.version, file);
-        // Only S3-confirmed hits are written back; misses/errors fall through.
         let cache_key = self.reuse_cache_key(&key);
         if let Some(ck) = &cache_key {
             if crate::rediscache::hit(ck) {
@@ -1597,9 +1594,6 @@ mod tests {
         map.insert("a/mesh.bin".to_string(), "m1".to_string());
         map.insert("a/tex2.png".to_string(), "t2".to_string());
 
-        // Content order: gdup listed under two file names (first must win —
-        // the b/ variant cannot resolve its dep), one broken gltf (warning),
-        // one plain image (filtered out entirely).
         let items = vec![
             ("g1".to_string(), "a/one.gltf".to_string()),
             ("gdup".to_string(), "a/dup.gltf".to_string()),
@@ -1621,7 +1615,6 @@ mod tests {
         assert_eq!(w1.len(), 1);
         assert_eq!(w1[0].0, "a/broken.gltf");
         assert_eq!(w1[0].1, "gbroken");
-        // A parse failure is a real digest error, never "undeployed dep".
         assert!(u1.is_empty());
     }
 
@@ -1632,9 +1625,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = LocalContentStore::new(&dir);
 
-        // ghat references a texture the entity never deployed (prod skips
-        // such GLBs: no manifest entry, exit 0 — #59); gok resolves fully;
-        // gbroken is not JSON (a genuine digest error).
         store
             .write(
                 "ghat",
@@ -1668,8 +1658,6 @@ mod tests {
             undeployed.into_iter().collect::<Vec<_>>(),
             vec!["ghat".to_string()]
         );
-        // Both failures still warn (visibility), but only gbroken would
-        // count toward the exit code.
         assert_eq!(warns.len(), 2);
     }
 
@@ -1695,8 +1683,6 @@ mod tests {
             ..Default::default()
         });
 
-        // Same oracle as the old inline check: source_image_decodes on the
-        // raw bytes.
         assert!(proxy.image_decode_ok("goodimg"));
         assert!(!proxy.image_decode_ok("badimg"));
         assert!(crate::builder::source_image_decodes(&png));
@@ -1704,14 +1690,11 @@ mod tests {
             b"not an image at all"
         ));
 
-        // Memoized: with every backing file gone, verdicts must survive.
         let _ = std::fs::remove_dir_all(proxy.cache_roots().0);
         let _ = std::fs::remove_dir_all(&local_dir);
         assert!(proxy.image_decode_ok("goodimg"));
         assert!(!proxy.image_decode_ok("badimg"));
 
-        // Fetch failure reads as "decodes" (not tolerated) and is NOT
-        // memoized: once the content appears, the real verdict wins.
         assert!(proxy.image_decode_ok("lateimg"));
         let local = LocalContentStore::new(&local_dir);
         local.write("lateimg", b"still not an image").unwrap();

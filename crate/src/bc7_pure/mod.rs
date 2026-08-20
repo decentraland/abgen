@@ -167,8 +167,6 @@ fn classify_block(pixels: &[ColorI; 16]) -> BlockClass {
     let (mut lo_r, mut hi_r) = (255i32, 0i32);
     let (mut lo_g, mut hi_g) = (255i32, 0i32);
     let (mut lo_b, mut hi_b) = (255i32, 0i32);
-    // Channel values are 0..=255 integers, so integer min/max on alpha is
-    // exactly the old f32 comparison chain.
     let (mut lo_a, mut hi_a) = (255i32, 0i32);
     for i in 0..16 {
         let r = pixels[i].c[0];
@@ -240,9 +238,6 @@ fn compress_group_into(group: &[[ColorI; 16]], cp: &Params, out: &mut [u8]) {
             lanes[k] = &group[opaque_idx[k]];
         }
         let sub_plans = build_partition_plans(&lanes[..opaque_n], cp);
-        // Whole-plan move: for an opaque block nothing reads `list7`, and an
-        // alpha block is never in `opaque_idx`, so this assigns exactly the
-        // fields the old field-by-field clone did.
         for (k, sub) in sub_plans.into_iter().enumerate() {
             plans[opaque_idx[k]] = sub;
         }

@@ -1338,7 +1338,6 @@ mod hc_kernel_tests {
                     .wrapping_mul(37)
                     .wrapping_add(period as u8);
             }
-            // A few aperiodic bytes so matches end mid-word too.
             v[1000] ^= 0x5A;
             v[65535] ^= 0xA5;
             cases.push(v);
@@ -1357,8 +1356,6 @@ mod hc_kernel_tests {
     #[test]
     fn hc_ctx_reuse_matches_fresh() {
         let cases = reuse_cases();
-        // Two passes so every case also runs against a context left dirty by
-        // every other case.
         for pass in 0..2 {
             for (i, case) in cases.iter().enumerate() {
                 let reused = compress_hc(case);
@@ -1367,8 +1364,6 @@ mod hc_kernel_tests {
                 assert_eq!(decompress(&reused, case.len()).unwrap(), *case);
             }
         }
-        // Exhausted index headroom must take the hard-reset path and still
-        // produce identical bytes.
         let case = &cases[3];
         let fresh = compress_optimal_with_ctx(case, &mut HcCtx::new());
         let mut ctx = HcCtx::new();
@@ -1496,13 +1491,11 @@ mod hc_kernel_tests {
             let a = decompress(comp, *dst_size);
             let b = decompress_ref(comp, *dst_size);
             assert_eq!(a, b);
-            // Truncations must fail identically (or agree, near the tail).
             for cut in [comp.len() / 3, comp.len() / 2, comp.len().saturating_sub(3)] {
                 let a = decompress(&comp[..cut], *dst_size);
                 let b = decompress_ref(&comp[..cut], *dst_size);
                 assert_eq!(a, b, "cut={cut}");
             }
-            // Bit flips: same verdict and same bytes when both accept.
             let mut x = 0x123456789ABCDEFu64;
             for _ in 0..32 {
                 x ^= x << 13;
