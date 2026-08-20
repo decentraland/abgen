@@ -925,8 +925,6 @@ jobs:
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
-      id-token: write
-      actions: read
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       - if: needs.build-id.outputs.image_lambda == ''
@@ -950,25 +948,43 @@ jobs:
           name: image-${{ needs.build-id.outputs.value }}-lambdaImage
           path: image.tar.gz
           if-no-files-found: error
-      - name: fetch prebuilt image
-        if: needs.build-id.outputs.image_lambda != ''
+  lambda-image-push:
+    name: push lambda image to ECR
+    needs: [build-id, lambda-image]
+    # Separate job: `environment` is job-level, and lambda-image also runs untagged.
+    if: >-
+      !cancelled() && needs.lambda-image.result == 'success' &&
+      startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
+    runs-on: ubuntu-24.04-arm
+    environment: biz
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - name: fetch image
         env:
           GH_TOKEN: ${{ github.token }}
           ARTIFACT_ID: ${{ needs.build-id.outputs.image_lambda }}
+          RUN_ARTIFACT: image-${{ needs.build-id.outputs.value }}-lambdaImage
         run: |
-          gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > i.zip
+          id="$ARTIFACT_ID"
+          if [ -z "$id" ]; then
+            id="$(gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+              --jq ".artifacts[] | select(.name==\"$RUN_ARTIFACT\") | .id" | head -1)"
+          fi
+          test -n "$id" || { echo "::error::no lambda image artifact to push" >&2; exit 1; }
+          gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > i.zip
           unzip -q i.zip
-          # The nix legs upload the tarball as <package>.tar.gz; normalize.
           [ -f lambdaImage.tar.gz ] && mv lambdaImage.tar.gz image.tar.gz
-          test -f image.tar.gz || { echo "no image tarball in artifact $ARTIFACT_ID" >&2; ls -l >&2; exit 1; }
+          test -f image.tar.gz || { echo "no image tarball in artifact $id" >&2; ls -l >&2; exit 1; }
           {
             echo "REF=${GITHUB_REF_NAME:-dev}"
             echo "IMG_SIZE=$(ls -lh image.tar.gz | awk '{print $5}')"
           } >> "$GITHUB_ENV"
-      - if: needs.build-id.outputs.image_lambda != '' && startsWith(github.ref, 'refs/tags/')
-        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
       - name: assume ECR push role (OIDC)
-        if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
         run: |
           role="${{ vars.ABGEN_LAMBDA_ECR_ROLE_ARN }}"
           region="${{ vars.ABGEN_LAMBDA_AWS_REGION }}"
@@ -991,14 +1007,13 @@ jobs:
             echo "AWS_REGION=${region}"
           } >> "$GITHUB_ENV"
       - name: push to ECR
-        if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
         run: |
           repo="${{ vars.ABGEN_LAMBDA_ECR_REPOSITORY }}"
           registry="${repo%%/*}"
           password="$(aws ecr get-login-password)"
           conf="$(mktemp)"
           echo 'unqualified-search-registries = []' > "$conf"
-          for tag in "${REF}" latest; do
+          for tag in "${REF}"; do
             nix run --inputs-from . nixpkgs#skopeo -- \
               --registries-conf "$conf" --insecure-policy copy \
               --dest-creds "AWS:${password}" \
@@ -1014,7 +1029,7 @@ jobs:
             echo ""
             echo "| | |"
             echo "|---|---|"
-            echo "| image | \`${repo}:${REF}\` (and \`:latest\`) |"
+            echo "| image | \`${repo}:${REF}\` |"
             echo "| digest | \`${digest}\` |"
             echo "| size | ${IMG_SIZE} compressed, no base OS |"
             echo "| arch | arm64 (Graviton Lambda) |"
