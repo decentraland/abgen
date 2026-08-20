@@ -7,6 +7,10 @@ let
   abgenRoot = ''export ABGEN_ROOT="$PWD"'';
 
   archIndependent = {
+    # The wasm toolchain + registry closure, exposed so the pipeline's deps
+    # stage can build and cache it before any source-keyed work starts.
+    wasm-deps = wasmCheck.cargoArtifacts;
+
     fmt = craneLib.cargoFmt {
       inherit (commonArgs) pname version src;
     };
@@ -25,20 +29,16 @@ let
   };
 
   archDependent = {
+    # The crane dependency closure as a first-class attr: the pipeline's
+    # deps stage builds exactly this, then publishes the binary cache, so a
+    # failure in any later stage never costs the next run its warm deps.
+    deps = cargoArtifacts;
+
     nextest = craneLib.cargoNextest (withArtifacts // {
       doCheck = true;
       __darwinAllowLocalNetworking = true;
       cargoExtraArgs = "--locked";
       cargoNextestExtraArgs = "--workspace";
-      preCheck = abgenRoot;
-    });
-
-    lambda-tests = craneLib.cargoTest (withArtifacts // {
-      doCheck = true;
-      __darwinAllowLocalNetworking = true;
-      pname = "abgen-lambda-tests";
-      cargoExtraArgs = "--locked";
-      cargoTestExtraArgs = "-p abgen-lambda -p abgen-native --tests";
       preCheck = abgenRoot;
     });
 
@@ -58,5 +58,26 @@ let
         touch $out
       '';
   };
+
+  # server-off config. The lambda binary ships and runs on aarch64 only, so
+  # its test lane follows the prod arch; the config stays covered fleet-wide
+  # (aarch64-linux in CI, darwin locally) without a second server-off
+  # workspace compile+test on the slower x86 lane. Folding it into nextest
+  # is rejected: feature unification differs, a merged compile would not
+  # test the no-server config the mac/windows legs ship.
+  lambdaTests = {
+    lambda-tests = craneLib.cargoTest (withArtifacts // {
+      doCheck = true;
+      __darwinAllowLocalNetworking = true;
+      pname = "abgen-lambda-tests";
+      cargoExtraArgs = "--locked";
+      cargoTestExtraArgs = "-p abgen-lambda -p abgen-native --tests";
+      preCheck = abgenRoot;
+    });
+  };
 in
-archDependent // lib.optionalAttrs (system == "x86_64-linux") archIndependent
+# Arch-independent checks ride the aarch64 lane: those runners are ~1.8x
+# faster per stage, which rebalances the two pipelines' critical paths.
+archDependent
+// lib.optionalAttrs (system != "x86_64-linux") lambdaTests
+// lib.optionalAttrs (system == "aarch64-linux") archIndependent

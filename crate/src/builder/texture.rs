@@ -84,7 +84,14 @@ pub fn source_image_decodes(raw: &[u8]) -> bool {
     decode_source_image(raw).is_some()
 }
 
-pub(super) fn decode_source_image(raw: &[u8]) -> Option<RgbaImage> {
+/// Decode with per-entity reuse: on the second platform of a conversion the
+/// same source bytes decode to the same image, so the cache (when the host
+/// enables it) returns the shared buffer instead of decoding again.
+pub(super) fn decode_source_image(raw: &[u8]) -> Option<std::sync::Arc<RgbaImage>> {
+    crate::decode_cache::get_or_decode(raw, || decode_source_image_uncached(raw))
+}
+
+fn decode_source_image_uncached(raw: &[u8]) -> Option<RgbaImage> {
     if is_psd(raw) {
         let p = psd::Psd::from_bytes(raw).ok()?;
         let (w, h) = (p.width(), p.height());

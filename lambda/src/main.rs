@@ -81,6 +81,7 @@ fn init() {
     });
     abgen::arm_gpu_default();
     abgen::texencode_cache::enable();
+    abgen::decode_cache::enable();
     if abgen::sns::Sns::global().is_some() {
         eprintln!("init: finished-event publishing enabled (ABGEN_SNS_TOPIC_ARN)");
     }

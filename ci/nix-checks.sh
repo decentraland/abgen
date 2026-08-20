@@ -17,15 +17,21 @@ done <<<"$names"
 printf 'building %s check(s):\n' "${#attrs[@]}"
 printf '  %s\n' "${attrs[@]}"
 
-nix build --keep-going --no-link --log-format raw "${attrs[@]}" \
-  || nix build --keep-going --no-link --print-build-logs "${attrs[@]}"
+# --max-jobs 2: the full check set holds several workspace-scale compiles;
+# unbounded derivation parallelism OOM-kills the 16 GB runners. Two at a
+# time bounds memory while keeping the cores saturated.
+nix build --keep-going --no-link --log-format raw --max-jobs 2 "${attrs[@]}" \
+  || nix build --keep-going --no-link --print-build-logs --max-jobs 2 "${attrs[@]}"
 
 # A test check that executed zero tests is a silent no-op (doCheck=false
 # reached the derivation once and nobody noticed for weeks) — make that
 # state red forever: the built check's log must show a nonzero test count.
 assert_ran_tests() {
   local attr="$1" pattern="$2"
-  grep -qE "$pattern" <(nix log "$attr") \
+  # CARGO_TERM_COLOR=always wraps the summary in ANSI escapes; strip them
+  # or the pattern can never match a CI log. No grep -q: under pipefail its
+  # early exit SIGPIPEs sed and fails the pipeline on a successful match.
+  nix log "$attr" | sed $'s/\x1b\\[[0-9;]*[A-Za-z]//g' | grep -E "$pattern" > /dev/null \
     || { echo "$attr built green but ran no tests ($pattern not in its log)" >&2; exit 1; }
 }
 while IFS= read -r name; do

@@ -43,6 +43,7 @@ struct TexCacheClearGuard;
 impl Drop for TexCacheClearGuard {
     fn drop(&mut self) {
         abgen::texencode_cache::clear();
+        abgen::decode_cache::clear();
     }
 }
 
@@ -54,6 +55,7 @@ pub fn convert_entity(
     platforms: &[String],
 ) -> Result<EntityOutcome> {
     let (h0, m0, _, _) = abgen::texencode_cache::stats();
+    let (dh0, dm0, _, _) = abgen::decode_cache::stats();
     let _clear_guard = TexCacheClearGuard;
 
     std::fs::create_dir_all(&cfg.out_root)
@@ -87,6 +89,12 @@ pub fn convert_entity(
     }
 
     let (h1, m1, _, _) = abgen::texencode_cache::stats();
+    let (dh1, dm1, _, _) = abgen::decode_cache::stats();
+    eprintln!(
+        "convert: {entity_id}: decodecache hits={} misses={}",
+        dh1.saturating_sub(dh0),
+        dm1.saturating_sub(dm0)
+    );
 
     Ok(EntityOutcome {
         entity_id: entity_id.to_string(),
