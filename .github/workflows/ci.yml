@@ -124,27 +124,35 @@ jobs:
           path: .win-green-marker
           key: windows-green-${{ needs.windows-gate.outputs.hash }}
 
-  # One staged pipeline per arch, everything on a single runner: deps are
-  # built and published to the binary cache FIRST (a later stage failing
-  # never costs the next run its warm deps), then the source-keyed
-  # build/test/lint work, then the cheap fan-out (image, node addon) reuses
-  # the already-hot store instead of paying setup+restore on fresh runners.
-  pipeline:
-    name: ${{ matrix.system }} pipeline
+  # Everything races in parallel off the shared binary cache: each lane
+  # restores, builds its deps closures, publishes the cache immediately
+  # (no-op unless the key is new), then runs only its slice of the checks.
+  # Image artifacts are produced by the release workflow's build legs,
+  # which start on the same push in parallel with all of this; publishing
+  # is what gates on green, not building.
+  nix-ci:
+    name: ${{ matrix.lane }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
+          - lane: x86 tests
+            runner: ubuntu-24.04
             system: x86_64-linux
             deps: .#checks.x86_64-linux.deps
-            image: dockerImage
-          - runner: ubuntu-24.04-arm
+            attrs: nextest native-smoke
+          - lane: arm tests
+            runner: ubuntu-24.04-arm
+            system: aarch64-linux
+            deps: .#checks.aarch64-linux.deps
+            attrs: nextest lambda-tests native-smoke
+          - lane: arm lints
+            runner: ubuntu-24.04-arm
             system: aarch64-linux
             deps: .#checks.aarch64-linux.deps .#checks.aarch64-linux.wasm-deps
-            image: lambdaImage
+            attrs: clippy fmt no-node-spawn wasm-check
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       # No standalone nix installer: the composite runs it with the
@@ -154,18 +162,21 @@ jobs:
       - name: deps (dependency closures)
         run: nix build --no-link ${{ matrix.deps }}
       # Publish immediately and from any branch: the composite no-ops
-      # unless the exact key is new, so this fires once per input rotation.
+      # unless the exact key is new, so this fires once per input rotation
+      # (lanes sharing a key race; first save wins, the rest skip).
       - uses: ./.github/actions/nix-store-cache/save
         continue-on-error: true
-      - name: build + checks
-        run: bash ci/nix-checks.sh ${{ matrix.system }}
-      # Fan-out: cheap on the hot store. Skipped on main pushes, where the
-      # release workflow builds the real thing from the same cache.
-      - name: image smoke (${{ matrix.image }})
-        if: github.event_name != 'push'
-        run: nix build --no-link .#${{ matrix.image }}
+      - name: checks (${{ matrix.attrs }})
+        run: bash ci/nix-checks.sh ${{ matrix.system }} ${{ matrix.attrs }}
+
+  node-addon:
+    name: node addon
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       - uses: ./.github/actions/rust-setup
-        if: github.event_name != 'push'
         with:
           # Pure consumer of the cache the release napi linux legs save from
           # main pushes (same shared-key); PR-scoped saves would be quota
@@ -173,8 +184,7 @@ jobs:
           workspaces: crate/abgen-node
           shared-key: abgen-node
           save-if: "false"
-      - name: node addon (build + smoke)
-        if: github.event_name != 'push'
+      - name: abgen-node (build + smoke)
         working-directory: crate/abgen-node
         run: |
           npm ci --no-audit --no-fund
@@ -187,4 +197,3 @@ jobs:
           # crate/abgen-node now that the step runs there.
           bash ../../ci/check-glibc-floor.sh 2.34 \
             target/release/libabgen_node.so
-
