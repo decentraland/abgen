@@ -130,6 +130,9 @@ pub struct Proxy {
     jit_cache: OnceLock<Arc<crate::jitcache::JitDiskCache>>,
     asset_reuse: bool,
     build_progress: Mutex<HashMap<String, BuildProgress>>,
+    /// Content is immutable per hash, so a standalone image's decode verdict
+    /// holds for every platform and repeat conversion in this process.
+    decode_ok: Mutex<HashMap<String, bool>>,
 }
 
 #[derive(Clone)]
@@ -332,6 +335,25 @@ impl Proxy {
         bounded_reserve(&mut g, self.entity_cap, cid);
         g.insert(cid.to_string(), ctx.clone());
         Ok(ctx)
+    }
+
+    /// Whether the standalone image behind `hash` decodes. The verdict feeds
+    /// the manifest's tolerated count only; it is memoized per hash so the
+    /// full decode runs once per content, not once per platform pass.
+    fn image_decode_ok(&self, hash: &str) -> bool {
+        if let Some(v) = self.decode_ok.lock().unwrap().get(hash) {
+            return *v;
+        }
+        self.ensure_content(hash).ok();
+        let Ok(raw) = self.content.fetch_mmap(hash) else {
+            // Unreadable content is not a decode failure (the old inline
+            // check skipped it too); left un-memoized so a later successful
+            // fetch still gets a real verdict.
+            return true;
+        };
+        let v = crate::builder::source_image_decodes(&raw);
+        self.decode_ok.lock().unwrap().insert(hash.to_string(), v);
+        v
     }
 
     fn bundle(&self, cid: &str, bundle_name: &str) -> Result<Vec<u8>> {
@@ -854,13 +876,8 @@ impl Proxy {
                         .lock()
                         .unwrap()
                         .push((it.order, it.bundle_name.clone()));
-                    if it.is_image {
-                        self.ensure_content(&it.hash).ok();
-                        if let Ok(raw) = self.content.fetch(&it.hash) {
-                            if !crate::builder::source_image_decodes(&raw) {
-                                tolerated_a.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
+                    if it.is_image && !self.image_decode_ok(&it.hash) {
+                        tolerated_a.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 Err(e) => {
@@ -1253,6 +1270,7 @@ impl Proxy {
             jit_cache: OnceLock::new(),
             asset_reuse,
             build_progress: Mutex::new(HashMap::new()),
+            decode_ok: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1380,6 +1398,49 @@ mod tests {
 
     fn stub_proxy(host: &str, read_only: bool, tag: &str) -> Arc<Proxy> {
         super::stub::stub_proxy_at(host, "http://127.0.0.1:9", read_only, &temp_cache(tag))
+    }
+
+    #[test]
+    fn image_decode_verdict_is_memoized_per_hash() {
+        let cache_dir = temp_cache("decode-ok-memo");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let local_dir = cache_dir.join("src-local");
+        let local = LocalContentStore::new(&local_dir);
+
+        let mut png = Vec::new();
+        image::RgbaImage::new(1, 1)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        local.write("goodimg", &png).unwrap();
+        local.write("badimg", b"not an image at all").unwrap();
+
+        let proxy = Proxy::new(ProxyConfig {
+            catalyst_url: "http://127.0.0.1:9".to_string(),
+            local_root: Some(local_dir.to_string_lossy().into_owned()),
+            cache_dir: cache_dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+
+        // Same oracle as the old inline check: source_image_decodes on the
+        // raw bytes.
+        assert!(proxy.image_decode_ok("goodimg"));
+        assert!(!proxy.image_decode_ok("badimg"));
+        assert!(crate::builder::source_image_decodes(&png));
+        assert!(!crate::builder::source_image_decodes(b"not an image at all"));
+
+        // Memoized: with every backing file gone, verdicts must survive.
+        let _ = std::fs::remove_dir_all(proxy.cache_roots().0);
+        let _ = std::fs::remove_dir_all(&local_dir);
+        assert!(proxy.image_decode_ok("goodimg"));
+        assert!(!proxy.image_decode_ok("badimg"));
+
+        // Fetch failure reads as "decodes" (not tolerated) and is NOT
+        // memoized: once the content appears, the real verdict wins.
+        assert!(proxy.image_decode_ok("lateimg"));
+        let local = LocalContentStore::new(&local_dir);
+        local.write("lateimg", b"still not an image").unwrap();
+        assert!(!proxy.image_decode_ok("lateimg"));
     }
 
     #[test]
