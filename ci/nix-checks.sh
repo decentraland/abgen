@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
 
-# Build every flake check the given system carries. The per-arch split
-# lives in nix/checks.nix (arch-independent checks exist only on
-# x86_64-linux), so this script never hardcodes check names.
-
 set -euo pipefail
 
 system="${1:?usage: nix-checks.sh <system>}"
@@ -21,10 +17,5 @@ done <<<"$names"
 printf 'building %s check(s):\n' "${#attrs[@]}"
 printf '  %s\n' "${attrs[@]}"
 
-# Quiet first: -L streams every check's full build log into the runner
-# log even when green, and the default non-tty status output re-emits each
-# "building ..." line ~150x (14MB/job of log). --log-format raw prints each
-# once. On failure, rerun with full logs — only the failed derivations
-# rebuild, everything else is a store hit.
 nix build --keep-going --no-link --log-format raw "${attrs[@]}" \
   || nix build --keep-going --no-link --print-build-logs "${attrs[@]}"

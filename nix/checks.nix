@@ -1,7 +1,3 @@
-# Flake checks. Deliberately outside the buildId hash set: editing a check
-# must never move buildId. Arch-independent checks exist only on
-# x86_64-linux so ci/nix-checks.sh can build every attr a system carries
-# without running them twice across arch families.
 { lib, system, pkgs, craneLib, commonArgs, cargoArtifacts, abgenConsumersPkg
 , wasmCheck }:
 

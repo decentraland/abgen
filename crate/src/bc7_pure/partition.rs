@@ -197,7 +197,9 @@ pub(super) fn estimate_partition_list_group(
         let mut out = Vec::with_capacity(n);
         for lane in 0..n {
             let take = (num_solutions[lane]).min(max_solutions_in) as usize;
-            out.push(sols[lane][..take].to_vec());
+            let mut s = std::mem::take(&mut sols[lane]);
+            s.truncate(take);
+            out.push(s);
         }
         return out;
     }
@@ -244,7 +246,9 @@ pub(super) fn estimate_partition_list_group(
         let mut out = Vec::with_capacity(n);
         for lane in 0..n {
             let take = (num_solutions[lane]).min(max_solutions_in) as usize;
-            out.push(sols[lane][..take].to_vec());
+            let mut s = std::mem::take(&mut sols[lane]);
+            s.truncate(take);
+            out.push(s);
         }
         return out;
     }
@@ -319,7 +323,9 @@ pub(super) fn estimate_partition_list_group(
     let mut out = Vec::with_capacity(n);
     for lane in 0..n {
         let take = (num_solutions[lane]).min(max_solutions_in) as usize;
-        out.push(sols[lane][..take].to_vec());
+        let mut s = std::mem::take(&mut sols[lane]);
+        s.truncate(take);
+        out.push(s);
     }
     out
 }
@@ -350,8 +356,8 @@ pub(super) fn build_partition_plans(lanes: &[&[ColorI; 16]], cp: &Params) -> Vec
             }
         } else {
             let r = estimate_partition_list_group(1, lanes, cp, cp.op_max_mode13 as i32);
-            for l in 0..n {
-                plans[l].list13 = r[l].clone();
+            for (l, list) in r.into_iter().enumerate() {
+                plans[l].list13 = list;
                 plans[l].use_list13 = true;
             }
         }
@@ -364,8 +370,8 @@ pub(super) fn build_partition_plans(lanes: &[&[ColorI; 16]], cp: &Params) -> Vec
             }
         } else {
             let r = estimate_partition_list_group(0, lanes, cp, cp.op_max_mode0 as i32);
-            for l in 0..n {
-                plans[l].list0 = r[l].clone();
+            for (l, list) in r.into_iter().enumerate() {
+                plans[l].list0 = list;
                 plans[l].use_list0 = true;
             }
         }
@@ -378,16 +384,16 @@ pub(super) fn build_partition_plans(lanes: &[&[ColorI; 16]], cp: &Params) -> Vec
             }
         } else {
             let r = estimate_partition_list_group(2, lanes, cp, cp.op_max_mode2 as i32);
-            for l in 0..n {
-                plans[l].list2 = r[l].clone();
+            for (l, list) in r.into_iter().enumerate() {
+                plans[l].list2 = list;
                 plans[l].use_list2 = true;
             }
         }
     }
     if cp.use_mode7 {
         let r = estimate_partition_list_group(7, lanes, cp, cp.al_max_mode7 as i32);
-        for l in 0..n {
-            plans[l].list7 = r[l].clone();
+        for (l, list) in r.into_iter().enumerate() {
+            plans[l].list7 = list;
         }
     }
     plans

@@ -167,7 +167,9 @@ fn classify_block(pixels: &[ColorI; 16]) -> BlockClass {
     let (mut lo_r, mut hi_r) = (255i32, 0i32);
     let (mut lo_g, mut hi_g) = (255i32, 0i32);
     let (mut lo_b, mut hi_b) = (255i32, 0i32);
-    let (mut lo_a, mut hi_a) = (255f32, 0f32);
+    // Channel values are 0..=255 integers, so integer min/max on alpha is
+    // exactly the old f32 comparison chain.
+    let (mut lo_a, mut hi_a) = (255i32, 0i32);
     for i in 0..16 {
         let r = pixels[i].c[0];
         let g = pixels[i].c[1];
@@ -179,57 +181,73 @@ fn classify_block(pixels: &[ColorI; 16]) -> BlockClass {
         hi_g = hi_g.max(g);
         lo_b = lo_b.min(b);
         hi_b = hi_b.max(b);
-        let fa = a as f32;
-        lo_a = lo_a.min(fa);
-        hi_a = hi_a.max(fa);
+        lo_a = lo_a.min(a);
+        hi_a = hi_a.max(a);
     }
     if lo_r == hi_r && lo_g == hi_g && lo_b == hi_b && lo_a == hi_a {
-        BlockClass::Solid([lo_r, lo_g, lo_b, lo_a as i32])
-    } else if lo_a < 255.0 {
-        BlockClass::Alpha(lo_a as i32, hi_a as i32)
+        BlockClass::Solid([lo_r, lo_g, lo_b, lo_a])
+    } else if lo_a < 255 {
+        BlockClass::Alpha(lo_a, hi_a)
     } else {
         BlockClass::Opaque
     }
 }
 
-fn compress_group(group: &[[ColorI; 16]], cp: &Params) -> Vec<[u8; 16]> {
+/// Encodes `group` (at most `SIMD_W` blocks) into `out`, 16 bytes per block.
+/// All per-group state lives in fixed arrays: the only heap traffic left is
+/// the partition-plan solution lists, which are moved here, never cloned.
+fn compress_group_into(group: &[[ColorI; 16]], cp: &Params, out: &mut [u8]) {
+    let n = group.len();
+    debug_assert!(n <= SIMD_W && out.len() == n * 16);
+    if n == 0 {
+        return;
+    }
     let mut base = CCParams::clear();
     base.weights = cp.weights;
 
-    let classes: Vec<BlockClass> = group.iter().map(classify_block).collect();
-
-    let alpha_idx: Vec<usize> = (0..group.len())
-        .filter(|&i| matches!(classes[i], BlockClass::Alpha(..)))
-        .collect();
-    let opaque_idx: Vec<usize> = (0..group.len())
-        .filter(|&i| classes[i] == BlockClass::Opaque && !cp.mode6_only)
-        .collect();
-
-    let mut plans: Vec<PartitionPlan> = vec![PartitionPlan::default(); group.len()];
-    if !alpha_idx.is_empty() && cp.use_mode7 {
-        let lanes: Vec<&[ColorI; 16]> = alpha_idx.iter().map(|&i| &group[i]).collect();
-        let r = estimate_partition_list_group(7, &lanes, cp, cp.al_max_mode7 as i32);
-        for (k, &i) in alpha_idx.iter().enumerate() {
-            plans[i].list7 = r[k].clone();
-        }
+    let mut classes = [BlockClass::Opaque; SIMD_W];
+    for (c, pixels) in classes.iter_mut().zip(group) {
+        *c = classify_block(pixels);
     }
-    if !opaque_idx.is_empty() {
-        let lanes: Vec<&[ColorI; 16]> = opaque_idx.iter().map(|&i| &group[i]).collect();
-        let sub_plans = build_partition_plans(&lanes, cp);
-        for (k, &i) in opaque_idx.iter().enumerate() {
-            plans[i].part0 = sub_plans[k].part0;
-            plans[i].part13 = sub_plans[k].part13;
-            plans[i].list13 = sub_plans[k].list13.clone();
-            plans[i].use_list13 = sub_plans[k].use_list13;
-            plans[i].part2 = sub_plans[k].part2;
-            plans[i].list2 = sub_plans[k].list2.clone();
-            plans[i].use_list2 = sub_plans[k].use_list2;
-            plans[i].list0 = sub_plans[k].list0.clone();
-            plans[i].use_list0 = sub_plans[k].use_list0;
+
+    let mut alpha_idx = [0usize; SIMD_W];
+    let mut alpha_n = 0usize;
+    let mut opaque_idx = [0usize; SIMD_W];
+    let mut opaque_n = 0usize;
+    for i in 0..n {
+        if matches!(classes[i], BlockClass::Alpha(..)) {
+            alpha_idx[alpha_n] = i;
+            alpha_n += 1;
+        } else if classes[i] == BlockClass::Opaque && !cp.mode6_only {
+            opaque_idx[opaque_n] = i;
+            opaque_n += 1;
         }
     }
 
-    let mut out = Vec::with_capacity(group.len());
+    let mut plans: [PartitionPlan; SIMD_W] = Default::default();
+    let mut lanes: [&[ColorI; 16]; SIMD_W] = [&group[0]; SIMD_W];
+    if alpha_n > 0 && cp.use_mode7 {
+        for k in 0..alpha_n {
+            lanes[k] = &group[alpha_idx[k]];
+        }
+        let r = estimate_partition_list_group(7, &lanes[..alpha_n], cp, cp.al_max_mode7 as i32);
+        for (k, list) in r.into_iter().enumerate() {
+            plans[alpha_idx[k]].list7 = list;
+        }
+    }
+    if opaque_n > 0 {
+        for k in 0..opaque_n {
+            lanes[k] = &group[opaque_idx[k]];
+        }
+        let sub_plans = build_partition_plans(&lanes[..opaque_n], cp);
+        // Whole-plan move: for an opaque block nothing reads `list7`, and an
+        // alpha block is never in `opaque_idx`, so this assigns exactly the
+        // fields the old field-by-field clone did.
+        for (k, sub) in sub_plans.into_iter().enumerate() {
+            plans[opaque_idx[k]] = sub;
+        }
+    }
+
     for (i, pixels) in group.iter().enumerate() {
         let blk = match classes[i] {
             BlockClass::Solid(c) => {
@@ -254,9 +272,21 @@ fn compress_group(group: &[[ColorI; 16]], cp: &Params) -> Vec<[u8; 16]> {
                 }
             }
         };
-        out.push(blk);
+        out[i * 16..i * 16 + 16].copy_from_slice(&blk);
     }
-    out
+}
+
+fn compress_group(group: &[[ColorI; 16]], cp: &Params) -> Vec<[u8; 16]> {
+    let mut bytes = vec![0u8; group.len() * 16];
+    compress_group_into(group, cp, &mut bytes);
+    bytes
+        .chunks_exact(16)
+        .map(|c| {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(c);
+            b
+        })
+        .collect()
 }
 
 fn block_from_bytes(rgba16: &[u8]) -> [ColorI; 16] {
@@ -279,23 +309,18 @@ pub fn encode_blocks(rgba_block_major: &[u8], num_blocks: usize, params: &Params
 
     use rayon::prelude::*;
     let group_bytes = SIMD_W * 64;
-    let parts: Vec<Vec<[u8; 16]>> = rgba_block_major
+    let mut out = vec![0u8; num_blocks * 16];
+    rgba_block_major
         .par_chunks(group_bytes)
-        .map(|chunk| {
+        .zip(out.par_chunks_mut(SIMD_W * 16))
+        .for_each(|(chunk, dst)| {
             let n = chunk.len() / 64;
-            let mut group: Vec<[ColorI; 16]> = Vec::with_capacity(n);
+            let mut group = [[ColorI::default(); 16]; SIMD_W];
             for k in 0..n {
-                group.push(block_from_bytes(&chunk[k * 64..k * 64 + 64]));
+                group[k] = block_from_bytes(&chunk[k * 64..k * 64 + 64]);
             }
-            compress_group(&group, params)
-        })
-        .collect();
-    let mut out = Vec::with_capacity(num_blocks * 16);
-    for part in parts {
-        for blk in part {
-            out.extend_from_slice(&blk);
-        }
-    }
+            compress_group_into(&group[..n], params, &mut dst[..n * 16]);
+        });
 
     if let Some(path) = bc7_capture_path() {
         use std::io::Write;

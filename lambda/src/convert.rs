@@ -38,7 +38,6 @@ pub fn make_proxy(cfg: &Config, content_server: &str) -> std::sync::Arc<abgen::l
     })
 }
 
-// Clears on drop so an early error return can't leak cache bytes into the next warm invocation.
 struct TexCacheClearGuard;
 
 impl Drop for TexCacheClearGuard {

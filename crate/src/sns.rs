@@ -130,8 +130,6 @@ impl Sns {
         amz_date: &str,
         date: &str,
     ) -> String {
-        // No x-amz-content-sha256 header (S3-specific); the payload hash still
-        // binds the body via the last line of the canonical request.
         let (signed_headers, canonical_headers) = match &c.session_token {
             Some(token) => (
                 "host;x-amz-date;x-amz-security-token",
