@@ -61,7 +61,7 @@ pub fn decompress(src: &[u8], dst_size: usize) -> Result<Vec<u8>, Lz4Error> {
 
     if slen == 0 {
         if dst_size == 0 {
-            dst.truncate(0);
+            dst.clear();
             return Ok(dst);
         }
         return Err(Lz4Error::Malformed("empty input but non-zero output"));
@@ -1334,7 +1334,9 @@ mod hc_kernel_tests {
         for period in [1usize, 2, 3, 4, 5, 6, 7, 8, 11, 16] {
             let mut v = vec![0u8; 96 * 1024];
             for (i, b) in v.iter_mut().enumerate() {
-                *b = ((i % period) as u8).wrapping_mul(37).wrapping_add(period as u8);
+                *b = ((i % period) as u8)
+                    .wrapping_mul(37)
+                    .wrapping_add(period as u8);
             }
             // A few aperiodic bytes so matches end mid-word too.
             v[1000] ^= 0x5A;
