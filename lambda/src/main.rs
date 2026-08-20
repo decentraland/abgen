@@ -123,8 +123,6 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
             !done
         });
         if pending.is_empty() {
-            // Prod publishes from every terminal branch, incl. already-converted
-            // (13); this also re-notifies on redelivery after a failed publish.
             let finished: Vec<notify::Finished> = already
                 .iter()
                 .map(|p| notify::Finished {

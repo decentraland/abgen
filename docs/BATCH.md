@@ -69,13 +69,10 @@ abgen-corpus --entity-ids ids.txt out_root \
 
 ## 5. GPU vs CPU
 
-Both GPU backends compile into every build with no feature flags — CUDA (`libcuda` is dlopen'd at
-runtime from the NVIDIA driver, no CUDA toolkit needed to build, PTX kernels vendored) and the
-portable `wgpu` Vulkan/Metal/DX12 backend. Opt in per run with `--gpu` (server: `ABGEN_GPU=1`);
-pick the backend with `ABGEN_GPU_BACKEND=auto|cuda|wgpu|off`. Self-qualification gate and exit-2
-contract: [README's Features table](../README.md#features). Without `ABGEN_GPU` (or a qualifying
-device) the CPU path produces the same corpus, just slower; texture encode dominates batch cost, so
-GPU is the recommendation for full-corpus runs.
+Backends, opt-in flags, and the self-qualification/exit-2 contract:
+[README's Features table](../README.md#features). Without `--gpu` (or a qualifying device) the
+CPU path produces the same corpus, just slower; texture encode dominates batch cost, so GPU is
+the recommendation for full-corpus runs.
 
 ## 6. Disk budget
 

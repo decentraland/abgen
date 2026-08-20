@@ -230,8 +230,6 @@ fn pad_to_block_size(rgba: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize)
 
 #[doc(hidden)]
 pub fn box_halve(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
-    // A short slice must stay a panic here: the NEON path reads through raw
-    // pointers and would otherwise turn it into out-of-bounds UB.
     assert!(
         arr.len() >= w * h * 4,
         "box_halve: {} f32s for {w}x{h}x4",
@@ -257,8 +255,6 @@ fn box_halve_neon(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
     let mut out = vec![0f32; nh * nw * c];
     let row_stride = w * c;
     // SAFETY: NEON is baseline on aarch64. For ny<nh, nx<nw the reads touch
-    // at most row 2*ny+1 <= h-1 and column floats nx*8+8 <= 4*w, all inside
-    // arr.len() >= w*h*4 (asserted by box_halve, the only caller).
     unsafe {
         let quarter = vdupq_n_f32(0.25);
         for ny in 0..nh {
@@ -387,9 +383,6 @@ fn encode_bc7_mip_chain_with_profile_uncached(
         Bc7Profile::Basic => Params::basic(perceptual),
     };
 
-    // The flip is fused into the source row index instead of materialising a
-    // flipped copy of the whole image first: every destination pixel is still
-    // produced by the identical expression from the identical source pixel.
     let mut cur: Vec<f32> = vec![0f32; w * h * 4];
     for y in 0..h {
         let sy = if flip { h - 1 - y } else { y };
@@ -416,9 +409,6 @@ fn encode_bc7_mip_chain_with_profile_uncached(
     let mut cw = w;
     let mut ch = h;
 
-    // Phase 1, serial: every level's block-major u8 buffer. box_halve and the
-    // quantizers are well under 1% of the cycles here, and doing them up front
-    // is what lets the encode of *all* levels share one parallel region.
     let mut levels: Vec<(Vec<u8>, usize)> = Vec::with_capacity(mip_count.max(0) as usize);
     for m in 0..mip_count {
         levels.push(level_to_blocks(&cur, cw, ch, srgb));
@@ -435,12 +425,6 @@ fn encode_bc7_mip_chain_with_profile_uncached(
     debug_assert_eq!(total, compute_mip_chain_size(width, height, mip_count));
     let mut parts = vec![0u8; total];
 
-    // Phase 2, parallel: one flat task list over (level, block range). Chunks
-    // are a fixed multiple of SIMD_W and never cross a level boundary, so the
-    // groups handed to compress_group are exactly the groups the per-level
-    // `par_chunks(SIMD_W * 64)` produced - including each level's trailing
-    // partial group. Each task owns a disjoint output slice, so there is no
-    // collect, no serial re-copy and no per-level join barrier.
     const TASK_BLOCKS: usize = 64;
     let mut tasks: Vec<(usize, usize, usize)> = Vec::new();
     for (li, (_, n)) in levels.iter().enumerate() {

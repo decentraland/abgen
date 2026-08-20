@@ -4,9 +4,6 @@ use std::time::Duration;
 const RETRIES: usize = 3;
 
 pub fn agent() -> ureq::Agent {
-    // max_redirects(0): the ALLOWED_CONTENT_SERVER_HOSTS check validates
-    // only the URL we start from; following a cross-host 302 would bypass
-    // it. Catalysts serve /contents directly today.
     ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(60)))
         .max_redirects(0)

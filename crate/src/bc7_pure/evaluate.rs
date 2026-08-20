@@ -448,7 +448,6 @@ pub(super) fn evaluate_solution(
         #[cfg(not(target_arch = "aarch64"))]
         let neon_perc_done = false;
         if neon_perc_done {
-            // handled by the NEON kernel above
         } else {
             let mut wy = [0f32; 16];
             let mut wcr = [0f32; 16];
@@ -996,8 +995,6 @@ mod neon {
         let mut wav4 = [vdupq_n_f32(0.0); ROWS];
         let mut bitv = [vdupq_n_u32(0); ROWS];
         for row in 0..ROWS {
-            // wc is [[f32;4];16] row-major, so vld4q de-interleaves 4 entries into
-            // per-channel lanes: .0 = r of entries 4*row..4*row+4, etc.
             let t = vld4q_f32(wc[row * 4].as_ptr());
             let y = vaddq_f32(
                 vaddq_f32(vmulq_f32(t.0, cy_r), vmulq_f32(t.1, cy_g)),

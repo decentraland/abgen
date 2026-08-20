@@ -28,6 +28,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use abgen::export::{self, HostInfo, InputBuilder, Kind, Sink};
+use abgen::hashes;
 use abgen::local_store::{LocalContentStore, ABGEN_CONTENT_ROOT_ENV, DEFAULT_CONTENT_ROOT};
 
 const HOST: HostInfo = HostInfo::new("v-abgen-bench", "bench://local");
@@ -94,6 +95,43 @@ impl Sink for TimingSink {
     }
 }
 
+/// A sink that keeps only what the bundles were: (name, sha256) per output.
+///
+/// Runs in its own untimed pass so `--out-hash` never inflates the numbers
+/// the timed reps report. Every bundle reaches a sink exactly once, through
+/// `emit_output`; the `Kind::Output` arm below only matters if a future
+/// emitter bypasses that helper, and synthesizes a name so such a bundle
+/// still lands in the digest instead of silently vanishing from it.
+#[derive(Default)]
+struct HashSink {
+    pairs: Mutex<Vec<(String, String)>>,
+    anon: Mutex<u64>,
+}
+
+impl Sink for HashSink {
+    fn emit_output(&self, name: &str, data: &[u8]) {
+        if let Ok(mut p) = self.pairs.lock() {
+            p.push((name.to_string(), hashes::sha256_hex(data)));
+        }
+    }
+
+    fn emit(&self, kind: Kind, bytes: &[u8]) {
+        if kind != Kind::Output {
+            return;
+        }
+        let n = match self.anon.lock() {
+            Ok(mut a) => {
+                *a += 1;
+                *a
+            }
+            Err(_) => return,
+        };
+        if let Ok(mut p) = self.pairs.lock() {
+            p.push((format!("!raw-output-{n}"), hashes::sha256_hex(bytes)));
+        }
+    }
+}
+
 /// One entity's conversion, timed.
 struct Run {
     total: Duration,
@@ -106,12 +144,16 @@ struct Run {
     code: i32,
 }
 
-fn time_once(files: &[(String, Vec<u8>)], platform: &str) -> Run {
+fn build_request(files: &[(String, Vec<u8>)], platform: &str) -> Vec<u8> {
     let mut builder = InputBuilder::new().platform(platform);
     for (name, data) in files {
         builder = builder.file(name.clone(), data.clone());
     }
-    let request = builder.build();
+    builder.build()
+}
+
+fn time_once(files: &[(String, Vec<u8>)], platform: &str) -> Run {
+    let request = build_request(files, platform);
 
     let sink = TimingSink::new();
     let began = Instant::now();
@@ -228,6 +270,7 @@ fn ms(d: Duration) -> f64 {
 fn main() {
     let mut reps = 3usize;
     let mut json = false;
+    let mut out_hash = false;
     let mut platform = "windows".to_string();
     let mut targets: Vec<PathBuf> = Vec::new();
     let mut id_list: Option<PathBuf> = None;
@@ -241,15 +284,20 @@ fn main() {
             "--entity-ids" => id_list = args.next().map(PathBuf::from),
             "--content-root" => content_root = args.next(),
             "--json" => json = true,
+            "--out-hash" => out_hash = true,
             "-h" | "--help" => {
                 eprintln!(
                     "usage:\n  \
-                     abgen-bench [--reps N] [--platform P] [--json] <entity-dir>...\n  \
-                     abgen-bench [--reps N] [--platform P] [--json] \\\n               \
+                     abgen-bench [--reps N] [--platform P] [--json] [--out-hash] <entity-dir>...\n  \
+                     abgen-bench [--reps N] [--platform P] [--json] [--out-hash] \\\n               \
                        --entity-ids <ids.txt> [--content-root <dir>]\n\
                      \n\
                      Times conversion, reporting the minimum of N repetitions per\n\
                      entity, broken down by file and by stage.\n\
+                     \n\
+                     --out-hash adds one untimed pass per entity and prints a single\n\
+                     digest over every output bundle: two builds are byte-identical\n\
+                     on this corpus iff they print the same digest.\n\
                      \n\
                      --content-root defaults to ${} then {}.",
                     ABGEN_CONTENT_ROOT_ENV, DEFAULT_CONTENT_ROOT
@@ -301,6 +349,7 @@ fn main() {
     }
 
     let mut report = Vec::new();
+    let mut out_pairs: Vec<(String, String)> = Vec::new();
     for (target, files) in &jobs {
         let input_bytes: u64 = files.iter().map(|(_, d)| d.len() as u64).sum();
 
@@ -313,7 +362,36 @@ fn main() {
         }
         let Some(best) = best else { continue };
 
+        if out_hash {
+            let request = build_request(files, &platform);
+            let sink = HashSink::default();
+            let code = export::run(&request, &sink, HOST);
+            if code != 0 {
+                eprintln!("abgen-bench: {target}: hash pass exited {code}");
+            }
+            for (name, hex) in sink.pairs.into_inner().unwrap_or_default() {
+                out_pairs.push((format!("{target}/{name}"), hex));
+            }
+        }
+
         report.push((target.clone(), input_bytes, best));
+    }
+
+    // Bundle names repeat across entities, so pairs carry the entity prefix;
+    // sorting makes the digest independent of emission order across threads.
+    let out_hash_hex = out_hash.then(|| {
+        out_pairs.sort();
+        let mut cat = String::new();
+        for (name, hex) in &out_pairs {
+            cat.push_str(name);
+            cat.push(':');
+            cat.push_str(hex);
+            cat.push('\n');
+        }
+        hashes::sha256_hex(cat.as_bytes())
+    });
+    if let Some(d) = &out_hash_hex {
+        eprintln!("out-hash: {d}");
     }
 
     if json {
@@ -338,14 +416,14 @@ fn main() {
                 })
             })
             .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "buildId": option_env!("ABGEN_BUILD_ID").unwrap_or("devbuild0000"),
-                "runs": out,
-            }))
-            .unwrap_or_default()
-        );
+        let mut top = serde_json::json!({
+            "buildId": option_env!("ABGEN_BUILD_ID").unwrap_or("devbuild0000"),
+            "runs": out,
+        });
+        if let Some(d) = &out_hash_hex {
+            top["out_hash"] = serde_json::Value::String(d.clone());
+        }
+        println!("{}", serde_json::to_string_pretty(&top).unwrap_or_default());
         return;
     }
 

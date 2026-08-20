@@ -72,27 +72,6 @@ fn prepare_kernel_const(
         })
 }
 
-async fn dispatch_prepared(
-    g: &Gpu,
-    pipeline: &::wgpu::ComputePipeline,
-    total: u32,
-    n_items: u32,
-    storages: &[(u32, &[u8])],
-    readback: u32,
-) -> std::result::Result<Vec<u8>, String> {
-    dispatch_prepared_wg_pad(
-        g,
-        pipeline,
-        total,
-        n_items,
-        storages,
-        readback,
-        WG,
-        1.0f32.to_bits(),
-    )
-    .await
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_prepared_wg_pad(
     g: &Gpu,
@@ -199,7 +178,65 @@ impl Harness {
         readback: u32,
     ) -> std::result::Result<Vec<u8>, String> {
         let pipeline = prepare_kernel_const(g, &self.module, entry, &[]);
-        dispatch_prepared(g, &pipeline, total, n_items, storages, readback).await
+        let one = 1.0f32.to_bits();
+        dispatch_prepared_wg_pad(g, &pipeline, total, n_items, storages, readback, WG, one).await
+    }
+
+    /// Common tail of every single-kernel entry: input at binding 4, an
+    /// all-zero output of `cases * per_case` bytes at binding 3 (plus any
+    /// `extra` storages), then compare against `want` at a `per_case` stride.
+    #[allow(clippy::too_many_arguments)]
+    async fn check_bytes(
+        &self,
+        g: &Gpu,
+        entry: &str,
+        name: String,
+        extra: &[(u32, &[u8])],
+        input_bytes: &[u8],
+        want: &[u8],
+        cases: usize,
+        per_case: usize,
+    ) -> EntryResult {
+        let total = cases as u32;
+        let out = vec![0u8; cases * per_case];
+        let mut storages: Vec<(u32, &[u8])> = extra.to_vec();
+        storages.push((4, input_bytes));
+        storages.push((3, &out));
+        match self.run_kernel(g, entry, total, 0, &storages, 3).await {
+            Ok(got) => compare(name, total, per_case as u32, &got, want),
+            Err(e) => error_result(&name, total, &e),
+        }
+    }
+
+    /// `check_bytes` for word-shaped IO; `wpc` is output words per case.
+    #[allow(clippy::too_many_arguments)]
+    async fn check_as(
+        &self,
+        g: &Gpu,
+        entry: &str,
+        name: String,
+        extra: &[(u32, &[u8])],
+        input: &[u32],
+        want: &[u32],
+        cases: usize,
+        wpc: usize,
+    ) -> EntryResult {
+        let (ib, wb) = (words_bytes(input), words_bytes(want));
+        self.check_bytes(g, entry, name, extra, &ib, &wb, cases, wpc * 4)
+            .await
+    }
+
+    async fn check(
+        &self,
+        g: &Gpu,
+        entry: &str,
+        input: &[u32],
+        want: &[u32],
+        cases: usize,
+        wpc: usize,
+    ) -> EntryResult {
+        self.check_as(g, entry, entry.to_string(), &[], input, want, cases, wpc)
+            .await
     }
 }
 
@@ -365,12 +402,6 @@ fn gen_block(st: &mut u64, strategy: usize, out: &mut [u8]) {
                 *b = byte(st);
             }
         }
-        1 => {
-            let px = [byte(st), byte(st), byte(st), byte(st)];
-            for i in 0..16 {
-                out[i * 4..i * 4 + 4].copy_from_slice(&px);
-            }
-        }
         2 => {
             let a = [byte(st), byte(st), byte(st), 255];
             let b = [byte(st), byte(st), byte(st), 255];
@@ -419,20 +450,21 @@ fn gen_block(st: &mut u64, strategy: usize, out: &mut [u8]) {
                 out[i * 4 + 3] = 255;
             }
         }
-        7 => {
-            let px = [byte(st), byte(st), byte(st), 255];
+        s => {
+            let px = [
+                byte(st),
+                byte(st),
+                byte(st),
+                if s == 1 { byte(st) } else { 255 },
+            ];
             for i in 0..16 {
                 out[i * 4..i * 4 + 4].copy_from_slice(&px);
             }
-        }
-        _ => {
-            let px = [byte(st), byte(st), byte(st), 255];
-            for i in 0..16 {
-                out[i * 4..i * 4 + 4].copy_from_slice(&px);
+            if s == 8 {
+                let j = (xs64(st) % 16) as usize;
+                out[j * 4] = out[j * 4].wrapping_add(40);
+                out[j * 4 + 3] = 200;
             }
-            let j = (xs64(st) % 16) as usize;
-            out[j * 4] = out[j * 4].wrapping_add(40);
-            out[j * 4 + 3] = 200;
         }
     }
 }
@@ -461,25 +493,30 @@ fn push_i32s(v: &mut Vec<u32>, s: &[i32]) {
     }
 }
 
+fn push_f32s(v: &mut Vec<u32>, s: &[f32]) {
+    for &f in s {
+        v.push(f.to_bits());
+    }
+}
+
+fn push_u64(v: &mut Vec<u32>, x: u64) {
+    v.push(x as u32);
+    v.push((x >> 32) as u32);
+}
+
 fn expected_const_words() -> Vec<u32> {
     let mut v = Vec::with_capacity(CONST_DUMP_WORDS);
     v.extend_from_slice(probe::weights2());
     v.extend_from_slice(probe::weights3());
     v.extend_from_slice(probe::weights4());
     for row in probe::weights2x() {
-        for f in row {
-            v.push(f.to_bits());
-        }
+        push_f32s(&mut v, &row);
     }
     for row in probe::weights3x() {
-        for f in row {
-            v.push(f.to_bits());
-        }
+        push_f32s(&mut v, &row);
     }
     for row in probe::weights4x() {
-        for f in row {
-            v.push(f.to_bits());
-        }
+        push_f32s(&mut v, &row);
     }
     for &b in probe::partition2().iter() {
         v.push(b as u32);
@@ -628,53 +665,26 @@ impl Harness {
         ];
         let mut input: Vec<u32> = Vec::new();
         let mut want: Vec<u32> = Vec::new();
-        let push64 = |w: &mut Vec<u32>, v: u64| {
-            w.push(v as u32);
-            w.push((v >> 32) as u32);
-        };
         for (i, &(a, b)) in pairs.iter().enumerate() {
             let f = fs[i % fs.len()];
             let sh = 1 + (i as u32) % 31;
-            input.extend_from_slice(&[
-                a as u32,
-                (a >> 32) as u32,
-                b as u32,
-                (b >> 32) as u32,
-                f.to_bits(),
-                sh,
-            ]);
-            push64(&mut want, a.wrapping_add(b));
-            push64(&mut want, a.saturating_add(b));
-            push64(&mut want, a.saturating_mul(b));
-            push64(&mut want, (a as u32 as u64) * (b as u32 as u64));
+            for v in [a, b] {
+                push_u64(&mut input, v);
+            }
+            input.push(f.to_bits());
+            input.push(sh);
+            push_u64(&mut want, a.wrapping_add(b));
+            push_u64(&mut want, a.saturating_add(b));
+            push_u64(&mut want, a.saturating_mul(b));
+            push_u64(&mut want, (a as u32 as u64) * (b as u32 as u64));
             want.push((a < b) as u32 | (((a <= b) as u32) << 1) | (((a == b) as u32) << 2));
-            push64(&mut want, a >> sh);
+            push_u64(&mut want, a >> sh);
             let conv = f as i64 as u64;
             assert!(conv < 1u64 << 31, "conv case {f} out of proven band");
             want.push(conv as u32);
         }
-        let out = vec![0u8; pairs.len() * 12 * 4];
-        let total = pairs.len() as u32;
-        match self
-            .run_kernel(
-                g,
-                "bc7_test_u64ops",
-                total,
-                0,
-                &[(4, &words_bytes(&input)), (3, &out)],
-                3,
-            )
+        self.check(g, "bc7_test_u64ops", &input, &want, pairs.len(), 12)
             .await
-        {
-            Ok(got) => compare(
-                "bc7_test_u64ops".into(),
-                total,
-                48,
-                &got,
-                &words_bytes(&want),
-            ),
-            Err(e) => error_result("bc7_test_u64ops", total, &e),
-        }
     }
 
     async fn entry_vecmath(&self, g: &Gpu) -> EntryResult {
@@ -755,26 +765,16 @@ impl Harness {
         let mut input: Vec<u32> = Vec::new();
         let mut want: Vec<u32> = Vec::new();
         for &(v, a, c, comp_bits, has_pbits, f, x) in &cases {
-            for q in v {
-                input.push(q.to_bits());
-            }
-            for q in a {
-                input.push(q.to_bits());
-            }
-            for q in c {
-                input.push(q as u32);
-            }
+            push_f32s(&mut input, &v);
+            push_f32s(&mut input, &a);
+            push_i32s(&mut input, &c);
             input.push(comp_bits);
             input.push(has_pbits as u32);
             input.push(f.to_bits());
             input.push(x as u32);
-            for q in probe::vec4f_normalize(v) {
-                want.push(q.to_bits());
-            }
+            push_f32s(&mut want, &probe::vec4f_normalize(v));
             want.push(probe::vec4f_dot(v, a).to_bits());
-            for q in probe::scale_color(c, comp_bits, has_pbits) {
-                want.push(q as u32);
-            }
+            push_i32s(&mut want, &probe::scale_color(c, comp_bits, has_pbits));
             want.push(probe::saturate(f).to_bits());
             want.push(probe::itrunc(f) as u32);
             want.push(probe::iabs32(x) as u32);
@@ -793,28 +793,8 @@ impl Harness {
                 want.push(0);
             }
         }
-        let out = vec![0u8; cases.len() * 16 * 4];
-        let total = cases.len() as u32;
-        match self
-            .run_kernel(
-                g,
-                "bc7_test_vecmath",
-                total,
-                0,
-                &[(4, &words_bytes(&input)), (3, &out)],
-                3,
-            )
+        self.check(g, "bc7_test_vecmath", &input, &want, cases.len(), 16)
             .await
-        {
-            Ok(got) => compare(
-                "bc7_test_vecmath".into(),
-                total,
-                64,
-                &got,
-                &words_bytes(&want),
-            ),
-            Err(e) => error_result("bc7_test_vecmath", total, &e),
-        }
     }
 }
 
@@ -857,36 +837,16 @@ impl Harness {
         let mut input: Vec<u32> = Vec::new();
         let mut want: Vec<u32> = Vec::new();
         for &(e1, e2, w, perc) in &cases {
-            for q in e1 {
-                input.push(q as u32);
-            }
-            for q in e2 {
-                input.push(q as u32);
-            }
+            push_i32s(&mut input, &e1);
+            push_i32s(&mut input, &e2);
             input.extend_from_slice(&w);
             input.push(perc as u32);
             input.extend_from_slice(&[0, 0, 0]);
             let d = host(e1, e2, perc, w);
             assert!(d < 1u64 << 31, "{entry}: host dist out of proven band");
-            want.push(d as u32);
-            want.push((d >> 32) as u32);
+            push_u64(&mut want, d);
         }
-        let out = vec![0u8; cases.len() * 2 * 4];
-        let total = cases.len() as u32;
-        match self
-            .run_kernel(
-                g,
-                entry,
-                total,
-                0,
-                &[(4, &words_bytes(&input)), (3, &out)],
-                3,
-            )
-            .await
-        {
-            Ok(got) => compare(entry.to_string(), total, 8, &got, &words_bytes(&want)),
-            Err(e) => error_result(entry, total, &e),
-        }
+        self.check(g, entry, &input, &want, cases.len(), 2).await
     }
 }
 
@@ -943,21 +903,19 @@ fn lsq_input_words(cases: &[(u32, u32, [i32; 16], [[i32; 4]; 16])]) -> Vec<u32> 
 impl Harness {
     async fn entry_lsq(&self, g: &Gpu, entry: &str, width: usize) -> EntryResult {
         let cases = lsq_cases();
-        let input = words_bytes(&lsq_input_words(&cases));
+        let input = lsq_input_words(&cases);
         let mut want: Vec<u32> = Vec::new();
         for &(n, tbl, sel, colors) in &cases {
             match entry {
                 "bc7_test_lsq_rgba" => {
                     let (xl, xh) = probe::lsq_rgba(n as usize, &sel, tbl as usize, &colors);
-                    for q in xl.iter().chain(xh.iter()) {
-                        want.push(q.to_bits());
-                    }
+                    push_f32s(&mut want, &xl);
+                    push_f32s(&mut want, &xh);
                 }
                 "bc7_test_lsq_rgb" => {
                     let (xl, xh) = probe::lsq_rgb(n as usize, &sel, tbl as usize, &colors);
-                    for q in xl.iter().chain(xh.iter()) {
-                        want.push(q.to_bits());
-                    }
+                    push_f32s(&mut want, &xl);
+                    push_f32s(&mut want, &xh);
                 }
                 _ => {
                     let (xl, xh) = probe::lsq_a(n as usize, &sel, tbl as usize, &colors);
@@ -966,21 +924,9 @@ impl Harness {
                 }
             }
         }
-        let out = vec![0u8; cases.len() * width * 4];
         let total = cases.len() as u32;
-        match self
-            .run_kernel(g, entry, total, 0, &[(4, &input), (3, &out)], 3)
+        self.check(g, entry, &input, &want, cases.len(), width)
             .await
-        {
-            Ok(got) => compare(
-                entry.to_string(),
-                total,
-                (width * 4) as u32,
-                &got,
-                &words_bytes(&want),
-            ),
-            Err(e) => error_result(entry, total, &e),
-        }
     }
 }
 
@@ -1067,23 +1013,12 @@ impl Harness {
         let mut want: Vec<u32> = Vec::with_capacity(cases.len() * 28);
         for c in &cases {
             input.push(c.num_pixels as u32);
-            for k in 0..4 {
-                input.push(c.color[k] as u32);
-            }
+            push_i32s(&mut input, &c.color);
             input.push(c.nsw);
             input.push(c.perceptual as u32);
             input.extend_from_slice(&c.weights);
-            for px in &c.pixels {
-                for &q in px {
-                    input.push(q as u32);
-                }
-            }
-            let rgba = [
-                c.color[0] as usize,
-                c.color[1] as usize,
-                c.color[2] as usize,
-                c.color[3] as usize,
-            ];
+            push_pixels(&mut input, &c.pixels);
+            let rgba = c.color.map(|q| q as usize);
             let (low, high, pbits, sel, err) = host(
                 c.nsw,
                 c.perceptual,
@@ -1092,35 +1027,15 @@ impl Harness {
                 c.num_pixels,
                 &c.pixels,
             );
-            for q in low {
-                want.push(q as u32);
-            }
-            for q in high {
-                want.push(q as u32);
-            }
+            push_i32s(&mut want, &low);
+            push_i32s(&mut want, &high);
             want.extend_from_slice(&pbits);
-            for q in sel {
-                want.push(q as u32);
-            }
-            want.push(err as u32);
-            want.push((err >> 32) as u32);
+            push_i32s(&mut want, &sel);
+            push_u64(&mut want, err);
         }
-        let out = vec![0u8; cases.len() * 28 * 4];
-        let total = cases.len() as u32;
-        match self
-            .run_kernel(
-                g,
-                entry,
-                total,
-                0,
-                &[(2, &opt_bytes), (4, &words_bytes(&input)), (3, &out)],
-                3,
-            )
+        let x = [(2, &opt_bytes[..])];
+        self.check_as(g, entry, name, &x, &input, &want, cases.len(), 28)
             .await
-        {
-            Ok(got) => compare(name, total, 112, &got, &words_bytes(&want)),
-            Err(e) => error_result(&name, total, &e),
-        }
     }
 
     async fn entry_fixdeg(&self, g: &Gpu) -> EntryResult {
@@ -1175,48 +1090,16 @@ impl Harness {
         for &(mode, iscale, tmin, tmax, xl, xh) in &cases {
             input.push(mode);
             input.push(iscale as u32);
-            for q in tmin {
-                input.push(q as u32);
-            }
-            for q in tmax {
-                input.push(q as u32);
-            }
-            for q in xl {
-                input.push(q.to_bits());
-            }
-            for q in xh {
-                input.push(q.to_bits());
-            }
+            push_i32s(&mut input, &tmin);
+            push_i32s(&mut input, &tmax);
+            push_f32s(&mut input, &xl);
+            push_f32s(&mut input, &xh);
             let (a, b) = probe::fix_degenerate(mode as usize, tmin, tmax, xl, xh, iscale);
-            for q in a {
-                want.push(q as u32);
-            }
-            for q in b {
-                want.push(q as u32);
-            }
+            push_i32s(&mut want, &a);
+            push_i32s(&mut want, &b);
         }
-        let out = vec![0u8; cases.len() * 8 * 4];
-        let total = cases.len() as u32;
-        match self
-            .run_kernel(
-                g,
-                "bc7_test_fixdeg",
-                total,
-                0,
-                &[(4, &words_bytes(&input)), (3, &out)],
-                3,
-            )
+        self.check(g, "bc7_test_fixdeg", &input, &want, cases.len(), 8)
             .await
-        {
-            Ok(got) => compare(
-                "bc7_test_fixdeg".into(),
-                total,
-                32,
-                &got,
-                &words_bytes(&want),
-            ),
-            Err(e) => error_result("bc7_test_fixdeg", total, &e),
-        }
     }
 }
 
@@ -1334,60 +1217,22 @@ impl Harness {
             input.push(c.init_err as u32);
             input.push((c.init_err >> 32) as u32);
             input.extend_from_slice(&c.weights);
-            for q in c.low {
-                input.push(q as u32);
-            }
-            for q in c.high {
-                input.push(q as u32);
-            }
+            push_i32s(&mut input, &c.low);
+            push_i32s(&mut input, &c.high);
             input.extend_from_slice(&c.pbits);
-            for px in pixels {
-                for &q in px {
-                    input.push(q as u32);
-                }
-            }
+            push_pixels(&mut input, pixels);
             let (ret, best, low, high, pbits, sel, seltmp) = probe::eval_solution(c, pixels);
             assert!(ret < 1u64 << 31, "evalsol: host total out of proven band");
-            want.push(ret as u32);
-            want.push((ret >> 32) as u32);
-            want.push(best as u32);
-            want.push((best >> 32) as u32);
-            for q in low {
-                want.push(q as u32);
-            }
-            for q in high {
-                want.push(q as u32);
-            }
+            push_u64(&mut want, ret);
+            push_u64(&mut want, best);
+            push_i32s(&mut want, &low);
+            push_i32s(&mut want, &high);
             want.extend_from_slice(&pbits);
-            for q in sel {
-                want.push(q as u32);
-            }
-            for q in seltmp {
-                want.push(q as u32);
-            }
+            push_i32s(&mut want, &sel);
+            push_i32s(&mut want, &seltmp);
         }
-        let out = vec![0u8; cases.len() * 46 * 4];
-        let total = cases.len() as u32;
-        match self
-            .run_kernel(
-                g,
-                "bc7_test_evalsol",
-                total,
-                0,
-                &[(4, &words_bytes(&input)), (3, &out)],
-                3,
-            )
+        self.check(g, "bc7_test_evalsol", &input, &want, cases.len(), 46)
             .await
-        {
-            Ok(got) => compare(
-                "bc7_test_evalsol".into(),
-                total,
-                184,
-                &got,
-                &words_bytes(&want),
-            ),
-            Err(e) => error_result("bc7_test_evalsol", total, &e),
-        }
     }
 }
 
@@ -1423,22 +1268,8 @@ impl Harness {
             input.push(b.to_bits());
             want.push((a / b).to_bits());
         }
-        let out = vec![0u8; cases.len() * 4];
-        let total = cases.len() as u32;
-        match self
-            .run_kernel(
-                g,
-                "bc7_test_div",
-                total,
-                0,
-                &[(4, &words_bytes(&input)), (3, &out)],
-                3,
-            )
+        self.check(g, "bc7_test_div", &input, &want, cases.len(), 1)
             .await
-        {
-            Ok(got) => compare("bc7_test_div".into(), total, 4, &got, &words_bytes(&want)),
-            Err(e) => error_result("bc7_test_div", total, &e),
-        }
     }
 }
 
@@ -1454,14 +1285,9 @@ fn push_ccp(input: &mut Vec<u32>, c: &probe::CCP) {
 }
 
 fn push_init(input: &mut Vec<u32>, init: &probe::CCInit) {
-    input.push(init.err as u32);
-    input.push((init.err >> 32) as u32);
-    for q in init.low {
-        input.push(q as u32);
-    }
-    for q in init.high {
-        input.push(q as u32);
-    }
+    push_u64(input, init.err);
+    push_i32s(input, &init.low);
+    push_i32s(input, &init.high);
     input.extend_from_slice(&init.pbits);
 }
 
@@ -1471,14 +1297,20 @@ fn push_ccout(want: &mut Vec<u32>, out: &probe::CCOut, ctx: &str) {
         *err < 1u64 << 31,
         "{ctx}: host err {err} out of proven band"
     );
-    want.push(*err as u32);
-    want.push((*err >> 32) as u32);
-    for q in low.iter().chain(high.iter()) {
-        want.push(*q as u32);
-    }
+    push_u64(want, *err);
+    push_i32s(want, low);
+    push_i32s(want, high);
     want.extend_from_slice(pbits);
-    for q in sel.iter().chain(seltmp.iter()) {
-        want.push(*q as u32);
+    push_i32s(want, sel);
+    push_i32s(want, seltmp);
+}
+
+fn init_none() -> probe::CCInit {
+    probe::CCInit {
+        err: u64::MAX,
+        low: [0; 4],
+        high: [0; 4],
+        pbits: [0, 0],
     }
 }
 
@@ -1644,12 +1476,7 @@ impl Harness {
                     c: mine_c,
                     lo,
                     hi,
-                    init: probe::CCInit {
-                        err: u64::MAX,
-                        low: [0; 4],
-                        high: [0; 4],
-                        pbits: [0, 0],
-                    },
+                    init: init_none(),
                     n: 16,
                     px,
                 });
@@ -1667,31 +1494,24 @@ impl Harness {
             input.push(e.n as u32);
             push_init(&mut input, &e.init);
             for arr in [e.lo[0], e.lo[1], e.hi[0], e.hi[1]] {
-                for q in arr {
-                    input.push(q as u32);
-                }
+                push_i32s(&mut input, &arr);
             }
             push_pixels(&mut input, &e.px);
             let out = probe::eval_4way(&e.c, e.lo, e.hi, &e.init, e.n, &e.px);
             push_ccout(&mut want, &out, "eval4way");
         }
         assert_eq!(input.len(), cases.len() * 104);
-        let out = vec![0u8; cases.len() * 44 * 4];
-        let total = cases.len() as u32;
-        match self
-            .run_kernel(
-                g,
-                "bc7_test_eval4way",
-                total,
-                0,
-                &[(4, &words_bytes(&input)), (3, &out)],
-                3,
-            )
-            .await
-        {
-            Ok(got) => compare(name, total, 176, &got, &words_bytes(&want)),
-            Err(e) => error_result(&name, total, &e),
-        }
+        self.check_as(
+            g,
+            "bc7_test_eval4way",
+            name,
+            &[],
+            &input,
+            &want,
+            cases.len(),
+            44,
+        )
+        .await
     }
 }
 
@@ -1786,12 +1606,7 @@ impl Harness {
                                 pbit_search,
                                 xl,
                                 xh,
-                                init: probe::CCInit {
-                                    err: u64::MAX,
-                                    low: [0; 4],
-                                    high: [0; 4],
-                                    pbits: [0, 0],
-                                },
+                                init: init_none(),
                                 n,
                                 px,
                             });
@@ -1822,39 +1637,17 @@ impl Harness {
             input.push(e.pbit_search as u32);
             input.push(e.n as u32);
             push_init(&mut input, &e.init);
-            for q in e.xl.iter().chain(e.xh.iter()) {
-                input.push(q.to_bits());
-            }
+            push_f32s(&mut input, &e.xl);
+            push_f32s(&mut input, &e.xh);
             push_pixels(&mut input, &e.px);
             let (ret, out) =
                 probe::find_optimal(e.mode, e.xl, e.xh, &e.c, e.pbit_search, &e.init, e.n, &e.px);
-            want.push(ret as u32);
-            want.push((ret >> 32) as u32);
+            push_u64(&mut want, ret);
             push_ccout(&mut want, &out, "findopt");
         }
         assert_eq!(input.len(), cases.len() * 98);
-        let out = vec![0u8; cases.len() * 46 * 4];
-        let total = cases.len() as u32;
-        match self
-            .run_kernel(
-                g,
-                "bc7_test_findopt",
-                total,
-                0,
-                &[(4, &words_bytes(&input)), (3, &out)],
-                3,
-            )
+        self.check(g, "bc7_test_findopt", &input, &want, cases.len(), 46)
             .await
-        {
-            Ok(got) => compare(
-                "bc7_test_findopt".into(),
-                total,
-                184,
-                &got,
-                &words_bytes(&want),
-            ),
-            Err(e) => error_result("bc7_test_findopt", total, &e),
-        }
     }
 
     async fn entry_ccc(&self, g: &Gpu) -> EntryResult {
@@ -1964,27 +1757,18 @@ impl Harness {
             }
         }
         assert_eq!(input.len(), total * 82);
-        let out = vec![0u8; total * 44 * 4];
-        match self
-            .run_kernel(
-                g,
-                "bc7_test_ccc",
-                total as u32,
-                0,
-                &[(2, &opt_bytes), (4, &words_bytes(&input)), (3, &out)],
-                3,
-            )
-            .await
-        {
-            Ok(got) => compare(
-                "bc7_test_ccc".into(),
-                total as u32,
-                176,
-                &got,
-                &words_bytes(&want),
-            ),
-            Err(e) => error_result("bc7_test_ccc", total as u32, &e),
-        }
+        let x = [(2, &opt_bytes[..])];
+        self.check_as(
+            g,
+            "bc7_test_ccc",
+            "bc7_test_ccc".into(),
+            &x,
+            &input,
+            &want,
+            total,
+            44,
+        )
+        .await
     }
 }
 
@@ -1992,21 +1776,18 @@ impl Harness {
     async fn entry_classify(&self, g: &Gpu) -> EntryResult {
         let (blocks, want) = classify_cases();
         let buf: Vec<u8> = blocks.concat();
-        let out = vec![0u8; blocks.len() * 4];
-        let total = blocks.len() as u32;
-        match self
-            .run_kernel(g, "bc7_test_classify", total, 0, &[(4, &buf), (3, &out)], 3)
-            .await
-        {
-            Ok(got) => compare(
-                "bc7_test_classify".into(),
-                total,
-                4,
-                &got,
-                &words_bytes(&want),
-            ),
-            Err(e) => error_result("bc7_test_classify", total, &e),
-        }
+        let n = "bc7_test_classify";
+        self.check_bytes(
+            g,
+            n,
+            n.into(),
+            &[],
+            &buf,
+            &words_bytes(&want),
+            blocks.len(),
+            4,
+        )
+        .await
     }
 }
 
@@ -2161,21 +1942,10 @@ impl Harness {
             push_case(&mut input, &mut want, cr, cg, cb, ca);
             total += 1;
         }
-        let out = vec![0u8; total * 16];
-        match self
-            .run_kernel(
-                g,
-                "bc7_test_solid",
-                total as u32,
-                0,
-                &[(2, &opt_bytes), (4, &words_bytes(&input)), (3, &out)],
-                3,
-            )
+        let x = [(2, &opt_bytes[..])];
+        let n = "bc7_test_solid";
+        self.check_bytes(g, n, n.into(), &x, &words_bytes(&input), &want, total, 16)
             .await
-        {
-            Ok(got) => compare("bc7_test_solid".into(), total as u32, 16, &got, &want),
-            Err(e) => error_result("bc7_test_solid", total as u32, &e),
-        }
     }
 
     async fn entry_est_partition(&self, g: &Gpu) -> EntryResult {
@@ -2185,22 +1955,15 @@ impl Harness {
         let mut st = 0xe57a_7e5e_ed06_0001u64;
         let blocks_px = est_blocks(&mut st);
         let mut grand_total = 0u32;
+        let zc = |input: &mut Vec<u32>, op: u32, mode: u32, ms: i32, px: &[[i32; 4]; 16]| {
+            push_est_case(input, op, mode, [0; 4], false, 0, ms, &[0; 16], px)
+        };
         for (vi, cp) in variants.iter().enumerate() {
             let mut input: Vec<u32> = Vec::new();
             let mut want: Vec<u32> = Vec::new();
             let mut total = 0usize;
             for mode in [0usize, 1, 2, 3, 6, 7] {
-                push_est_case(
-                    &mut input,
-                    4,
-                    mode as u32,
-                    [0; 4],
-                    false,
-                    0,
-                    0,
-                    &[0; 16],
-                    &blocks_px[0],
-                );
+                zc(&mut input, 4, mode as u32, 0, &blocks_px[0]);
                 let (w, nsw, tbl, perc) = probe::est_params(mode, cp);
                 want.extend_from_slice(&w);
                 want.push(nsw);
@@ -2211,17 +1974,7 @@ impl Harness {
             }
             for mode in [0usize, 1, 2, 3, 7] {
                 for px in &blocks_px {
-                    push_est_case(
-                        &mut input,
-                        2,
-                        mode as u32,
-                        [0; 4],
-                        false,
-                        0,
-                        0,
-                        &[0; 16],
-                        px,
-                    );
+                    zc(&mut input, 2, mode as u32, 0, px);
                     want.push(probe::estimate_partition(mode, cp, px));
                     want.extend([0u32; 24]);
                     total += 1;
@@ -2233,17 +1986,7 @@ impl Harness {
                         continue;
                     }
                     for px in blocks_px.iter().step_by(3) {
-                        push_est_case(
-                            &mut input,
-                            3,
-                            mode as u32,
-                            [0; 4],
-                            false,
-                            0,
-                            ms,
-                            &[0; 16],
-                            px,
-                        );
+                        zc(&mut input, 3, mode as u32, ms, px);
                         push_sol_list(&mut want, &probe::estimate_partition_list(mode, cp, ms, px));
                         total += 1;
                     }
@@ -2287,31 +2030,18 @@ impl Harness {
             assert_eq!(want.len(), total * 25);
             grand_total += total as u32;
             let pbytes = words_bytes(&params_words(cp));
-            let out = vec![0u8; total * 25 * 4];
-            let r = match self
-                .run_kernel(
+            let r = self
+                .check_as(
                     g,
                     "bc7_test_est_partition",
-                    total as u32,
-                    0,
-                    &[(1, &pbytes), (4, &words_bytes(&input)), (3, &out)],
-                    3,
-                )
-                .await
-            {
-                Ok(got) => compare(
                     format!("bc7_test_est_partition[variant {vi}]"),
-                    total as u32,
-                    100,
-                    &got,
-                    &words_bytes(&want),
-                ),
-                Err(e) => error_result(
-                    &format!("bc7_test_est_partition[variant {vi}]"),
-                    total as u32,
-                    &e,
-                ),
-            };
+                    &[(1, &pbytes)],
+                    &input,
+                    &want,
+                    total,
+                    25,
+                )
+                .await;
             if !r.pass {
                 return r;
             }
@@ -2383,27 +2113,18 @@ impl Harness {
             assert_eq!(want.len(), total * 106);
             grand_total += total as u32;
             let pbytes = words_bytes(&params_words(cp));
-            let out = vec![0u8; total * 106 * 4];
-            let r = match self
-                .run_kernel(
+            let r = self
+                .check_as(
                     g,
                     "bc7_test_plans",
-                    total as u32,
-                    0,
-                    &[(1, &pbytes), (4, &words_bytes(&input)), (3, &out)],
-                    3,
-                )
-                .await
-            {
-                Ok(got) => compare(
                     format!("bc7_test_plans[variant {vi}]"),
-                    total as u32,
-                    424,
-                    &got,
-                    &words_bytes(&want),
-                ),
-                Err(e) => error_result(&format!("bc7_test_plans[variant {vi}]"), total as u32, &e),
-            };
+                    &[(1, &pbytes)],
+                    &input,
+                    &want,
+                    total,
+                    106,
+                )
+                .await;
             if !r.pass {
                 return r;
             }
