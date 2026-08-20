@@ -7,6 +7,10 @@ let
   abgenRoot = ''export ABGEN_ROOT="$PWD"'';
 
   archIndependent = {
+    # The wasm toolchain + registry closure, exposed so the pipeline's deps
+    # stage can build and cache it before any source-keyed work starts.
+    wasm-deps = wasmCheck.cargoArtifacts;
+
     fmt = craneLib.cargoFmt {
       inherit (commonArgs) pname version src;
     };
@@ -25,6 +29,11 @@ let
   };
 
   archDependent = {
+    # The crane dependency closure as a first-class attr: the pipeline's
+    # deps stage builds exactly this, then publishes the binary cache, so a
+    # failure in any later stage never costs the next run its warm deps.
+    deps = cargoArtifacts;
+
     nextest = craneLib.cargoNextest (withArtifacts // {
       doCheck = true;
       __darwinAllowLocalNetworking = true;
@@ -67,6 +76,8 @@ let
     });
   };
 in
+# Arch-independent checks ride the aarch64 lane: those runners are ~1.8x
+# faster per stage, which rebalances the two pipelines' critical paths.
 archDependent
 // lib.optionalAttrs (system != "x86_64-linux") lambdaTests
-// lib.optionalAttrs (system == "x86_64-linux") archIndependent
+// lib.optionalAttrs (system == "aarch64-linux") archIndependent
