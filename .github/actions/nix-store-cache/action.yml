@@ -10,6 +10,15 @@ description: >
   save action. runner.arch is part of the key so x86_64 and aarch64 stores
   never cross.
 
+inputs:
+  flavor:
+    description: >
+      Which deps closure this job consumes (build = release-profile deps;
+      checkfast = the test-lane profile). Separate entries per flavor keep
+      the first-save-wins race from caching one flavor's closure under the
+      other's key.
+    default: build
+
 runs:
   using: composite
   steps:
@@ -49,8 +58,8 @@ runs:
       id: restore
       with:
         path: /var/tmp/abgen-nixcache
-        key: nix-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'Cargo.lock', '**/Cargo.toml', 'flake.nix', 'rust-toolchain.toml', 'nix/*.nix', 'crate/abgen-wasm/toolchain/flake.lock', 'crate/abgen-wasm/toolchain/flake.nix') }}
-        restore-keys: nix-v3-${{ runner.os }}-${{ runner.arch }}-
+        key: nix-v4-${{ runner.os }}-${{ runner.arch }}-${{ inputs.flavor }}-${{ hashFiles('flake.lock', 'Cargo.lock', '**/Cargo.toml', 'flake.nix', 'rust-toolchain.toml', 'nix/*.nix', 'crate/abgen-wasm/toolchain/flake.lock', 'crate/abgen-wasm/toolchain/flake.nix') }}
+        restore-keys: nix-v4-${{ runner.os }}-${{ runner.arch }}-${{ inputs.flavor }}-
 
     - name: expose cache facts to the save action
       shell: bash

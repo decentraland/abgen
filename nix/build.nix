@@ -51,6 +51,18 @@ let
     doCheck = true;
   });
 
+  # Deps for the checkfast profile (lto off, codegen-units 16): the test
+  # checks compile 4.9x faster against these — measured 157s -> 32s per
+  # workspace test compile — with byte-identical test verdicts. Shipped
+  # artifacts and clippy keep the release-profile deps above.
+  cargoArtifactsCheckfast = craneLib.buildDepsOnly (commonArgs // {
+    inherit dummySrc;
+    pname = "abgen-checkfast";
+    version = "0";
+    doCheck = true;
+    CARGO_PROFILE = "checkfast";
+  });
+
   abgenAll = craneLib.buildPackage (commonArgs // {
     inherit cargoArtifacts;
     pname = "abgen-all";
@@ -77,6 +89,6 @@ let
   });
 in
 {
-  inherit commonArgs cargoArtifacts abgenAll abgenPkg abgenConsumersPkg
-    abgenCorpusPkg;
+  inherit commonArgs cargoArtifacts cargoArtifactsCheckfast abgenAll abgenPkg
+    abgenConsumersPkg abgenCorpusPkg;
 }

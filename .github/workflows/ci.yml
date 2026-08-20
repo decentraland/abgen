@@ -208,10 +208,11 @@ jobs:
           - lane: x86 nextest
             runner: ubuntu-24.04
             system: x86_64-linux
-            deps: .#checks.x86_64-linux.deps
+            deps: .#checks.x86_64-linux.deps-checkfast
             attrs: nextest
             gate: run_crate
             marker: x86-nextest
+            flavor: checkfast
           - lane: x86 build + smoke
             runner: ubuntu-24.04
             system: x86_64-linux
@@ -222,17 +223,19 @@ jobs:
           - lane: arm nextest
             runner: ubuntu-24.04-arm
             system: aarch64-linux
-            deps: .#checks.aarch64-linux.deps
+            deps: .#checks.aarch64-linux.deps-checkfast
             attrs: nextest
             gate: run_crate
             marker: arm-nextest
+            flavor: checkfast
           - lane: arm lambda + smoke
             runner: ubuntu-24.04-arm
             system: aarch64-linux
-            deps: .#checks.aarch64-linux.deps
+            deps: .#checks.aarch64-linux.deps-checkfast
             attrs: lambda-tests native-smoke
             gate: run_lambda
             marker: arm-lambda
+            flavor: checkfast
           - lane: arm lints
             runner: ubuntu-24.04-arm
             system: aarch64-linux
@@ -253,6 +256,8 @@ jobs:
       # silently a no-op.
       - uses: ./.github/actions/nix-store-cache
         if: needs.nix-gate.outputs[matrix.gate] == 'true' && needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
+        with:
+          flavor: ${{ matrix.flavor || 'build' }}
       - name: deps (dependency closures)
         if: needs.nix-gate.outputs[matrix.gate] == 'true' && needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
         run: nix build --no-link ${{ matrix.deps }}

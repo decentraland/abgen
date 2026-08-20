@@ -21,3 +21,12 @@ version = "0.17.1"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# Test-lane profile: identical semantics, none of the fat-LTO link cost.
+# Shipped artifacts keep [profile.release]; only the CI test checks and
+# local test runs use this. Parity is semantics, not codegen: encoder
+# outputs are optimization-independent.
+[profile.checkfast]
+inherits = "release"
+lto = "off"
+codegen-units = 16

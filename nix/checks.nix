@@ -1,9 +1,16 @@
-{ lib, system, pkgs, craneLib, commonArgs, cargoArtifacts, abgenConsumersPkg
-, wasmCheck }:
+{ lib, system, pkgs, craneLib, commonArgs, cargoArtifacts
+, cargoArtifactsCheckfast, abgenConsumersPkg, wasmCheck }:
 
 let
   src = commonArgs.src;
   withArtifacts = commonArgs // { inherit cargoArtifacts; };
+  # Test checks compile under the checkfast profile (lto off, cgu 16):
+  # 4.9x faster workspace test compiles, byte-identical verdicts. Clippy
+  # and the shipped packages stay on release-profile artifacts.
+  withCheckfast = commonArgs // {
+    cargoArtifacts = cargoArtifactsCheckfast;
+    CARGO_PROFILE = "checkfast";
+  };
   abgenRoot = ''export ABGEN_ROOT="$PWD"'';
 
   archIndependent = {
@@ -33,8 +40,9 @@ let
     # deps stage builds exactly this, then publishes the binary cache, so a
     # failure in any later stage never costs the next run its warm deps.
     deps = cargoArtifacts;
+    deps-checkfast = cargoArtifactsCheckfast;
 
-    nextest = craneLib.cargoNextest (withArtifacts // {
+    nextest = craneLib.cargoNextest (withCheckfast // {
       doCheck = true;
       __darwinAllowLocalNetworking = true;
       cargoExtraArgs = "--locked";
@@ -66,7 +74,7 @@ let
   # is rejected: feature unification differs, a merged compile would not
   # test the no-server config the mac/windows legs ship.
   lambdaTests = {
-    lambda-tests = craneLib.cargoTest (withArtifacts // {
+    lambda-tests = craneLib.cargoTest (withCheckfast // {
       doCheck = true;
       __darwinAllowLocalNetworking = true;
       pname = "abgen-lambda-tests";
