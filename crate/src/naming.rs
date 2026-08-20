@@ -1,5 +1,5 @@
 use crate::hashes::Sha256;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use std::collections::HashMap;
 
 pub const GLTF_EXTENSIONS: [&str; 2] = [".glb", ".gltf"];
@@ -328,6 +328,22 @@ pub fn compute_deps_digest(deps: &[(String, String)]) -> String {
     hex[..32].to_string()
 }
 
+/// Marker for a GLB dependency that is absent from the entity's deployed
+/// content. This is a static property of the deployment (a broken upload),
+/// not a conversion error: prod's pipeline skips such GLBs — no manifest
+/// entry, exit 0 — so callers must be able to tell this apart from real
+/// digest failures to keep exit-code parity (#59).
+#[derive(Debug)]
+pub struct DepNotDeployed;
+
+impl std::fmt::Display for DepNotDeployed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("glb dependency not deployed in this entity")
+    }
+}
+
+impl std::error::Error for DepNotDeployed {}
+
 pub fn deps_digest_for_glb(
     glb_bytes: &[u8],
     glb_file: &str,
@@ -350,23 +366,20 @@ pub fn deps_digest_for_glb(
                 let elsewhere = content_by_file
                     .keys()
                     .find(|k| k.rsplit('/').next() == Some(base));
-                return Err(match elsewhere {
-                    Some(other) => anyhow!(
+                let msg = match elsewhere {
+                    Some(other) => format!(
                         "dep \"{}\" -> \"{}\" not in entity content \
                          (but \"{}\" is deployed at \"{}\" — mis-pathed kit-pack asset; \
                          republish with the texture in the referenced folder)",
-                        uri,
-                        resolved,
-                        base,
-                        other
+                        uri, resolved, base, other
                     ),
-                    None => anyhow!(
+                    None => format!(
                         "dep \"{}\" -> \"{}\" not in entity content \
                          (texture not deployed in this entity)",
-                        uri,
-                        resolved
+                        uri, resolved
                     ),
-                });
+                };
+                return Err(anyhow::Error::new(DepNotDeployed).context(msg));
             }
         };
         let key = format!("{resolved}\0{h}");

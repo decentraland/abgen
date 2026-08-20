@@ -130,8 +130,46 @@ jobs:
   # Image artifacts are produced by the release workflow's build legs,
   # which start on the same push in parallel with all of this; publishing
   # is what gates on green, not building.
+  # Windows-gate pattern for the nix lanes: a PR pays only for the lanes
+  # its diff can affect. Pushes to main and schedules always run everything.
+  # crate  -> workspace tests/build (crate/, template/, roots, nix build wiring)
+  # lambda -> the lambda test config (also affected by crate/)
+  # lint   -> anything lintable at all (rust/nix/toml sources)
+  nix-gate:
+    name: nix gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run_crate: ${{ steps.decide.outputs.crate }}
+      run_lambda: ${{ steps.decide.outputs.lambda }}
+      run_lint: ${{ steps.decide.outputs.lint }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+      - id: decide
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            printf 'crate=true\nlambda=true\nlint=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base="${{ github.event.pull_request.base.sha }}"
+          changed() { ! git diff --quiet "$base"...HEAD -- "$@"; }
+          crate=false; lambda=false; lint=false
+          changed 'crate' 'template' 'Cargo.lock' 'Cargo.toml' \
+            'rust-toolchain.toml' 'nix/build.nix' 'flake.nix' 'flake.lock' \
+            '.config/nextest.toml' && crate=true
+          changed 'lambda' && lambda=true
+          # crate changes reach the lambda tests too (shared workspace).
+          [ "$crate" = "true" ] && lambda=true
+          changed '**/*.rs' '**/*.toml' 'nix' 'flake.nix' 'flake.lock' \
+            'ci/nix-checks.sh' && lint=true
+          printf 'crate=%s\nlambda=%s\nlint=%s\n' "$crate" "$lambda" "$lint" >> "$GITHUB_OUTPUT"
+          echo "crate=$crate lambda=$lambda lint=$lint"
+
   nix-ci:
     name: ${{ matrix.lane }}
+    needs: nix-gate
     strategy:
       fail-fast: false
       matrix:
@@ -139,48 +177,62 @@ jobs:
           # One workspace-scale compile per lane: nextest's test-target
           # build and abgen-all (behind native-smoke) each cost ~10 min on
           # 4 cores, so pairing them serialized the verdict. Wall time is
-          # the slowest single lane.
+          # the slowest single lane. `gate` names the nix-gate output that
+          # decides whether the lane runs for this diff.
           - lane: x86 nextest
             runner: ubuntu-24.04
             system: x86_64-linux
             deps: .#checks.x86_64-linux.deps
             attrs: nextest
+            gate: run_crate
           - lane: x86 build + smoke
             runner: ubuntu-24.04
             system: x86_64-linux
             deps: .#checks.x86_64-linux.deps
             attrs: native-smoke
+            gate: run_crate
           - lane: arm nextest
             runner: ubuntu-24.04-arm
             system: aarch64-linux
             deps: .#checks.aarch64-linux.deps
             attrs: nextest
+            gate: run_crate
           - lane: arm lambda + smoke
             runner: ubuntu-24.04-arm
             system: aarch64-linux
             deps: .#checks.aarch64-linux.deps
             attrs: lambda-tests native-smoke
+            gate: run_lambda
           - lane: arm lints
             runner: ubuntu-24.04-arm
             system: aarch64-linux
             deps: .#checks.aarch64-linux.deps .#checks.aarch64-linux.wasm-deps
             attrs: clippy fmt no-node-spawn wasm-check
+            gate: run_lint
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
+      - name: skip notice
+        if: needs.nix-gate.outputs[matrix.gate] != 'true'
+        run: echo "diff cannot affect this lane (${{ matrix.gate }}=false); skipping."
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        if: needs.nix-gate.outputs[matrix.gate] == 'true'
       # No standalone nix installer: the composite runs it with the
       # extra-conf this job needs; a prior bare install made that conf
       # silently a no-op.
       - uses: ./.github/actions/nix-store-cache
+        if: needs.nix-gate.outputs[matrix.gate] == 'true'
       - name: deps (dependency closures)
+        if: needs.nix-gate.outputs[matrix.gate] == 'true'
         run: nix build --no-link ${{ matrix.deps }}
       # Publish immediately and from any branch: the composite no-ops
       # unless the exact key is new, so this fires once per input rotation
       # (lanes sharing a key race; first save wins, the rest skip).
       - uses: ./.github/actions/nix-store-cache/save
+        if: needs.nix-gate.outputs[matrix.gate] == 'true'
         continue-on-error: true
       - name: checks (${{ matrix.attrs }})
+        if: needs.nix-gate.outputs[matrix.gate] == 'true'
         run: bash ci/nix-checks.sh ${{ matrix.system }} ${{ matrix.attrs }}
 
   node-addon:

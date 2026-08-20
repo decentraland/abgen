@@ -339,8 +339,6 @@ fn decode_cache_warm_encode_is_byte_identical() {
         "cache returns the decoded pixels"
     );
 
-    // A fresh decode after clearing must produce the same pixels, and the
-    // builder encode of cached vs fresh must be byte-identical.
     crate::decode_cache::clear();
     let fresh = super::texture::decode_source_image(&raw).expect("png decodes");
     assert!(!std::sync::Arc::ptr_eq(&warm, &fresh));

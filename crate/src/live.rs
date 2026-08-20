@@ -106,7 +106,11 @@ fn compute_deps_digests(
     content_by_file: &HashMap<String, String>,
     tolerant: bool,
     jobs: usize,
-) -> (HashMap<String, String>, Vec<(String, String, String)>) {
+) -> (
+    HashMap<String, String>,
+    std::collections::HashSet<String>,
+    Vec<(String, String, String)>,
+) {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -115,7 +119,7 @@ fn compute_deps_digests(
         .filter(|(hash, file)| is_convertible(file).0 && seen.insert(hash.clone()))
         .collect();
 
-    let slots: Vec<Mutex<Option<Result<String, String>>>> =
+    let slots: Vec<Mutex<Option<Result<String, (bool, String)>>>> =
         work.iter().map(|_| Mutex::new(None)).collect();
     let workers = jobs.clamp(1, work.len().max(1));
     let next = AtomicUsize::new(0);
@@ -129,23 +133,31 @@ fn compute_deps_digests(
                 let digest = content.fetch_mmap(hash).and_then(|bytes| {
                     naming::deps_digest_for_glb(&bytes, file, content_by_file, tolerant)
                 });
-                *slots[i].lock().unwrap() = Some(digest.map_err(|e| format!("{e:#}")));
+                *slots[i].lock().unwrap() = Some(digest.map_err(|e| {
+                    let undeployed = e.downcast_ref::<naming::DepNotDeployed>().is_some();
+                    (undeployed, format!("{e:#}"))
+                }));
             });
         }
     });
 
     let mut digests: HashMap<String, String> = HashMap::new();
+    let mut undeployed: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut warns: Vec<(String, String, String)> = Vec::new();
     for ((hash, file), slot) in work.iter().map(|w| (&w.0, &w.1)).zip(slots) {
         match slot.into_inner().unwrap() {
             Some(Ok(d)) => {
                 digests.insert(hash.clone(), d);
             }
-            Some(Err(e)) => warns.push((file.clone(), hash.clone(), e)),
+            Some(Err((true, e))) => {
+                undeployed.insert(hash.clone());
+                warns.push((file.clone(), hash.clone(), e));
+            }
+            Some(Err((false, e))) => warns.push((file.clone(), hash.clone(), e)),
             None => {}
         }
     }
-    (digests, warns)
+    (digests, undeployed, warns)
 }
 
 fn bounded_reserve<V>(map: &mut HashMap<String, V>, cap: usize, key: &str) {
@@ -174,6 +186,10 @@ pub(crate) struct EntityCtx {
     pub(crate) scan: EntityScan,
 
     deps_digests: HashMap<String, String>,
+    /// GLBs whose referenced textures are not deployed in the entity: prod
+    /// skips these (no manifest entry, exit 0), so they must not count as
+    /// conversion failures (#59).
+    undeployed_dep_glbs: std::collections::HashSet<String>,
 }
 
 pub struct Proxy {
@@ -369,14 +385,12 @@ impl Proxy {
         let content_by_file = scene.content_by_file();
         let scan = scan_entity(&self.content, &content_by_file, &self.uri_cache);
 
-        // Every digest parses its whole GLB; done serially this was most of
-        // the gap between fetch and the first build on large scenes.
         let digest_items: Vec<(String, String)> = scene
             .content
             .iter()
             .map(|c| (c.hash.clone(), c.file.clone()))
             .collect();
-        let (deps_digests, digest_warns) = compute_deps_digests(
+        let (deps_digests, undeployed_dep_glbs, digest_warns) = compute_deps_digests(
             &self.content,
             &digest_items,
             &content_by_file,
@@ -401,6 +415,7 @@ impl Proxy {
             content_by_file,
             scan,
             deps_digests,
+            undeployed_dep_glbs,
         });
         let mut g = self.entities.lock().unwrap();
         bounded_reserve(&mut g, self.entity_cap, cid);
@@ -742,7 +757,6 @@ impl Proxy {
             return false;
         };
         let key = Self::asset_bundle_key(&self.version, file);
-        // Only S3-confirmed hits are written back; misses/errors fall through.
         let cache_key = self.reuse_cache_key(&key);
         if let Some(ck) = &cache_key {
             if crate::rediscache::hit(ck) {
@@ -887,6 +901,20 @@ impl Proxy {
             let bundle_name = if digest_naming {
                 match ctx.deps_digests.get(&c.hash) {
                     Some(d) => format!("{case_hash}_{d}_{platform}"),
+                    None if ctx.undeployed_dep_glbs.contains(&c.hash) => {
+                        // Broken deployment, not a conversion error: prod
+                        // skips these GLBs entirely (no manifest entry,
+                        // exit 0) — counting them as failed broke exit-code
+                        // parity on every scene carrying one (#59).
+                        tracing::warn!(
+                            entity = %cid,
+                            file = %c.file,
+                            hash = %c.hash,
+                            "glb references undeployed textures — skipped (prod parity)"
+                        );
+                        done_pre += 1;
+                        continue;
+                    }
                     None => {
                         tracing::error!(
                             entity = %cid,
@@ -1566,9 +1594,6 @@ mod tests {
         map.insert("a/mesh.bin".to_string(), "m1".to_string());
         map.insert("a/tex2.png".to_string(), "t2".to_string());
 
-        // Content order: gdup listed under two file names (first must win —
-        // the b/ variant cannot resolve its dep), one broken gltf (warning),
-        // one plain image (filtered out entirely).
         let items = vec![
             ("g1".to_string(), "a/one.gltf".to_string()),
             ("gdup".to_string(), "a/dup.gltf".to_string()),
@@ -1578,9 +1603,10 @@ mod tests {
             ("g2".to_string(), "a/two.gltf".to_string()),
         ];
 
-        let (d1, w1) = compute_deps_digests(&store, &items, &map, false, 1);
-        let (d8, w8) = compute_deps_digests(&store, &items, &map, false, 8);
+        let (d1, u1, w1) = compute_deps_digests(&store, &items, &map, false, 1);
+        let (d8, u8_, w8) = compute_deps_digests(&store, &items, &map, false, 8);
         assert_eq!(d1, d8);
+        assert_eq!(u1, u8_);
         assert_eq!(w1, w8);
         assert_eq!(d1.len(), 3);
         assert!(d1.contains_key("g1"));
@@ -1589,6 +1615,50 @@ mod tests {
         assert_eq!(w1.len(), 1);
         assert_eq!(w1[0].0, "a/broken.gltf");
         assert_eq!(w1[0].1, "gbroken");
+        assert!(u1.is_empty());
+    }
+
+    #[test]
+    fn undeployed_dep_glbs_classified_skipped_not_failed() {
+        let dir = temp_cache("deps-digest-undeployed");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = LocalContentStore::new(&dir);
+
+        store
+            .write(
+                "ghat",
+                b"{\"asset\":{\"version\":\"2.0\"},\"images\":[{\"uri\":\"missing-hat.png\"}]}",
+            )
+            .unwrap();
+        store
+            .write(
+                "gok",
+                b"{\"asset\":{\"version\":\"2.0\"},\"images\":[{\"uri\":\"tex1.png\"}]}",
+            )
+            .unwrap();
+        store.write("gbroken", b"{not json").unwrap();
+
+        let mut map: HashMap<String, String> = HashMap::new();
+        map.insert("a/hat.gltf".to_string(), "ghat".to_string());
+        map.insert("a/ok.gltf".to_string(), "gok".to_string());
+        map.insert("a/broken.gltf".to_string(), "gbroken".to_string());
+        map.insert("a/tex1.png".to_string(), "t1".to_string());
+
+        let items = vec![
+            ("ghat".to_string(), "a/hat.gltf".to_string()),
+            ("gok".to_string(), "a/ok.gltf".to_string()),
+            ("gbroken".to_string(), "a/broken.gltf".to_string()),
+        ];
+
+        let (digests, undeployed, warns) = compute_deps_digests(&store, &items, &map, false, 2);
+        assert_eq!(digests.len(), 1);
+        assert!(digests.contains_key("gok"));
+        assert_eq!(
+            undeployed.into_iter().collect::<Vec<_>>(),
+            vec!["ghat".to_string()]
+        );
+        assert_eq!(warns.len(), 2);
     }
 
     #[test]
@@ -1613,8 +1683,6 @@ mod tests {
             ..Default::default()
         });
 
-        // Same oracle as the old inline check: source_image_decodes on the
-        // raw bytes.
         assert!(proxy.image_decode_ok("goodimg"));
         assert!(!proxy.image_decode_ok("badimg"));
         assert!(crate::builder::source_image_decodes(&png));
@@ -1622,14 +1690,11 @@ mod tests {
             b"not an image at all"
         ));
 
-        // Memoized: with every backing file gone, verdicts must survive.
         let _ = std::fs::remove_dir_all(proxy.cache_roots().0);
         let _ = std::fs::remove_dir_all(&local_dir);
         assert!(proxy.image_decode_ok("goodimg"));
         assert!(!proxy.image_decode_ok("badimg"));
 
-        // Fetch failure reads as "decodes" (not tolerated) and is NOT
-        // memoized: once the content appears, the real verdict wins.
         assert!(proxy.image_decode_ok("lateimg"));
         let local = LocalContentStore::new(&local_dir);
         local.write("lateimg", b"still not an image").unwrap();
