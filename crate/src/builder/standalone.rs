@@ -114,6 +114,7 @@ impl<'a> StandaloneTextureBuilder<'a> {
 
         let mut tex_pid: Option<i64> = None;
         if let Some(img) = &decoded {
+            let img: &RgbaImage = img;
             let (w, h) = img.dimensions();
             let container = detect_container(raw);
             let has_real_alpha = img.as_raw().iter().skip(3).step_by(4).any(|&a| a < 255);

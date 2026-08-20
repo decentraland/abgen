@@ -309,6 +309,58 @@ fn standalone_readable_is_decoupled_from_streaming() {
     }
 }
 
+#[test]
+fn decode_cache_warm_encode_is_byte_identical() {
+    crate::decode_cache::enable();
+    crate::decode_cache::clear();
+
+    let src = image::RgbaImage::from_fn(20, 14, |x, y| {
+        image::Rgba([
+            (x * 13) as u8,
+            (y * 29) as u8,
+            (x * y) as u8,
+            if (x + y) % 3 == 0 { 128 } else { 255 },
+        ])
+    });
+    let mut raw = Vec::new();
+    src.write_to(&mut std::io::Cursor::new(&mut raw), image::ImageFormat::Png)
+        .expect("png encode");
+
+    let (h0, m0, _, _) = crate::decode_cache::stats();
+    let cold = super::texture::decode_source_image(&raw).expect("png decodes");
+    let warm = super::texture::decode_source_image(&raw).expect("png decodes");
+    let (h1, m1, _, _) = crate::decode_cache::stats();
+    assert!(std::sync::Arc::ptr_eq(&cold, &warm), "warm decode is a hit");
+    assert_eq!(m1, m0 + 1, "exactly one real decode");
+    assert!(h1 > h0);
+    assert_eq!(
+        cold.as_raw(),
+        src.as_raw(),
+        "cache returns the decoded pixels"
+    );
+
+    // A fresh decode after clearing must produce the same pixels, and the
+    // builder encode of cached vs fresh must be byte-identical.
+    crate::decode_cache::clear();
+    let fresh = super::texture::decode_source_image(&raw).expect("png decodes");
+    assert!(!std::sync::Arc::ptr_eq(&warm, &fresh));
+    assert_eq!(fresh.as_raw(), warm.as_raw());
+
+    let prof = texprofile::standalone_texture_profile_named(
+        &texprofile::SourceImage {
+            width: 20,
+            height: 14,
+            container: "PNG".to_string(),
+            has_real_alpha: true,
+        },
+        2048,
+        None,
+    );
+    let (a, am) = encode_standalone_dxt5(&warm, &prof, None);
+    let (b, bm) = encode_standalone_dxt5(&fresh, &prof, None);
+    assert_eq!((a, am), (b, bm), "cached-image encode is byte-identical");
+}
+
 fn png_with_chunks(extra: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
     let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
     let mut push = |typ: &[u8; 4], body: &[u8]| {
