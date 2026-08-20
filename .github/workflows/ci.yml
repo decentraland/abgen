@@ -143,10 +143,36 @@ jobs:
       run_crate: ${{ steps.decide.outputs.crate }}
       run_lambda: ${{ steps.decide.outputs.lambda }}
       run_lint: ${{ steps.decide.outputs.lint }}
+      # Hash of every input the nix lanes actually consume. Pushes that
+      # leave it unchanged (hash-manifest records, workflow edits, docs)
+      # skip lanes that are already green for it, windows-marker style.
+      inputs_hash: ${{ steps.hash.outputs.h }}
+      skip_x86-nextest: ${{ steps.memo.outputs.m_x86-nextest }}
+      skip_x86-smoke: ${{ steps.memo.outputs.m_x86-smoke }}
+      skip_arm-nextest: ${{ steps.memo.outputs.m_arm-nextest }}
+      skip_arm-lambda: ${{ steps.memo.outputs.m_arm-lambda }}
+      skip_arm-lints: ${{ steps.memo.outputs.m_arm-lints }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           fetch-depth: 0
+      - id: hash
+        run: echo "h=${{ hashFiles('crate/**', 'lambda/**', 'template/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'flake.nix', 'flake.lock', 'nix/**', 'ci/nix-checks.sh', '.config/nextest.toml') }}" >> "$GITHUB_OUTPUT"
+      - id: memo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          H: ${{ steps.hash.outputs.h }}
+        run: |
+          keys="$(gh api "/repos/$GITHUB_REPOSITORY/actions/caches?key=nix-green-&per_page=100" \
+            --jq '.actions_caches[].key' 2>/dev/null || true)"
+          for lane in x86-nextest x86-smoke arm-nextest arm-lambda arm-lints; do
+            if printf '%s\n' "$keys" | grep -qx "nix-green-$lane-$H"; then
+              echo "m_$lane=true" >> "$GITHUB_OUTPUT"
+              echo "$lane: green marker for $H — skip"
+            else
+              echo "m_$lane=false" >> "$GITHUB_OUTPUT"
+            fi
+          done
       - id: decide
         run: |
           if [ "${{ github.event_name }}" != "pull_request" ]; then
@@ -185,55 +211,71 @@ jobs:
             deps: .#checks.x86_64-linux.deps
             attrs: nextest
             gate: run_crate
+            marker: x86-nextest
           - lane: x86 build + smoke
             runner: ubuntu-24.04
             system: x86_64-linux
             deps: .#checks.x86_64-linux.deps
             attrs: native-smoke
             gate: run_crate
+            marker: x86-smoke
           - lane: arm nextest
             runner: ubuntu-24.04-arm
             system: aarch64-linux
             deps: .#checks.aarch64-linux.deps
             attrs: nextest
             gate: run_crate
+            marker: arm-nextest
           - lane: arm lambda + smoke
             runner: ubuntu-24.04-arm
             system: aarch64-linux
             deps: .#checks.aarch64-linux.deps
             attrs: lambda-tests native-smoke
             gate: run_lambda
+            marker: arm-lambda
           - lane: arm lints
             runner: ubuntu-24.04-arm
             system: aarch64-linux
             deps: .#checks.aarch64-linux.deps .#checks.aarch64-linux.wasm-deps
             attrs: clippy fmt no-node-spawn wasm-check
             gate: run_lint
+            marker: arm-lints
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - name: skip notice
-        if: needs.nix-gate.outputs[matrix.gate] != 'true'
-        run: echo "diff cannot affect this lane (${{ matrix.gate }}=false); skipping."
+        if: needs.nix-gate.outputs[matrix.gate] != 'true' || needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] == 'true'
+        run: echo "skipping (gate=${{ needs.nix-gate.outputs[matrix.gate] }}, green-marker=${{ needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] }})"
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-        if: needs.nix-gate.outputs[matrix.gate] == 'true'
+        if: needs.nix-gate.outputs[matrix.gate] == 'true' && needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
       # No standalone nix installer: the composite runs it with the
       # extra-conf this job needs; a prior bare install made that conf
       # silently a no-op.
       - uses: ./.github/actions/nix-store-cache
-        if: needs.nix-gate.outputs[matrix.gate] == 'true'
+        if: needs.nix-gate.outputs[matrix.gate] == 'true' && needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
       - name: deps (dependency closures)
-        if: needs.nix-gate.outputs[matrix.gate] == 'true'
+        if: needs.nix-gate.outputs[matrix.gate] == 'true' && needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
         run: nix build --no-link ${{ matrix.deps }}
       # Publish immediately and from any branch: the composite no-ops
       # unless the exact key is new, so this fires once per input rotation
       # (lanes sharing a key race; first save wins, the rest skip).
       - uses: ./.github/actions/nix-store-cache/save
-        if: needs.nix-gate.outputs[matrix.gate] == 'true'
+        if: needs.nix-gate.outputs[matrix.gate] == 'true' && needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
         continue-on-error: true
       - name: checks (${{ matrix.attrs }})
-        if: needs.nix-gate.outputs[matrix.gate] == 'true'
+        if: needs.nix-gate.outputs[matrix.gate] == 'true' && needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
         run: bash ci/nix-checks.sh ${{ matrix.system }} ${{ matrix.attrs }}
+      - name: write green marker
+        if: needs.nix-gate.outputs[matrix.gate] == 'true' && needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
+        run: echo green > .nix-green-marker
+      # Identical inputs => identical verdict (the checks are hermetic),
+      # so a marker minted anywhere skips the lane everywhere. Lookup
+      # goes through the caches API, which sees every scope.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        if: needs.nix-gate.outputs[matrix.gate] == 'true' && needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
+        with:
+          path: .nix-green-marker
+          key: nix-green-${{ matrix.marker }}-${{ needs.nix-gate.outputs.inputs_hash }}
 
   node-addon:
     name: node addon
