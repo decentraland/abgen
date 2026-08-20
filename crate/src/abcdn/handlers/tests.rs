@@ -17,12 +17,7 @@ fn reason_header_helper_sets_taxonomy_values() {
     ] {
         let resp = super::with_reason((StatusCode::NOT_FOUND, "not found").into_response(), reason);
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            resp.headers()
-                .get(super::lodjit::REASON_HEADER)
-                .and_then(|v| v.to_str().ok()),
-            Some(reason)
-        );
+        assert_eq!(hdr(&resp, super::lodjit::REASON_HEADER), Some(reason));
     }
     assert_eq!(
         super::lodjit::invalid_lod_reason("LOD/2/scene_2_windows"),
@@ -41,35 +36,14 @@ fn is_ready_invariant_under_lod_jit_state() {
 
     let mk = |jit: LodJit| mk_lane_state_jit(&dir, None, None, "http://127.0.0.1:9", jit);
 
-    use crate::lodgen::simplify::SimplifierBackend;
     let base = "/tmp/abgen-handlers-ready-test";
-    let disabled = mk(LodJit::assemble(
-        false,
-        SimplifierBackend::Gltfpack,
-        None,
-        base,
-        600,
-        3600,
-        1,
-    ));
-    let missing_dep = mk(LodJit::assemble(
+    let disabled = mk(lane_jit(false, None, base));
+    let missing_dep = mk(lane_jit(
         true,
-        SimplifierBackend::Gltfpack,
         Some(Err(anyhow::anyhow!("gltfpack not found"))),
         base,
-        600,
-        3600,
-        1,
     ));
-    let enabled = mk(LodJit::assemble(
-        true,
-        SimplifierBackend::Gltfpack,
-        Some(Ok(PathBuf::from("/bin/true"))),
-        base,
-        600,
-        3600,
-        1,
-    ));
+    let enabled = mk(lane_jit(true, Some(Ok(PathBuf::from("/bin/true"))), base));
     assert!(!missing_dep.lod_jit.enabled);
     assert!(enabled.lod_jit.enabled);
 
@@ -179,16 +153,9 @@ async fn dispatch_local_serves_iss_manifest_route() {
     let path = format!("lods-unity/manifests/{sid}_InitialSceneState.json");
     let resp = super::dispatch_local(&state, &path, &Method::GET, &headers).await;
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(hdr(&resp, "Content-Type"), Some("application/json"));
     assert_eq!(
-        resp.headers()
-            .get("Content-Type")
-            .and_then(|v| v.to_str().ok()),
-        Some("application/json")
-    );
-    assert_eq!(
-        resp.headers()
-            .get("Cache-Control")
-            .and_then(|v| v.to_str().ok()),
+        hdr(&resp, "Cache-Control"),
         Some("private, max-age=0, no-cache")
     );
     let got = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -296,6 +263,49 @@ pub(super) fn lane_temp_dir(tag: &str) -> std::path::PathBuf {
     dir
 }
 
+fn hdr<'r>(resp: &'r axum::response::Response, name: &str) -> Option<&'r str> {
+    resp.headers().get(name).and_then(|v| v.to_str().ok())
+}
+
+fn lane_jit(
+    flag_on: bool,
+    gltfpack_probe: Option<anyhow::Result<std::path::PathBuf>>,
+    cache_base: &str,
+) -> super::super::lodjit::LodJit {
+    super::super::lodjit::LodJit::assemble(
+        flag_on,
+        crate::lodgen::simplify::SimplifierBackend::Gltfpack,
+        gltfpack_probe,
+        cache_base,
+        600,
+        3600,
+        1,
+    )
+}
+
+fn base_inner(
+    dir: &std::path::Path,
+    content_url: &str,
+    proxy: Option<std::sync::Arc<crate::live::Proxy>>,
+    jit: super::super::lodjit::LodJit,
+) -> super::super::state::AppStateInner {
+    super::super::state::AppStateInner::new(
+        dir.to_path_buf(),
+        crate::catalyst::CatalystClient::new(content_url),
+        std::collections::HashMap::new(),
+        proxy,
+        "http://c".to_string(),
+        true,
+        Vec::new(),
+        "v41".to_string(),
+        "date".to_string(),
+        "http://c".to_string(),
+        true,
+        jit,
+        crate::abcdn::state::IndexBuild::disabled(),
+    )
+}
+
 pub(super) fn mk_lane_state(
     dir: &std::path::Path,
     proxy: Option<std::sync::Arc<crate::live::Proxy>>,
@@ -317,21 +327,12 @@ fn mk_lane_state_content(
     worlds_content_url: Option<String>,
     content_url: &str,
 ) -> super::super::state::AppState {
-    use super::super::lodjit::LodJit;
     mk_lane_state_jit(
         dir,
         proxy,
         worlds_content_url,
         content_url,
-        LodJit::assemble(
-            false,
-            crate::lodgen::simplify::SimplifierBackend::Gltfpack,
-            None,
-            "/tmp/abgen-handlers-lane",
-            600,
-            3600,
-            1,
-        ),
+        lane_jit(false, None, "/tmp/abgen-handlers-lane"),
     )
 }
 
@@ -342,24 +343,8 @@ fn mk_lane_state_jit(
     content_url: &str,
     jit: super::super::lodjit::LodJit,
 ) -> super::super::state::AppState {
-    use super::super::state::AppStateInner;
     std::sync::Arc::new(
-        AppStateInner::new(
-            dir.to_path_buf(),
-            crate::catalyst::CatalystClient::new(content_url),
-            std::collections::HashMap::new(),
-            proxy,
-            "http://c".to_string(),
-            true,
-            Vec::new(),
-            "v41".to_string(),
-            "date".to_string(),
-            "http://c".to_string(),
-            true,
-            jit,
-            crate::abcdn::state::IndexBuild::disabled(),
-        )
-        .with_worlds_content_url(worlds_content_url),
+        base_inner(dir, content_url, proxy, jit).with_worlds_content_url(worlds_content_url),
     )
 }
 
@@ -375,31 +360,12 @@ fn mk_lane_state_upstream_with_proxy(
     upstream: String,
     proxy: Option<std::sync::Arc<crate::live::Proxy>>,
 ) -> super::super::state::AppState {
-    use super::super::lodjit::LodJit;
-    use super::super::state::AppStateInner;
     std::sync::Arc::new(
-        AppStateInner::new(
-            dir.to_path_buf(),
-            crate::catalyst::CatalystClient::new("http://127.0.0.1:9"),
-            std::collections::HashMap::new(),
+        base_inner(
+            dir,
+            "http://127.0.0.1:9",
             proxy,
-            "http://c".to_string(),
-            true,
-            Vec::new(),
-            "v41".to_string(),
-            "date".to_string(),
-            "http://c".to_string(),
-            true,
-            LodJit::assemble(
-                false,
-                crate::lodgen::simplify::SimplifierBackend::Gltfpack,
-                None,
-                "/tmp/abgen-handlers-lane",
-                600,
-                3600,
-                1,
-            ),
-            crate::abcdn::state::IndexBuild::disabled(),
+            lane_jit(false, None, "/tmp/abgen-handlers-lane"),
         )
         .with_dev_lanes(false, Some(upstream)),
     )
@@ -442,10 +408,7 @@ pub(super) async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
 }
 
 pub(super) fn reason_of(resp: &axum::response::Response) -> Option<String> {
-    resp.headers()
-        .get(super::lodjit::REASON_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
+    hdr(&resp, super::lodjit::REASON_HEADER).map(str::to_string)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -463,7 +426,7 @@ async fn lod_lane_reads_through_space_before_jit() {
     let resp = lane_get(&state, &format!("LOD/1/{sid}_1_windows")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        resp.headers().get("ETag").and_then(|v| v.to_str().ok()),
+        hdr(&resp, "ETag"),
         Some(format!("\"{sid}_1_windows\"").as_str())
     );
     assert_eq!(body_bytes(resp).await, b"LODBYTES");
@@ -503,12 +466,7 @@ async fn iss_lane_reads_through_space_and_reports_reason() {
     let path = format!("lods-unity/manifests/{sid}_InitialSceneState.json");
     let resp = lane_get(&state, &path).await;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers()
-            .get("Content-Type")
-            .and_then(|v| v.to_str().ok()),
-        Some("application/json")
-    );
+    assert_eq!(hdr(&resp, "Content-Type"), Some("application/json"));
     assert_eq!(body_bytes(resp).await, body);
     assert!(dir
         .join(sid)
@@ -603,10 +561,7 @@ async fn flat_lane_space_mirror_and_alias_rewrite() {
 
     let resp = lane_get(&state, "v41/Qmflatmirror_windows").await;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers().get("ETag").and_then(|v| v.to_str().ok()),
-        Some("\"Qmflatmirror_windows\"")
-    );
+    assert_eq!(hdr(&resp, "ETag"), Some("\"Qmflatmirror_windows\""));
     assert_eq!(body_bytes(resp).await, b"MIRROR");
     assert!(dir.join("Qmflatmirror_windows").is_file());
 
@@ -614,7 +569,7 @@ async fn flat_lane_space_mirror_and_alias_rewrite() {
     let resp = lane_get(&state, &format!("v41/{hash}_windows")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        resp.headers().get("ETag").and_then(|v| v.to_str().ok()),
+        hdr(&resp, "ETag"),
         Some(format!("\"{hash}_windows\"").as_str())
     );
     assert_eq!(body_bytes(resp).await, b"ALIAS");
@@ -633,7 +588,7 @@ async fn flat_lane_space_mirror_and_alias_rewrite() {
     .await;
     assert_eq!(local.status(), StatusCode::OK);
     assert_eq!(
-        local.headers().get("ETag").and_then(|v| v.to_str().ok()),
+        hdr(&local, "ETag"),
         Some(format!("\"{hash}_windows\"").as_str())
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -802,10 +757,7 @@ async fn shader_lane_materializes_vendored_and_strips_scene_id() {
 
     let plain = lane_get(&state, "v41/dcl/scene_ignore_windows").await;
     assert_eq!(plain.status(), StatusCode::OK);
-    assert_eq!(
-        plain.headers().get("ETag").and_then(|v| v.to_str().ok()),
-        Some("\"scene_ignore_windows\"")
-    );
+    assert_eq!(hdr(&plain, "ETag"), Some("\"scene_ignore_windows\""));
     let plain_body = body_bytes(plain).await;
     assert_eq!(plain_body, expect);
     assert!(dir.join("dcl").join("scene_ignore_windows").is_file());
@@ -878,10 +830,7 @@ async fn shader_lane_reads_lit_payload_from_space() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers().get("ETag").and_then(|v| v.to_str().ok()),
-        Some("\"lit_ignore_windows\"")
-    );
+    assert_eq!(hdr(&resp, "ETag"), Some("\"lit_ignore_windows\""));
     assert_eq!(body_bytes(resp).await, b"LITBYTES");
     assert!(dir
         .join("dcl")
@@ -1350,31 +1299,12 @@ async fn registry_records_pass_through_upstream_versions() {
     )]);
 
     let state: super::super::state::AppState = {
-        use super::super::lodjit::LodJit;
-        use super::super::state::AppStateInner;
         std::sync::Arc::new(
-            AppStateInner::new(
-                dir.to_path_buf(),
-                crate::catalyst::CatalystClient::new("http://127.0.0.1:9"),
-                std::collections::HashMap::new(),
+            base_inner(
+                &dir,
+                "http://127.0.0.1:9",
                 None,
-                "http://c".to_string(),
-                true,
-                Vec::new(),
-                "v41".to_string(),
-                "date".to_string(),
-                "http://c".to_string(),
-                true,
-                LodJit::assemble(
-                    false,
-                    crate::lodgen::simplify::SimplifierBackend::Gltfpack,
-                    None,
-                    "/tmp/abgen-handlers-lane",
-                    600,
-                    3600,
-                    1,
-                ),
-                crate::abcdn::state::IndexBuild::disabled(),
+                lane_jit(false, None, "/tmp/abgen-handlers-lane"),
             )
             .with_registry_state(Some(mk_registry_state(
                 &dir,
