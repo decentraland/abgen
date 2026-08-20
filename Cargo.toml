@@ -12,3 +12,12 @@ exclude = [
 
 [workspace.package]
 version = "0.17.0"
+
+# Whole-program LTO and a single codegen unit: the hot paths cross crate
+# boundaries (image/gltf decode -> abgen kernels -> lz4 pack), and the
+# per-texel kernels benefit from cross-CGU inlining. Costs link time on
+# every target, buys runtime. panic stays "unwind": catch_unwind is
+# per-asset isolation (glbscan, regen, bvwebgpu) and must keep working.
+[profile.release]
+lto = "fat"
+codegen-units = 1

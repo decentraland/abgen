@@ -9,6 +9,24 @@ pub(super) fn handle_opaque_block(
     let mut opt_results = OptResults::new();
     let mut best_err = u64::MAX;
 
+    // Scatter scratch for the 2-subset (modes 1/3) and 3-subset (modes 0/2)
+    // trial loops, zero-initialized once per block instead of once per trial:
+    // every trial rewrites the `0..st[s]` prefix it then reads, and every
+    // consumer is bounded by the `st[s]` it is handed, so stale tails from an
+    // earlier trial are never observed.
+    let mut sc2 = [[ColorI::default(); 16]; 2];
+    let mut spi2 = [[0usize; 16]; 2];
+    let mut ssel2 = [[0i32; 16]; 2];
+    let mut slow2 = [ColorI::default(); 2];
+    let mut shigh2 = [ColorI::default(); 2];
+    let mut spb2 = [[0u32; 2]; 2];
+    let mut sc3 = [[ColorI::default(); 16]; 3];
+    let mut spi3 = [[0usize; 16]; 3];
+    let mut ssel3 = [[0i32; 16]; 3];
+    let mut slow3 = [ColorI::default(); 3];
+    let mut shigh3 = [ColorI::default(); 3];
+    let mut spb3 = [[0u32; 2]; 3];
+
     if cp.use_mode[6] {
         let mut params = base.clone();
         params.psel_weights = &G_WEIGHTS4;
@@ -30,17 +48,19 @@ pub(super) fn handle_opaque_block(
         opt_results.selectors = results6.selectors;
     }
 
-    let mut solutions2: Vec<Solution> = Vec::new();
-    if cp.use_mode[1] || cp.use_mode[3] {
+    let single13 = Solution {
+        index: plan.part13,
+        err: 0,
+    };
+    let solutions2: &[Solution] = if cp.use_mode[1] || cp.use_mode[3] {
         if plan.use_list13 {
-            solutions2 = plan.list13.clone();
+            &plan.list13
         } else {
-            solutions2.push(Solution {
-                index: plan.part13,
-                err: 0,
-            });
+            std::slice::from_ref(&single13)
         }
-    }
+    } else {
+        &[]
+    };
     let num_solutions2 = solutions2.len();
 
     if cp.use_mode[1] {
@@ -53,18 +73,20 @@ pub(super) fn handle_opaque_block(
         params.endpoints_share_pbit = true;
         params.perceptual = cp.perceptual;
 
-        let run = |trial_partition: u32,
-                   best_err: &mut u64,
-                   opt: &mut OptResults,
-                   refine_force: bool| {
+        let mut run = |trial_partition: u32,
+                       best_err: &mut u64,
+                       opt: &mut OptResults,
+                       refine_force: bool| {
             let part = &G_PARTITION2[(trial_partition as usize) * 16..];
-            let mut sc = [[ColorI::default(); 16]; 2];
+            let (sc, spi, ssel, slow, shigh, spb) = (
+                &mut sc2,
+                &mut spi2,
+                &mut ssel2,
+                &mut slow2,
+                &mut shigh2,
+                &mut spb2,
+            );
             let mut st = [0usize; 2];
-            let mut spi = [[0usize; 16]; 2];
-            let mut ssel = [[0i32; 16]; 2];
-            let mut slow = [ColorI::default(); 2];
-            let mut shigh = [ColorI::default(); 2];
-            let mut spb = [[0u32; 2]; 2];
             for idx in 0..16 {
                 let pp = part[idx] as usize;
                 sc[pp][st[pp]] = pixels[idx];
@@ -116,13 +138,14 @@ pub(super) fn handle_opaque_block(
     }
 
     if cp.use_mode[0] {
-        let solutions3: Vec<Solution> = if plan.use_list0 {
-            plan.list0.clone()
+        let single0 = Solution {
+            index: plan.part0,
+            err: 0,
+        };
+        let solutions3: &[Solution] = if plan.use_list0 {
+            &plan.list0
         } else {
-            vec![Solution {
-                index: plan.part0,
-                err: 0,
-            }]
+            std::slice::from_ref(&single0)
         };
         let num_solutions3 = solutions3.len();
         let mut params = base.clone();
@@ -137,19 +160,21 @@ pub(super) fn handle_opaque_block(
         for si in 0..num_solutions3 {
             let best_partition0 = solutions3[si].index;
             let part = &G_PARTITION3[(best_partition0 as usize) * 16..];
-            let mut sc = [[ColorI::default(); 16]; 3];
+            let (sc, spi, ssel, slow, shigh, spb) = (
+                &mut sc3,
+                &mut spi3,
+                &mut ssel3,
+                &mut slow3,
+                &mut shigh3,
+                &mut spb3,
+            );
             let mut st = [0usize; 3];
-            let mut spi = [[0usize; 16]; 3];
             for idx in 0..16 {
                 let pp = part[idx] as usize;
                 sc[pp][st[pp]] = pixels[idx];
                 spi[pp][st[pp]] = idx;
                 st[pp] += 1;
             }
-            let mut ssel = [[0i32; 16]; 3];
-            let mut slow = [ColorI::default(); 3];
-            let mut shigh = [ColorI::default(); 3];
-            let mut spb = [[0u32; 2]; 3];
             let mut mode0_err = 0u64;
             let mut ok = true;
             for subset in 0..3 {
@@ -194,18 +219,20 @@ pub(super) fn handle_opaque_block(
         params.endpoints_share_pbit = false;
         params.perceptual = cp.perceptual;
 
-        let run = |trial_partition: u32,
-                   best_err: &mut u64,
-                   opt: &mut OptResults,
-                   refine_force: bool| {
+        let mut run = |trial_partition: u32,
+                       best_err: &mut u64,
+                       opt: &mut OptResults,
+                       refine_force: bool| {
             let part = &G_PARTITION2[(trial_partition as usize) * 16..];
-            let mut sc = [[ColorI::default(); 16]; 2];
+            let (sc, spi, ssel, slow, shigh, spb) = (
+                &mut sc2,
+                &mut spi2,
+                &mut ssel2,
+                &mut slow2,
+                &mut shigh2,
+                &mut spb2,
+            );
             let mut st = [0usize; 2];
-            let mut spi = [[0usize; 16]; 2];
-            let mut ssel = [[0i32; 16]; 2];
-            let mut slow = [ColorI::default(); 2];
-            let mut shigh = [ColorI::default(); 2];
-            let mut spb = [[0u32; 2]; 2];
             for idx in 0..16 {
                 let pp = part[idx] as usize;
                 sc[pp][st[pp]] = pixels[idx];
@@ -297,13 +324,14 @@ pub(super) fn handle_opaque_block(
     }
 
     if cp.use_mode[2] {
-        let solutions3: Vec<Solution> = if plan.use_list2 {
-            plan.list2.clone()
+        let single2 = Solution {
+            index: plan.part2,
+            err: 0,
+        };
+        let solutions3: &[Solution] = if plan.use_list2 {
+            &plan.list2
         } else {
-            vec![Solution {
-                index: plan.part2,
-                err: 0,
-            }]
+            std::slice::from_ref(&single2)
         };
         let num_solutions3 = solutions3.len();
         let mut params = base.clone();
@@ -318,18 +346,15 @@ pub(super) fn handle_opaque_block(
         for si in 0..num_solutions3 {
             let best_partition2 = solutions3[si].index;
             let part = &G_PARTITION3[(best_partition2 as usize) * 16..];
-            let mut sc = [[ColorI::default(); 16]; 3];
+            let (sc, spi, ssel, slow, shigh) =
+                (&mut sc3, &mut spi3, &mut ssel3, &mut slow3, &mut shigh3);
             let mut st = [0usize; 3];
-            let mut spi = [[0usize; 16]; 3];
             for idx in 0..16 {
                 let pp = part[idx] as usize;
                 sc[pp][st[pp]] = pixels[idx];
                 spi[pp][st[pp]] = idx;
                 st[pp] += 1;
             }
-            let mut ssel = [[0i32; 16]; 3];
-            let mut slow = [ColorI::default(); 3];
-            let mut shigh = [ColorI::default(); 3];
             let mut mode2_err = 0u64;
             let mut ok = true;
             for subset in 0..3 {
