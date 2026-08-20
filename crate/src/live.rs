@@ -46,6 +46,25 @@ fn is_convertible(file: &str) -> (bool, bool) {
     (is_glb, is_image)
 }
 
+/// Entity files a conversion actually emits bundles for: convertible by
+/// extension, minus the hashes upstream drops via `-skippedHashes`. Skipped
+/// files leave no manifest entry and no failure, matching the prod converter's
+/// output shape (an attempt that "merely" tolerates the failure would report
+/// exitCode 12 and carry extra names).
+fn convertible_entries<'a>(
+    scene: &'a Scene,
+    skipped_hashes: &std::collections::HashSet<String>,
+) -> Vec<&'a crate::catalyst::ContentEntry> {
+    scene
+        .content
+        .iter()
+        .filter(|c| {
+            let lf = c.file.to_lowercase();
+            CONVERTIBLE_EXTS.iter().any(|e| lf.ends_with(e)) && !skipped_hashes.contains(&c.hash)
+        })
+        .collect()
+}
+
 fn fetch_jobs() -> usize {
     static JOBS: OnceLock<usize> = OnceLock::new();
     *JOBS.get_or_init(|| {
@@ -640,6 +659,19 @@ impl Proxy {
         self.space.is_some()
     }
 
+    pub fn space_bucket(&self) -> Option<&str> {
+        self.space.as_ref()?.bucket.as_deref()
+    }
+
+    /// Bucket-scoped: a hit in one CDN bucket says nothing about another.
+    fn reuse_cache_key(&self, key: &str) -> Option<String> {
+        if !crate::rediscache::enabled() {
+            return None;
+        }
+        let bucket = self.space.as_ref()?.bucket.as_deref().unwrap_or("-");
+        Some(format!("abgen:hit:{bucket}:{key}"))
+    }
+
     fn space_get_timed(space: &crate::space::Space, key: &str) -> crate::Result<Option<Vec<u8>>> {
         let t = std::time::Instant::now();
         let r = space.get(key);
@@ -661,14 +693,9 @@ impl Proxy {
         r
     }
 
-    fn space_put_timed(
-        space: &crate::space::Space,
-        key: &str,
-        bytes: &[u8],
-        content_type: &str,
-    ) -> crate::Result<()> {
+    fn space_put_timed(space: &crate::space::Space, key: &str, bytes: &[u8]) -> crate::Result<()> {
         let t = std::time::Instant::now();
-        let r = space.put(key, bytes, content_type);
+        let r = space.put(key, bytes);
         let result = if r.is_ok() { "ok" } else { "error" };
         metrics::histogram!("abgen_space_request_duration_seconds", "op" => "put", "result" => result)
             .record(t.elapsed().as_secs_f64());
@@ -715,6 +742,13 @@ impl Proxy {
             return false;
         };
         let key = Self::asset_bundle_key(&self.version, file);
+        // Only S3-confirmed hits are written back; misses/errors fall through.
+        let cache_key = self.reuse_cache_key(&key);
+        if let Some(ck) = &cache_key {
+            if crate::rediscache::hit(ck) {
+                return true;
+            }
+        }
         let t = std::time::Instant::now();
         let r = space.head(&key);
         let result = match &r {
@@ -725,7 +759,14 @@ impl Proxy {
         metrics::histogram!("abgen_space_request_duration_seconds", "op" => "head", "result" => result)
             .record(t.elapsed().as_secs_f64());
         match r {
-            Ok(hit) => hit,
+            Ok(hit) => {
+                if hit {
+                    if let Some(ck) = &cache_key {
+                        crate::rediscache::mark(ck);
+                    }
+                }
+                hit
+            }
             Err(e) => {
                 metrics::counter!("abgen_space_errors_total", "op" => "head").increment(1);
                 tracing::warn!(key = %key, error = %format!("{e:#}"), "space probe failed; building locally");
@@ -746,14 +787,14 @@ impl Proxy {
         }
     }
 
-    pub fn space_put_key(&self, key: &str, bytes: &[u8], content_type: &str) {
+    pub fn space_put_key(&self, key: &str, bytes: &[u8]) {
         let Some(space) = self.space.as_ref() else {
             return;
         };
         if space.read_only {
             return;
         }
-        match Self::space_put_timed(space, key, bytes, content_type) {
+        match Self::space_put_timed(space, key, bytes) {
             Ok(()) => tracing::info!(key = %key, bytes = bytes.len(), "space put"),
             Err(e) => tracing::warn!(key = %key, error = %format!("{e:#}"), "space put failed"),
         }
@@ -779,11 +820,11 @@ impl Proxy {
         } else {
             Self::bundle_key(&self.version, cid, file)
         };
-        self.space_put_key(&key, bytes, "application/octet-stream");
+        self.space_put_key(&key, bytes);
     }
 
     pub fn space_put_manifest(&self, stem: &str, bytes: &[u8]) {
-        self.space_put_key(&format!("manifest/{stem}.json"), bytes, "application/json");
+        self.space_put_key(&format!("manifest/{stem}.json"), bytes);
     }
 
     pub fn date(&self) -> &str {
@@ -809,15 +850,16 @@ impl Proxy {
         let mut failed: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut collapsed_names: HashMap<String, String> = HashMap::new();
-        let total = ctx
-            .scene
-            .content
-            .iter()
-            .filter(|c| {
-                let lf = c.file.to_lowercase();
-                CONVERTIBLE_EXTS.iter().any(|e| lf.ends_with(e))
-            })
-            .count();
+        let skipped = ctx.scene.metadata_only_hashes();
+        let convertible = convertible_entries(&ctx.scene, &skipped);
+        if !skipped.is_empty() {
+            tracing::info!(
+                entity = %cid,
+                count = skipped.len(),
+                "metadata-only files dropped from conversion input"
+            );
+        }
+        let total = convertible.len();
         let _progress = ProgressGuard { proxy: self, cid };
 
         struct WorkItem {
@@ -832,11 +874,7 @@ impl Proxy {
         let mut work: Vec<WorkItem> = Vec::new();
         let mut order: usize = 0;
         let mut done_pre: usize = 0;
-        for c in &ctx.scene.content {
-            let lf = c.file.to_lowercase();
-            if !CONVERTIBLE_EXTS.iter().any(|e| lf.ends_with(e)) {
-                continue;
-            }
+        for c in &convertible {
             order += 1;
             let (is_glb, is_image) = is_convertible(&c.file);
             let case_hash = if platform == "mac" {
@@ -929,6 +967,12 @@ impl Proxy {
                         .unwrap()
                         .push((it.order, it.bundle_name.clone()));
                     if it.is_image && !self.image_decode_ok(&it.hash) {
+                        tracing::warn!(
+                            entity = %cid,
+                            file = %it.file,
+                            hash = %it.hash,
+                            "source image does not decode — bundle kept, exitCode will be non-zero"
+                        );
                         tolerated_a.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -1453,6 +1497,47 @@ mod tests {
     }
 
     #[test]
+    fn metadata_only_files_leave_the_conversion_input() {
+        let scene = Scene {
+            entity_id: "bafkentity".into(),
+            entity_type: "scene".into(),
+            pointers: vec![],
+            content: vec![
+                crate::catalyst::ContentEntry {
+                    file: "models/a.glb".into(),
+                    hash: "h_glb".into(),
+                },
+                crate::catalyst::ContentEntry {
+                    file: "tex/real.png".into(),
+                    hash: "h_tex".into(),
+                },
+                crate::catalyst::ContentEntry {
+                    file: "assets/autogenerated-thumbnail.png".into(),
+                    hash: "h_auto".into(),
+                },
+                crate::catalyst::ContentEntry {
+                    file: "assets/navmap.png".into(),
+                    hash: "h_navmap".into(),
+                },
+                crate::catalyst::ContentEntry {
+                    file: "bin/game.js".into(),
+                    hash: "h_js".into(),
+                },
+            ],
+            metadata: serde_json::json!({"display": {"navmapThumbnail": "assets/navmap.png"}}),
+        };
+        let skipped = scene.metadata_only_hashes();
+        let names: Vec<&str> = convertible_entries(&scene, &skipped)
+            .iter()
+            .map(|c| c.file.as_str())
+            .collect();
+        assert_eq!(names, vec!["models/a.glb", "tex/real.png"]);
+
+        let unfiltered = convertible_entries(&scene, &std::collections::HashSet::new());
+        assert_eq!(unfiltered.len(), 4);
+    }
+
+    #[test]
     fn deps_digests_parallel_matches_serial() {
         let dir = temp_cache("deps-digest-par");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1590,7 +1675,7 @@ mod tests {
             Some(&b"LODBYTES"[..])
         );
         assert_eq!(proxy.space_get_key("LOD/1/other_1_windows"), None);
-        proxy.space_put_key("v41/flatalias_windows", b"X", "application/octet-stream");
+        proxy.space_put_key("v41/flatalias_windows", b"X");
         let log = seen.lock().unwrap().clone();
         assert!(
             log.contains(&"PUT /v41/flatalias_windows".to_string()),
@@ -1599,7 +1684,7 @@ mod tests {
 
         let (host_ro, seen_ro) = super::stub::serve(vec![]);
         let ro = stub_proxy(&host_ro, true, "keys-ro");
-        ro.space_put_key("v41/never_windows", b"X", "application/octet-stream");
+        ro.space_put_key("v41/never_windows", b"X");
         assert!(seen_ro.lock().unwrap().is_empty());
     }
 

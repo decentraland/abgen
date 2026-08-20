@@ -1,6 +1,7 @@
 {
   "Records": [
     {
+      "messageId": "00000000-0000-0000-0000-000000000001",
       "body": "{\"entity\":{\"entityId\":\"bafkreidudwlm33df2wpqvv4amaiorhcdatp77gf57cf6vidz5hnfipx244\",\"authChain\":[]},\"contentServerUrls\":[\"https://peer.decentraland.org/content\"]}"
     }
   ]

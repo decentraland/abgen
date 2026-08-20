@@ -5,20 +5,50 @@ use abgen::live::Proxy;
 use anyhow::Result;
 use std::sync::Arc;
 
+/// Bucket+version-scoped so an `AB_VERSION` bump can't suppress reconversion;
+/// only verdicts read back from S3 are cached — never our own fail-soft uploads.
+pub fn converted_marker_key(
+    proxy: &Arc<Proxy>,
+    cfg: &Config,
+    entity_id: &str,
+    platform: &str,
+) -> Option<String> {
+    if !abgen::rediscache::enabled() {
+        return None;
+    }
+    let bucket = proxy.space_bucket()?;
+    Some(format!(
+        "abgen:converted:{bucket}:{}:{entity_id}_{platform}",
+        cfg.version
+    ))
+}
+
 pub fn platform_converted(
     proxy: &Arc<Proxy>,
     cfg: &Config,
     entity_id: &str,
     platform: &str,
 ) -> bool {
+    let marker = converted_marker_key(proxy, cfg, entity_id, platform);
+    if let Some(key) = &marker {
+        if abgen::rediscache::hit(key) {
+            return true;
+        }
+    }
     let Some(bytes) = proxy.space_get_manifest(&format!("{entity_id}_{platform}")) else {
         return false;
     };
     let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return false;
     };
-    json.get("exitCode").and_then(serde_json::Value::as_i64) == Some(0)
-        && json.get("version").and_then(serde_json::Value::as_str) == Some(cfg.version.as_str())
+    let converted = json.get("exitCode").and_then(serde_json::Value::as_i64) == Some(0)
+        && json.get("version").and_then(serde_json::Value::as_str) == Some(cfg.version.as_str());
+    if converted {
+        if let Some(key) = &marker {
+            abgen::rediscache::mark(key);
+        }
+    }
+    converted
 }
 
 pub fn publish(
@@ -132,15 +162,8 @@ fn upload_scene_sources(
                 continue;
             }
         };
-        let content_type = if file.ends_with(".js") {
-            "application/javascript"
-        } else if file.ends_with(".json") {
-            "application/json"
-        } else {
-            "application/octet-stream"
-        };
         let key = format!("{}/{}/{file}", cfg.version, outcome.entity_id);
-        proxy.space_put_key(&key, &bytes, content_type);
+        proxy.space_put_key(&key, &bytes);
         count += 1;
     }
     count

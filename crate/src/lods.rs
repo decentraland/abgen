@@ -435,6 +435,58 @@ pub fn s3_source_urls(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishedObject {
+    pub key: String,
+    pub path: PathBuf,
+}
+
+/// Space objects a generated LOD scene directory publishes, keyed the way the
+/// abcdn asks for them: bundles at `LOD/{level}/{file}` and the ISS descriptor
+/// at `lods-unity/manifests/{file}` — both unversioned, unlike asset bundles.
+/// Upload metadata (Content-Type/Cache-Control/Content-Encoding) is derived
+/// from the key by `space::object_headers`, not carried here.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn published_objects(scene_dir: &Path, levels: &[u32]) -> Vec<PublishedObject> {
+    let mut out: Vec<PublishedObject> = Vec::new();
+    for level in levels {
+        let dir = scene_dir.join("LOD").join(level.to_string());
+        for name in dir_file_names(&dir) {
+            out.push(PublishedObject {
+                key: format!("LOD/{level}/{name}"),
+                path: dir.join(&name),
+            });
+        }
+    }
+    for name in dir_file_names(scene_dir) {
+        let base = name.strip_suffix(".br").unwrap_or(&name);
+        if !base.ends_with(crate::lodgen::placements::ISS_SUFFIX) {
+            continue;
+        }
+        out.push(PublishedObject {
+            key: format!("lods-unity/manifests/{name}"),
+            path: scene_dir.join(&name),
+        });
+    }
+    out
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn dir_file_names(dir: &Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = rd
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|n| !n.contains(".tmp."))
+        .collect();
+    names.sort();
+    names
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     let mut tmp_os = path.as_os_str().to_owned();
     tmp_os.push(format!(".tmp.{}", std::process::id()));
@@ -631,5 +683,38 @@ mod tests {
         assert_eq!(urls.len(), 3);
         assert!(urls[0].ends_with("/-17,-21/LOD/Sources/1707776785658/bafkrei_0.fbx"));
         assert!(urls[2].ends_with("bafkrei_2.fbx"));
+    }
+
+    #[test]
+    fn published_objects_lists_bundles_and_iss_with_cdn_keys() {
+        let base = std::env::temp_dir().join(format!("lods-pub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let scene = base.join("bafkscene");
+        for level in [0u32, 1] {
+            std::fs::create_dir_all(scene.join("LOD").join(level.to_string())).unwrap();
+        }
+        std::fs::write(scene.join("LOD/0/bafkscene_0_windows"), b"a").unwrap();
+        std::fs::write(scene.join("LOD/0/bafkscene_0_windows.br"), b"b").unwrap();
+        std::fs::write(scene.join("LOD/1/bafkscene_1_mac"), b"c").unwrap();
+        std::fs::write(scene.join("LOD/1/bafkscene_1_mac.tmp.9"), b"d").unwrap();
+        std::fs::write(scene.join("bafkscene_InitialSceneState.json"), b"{}").unwrap();
+        std::fs::write(scene.join("bafkscene_InitialSceneState.json.br"), b"z").unwrap();
+        std::fs::write(scene.join("LOD.manifest.json"), b"{}").unwrap();
+
+        let objs = published_objects(&scene, &[0, 1]);
+        let keys: Vec<&str> = objs.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "LOD/0/bafkscene_0_windows",
+                "LOD/0/bafkscene_0_windows.br",
+                "LOD/1/bafkscene_1_mac",
+                "lods-unity/manifests/bafkscene_InitialSceneState.json",
+                "lods-unity/manifests/bafkscene_InitialSceneState.json.br",
+            ]
+        );
+        assert_eq!(objs[2].path, scene.join("LOD/1/bafkscene_1_mac"));
+        assert!(published_objects(&base.join("missing"), &[0, 1]).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

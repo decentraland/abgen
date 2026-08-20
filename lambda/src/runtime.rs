@@ -27,7 +27,15 @@ pub fn serve(
             }
         };
 
-        match handler(cfg, &event) {
+        let started = std::time::Instant::now();
+        let outcome = handler(cfg, &event);
+        let result = if outcome.is_ok() { "ok" } else { "error" };
+        metrics::counter!("abgen_lambda_invocations_total", "result" => result).increment(1);
+        metrics::histogram!("abgen_lambda_invocation_duration_seconds", "result" => result)
+            .record(started.elapsed().as_secs_f64());
+        crate::emf::flush();
+
+        match outcome {
             Ok(response) => {
                 let url =
                     format!("http://{api}/{API_VERSION}/runtime/invocation/{request_id}/response");

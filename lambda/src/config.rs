@@ -8,6 +8,8 @@ pub struct Config {
     pub out_root: PathBuf,
     pub keep_output: bool,
     pub allowed_content_server_hosts: Option<Vec<String>>,
+    pub http_secret: Option<String>,
+    pub lods_enabled: bool,
 }
 
 impl Config {
@@ -44,6 +46,10 @@ impl Config {
                         .collect::<Vec<_>>()
                 })
                 .filter(|v| !v.is_empty()),
+            http_secret: std::env::var("ABGEN_HTTP_SECRET")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            lods_enabled: abgen::clihelp::env_bool("ENABLE_LODS", false),
         }
     }
 }

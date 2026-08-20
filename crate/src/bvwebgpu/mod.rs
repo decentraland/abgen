@@ -229,13 +229,8 @@ impl crate::live::Proxy {
             self.space_put_key(
                 &format!("{BVW_PLATFORM}/{BVW_PROFILE}/{cid}.pack"),
                 &pack_bytes,
-                "application/octet-stream",
             );
-            self.space_put_key(
-                &format!("{BVW_PLATFORM}/{BVW_PROFILE}/{cid}.pack.br"),
-                &br,
-                "application/octet-stream",
-            );
+            self.space_put_key(&format!("{BVW_PLATFORM}/{BVW_PROFILE}/{cid}.pack.br"), &br);
         }
         tracing::info!(
             entity = %cid,

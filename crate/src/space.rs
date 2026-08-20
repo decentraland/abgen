@@ -116,6 +116,75 @@ fn parse_iso8601_epoch(s: &str) -> Option<u64> {
     u64::try_from(t).ok()
 }
 
+pub struct ObjectHeaders {
+    pub content_type: &'static str,
+    pub cache_control: &'static str,
+    /// `Some("br")` for `.br` keys — `@dcl/cdn-uploader` stamps
+    /// `ContentEncoding: 'br'` on every brotli variant it writes, and clients
+    /// (and the abcdn edge, `serve.rs`) rely on the header to decode.
+    pub content_encoding: Option<&'static str>,
+}
+
+/// Verbatim from what the production writers put on the same keys:
+/// content-addressed keys are immutable forever; `manifest/…` is rewritten in
+/// place on every rebuild so the origin must never let it be cached.
+///
+/// Two immutable spellings exist upstream, byte for byte: bundle-style keys go
+/// through `@dcl/cdn-uploader`, whose `cacheHeader()` joins directives with a
+/// bare comma, while scene source files are uploaded directly by
+/// `scenes/component.ts` with a comma-space string. The `.br` variant adds
+/// `no-transform` exactly where cdn-uploader does.
+///
+/// `lods-unity/manifests/…` is NOT a consumer-server manifest: its production
+/// writer is lod-generator-unity's storage adapter, which uploads every file
+/// with `CACHE_CONTROL_ONE_YEAR = 'public, max-age=31536000'` (the ISS
+/// descriptor file names embed the content-addressed entity id). The abcdn
+/// edge deliberately serves its JIT-regenerated copies no-cache; the S3
+/// objects match the production writer.
+const IMMUTABLE_BUNDLE: &str = "public,max-age=31536000,immutable";
+const IMMUTABLE_BUNDLE_BR: &str = "public,no-transform,max-age=31536000,immutable";
+const IMMUTABLE_SOURCE: &str = "public, max-age=31536000, immutable";
+const NO_CACHE: &str = "private, max-age=0, no-cache";
+const PUBLIC_ONE_YEAR: &str = "public, max-age=31536000";
+
+/// Single source of truth for the metadata every upload carries.
+pub fn object_headers(key: &str) -> ObjectHeaders {
+    let base = key.strip_suffix(".br").unwrap_or(key);
+    let is_br = base.len() != key.len();
+    let lower = base.to_ascii_lowercase();
+    let content_type = if lower.ends_with(".json") {
+        "application/json"
+    } else if lower.ends_with(".js") {
+        "application/javascript"
+    } else if lower.ends_with(".manifest") {
+        "text/cache-manifest"
+    } else if lower.ends_with(".pack") || lower.ends_with(".crdt") {
+        "application/octet-stream"
+    } else {
+        "application/wasm"
+    };
+    // cdn-uploader lane = the bundle output dir (wasm + .manifest files) and
+    // every `.br` sibling; the direct-upload lane is scene sources (.js/.json/
+    // .crdt) which upstream never brotli-compresses.
+    let uploader_lane = matches!(content_type, "application/wasm" | "text/cache-manifest");
+    let cache_control = if key.starts_with("manifest/") {
+        NO_CACHE
+    } else if key.starts_with("lods-unity/manifests/") {
+        PUBLIC_ONE_YEAR
+    } else if is_br {
+        IMMUTABLE_BUNDLE_BR
+    } else if uploader_lane {
+        IMMUTABLE_BUNDLE
+    } else {
+        IMMUTABLE_SOURCE
+    };
+    ObjectHeaders {
+        content_type,
+        cache_control,
+        content_encoding: is_br.then_some("br"),
+    }
+}
+
 fn warn_once_403(key: &str) {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
@@ -408,12 +477,13 @@ impl Space {
         }
     }
 
-    pub fn put(&self, key: &str, body: &[u8], content_type: &str) -> Result<()> {
+    pub fn put(&self, key: &str, body: &[u8]) -> Result<()> {
         if self.read_only {
             return Err(crate::anyhow!(
                 "space is read-only (ABGEN_S3_READ_ONLY): refusing PUT {key}"
             ));
         }
+        let headers = object_headers(key);
         let c = self.creds()?;
         let payload_hash = sha256_hex(body);
         let (date, amz) = timestamps();
@@ -424,7 +494,11 @@ impl Space {
             .header("x-amz-date", &amz)
             .header("x-amz-content-sha256", &payload_hash)
             .header("Authorization", &auth)
-            .header("Content-Type", content_type);
+            .header("Content-Type", headers.content_type)
+            .header("Cache-Control", headers.cache_control);
+        if let Some(encoding) = headers.content_encoding {
+            req = req.header("Content-Encoding", encoding);
+        }
         if let Some(token) = &c.session_token {
             req = req.header("x-amz-security-token", token);
         }
@@ -477,7 +551,7 @@ mod tests {
     #[test]
     fn read_only_put_refuses_without_network() {
         let s = test_space(true, None);
-        let err = s.put("k", b"x", "text/plain").unwrap_err();
+        let err = s.put("k", b"x").unwrap_err();
         assert!(err.to_string().contains("read-only"));
     }
 
@@ -528,12 +602,7 @@ mod tests {
             let mut s = test_space(false, token);
             s.scheme = "http".to_string();
             s.host = addr.to_string();
-            s.put(
-                "v41/cid/Qmhash_windows",
-                b"body",
-                "application/octet-stream",
-            )
-            .unwrap();
+            s.put("v41/cid/Qmhash_windows", b"body").unwrap();
             handle.join().unwrap();
             let head = captured.lock().unwrap().join("\n");
             let amz_sent: Vec<String> = head
@@ -562,6 +631,154 @@ mod tests {
             for h in &amz_sent {
                 assert!(signed.contains(&h.as_str()), "unsigned {h} in {auth}");
             }
+        }
+    }
+
+    #[test]
+    fn object_headers_match_production_ab_cdn() {
+        for (key, ct, cc, ce) in [
+            (
+                "v41/bafkScene/Qmhash_windows",
+                "application/wasm",
+                IMMUTABLE_BUNDLE,
+                None,
+            ),
+            (
+                "v41/assets/Qmhash_mac",
+                "application/wasm",
+                IMMUTABLE_BUNDLE,
+                None,
+            ),
+            (
+                "v41/dcl/scene_ignore_windows",
+                "application/wasm",
+                IMMUTABLE_BUNDLE,
+                None,
+            ),
+            (
+                "LOD/1/bafkscene_1_windows",
+                "application/wasm",
+                IMMUTABLE_BUNDLE,
+                None,
+            ),
+            (
+                "v41/bafkScene/Qmhash_windows.br",
+                "application/wasm",
+                IMMUTABLE_BUNDLE_BR,
+                Some("br"),
+            ),
+            (
+                "LOD/0/bafkscene_0_mac.br",
+                "application/wasm",
+                IMMUTABLE_BUNDLE_BR,
+                Some("br"),
+            ),
+            (
+                "manifest/bafkEntity_windows.json",
+                "application/json",
+                NO_CACHE,
+                None,
+            ),
+            // Production writer of this family is lod-generator-unity's
+            // storage adapter: CACHE_CONTROL_ONE_YEAR = 'public, max-age=31536000'.
+            (
+                "lods-unity/manifests/bafkscene_InitialSceneState.json",
+                "application/json",
+                PUBLIC_ONE_YEAR,
+                None,
+            ),
+            (
+                "lods-unity/manifests/bafkscene_InitialSceneState.json.br",
+                "application/json",
+                PUBLIC_ONE_YEAR,
+                Some("br"),
+            ),
+            (
+                "v41/bafkScene/scene.json",
+                "application/json",
+                IMMUTABLE_SOURCE,
+                None,
+            ),
+            (
+                "v41/bafkScene/bin/game.js",
+                "application/javascript",
+                IMMUTABLE_SOURCE,
+                None,
+            ),
+            (
+                "v41/bafkScene/main.crdt",
+                "application/octet-stream",
+                IMMUTABLE_SOURCE,
+                None,
+            ),
+            (
+                "bvwebgpu/p0/bafkScene.pack",
+                "application/octet-stream",
+                IMMUTABLE_SOURCE,
+                None,
+            ),
+            (
+                "bvwebgpu/p0/bafkScene.pack.br",
+                "application/octet-stream",
+                IMMUTABLE_BUNDLE_BR,
+                Some("br"),
+            ),
+            (
+                "v41/bafkScene/Qmhash_windows.manifest",
+                "text/cache-manifest",
+                IMMUTABLE_BUNDLE,
+                None,
+            ),
+        ] {
+            let h = object_headers(key);
+            assert_eq!(h.content_type, ct, "content type for {key}");
+            assert_eq!(h.cache_control, cc, "cache control for {key}");
+            assert_eq!(h.content_encoding, ce, "content encoding for {key}");
+        }
+    }
+
+    #[test]
+    fn put_sends_key_derived_content_type_and_cache_control() {
+        for (key, ct, cc, ce) in [
+            (
+                "v41/cid/Qmhash_windows",
+                "application/wasm",
+                IMMUTABLE_BUNDLE,
+                None,
+            ),
+            (
+                "manifest/cid_windows.json",
+                "application/json",
+                NO_CACHE,
+                None,
+            ),
+            // cdn-uploader stamps ContentEncoding: 'br' on every .br variant.
+            (
+                "LOD/1/bafkscene_1_windows.br",
+                "application/wasm",
+                IMMUTABLE_BUNDLE_BR,
+                Some("br"),
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let handle = capture_one_request(listener, captured.clone());
+            let mut s = test_space(false, None);
+            s.scheme = "http".to_string();
+            s.host = addr.to_string();
+            s.put(key, b"body").unwrap();
+            handle.join().unwrap();
+            let head = captured.lock().unwrap().join("\n");
+            let value = |name: &str| {
+                head.lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with(&format!("{name}:")))
+                    .and_then(|l| l.split_once(':'))
+                    .map(|(_, v)| v.trim().to_string())
+            };
+            assert_eq!(value("content-type").as_deref(), Some(ct), "{head}");
+            assert_eq!(value("cache-control").as_deref(), Some(cc), "{head}");
+            assert_eq!(value("content-encoding").as_deref(), ce, "{head}");
         }
     }
 

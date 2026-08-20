@@ -8,21 +8,45 @@ pub struct Job {
     pub force: bool,
 }
 
-pub fn jobs_from_event(event: &Value) -> Result<Vec<Job>> {
+pub struct Record {
+    /// `None` when the record carries no usable `messageId`; such a record can
+    /// never be named in a `batchItemFailures` entry.
+    pub message_id: Option<String>,
+    pub job: Result<Job>,
+}
+
+pub enum Event {
+    /// Direct invoke (console, `--once`, manual payload): no partial-batch protocol.
+    Direct(Job),
+    Sqs(Vec<Record>),
+}
+
+pub fn parse_event(event: &Value) -> Result<Event> {
     if let Some(records) = event.get("Records").and_then(Value::as_array) {
-        let mut jobs = Vec::with_capacity(records.len());
-        for (i, record) in records.iter().enumerate() {
-            let body = record
-                .get("body")
-                .and_then(Value::as_str)
-                .with_context(|| format!("SQS record {i} has no string body"))?;
-            let parsed: Value = serde_json::from_str(body)
-                .with_context(|| format!("SQS record {i} body is not JSON"))?;
-            jobs.push(job_from_value(&parsed).with_context(|| format!("SQS record {i}"))?);
-        }
-        return Ok(jobs);
+        let parsed = records
+            .iter()
+            .enumerate()
+            .map(|(i, record)| Record {
+                message_id: record
+                    .get("messageId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string),
+                job: job_from_record(record).with_context(|| format!("SQS record {i}")),
+            })
+            .collect();
+        return Ok(Event::Sqs(parsed));
     }
-    Ok(vec![job_from_value(event)?])
+    Ok(Event::Direct(job_from_value(event)?))
+}
+
+fn job_from_record(record: &Value) -> Result<Job> {
+    let body = record
+        .get("body")
+        .and_then(Value::as_str)
+        .context("no string body")?;
+    let parsed: Value = serde_json::from_str(body).context("body is not JSON")?;
+    job_from_value(&parsed)
 }
 
 fn job_from_value(v: &Value) -> Result<Job> {
@@ -70,7 +94,11 @@ fn validated_entity_id(id: &str) -> Result<String> {
     Ok(id.to_string())
 }
 
-pub fn ensure_allowed_content_server(url: &str, allowed: &[String]) -> Result<()> {
+/// Scheme/shape validation (https, no userinfo, non-empty host) runs
+/// unconditionally — an event-supplied URL is attacker-adjacent input and must
+/// never point the handler at plaintext or internal targets, allowlist or not.
+/// The host allowlist additionally applies when configured.
+pub fn validate_content_server(url: &str, allowed: Option<&[String]>) -> Result<()> {
     let Some(rest) = url.strip_prefix("https://") else {
         bail!("content server {url:?} rejected: https required");
     };
@@ -80,8 +108,13 @@ pub fn ensure_allowed_content_server(url: &str, allowed: &[String]) -> Result<()
         .unwrap_or("")
         .to_ascii_lowercase();
     let host = authority.split(':').next().unwrap_or("");
-    if authority.contains('@') || host.is_empty() || !allowed.iter().any(|a| a == host) {
-        bail!("content server host {host:?} is not in ALLOWED_CONTENT_SERVER_HOSTS");
+    if authority.contains('@') || host.is_empty() {
+        bail!("content server {url:?} rejected: bad authority");
+    }
+    if let Some(allowed) = allowed {
+        if !allowed.iter().any(|a| a == host) {
+            bail!("content server host {host:?} is not in ALLOWED_CONTENT_SERVER_HOSTS");
+        }
     }
     Ok(())
 }
@@ -97,6 +130,20 @@ fn normalize_content_server(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn jobs_from_event(event: &Value) -> Result<Vec<Job>> {
+        match parse_event(event)? {
+            Event::Direct(job) => Ok(vec![job]),
+            Event::Sqs(records) => records.into_iter().map(|r| r.job).collect(),
+        }
+    }
+
+    fn records(event: &Value) -> Vec<Record> {
+        match parse_event(event).unwrap() {
+            Event::Sqs(records) => records,
+            Event::Direct(_) => panic!("expected an SQS batch"),
+        }
+    }
 
     #[test]
     fn parses_manual_payload() {
@@ -123,6 +170,25 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].entity_id, "bafkdef456");
         assert!(!jobs[0].is_lods);
+    }
+
+    #[test]
+    fn keeps_per_record_message_ids_and_isolates_parse_errors() {
+        let ok = serde_json::json!({"entityId": "bafkok0001"}).to_string();
+        let e = serde_json::json!({"Records": [
+            {"messageId": "m-1", "body": ok},
+            {"messageId": "m-2", "body": "not json"},
+            {"messageId": "", "body": "{}"},
+            {"body": "{}"},
+        ]});
+        let records = records(&e);
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].message_id.as_deref(), Some("m-1"));
+        assert_eq!(records[0].job.as_ref().unwrap().entity_id, "bafkok0001");
+        assert_eq!(records[1].message_id.as_deref(), Some("m-2"));
+        assert!(records[1].job.is_err());
+        assert!(records[2].message_id.is_none());
+        assert!(records[3].message_id.is_none());
     }
 
     #[test]
@@ -160,7 +226,7 @@ mod tests {
     #[test]
     fn content_server_allowlist() {
         let allowed = vec!["peer.decentraland.org".to_string()];
-        let ok = |u: &str| ensure_allowed_content_server(u, &allowed).is_ok();
+        let ok = |u: &str| validate_content_server(u, Some(&allowed)).is_ok();
         assert!(ok("https://peer.decentraland.org/content"));
         assert!(ok("https://PEER.decentraland.org"));
         assert!(ok("https://peer.decentraland.org:443/content"));
@@ -169,5 +235,19 @@ mod tests {
         assert!(!ok("https://peer.decentraland.org.evil.com/content"));
         assert!(!ok("https://peer.decentraland.org@evil.com/content"));
         assert!(!ok("https://sub.peer.decentraland.org/content"));
+    }
+
+    #[test]
+    fn content_server_shape_checks_apply_without_an_allowlist() {
+        let ok = |u: &str| validate_content_server(u, None).is_ok();
+        // No allowlist: any https host passes (documented fail-open)…
+        assert!(ok("https://peer.decentraland.org/content"));
+        assert!(ok("https://anything.example.com"));
+        // …but scheme/shape validation still applies unconditionally.
+        assert!(!ok("http://10.0.3.7:8500"));
+        assert!(!ok("http://169.254.169.254/latest/meta-data"));
+        assert!(!ok("https://user:pass@evil.example.com/content"));
+        assert!(!ok("https://"));
+        assert!(!ok("ftp://host"));
     }
 }

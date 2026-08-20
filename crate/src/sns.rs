@@ -161,8 +161,37 @@ impl Sns {
         )
     }
 
+    /// Publishes with a few in-process retries before propagating: for a
+    /// non-zero-exit conversion there is no `exitCode: 0` manifest, so losing
+    /// the event to a transient SNS blip forces a full reconversion on the
+    /// SQS redelivery.
     pub fn publish(&self, message: &str, attributes: &[(&str, &str)]) -> Result<()> {
+        const ATTEMPTS: u32 = 3;
         let body = build_publish_body(&self.topic_arn, message, attributes);
+        let mut last_err = None;
+        for attempt in 1..=ATTEMPTS {
+            if attempt > 1 {
+                std::thread::sleep(std::time::Duration::from_millis(250 * (attempt as u64 - 1)));
+            }
+            match self.publish_once(&body) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(
+                        topic = %self.topic_arn,
+                        attempt,
+                        error = %e,
+                        "sns publish attempt failed"
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.expect("at least one attempt ran"))
+    }
+
+    /// One signed POST; each attempt re-resolves creds and re-signs so a
+    /// retry never reuses a stale x-amz-date.
+    fn publish_once(&self, body: &str) -> Result<()> {
         let c = self.creds.resolve()?;
         let payload_hash = sha256_hex(body.as_bytes());
         let (date, amz) = timestamps();
@@ -225,38 +254,45 @@ mod tests {
         );
     }
 
+    /// Reads one full HTTP request (headers + content-length body).
+    fn read_http_request(sock: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let (headers_end, content_length) = loop {
+            let n = sock.read(&mut tmp).expect("read");
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+                let len = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(str::to_string)
+                    })
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                break (pos + 4, len);
+            }
+        };
+        while buf.len() < headers_end + content_length {
+            let n = sock.read(&mut tmp).expect("read body");
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        let headers = String::from_utf8_lossy(&buf[..headers_end]).to_string();
+        let body = buf[headers_end..headers_end + content_length].to_vec();
+        (headers, body)
+    }
+
     /// Accepts one HTTP request, returns (headers, body), responds 200.
     fn capture_one_request(
         listener: std::net::TcpListener,
     ) -> std::thread::JoinHandle<(String, Vec<u8>)> {
         std::thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
             let (mut sock, _) = listener.accept().expect("accept");
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 4096];
-            let (headers_end, content_length) = loop {
-                let n = sock.read(&mut tmp).expect("read");
-                buf.extend_from_slice(&tmp[..n]);
-                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let head = String::from_utf8_lossy(&buf[..pos]).to_string();
-                    let len = head
-                        .lines()
-                        .find_map(|l| {
-                            l.to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(str::to_string)
-                        })
-                        .and_then(|v| v.trim().parse::<usize>().ok())
-                        .unwrap_or(0);
-                    break (pos + 4, len);
-                }
-            };
-            while buf.len() < headers_end + content_length {
-                let n = sock.read(&mut tmp).expect("read body");
-                buf.extend_from_slice(&tmp[..n]);
-            }
-            let headers = String::from_utf8_lossy(&buf[..headers_end]).to_string();
-            let body = buf[headers_end..headers_end + content_length].to_vec();
+            let (headers, body) = read_http_request(&mut sock);
             let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             sock.write_all(resp).expect("write");
             (headers, body)
@@ -291,5 +327,40 @@ mod tests {
         let body = String::from_utf8(body).expect("utf8 body");
         assert!(body.starts_with("Action=Publish&Version=2010-03-31&TopicArn="));
         assert!(body.contains("MessageAttributes.entry.1.Value.StringValue=asset-bundle"));
+    }
+
+    #[test]
+    fn publish_retries_a_transient_500() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            let mut bodies = Vec::new();
+            for status in ["500 Internal Server Error", "200 OK"] {
+                let (mut sock, _) = listener.accept().expect("accept");
+                let (_headers, body) = read_http_request(&mut sock);
+                bodies.push(body);
+                let resp =
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                sock.write_all(resp.as_bytes()).expect("write");
+            }
+            bodies
+        });
+
+        let sns = Sns::with_static_creds(
+            "arn:aws:sns:us-east-1:123:t",
+            "http",
+            &format!("127.0.0.1:{}", addr.port()),
+            "us-east-1",
+            "AKIDEXAMPLE",
+            "sekret",
+            None,
+        );
+        sns.publish("{\"a\":1}", &[("type", "asset-bundle")])
+            .expect("publish succeeds on the retry");
+
+        let bodies = server.join().expect("join");
+        assert_eq!(bodies.len(), 2, "one retry after the 500");
+        assert_eq!(bodies[0], bodies[1], "retries resend the same form body");
     }
 }

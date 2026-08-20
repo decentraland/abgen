@@ -382,6 +382,11 @@ async fn lod_space_read_through(
     resp
 }
 
+/// Server-lane write-back. Upload metadata is deliberately shared with the
+/// lambda lane: `space::object_headers` derives Content-Type / Cache-Control /
+/// Content-Encoding from the key (#60), replacing the per-call-site
+/// `application/octet-stream` this path used to send, so origin objects match
+/// their production writers no matter which lane wrote them.
 pub(super) fn spawn_lod_writeback(state: &AppState, sid: &str) {
     let Some(proxy) = state.live_proxy.clone() else {
         return;
@@ -408,11 +413,7 @@ pub(super) fn spawn_lod_writeback(state: &AppState, sid: &str) {
                     continue;
                 }
                 if let Ok(bytes) = std::fs::read(ent.path()) {
-                    proxy.space_put_key(
-                        &format!("LOD/{level}/{name}"),
-                        &bytes,
-                        "application/octet-stream",
-                    );
+                    proxy.space_put_key(&format!("LOD/{level}/{name}"), &bytes);
                     puts += 1;
                 }
             }
@@ -420,12 +421,7 @@ pub(super) fn spawn_lod_writeback(state: &AppState, sid: &str) {
         let iss = format!("{sid}{}", crate::lodgen::placements::ISS_SUFFIX);
         for cand in [iss.clone(), format!("{iss}.br")] {
             if let Ok(bytes) = std::fs::read(scene_dir.join(&cand)) {
-                let ct = if cand.ends_with(".json") {
-                    "application/json"
-                } else {
-                    "application/octet-stream"
-                };
-                proxy.space_put_key(&format!("lods-unity/manifests/{cand}"), &bytes, ct);
+                proxy.space_put_key(&format!("lods-unity/manifests/{cand}"), &bytes);
                 puts += 1;
             }
         }
@@ -763,7 +759,7 @@ pub(super) async fn flat_fallback(
         let p3 = proxy.clone();
         tokio::task::spawn_blocking(move || {
             if let Ok(bytes) = std::fs::read(&src) {
-                p3.space_put_key(&alias, &bytes, "application/octet-stream");
+                p3.space_put_key(&alias, &bytes);
             }
         });
     }
@@ -855,7 +851,7 @@ pub(super) async fn shader_fallback(
                     let ok = materialize_shader(&dst, flat.as_ref(), &bytes);
                     if ok {
                         if let Some(p) = proxy {
-                            p.space_put_key(&put_key, &bytes, "application/octet-stream");
+                            p.space_put_key(&put_key, &bytes);
                         }
                     }
                     ok
