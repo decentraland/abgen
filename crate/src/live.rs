@@ -75,6 +75,60 @@ fn corpus_file_jobs() -> usize {
     })
 }
 
+/// Deps digests for every distinct convertible GLB in `items` — (hash, file)
+/// pairs in entity content order, duplicates and non-GLBs welcome; the first
+/// occurrence of a hash picks the file name, exactly like the serial scan it
+/// replaces. Each digest parses its whole GLB, so the work is spread across
+/// `jobs` workers. Returns the digest map plus warnings as (file, hash,
+/// rendered error), in work order.
+fn compute_deps_digests(
+    content: &LocalContentStore,
+    items: &[(String, String)],
+    content_by_file: &HashMap<String, String>,
+    tolerant: bool,
+    jobs: usize,
+) -> (HashMap<String, String>, Vec<(String, String, String)>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let work: Vec<&(String, String)> = items
+        .iter()
+        .filter(|(hash, file)| is_convertible(file).0 && seen.insert(hash.clone()))
+        .collect();
+
+    let slots: Vec<Mutex<Option<Result<String, String>>>> =
+        work.iter().map(|_| Mutex::new(None)).collect();
+    let workers = jobs.clamp(1, work.len().max(1));
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some((hash, file)) = work.get(i).map(|w| (&w.0, &w.1)) else {
+                    break;
+                };
+                let digest = content.fetch_mmap(hash).and_then(|bytes| {
+                    naming::deps_digest_for_glb(&bytes, file, content_by_file, tolerant)
+                });
+                *slots[i].lock().unwrap() = Some(digest.map_err(|e| format!("{e:#}")));
+            });
+        }
+    });
+
+    let mut digests: HashMap<String, String> = HashMap::new();
+    let mut warns: Vec<(String, String, String)> = Vec::new();
+    for ((hash, file), slot) in work.iter().map(|w| (&w.0, &w.1)).zip(slots) {
+        match slot.into_inner().unwrap() {
+            Some(Ok(d)) => {
+                digests.insert(hash.clone(), d);
+            }
+            Some(Err(e)) => warns.push((file.clone(), hash.clone(), e)),
+            None => {}
+        }
+    }
+    (digests, warns)
+}
+
 fn bounded_reserve<V>(map: &mut HashMap<String, V>, cap: usize, key: &str) {
     if map.len() >= cap && !map.contains_key(key) {
         if let Some(k) = map.keys().next().cloned() {
@@ -296,24 +350,22 @@ impl Proxy {
         let content_by_file = scene.content_by_file();
         let scan = scan_entity(&self.content, &content_by_file, &self.uri_cache);
 
-        let mut deps_digests: HashMap<String, String> = HashMap::new();
-        for c in &scene.content {
-            let (is_glb, _) = is_convertible(&c.file);
-            if !is_glb || deps_digests.contains_key(&c.hash) {
-                continue;
-            }
-            let digest = self.content.fetch_mmap(&c.hash).and_then(|bytes| {
-                naming::deps_digest_for_glb(&bytes, &c.file, &content_by_file, self.magenta_missing)
-            });
-            match digest {
-                Ok(d) => {
-                    deps_digests.insert(c.hash.clone(), d);
-                }
-                Err(e) => eprintln!(
-                    "warn: {cid}: deps digest for {} ({}): {e:#}",
-                    c.file, c.hash
-                ),
-            }
+        // Every digest parses its whole GLB; done serially this was most of
+        // the gap between fetch and the first build on large scenes.
+        let digest_items: Vec<(String, String)> = scene
+            .content
+            .iter()
+            .map(|c| (c.hash.clone(), c.file.clone()))
+            .collect();
+        let (deps_digests, digest_warns) = compute_deps_digests(
+            &self.content,
+            &digest_items,
+            &content_by_file,
+            self.magenta_missing,
+            corpus_file_jobs(),
+        );
+        for (file, hash, e) in &digest_warns {
+            eprintln!("warn: {cid}: deps digest for {file} ({hash}): {e}");
         }
 
         {
@@ -1401,6 +1453,60 @@ mod tests {
     }
 
     #[test]
+    fn deps_digests_parallel_matches_serial() {
+        let dir = temp_cache("deps-digest-par");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = LocalContentStore::new(&dir);
+
+        let gltf = |uris: &[&str]| {
+            let imgs: Vec<String> = uris
+                .iter()
+                .map(|u| format!("{{\"uri\":\"{u}\"}}"))
+                .collect();
+            format!(
+                "{{\"asset\":{{\"version\":\"2.0\"}},\"images\":[{}]}}",
+                imgs.join(",")
+            )
+        };
+        store
+            .write("g1", gltf(&["tex1.png", "mesh.bin"]).as_bytes())
+            .unwrap();
+        store.write("g2", gltf(&["tex2.png"]).as_bytes()).unwrap();
+        store.write("gbroken", b"{not json").unwrap();
+        store.write("gdup", gltf(&["tex1.png"]).as_bytes()).unwrap();
+
+        let mut map: HashMap<String, String> = HashMap::new();
+        map.insert("a/tex1.png".to_string(), "t1".to_string());
+        map.insert("a/mesh.bin".to_string(), "m1".to_string());
+        map.insert("a/tex2.png".to_string(), "t2".to_string());
+
+        // Content order: gdup listed under two file names (first must win —
+        // the b/ variant cannot resolve its dep), one broken gltf (warning),
+        // one plain image (filtered out entirely).
+        let items = vec![
+            ("g1".to_string(), "a/one.gltf".to_string()),
+            ("gdup".to_string(), "a/dup.gltf".to_string()),
+            ("gdup".to_string(), "b/dup.gltf".to_string()),
+            ("gbroken".to_string(), "a/broken.gltf".to_string()),
+            ("t1".to_string(), "a/tex1.png".to_string()),
+            ("g2".to_string(), "a/two.gltf".to_string()),
+        ];
+
+        let (d1, w1) = compute_deps_digests(&store, &items, &map, false, 1);
+        let (d8, w8) = compute_deps_digests(&store, &items, &map, false, 8);
+        assert_eq!(d1, d8);
+        assert_eq!(w1, w8);
+        assert_eq!(d1.len(), 3);
+        assert!(d1.contains_key("g1"));
+        assert!(d1.contains_key("gdup"));
+        assert!(d1.contains_key("g2"));
+        assert_eq!(w1.len(), 1);
+        assert_eq!(w1[0].0, "a/broken.gltf");
+        assert_eq!(w1[0].1, "gbroken");
+    }
+
+    #[test]
     fn image_decode_verdict_is_memoized_per_hash() {
         let cache_dir = temp_cache("decode-ok-memo");
         let _ = std::fs::remove_dir_all(&cache_dir);
@@ -1427,7 +1533,9 @@ mod tests {
         assert!(proxy.image_decode_ok("goodimg"));
         assert!(!proxy.image_decode_ok("badimg"));
         assert!(crate::builder::source_image_decodes(&png));
-        assert!(!crate::builder::source_image_decodes(b"not an image at all"));
+        assert!(!crate::builder::source_image_decodes(
+            b"not an image at all"
+        ));
 
         // Memoized: with every backing file gone, verdicts must survive.
         let _ = std::fs::remove_dir_all(proxy.cache_roots().0);
