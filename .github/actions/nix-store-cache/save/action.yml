@@ -30,10 +30,18 @@ runs:
           nix copy --to 'file:///var/tmp/abgen-nixcache-out?compression=zstd'
         echo "cache: $(wc -l < /var/tmp/abgen-nix-delta.txt) paths," \
           "$(du -sh /var/tmp/abgen-nixcache-out | cut -f1)"
+        # actions/cache versions an entry by its path: saving a different
+        # directory than the restore looks up makes every save invisible to
+        # every restore. Pack fresh for hygiene, then swap into the restore
+        # path so both sides share one cache version. The fresh dir is a
+        # superset of everything this run substituted, so the substituter
+        # keeps working for the rest of the job.
+        rm -rf /var/tmp/abgen-nixcache
+        mv /var/tmp/abgen-nixcache-out /var/tmp/abgen-nixcache
         echo "publish=true" >> "$GITHUB_OUTPUT"
 
     - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
       if: steps.pack.outputs.publish == 'true'
       with:
-        path: /var/tmp/abgen-nixcache-out
+        path: /var/tmp/abgen-nixcache
         key: ${{ env.ABGEN_NIXCACHE_KEY }}
