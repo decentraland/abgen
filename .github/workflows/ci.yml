@@ -124,22 +124,57 @@ jobs:
           path: .win-green-marker
           key: windows-green-${{ needs.windows-gate.outputs.hash }}
 
-  node-addon:
-    name: node addon
-    if: github.event_name != 'push'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  # One staged pipeline per arch, everything on a single runner: deps are
+  # built and published to the binary cache FIRST (a later stage failing
+  # never costs the next run its warm deps), then the source-keyed
+  # build/test/lint work, then the cheap fan-out (image, node addon) reuses
+  # the already-hot store instead of paying setup+restore on fresh runners.
+  pipeline:
+    name: ${{ matrix.system }} pipeline
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            system: x86_64-linux
+            deps: .#checks.x86_64-linux.deps
+            image: dockerImage
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+            deps: .#checks.aarch64-linux.deps .#checks.aarch64-linux.wasm-deps
+            image: lambdaImage
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      # No standalone nix installer: the composite runs it with the
+      # extra-conf this job needs; a prior bare install made that conf
+      # silently a no-op.
+      - uses: ./.github/actions/nix-store-cache
+      - name: deps (dependency closures)
+        run: nix build --no-link ${{ matrix.deps }}
+      # Publish immediately and from any branch: the composite no-ops
+      # unless the exact key is new, so this fires once per input rotation.
+      - uses: ./.github/actions/nix-store-cache/save
+        continue-on-error: true
+      - name: build + checks
+        run: bash ci/nix-checks.sh ${{ matrix.system }}
+      # Fan-out: cheap on the hot store. Skipped on main pushes, where the
+      # release workflow builds the real thing from the same cache.
+      - name: image smoke (${{ matrix.image }})
+        if: github.event_name != 'push'
+        run: nix build --no-link .#${{ matrix.image }}
       - uses: ./.github/actions/rust-setup
+        if: github.event_name != 'push'
         with:
-          # Pure consumer of the cache the release napi linux leg saves from
-          # main pushes (same shared-key); this job is PR-only, so its own
-          # saves would be PR-scoped quota waste.
+          # Pure consumer of the cache the release napi linux legs save from
+          # main pushes (same shared-key); PR-scoped saves would be quota
+          # waste.
           workspaces: crate/abgen-node
           shared-key: abgen-node
           save-if: "false"
-      - name: abgen-node (build + smoke)
+      - name: node addon (build + smoke)
+        if: github.event_name != 'push'
         working-directory: crate/abgen-node
         run: |
           npm ci --no-audit --no-fund
@@ -152,30 +187,4 @@ jobs:
           # crate/abgen-node now that the step runs there.
           bash ../../ci/check-glibc-floor.sh 2.34 \
             target/release/libabgen_node.so
-
-  nix-ci:
-    name: nix checks
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-      # No standalone nix installer: the composite runs it with the
-      # extra-conf this job needs; a prior bare install made that conf
-      # silently a no-op.
-      - uses: ./.github/actions/nix-store-cache
-      - name: build flake checks
-        run: |
-          case "$(uname -m)" in
-            x86_64)  system=x86_64-linux ;;
-            aarch64) system=aarch64-linux ;;
-            *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
-          esac
-          bash ci/nix-checks.sh "$system"
-      - if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-        uses: ./.github/actions/nix-store-cache/save
-        continue-on-error: true
 
