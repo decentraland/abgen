@@ -701,6 +701,38 @@ jobs:
           path: lambdaImage.tar.gz
           if-no-files-found: error
 
+  # Building races ahead of the test verdict; SHIPPING is what gates on it.
+  # A tag's commit already ran ci when it landed on main — this waits for
+  # that verdict and fails closed if it is missing or red.
+  ci-green:
+    name: ci green gate
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: wait for the commit's ci verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 40); do
+            run="$(gh api "/repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&per_page=1" \
+              --jq '"\(.workflow_runs[0].status // "none") \(.workflow_runs[0].conclusion // "")"')"
+            status="${run%% *}"; conclusion="${run#* }"
+            [ "$conclusion" = "success" ] && exit 0
+            if [ "$status" = "completed" ]; then
+              echo "ci for $GITHUB_SHA concluded: ${conclusion:-none}" >&2
+              exit 1
+            fi
+            echo "ci for $GITHUB_SHA: $status — waiting"
+            sleep 60
+          done
+          echo "timed out waiting for the ci verdict" >&2
+          exit 1
+
   promote:
     name: promote prebuilt targets
     needs: build-id
@@ -797,11 +829,15 @@ jobs:
 
   image:
     name: ghcr image
-    needs: build-id
-    # Tags always run (they push); otherwise only when no prebuilt artifact
-    # exists yet — a non-tag run with a prebuilt would skip every step and
-    # burn a runner fetching an artifact it discards.
-    if: startsWith(github.ref, 'refs/tags/') || needs.build-id.outputs.image_docker == ''
+    needs: [build-id, ci-green]
+    # Tags always run (they push) but only with a green ci verdict for the
+    # commit; otherwise only when no prebuilt artifact exists yet — a
+    # non-tag run with a prebuilt would skip every step and burn a runner
+    # fetching an artifact it discards.
+    if: >-
+      !cancelled() && needs.build-id.result == 'success' &&
+      ((startsWith(github.ref, 'refs/tags/') && needs.ci-green.result == 'success') ||
+       (!startsWith(github.ref, 'refs/tags/') && needs.build-id.outputs.image_docker == ''))
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -875,9 +911,13 @@ jobs:
 
   lambda-image:
     name: ECR lambda image
-    needs: build-id
-    # Same gate as the ghcr image: tags push, non-tag runs only build.
-    if: startsWith(github.ref, 'refs/tags/') || needs.build-id.outputs.image_lambda == ''
+    needs: [build-id, ci-green]
+    # Same gate as the ghcr image: tags push (green ci only), non-tag runs
+    # only build.
+    if: >-
+      !cancelled() && needs.build-id.result == 'success' &&
+      ((startsWith(github.ref, 'refs/tags/') && needs.ci-green.result == 'success') ||
+       (!startsWith(github.ref, 'refs/tags/') && needs.build-id.outputs.image_lambda == ''))
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
@@ -980,11 +1020,12 @@ jobs:
 
   napi-publish:
     name: publish @dcl/abgen-node
-    needs: [build-id, napi]
+    needs: [build-id, napi, ci-green]
     runs-on: ubuntu-24.04
     if: >-
       !cancelled() &&
       startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true &&
+      needs.ci-green.result == 'success' &&
       (needs.napi.result == 'success' ||
        (needs.napi.result == 'skipped' && needs.build-id.outputs.napi_promote == 'true'))
     permissions:
@@ -1046,11 +1087,12 @@ jobs:
           npm publish --access public
 
   publish:
-    needs: [build, promote]
+    needs: [build, promote, ci-green]
     runs-on: ubuntu-24.04
     if: >-
       !cancelled() &&
       startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true &&
+      needs.ci-green.result == 'success' &&
       needs.build.result != 'failure' && needs.build.result != 'cancelled' &&
       needs.promote.result != 'failure' && needs.promote.result != 'cancelled'
     permissions:
