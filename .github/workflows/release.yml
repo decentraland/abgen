@@ -925,7 +925,6 @@ jobs:
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
-      actions: read
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       - if: needs.build-id.outputs.image_lambda == ''

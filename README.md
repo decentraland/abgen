@@ -199,7 +199,7 @@ unprivileged user on `:5147` with `template/` and `shader/` baked in and `ABGEN_
 preset. The `image` job in [`.github/workflows/release.yml`](.github/workflows/release.yml) builds
 that image and pushes it to `ghcr.io/decentraland/abgen:<tag>` (and `:latest`) on every `v*` tag.
 The workspace also ships an AWS Lambda consumer in `lambda/` (the `abgen-lambda` bin);
-`nix build .#lambdaImage` produces its container image, which the `lambda-image` job pushes to ECR
+`nix build .#lambdaImage` produces its container image, which the `lambda-image-push` job pushes to ECR
 on the same tags - see [lambda/README.md](lambda/README.md). The org
 services-pipeline that publishes the same service to quay (service-name `abgen`) is configured
 externally in the private `decentraland/definitions` repo, not in this tree. Cutting a release -
