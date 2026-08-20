@@ -11,7 +11,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.17.0"
+version = "0.17.1"
 
 # Whole-program LTO and a single codegen unit: the hot paths cross crate
 # boundaries (image/gltf decode -> abgen kernels -> lz4 pack), and the
