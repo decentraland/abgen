@@ -26,12 +26,16 @@ let
 
   archDependent = {
     nextest = craneLib.cargoNextest (withArtifacts // {
+      doCheck = true;
+      __darwinAllowLocalNetworking = true;
       cargoExtraArgs = "--locked";
       cargoNextestExtraArgs = "--workspace";
       preCheck = abgenRoot;
     });
 
     lambda-tests = craneLib.cargoTest (withArtifacts // {
+      doCheck = true;
+      __darwinAllowLocalNetworking = true;
       pname = "abgen-lambda-tests";
       cargoExtraArgs = "--locked";
       cargoTestExtraArgs = "-p abgen-lambda -p abgen-native --tests";
