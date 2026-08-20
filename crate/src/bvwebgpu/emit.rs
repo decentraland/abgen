@@ -4,7 +4,6 @@ use gltf_json::validation::{Checked, USize64};
 use gltf_json::{buffer, mesh, Index, Root};
 use image::RgbaImage;
 use std::collections::{BTreeSet, HashSet};
-use std::io::Write;
 
 pub(crate) type ResolveUri<'a> = crate::gltf::Resolve<'a>;
 
@@ -17,6 +16,12 @@ pub(crate) fn transform_img(bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 const DDS_HEADER_LEN: usize = 148;
+
+fn pad4(v: &mut Vec<u8>, fill: u8) {
+    while !v.len().is_multiple_of(4) {
+        v.push(fill);
+    }
+}
 
 fn encoded_dds_len(w: u32, h: u32) -> usize {
     let (tw, th) = crate::texprofile::bc7_target_size(w, h, super::BVW_TEXTURE_MAX);
@@ -178,7 +183,7 @@ struct AccLayout {
     count: usize,
 }
 
-fn acc_layout(root: &Root, ai: usize, elem: usize) -> Option<AccLayout> {
+fn acc_layout(root: &Root, ai: usize, elem: usize, bin: &[u8]) -> Option<AccLayout> {
     let a = root.accessors.get(ai)?;
     if a.sparse.is_some() {
         return None;
@@ -187,10 +192,14 @@ fn acc_layout(root: &Root, ai: usize, elem: usize) -> Option<AccLayout> {
     let start =
         v.byte_offset.map_or(0, |o| o.0) as usize + a.byte_offset.map_or(0, |o| o.0) as usize;
     let stride = v.byte_stride.map_or(elem, |s| s.0);
+    let count = a.count.0 as usize;
+    if count == 0 || start + stride * (count - 1) + elem > bin.len() {
+        return None;
+    }
     Some(AccLayout {
         start,
         stride,
-        count: a.count.0 as usize,
+        count,
     })
 }
 
@@ -222,19 +231,11 @@ pub(super) fn read_f32_rows<const N: usize>(
     }
     let comp = match ct {
         ComponentType::F32 => 4,
-        ComponentType::U8 | ComponentType::U16 if normalized => {
-            if ct == ComponentType::U8 {
-                1
-            } else {
-                2
-            }
-        }
+        ComponentType::U8 if normalized => 1,
+        ComponentType::U16 if normalized => 2,
         _ => return None,
     };
-    let l = acc_layout(root, ai, comp * N)?;
-    if l.count == 0 || l.start + l.stride * (l.count - 1) + comp * N > bin.len() {
-        return None;
-    }
+    let l = acc_layout(root, ai, comp * N, bin)?;
     let mut out = Vec::with_capacity(l.count);
     for i in 0..l.count {
         let base = l.start + i * l.stride;
@@ -266,10 +267,7 @@ pub(super) fn read_indices(root: &Root, bin: &[u8], ai: usize) -> Option<Vec<u32
         ComponentType::U32 => 4,
         _ => return None,
     };
-    let l = acc_layout(root, ai, comp)?;
-    if l.count == 0 || l.start + l.stride * (l.count - 1) + comp > bin.len() {
-        return None;
-    }
+    let l = acc_layout(root, ai, comp, bin)?;
     let mut out = Vec::with_capacity(l.count);
     for i in 0..l.count {
         let p = l.start + i * l.stride;
@@ -300,10 +298,7 @@ pub(super) fn read_tight(root: &Root, bin: &[u8], ai: usize) -> Option<(Vec<u8>,
         Type::Mat4 => 16,
     };
     let elem = comp * ncomp;
-    let l = acc_layout(root, ai, elem)?;
-    if l.count == 0 || l.start + l.stride * (l.count - 1) + elem > bin.len() {
-        return None;
-    }
+    let l = acc_layout(root, ai, elem, bin)?;
     let mut out = Vec::with_capacity(l.count * elem);
     for i in 0..l.count {
         let s = l.start + i * l.stride;
@@ -316,12 +311,9 @@ fn renorm_weights_f32(root: &Root, bin: &mut [u8], ai: usize) {
     let Some((ComponentType::F32, Type::Vec4, _)) = acc_kind(root, ai) else {
         return;
     };
-    let Some(l) = acc_layout(root, ai, 16) else {
+    let Some(l) = acc_layout(root, ai, 16, bin) else {
         return;
     };
-    if l.count == 0 || l.start + l.stride * (l.count - 1) + 16 > bin.len() {
-        return;
-    }
     for i in 0..l.count {
         let base = l.start + i * l.stride;
         let mut w = [0f32; 4];
@@ -458,31 +450,68 @@ fn extract_image_bytes(
     (end <= bin.len()).then(|| bin[start..end].to_vec())
 }
 
+fn glb_frame(mut json_bytes: Vec<u8>, bin: &[u8]) -> Vec<u8> {
+    pad4(&mut json_bytes, 0x20);
+    let mut bin_data = bin.to_vec();
+    pad4(&mut bin_data, 0x00);
+    let total_len = (12 + 8 + json_bytes.len() + 8 + bin_data.len()) as u32;
+    let mut out = Vec::with_capacity(total_len as usize);
+    out.extend_from_slice(b"glTF");
+    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&total_len.to_le_bytes());
+    out.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(b"JSON");
+    out.extend_from_slice(&json_bytes);
+    out.extend_from_slice(&(bin_data.len() as u32).to_le_bytes());
+    out.extend_from_slice(b"BIN\0");
+    out.extend_from_slice(&bin_data);
+    out
+}
+
 fn write_glb(root: &Root, binary_payload: &[u8]) -> Result<Vec<u8>> {
     let json_string =
         gltf_json::serialize::to_string(root).map_err(|e| anyhow!("gltf serialize: {e}"))?;
-    let mut json_bytes = json_string.into_bytes();
-    while !json_bytes.len().is_multiple_of(4) {
-        json_bytes.push(0x20);
+    Ok(glb_frame(json_string.into_bytes(), binary_payload))
+}
+
+fn append_bytes_view(root: &mut Root, bin: &mut Vec<u8>, data: &[u8], name: Option<&str>) -> u32 {
+    pad4(bin, 0);
+    let offset = bin.len() as u64;
+    bin.extend_from_slice(data);
+    let vidx = root.buffer_views.len() as u32;
+    root.buffer_views.push(buffer::View {
+        buffer: Index::new(0),
+        byte_length: USize64(data.len() as u64),
+        byte_offset: Some(USize64(offset)),
+        byte_stride: None,
+        name: name.map(Into::into),
+        target: None,
+        extensions: None,
+        extras: Default::default(),
+    });
+    vidx
+}
+
+fn vec4_accessor(
+    vidx: u32,
+    count: u64,
+    ct: ComponentType,
+    normalized: bool,
+) -> gltf_json::Accessor {
+    gltf_json::Accessor {
+        buffer_view: Some(Index::new(vidx)),
+        byte_offset: Some(USize64(0)),
+        count: USize64(count),
+        component_type: Checked::Valid(GenericComponentType(ct)),
+        extensions: None,
+        extras: Default::default(),
+        type_: Checked::Valid(Type::Vec4),
+        min: None,
+        max: None,
+        name: None,
+        normalized,
+        sparse: None,
     }
-    let mut bin_data = binary_payload.to_vec();
-    while !bin_data.len().is_multiple_of(4) {
-        bin_data.push(0x00);
-    }
-    let json_len = json_bytes.len() as u32;
-    let bin_len = bin_data.len() as u32;
-    let total_len = 12 + 8 + json_len + 8 + bin_len;
-    let mut out = Vec::with_capacity(total_len as usize);
-    out.write_all(b"glTF")?;
-    out.write_all(&2u32.to_le_bytes())?;
-    out.write_all(&total_len.to_le_bytes())?;
-    out.write_all(&json_len.to_le_bytes())?;
-    out.write_all(b"JSON")?;
-    out.write_all(&json_bytes)?;
-    out.write_all(&bin_len.to_le_bytes())?;
-    out.write_all(b"BIN\0")?;
-    out.write_all(&bin_data)?;
-    Ok(out)
 }
 
 pub(crate) fn transform_glb(
@@ -507,9 +536,7 @@ pub(crate) fn transform_glb(
                 .and_then(|f| f(uri))
                 .ok_or_else(|| anyhow!("buffer[{bi}] external uri {uri:?} unresolved"))?,
         };
-        while !merged.len().is_multiple_of(4) {
-            merged.push(0);
-        }
+        pad4(&mut merged, 0);
         bases.push(merged.len() as u64);
         merged.extend_from_slice(&chunk);
     }
@@ -613,9 +640,7 @@ pub(crate) fn transform_glb(
         } else {
             let start = view.byte_offset.map_or(0, |o| o.0) as usize;
             let len = view.byte_length.0 as usize;
-            while !new_bin.len().is_multiple_of(4) {
-                new_bin.push(0);
-            }
+            pad4(&mut new_bin, 0);
             let offset = new_bin.len() as u64;
             if merged.len() >= start + len {
                 new_bin.extend_from_slice(&merged[start..start + len]);
@@ -633,22 +658,7 @@ pub(crate) fn transform_glb(
         let dds =
             encode_dds_bc7(&rgba, srgb, is_normal).with_context(|| format!("encode image[{i}]"))?;
         debug_assert_eq!(dds.len(), encoded_dds_len(rgba.width(), rgba.height()));
-        while !new_bin.len().is_multiple_of(4) {
-            new_bin.push(0);
-        }
-        let offset = new_bin.len() as u64;
-        new_bin.extend_from_slice(&dds);
-        let vidx = root.buffer_views.len() as u32;
-        root.buffer_views.push(buffer::View {
-            buffer: Index::new(0),
-            byte_length: USize64(dds.len() as u64),
-            byte_offset: Some(USize64(offset)),
-            byte_stride: None,
-            name: Some("BC7_Data".into()),
-            target: None,
-            extensions: None,
-            extras: Default::default(),
-        });
+        let vidx = append_bytes_view(&mut root, &mut new_bin, &dds, Some("BC7_Data"));
         root.images[i].buffer_view = Some(Index::new(vidx));
         root.images[i].uri = None;
         root.images[i].mime_type = Some(gltf_json::image::MimeType("image/vnd-ms.dds".into()));
@@ -677,55 +687,22 @@ pub(crate) fn transform_glb(
                 normalized: true,
             };
             let vidx = super::meshcomp::append_stream_view(&mut root, &mut new_bin, &s);
-            root.accessors.push(gltf_json::Accessor {
-                buffer_view: Some(Index::new(vidx)),
-                byte_offset: Some(USize64(0)),
-                count: USize64(count as u64),
-                component_type: Checked::Valid(GenericComponentType(ComponentType::I8)),
-                extensions: None,
-                extras: Default::default(),
-                type_: Checked::Valid(Type::Vec4),
-                min: None,
-                max: None,
-                name: None,
-                normalized: true,
-                sparse: None,
-            });
+            root.accessors
+                .push(vec4_accessor(vidx, count as u64, ComponentType::I8, true));
         } else {
-            while !new_bin.len().is_multiple_of(4) {
-                new_bin.push(0);
-            }
-            let offset = new_bin.len() as u64;
+            let mut raw = Vec::with_capacity(tangents.len() * 16);
             for t in &tangents {
                 for c in t {
-                    new_bin.extend_from_slice(&c.to_le_bytes());
+                    raw.extend_from_slice(&c.to_le_bytes());
                 }
             }
-            let vidx = root.buffer_views.len() as u32;
-            root.buffer_views.push(buffer::View {
-                buffer: Index::new(0),
-                byte_length: USize64(tangents.len() as u64 * 16),
-                byte_offset: Some(USize64(offset)),
-                byte_stride: None,
-                name: None,
-                target: None,
-                extensions: None,
-                extras: Default::default(),
-            });
-            root.accessors.push(gltf_json::Accessor {
-                buffer_view: Some(Index::new(vidx)),
-                byte_offset: Some(USize64(0)),
-                count: USize64(tangents.len() as u64),
-                component_type: Checked::Valid(GenericComponentType(ComponentType::F32)),
-                extensions: None,
-                extras: Default::default(),
-                type_: Checked::Valid(Type::Vec4),
-                min: None,
-                max: None,
-                name: None,
-                normalized: false,
-                sparse: None,
-            });
+            let vidx = append_bytes_view(&mut root, &mut new_bin, &raw, None);
+            root.accessors.push(vec4_accessor(
+                vidx,
+                tangents.len() as u64,
+                ComponentType::F32,
+                false,
+            ));
         }
         root.meshes[mi].primitives[pi]
             .attributes
@@ -741,12 +718,15 @@ pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
-    pub(crate) fn png_bytes(w: u32, h: u32, px: [u8; 4]) -> Vec<u8> {
-        let img = image::RgbaImage::from_pixel(w, h, image::Rgba(px));
+    fn png_of(img: image::RgbaImage) -> Vec<u8> {
         let mut out = Vec::new();
         img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
             .unwrap();
         out
+    }
+
+    pub(crate) fn png_bytes(w: u32, h: u32, px: [u8; 4]) -> Vec<u8> {
+        png_of(image::RgbaImage::from_pixel(w, h, image::Rgba(px)))
     }
 
     pub(crate) fn noise_png_bytes(w: u32, h: u32) -> Vec<u8> {
@@ -757,10 +737,7 @@ pub(crate) mod tests {
             let b = s.to_le_bytes();
             *p = image::Rgba([b[0], b[1], b[2], 255]);
         }
-        let mut out = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
-            .unwrap();
-        out
+        png_of(img)
     }
 
     pub(crate) fn mk_glb(mut gltf: serde_json::Value, bin: &[u8]) -> Vec<u8> {
@@ -768,26 +745,7 @@ pub(crate) mod tests {
         if !bin.is_empty() {
             gltf["buffers"] = json!([{ "byteLength": bin.len() }]);
         }
-        let mut json_chunk = serde_json::to_vec(&gltf).unwrap();
-        while !json_chunk.len().is_multiple_of(4) {
-            json_chunk.push(b' ');
-        }
-        let mut bin_chunk = bin.to_vec();
-        while !bin_chunk.len().is_multiple_of(4) {
-            bin_chunk.push(0);
-        }
-        let total = 12 + 8 + json_chunk.len() + 8 + bin_chunk.len();
-        let mut glb: Vec<u8> = Vec::new();
-        glb.extend_from_slice(b"glTF");
-        glb.extend_from_slice(&2u32.to_le_bytes());
-        glb.extend_from_slice(&(total as u32).to_le_bytes());
-        glb.extend_from_slice(&(json_chunk.len() as u32).to_le_bytes());
-        glb.extend_from_slice(b"JSON");
-        glb.extend_from_slice(&json_chunk);
-        glb.extend_from_slice(&(bin_chunk.len() as u32).to_le_bytes());
-        glb.extend_from_slice(b"BIN\0");
-        glb.extend_from_slice(&bin_chunk);
-        glb
+        glb_frame(serde_json::to_vec(&gltf).unwrap(), bin)
     }
 
     pub(crate) fn out_root_and_bin(out: &[u8]) -> (Root, Vec<u8>) {
@@ -849,9 +807,7 @@ pub(crate) mod tests {
         assert_eq!(transform_img(&flat).unwrap(), flat);
         let noisy = noise_png_bytes(16, 16);
         let mut bin = flat.clone();
-        while !bin.len().is_multiple_of(4) {
-            bin.push(0);
-        }
+        pad4(&mut bin, 0);
         let noisy_off = bin.len();
         bin.extend_from_slice(&noisy);
         let gltf = json!({
@@ -958,30 +914,26 @@ pub(crate) mod tests {
         ];
         let joints: [[u16; 4]; 4] = [[0, 1, 0, 0]; 4];
         let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
-        let pos_off = bin.len();
-        for v in positions.iter().flatten() {
-            bin.extend_from_slice(&v.to_le_bytes());
+        fn le_f32(bin: &mut Vec<u8>, vals: &[f32]) -> usize {
+            let off = bin.len();
+            for v in vals {
+                bin.extend_from_slice(&v.to_le_bytes());
+            }
+            off
         }
-        let nrm_off = bin.len();
-        for v in normals.iter().flatten() {
-            bin.extend_from_slice(&v.to_le_bytes());
+        fn le_u16(bin: &mut Vec<u8>, vals: &[u16]) -> usize {
+            let off = bin.len();
+            for v in vals {
+                bin.extend_from_slice(&v.to_le_bytes());
+            }
+            off
         }
-        let uv_off = bin.len();
-        for v in uvs.iter().flatten() {
-            bin.extend_from_slice(&v.to_le_bytes());
-        }
-        let w_off = bin.len();
-        for v in weights.iter().flatten() {
-            bin.extend_from_slice(&v.to_le_bytes());
-        }
-        let j_off = bin.len();
-        for v in joints.iter().flatten() {
-            bin.extend_from_slice(&v.to_le_bytes());
-        }
-        let idx_off = bin.len();
-        for v in indices.iter() {
-            bin.extend_from_slice(&v.to_le_bytes());
-        }
+        let pos_off = le_f32(&mut bin, positions.as_flattened());
+        let nrm_off = le_f32(&mut bin, normals.as_flattened());
+        let uv_off = le_f32(&mut bin, uvs.as_flattened());
+        let w_off = le_f32(&mut bin, weights.as_flattened());
+        let j_off = le_u16(&mut bin, joints.as_flattened());
+        let idx_off = le_u16(&mut bin, &indices);
         let png_off = bin.len();
         bin.extend_from_slice(png);
         let views = json!([
