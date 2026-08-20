@@ -45,16 +45,11 @@ pub fn sanitize_glb_json_padding(bytes: &mut [u8]) {
     if bytes.len() < 12 || &bytes[0..4] != b"glTF" {
         return;
     }
+    let rd = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
     let mut pos = 12usize;
     while pos + 8 <= bytes.len() {
-        let clen = u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
-            as usize;
-        let ctype = u32::from_le_bytes([
-            bytes[pos + 4],
-            bytes[pos + 5],
-            bytes[pos + 6],
-            bytes[pos + 7],
-        ]);
+        let clen = rd(bytes, pos) as usize;
+        let ctype = rd(bytes, pos + 4);
         let data_start = pos + 8;
         let Some(data_end) = data_start.checked_add(clen).filter(|&e| e <= bytes.len()) else {
             return;
@@ -146,20 +141,11 @@ fn intern_material(
     model.materials.push(LodMaterial {
         name: unique_name(name, used_names),
         class: key.class,
-        base_color: [
-            f64::from_bits(key.base_color[0]),
-            f64::from_bits(key.base_color[1]),
-            f64::from_bits(key.base_color[2]),
-            f64::from_bits(key.base_color[3]),
-        ],
+        base_color: key.base_color.map(f64::from_bits),
         cutoff: f64::from_bits(key.cutoff),
         image: key.image,
         double_sided: key.double_sided,
-        emissive: [
-            f64::from_bits(key.emissive[0]),
-            f64::from_bits(key.emissive[1]),
-            f64::from_bits(key.emissive[2]),
-        ],
+        emissive: key.emissive.map(f64::from_bits),
         emissive_image: key.emissive_image,
         metallic: f64::from_bits(key.metallic),
         roughness: f64::from_bits(key.roughness),
@@ -511,21 +497,12 @@ pub fn assemble_from(
                     None,
                 )
             };
-            key.base_color = [
-                eff[0].to_bits(),
-                eff[1].to_bits(),
-                eff[2].to_bits(),
-                eff[3].to_bits(),
-            ];
+            key.base_color = eff.map(f64::to_bits);
             key.class = AlphaClass::from_alpha_mode(&m.alpha_mode);
             key.cutoff = m.alpha_cutoff.to_bits();
             key.double_sided = m.double_sided;
             key.image = image;
-            key.emissive = [
-                emissive[0].to_bits(),
-                emissive[1].to_bits(),
-                emissive[2].to_bits(),
-            ];
+            key.emissive = emissive.map(f64::to_bits);
             key.emissive_image = emissive_image;
             mats.push(intern_material(
                 key,
@@ -644,10 +621,15 @@ mod tests {
     }
 
     fn rebuild(json: &Value, bin: &[u8]) -> Vec<u8> {
+        rebuild_pad(json, bin, b' ', 0)
+    }
+
+    fn rebuild_pad(json: &Value, bin: &[u8], pad: u8, extra: usize) -> Vec<u8> {
         let mut jb = serde_json::to_vec(json).unwrap();
         while !jb.len().is_multiple_of(4) {
-            jb.push(b' ');
+            jb.push(pad);
         }
+        jb.extend(std::iter::repeat_n(pad, extra));
         let mut bb = bin.to_vec();
         while !bb.len().is_multiple_of(4) {
             bb.push(0);
@@ -679,20 +661,12 @@ mod tests {
     }
 
     fn tri_glb() -> Vec<u8> {
-        emit_glb(&LodModel {
-            root_name: "tri".to_string(),
-            primitives: vec![LodPrimitive {
-                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-                normals: vec![[0.0, 0.0, 1.0]; 3],
-                uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
-                indices: vec![0, 1, 2],
-                material: 0,
-                ..Default::default()
-            }],
-            materials: vec![base_material()],
-            images: Vec::new(),
-            log: Vec::new(),
-        })
+        emit_glb(&model_of(
+            "tri",
+            vec![tri_prim(0.0, [0.0, 0.0])],
+            vec![base_material()],
+            Vec::new(),
+        ))
         .unwrap()
     }
 
@@ -730,9 +704,9 @@ mod tests {
             }
             indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
-        LodModel {
-            root_name: "cube".to_string(),
-            primitives: vec![LodPrimitive {
+        model_of(
+            "cube",
+            vec![LodPrimitive {
                 positions,
                 normals,
                 uvs,
@@ -740,10 +714,9 @@ mod tests {
                 material: 0,
                 ..Default::default()
             }],
-            materials: vec![base_material()],
-            images: Vec::new(),
-            log: Vec::new(),
-        }
+            vec![base_material()],
+            Vec::new(),
+        )
     }
 
     fn signed_volume(model: &LodModel) -> f64 {
@@ -793,6 +766,62 @@ mod tests {
             .unwrap()
     }
 
+    fn place(h: &str) -> Placement {
+        Placement {
+            glb_hash: Some(h.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn asm_lane(
+        ent: &crate::catalyst::Scene,
+        places: &[Placement],
+        cache: &Path,
+        lane: model::MatLane,
+    ) -> LodModel {
+        assemble(&dummy_client(), ent, places, 1, Some(cache), lane).unwrap()
+    }
+
+    fn asm(ent: &crate::catalyst::Scene, places: &[Placement], cache: &Path) -> LodModel {
+        asm_lane(ent, places, cache, Default::default())
+    }
+
+    fn model_of(
+        name: &str,
+        primitives: Vec<LodPrimitive>,
+        materials: Vec<LodMaterial>,
+        images: Vec<LodImage>,
+    ) -> LodModel {
+        LodModel {
+            root_name: name.to_string(),
+            primitives,
+            materials,
+            images,
+            log: Vec::new(),
+        }
+    }
+
+    fn tri_prim(x0: f32, uv0: [f32; 2]) -> LodPrimitive {
+        LodPrimitive {
+            positions: vec![[x0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            uvs: vec![uv0, [1.0, 0.0], [0.0, 1.0]],
+            indices: vec![0, 1, 2],
+            material: 0,
+            ..Default::default()
+        }
+    }
+
+    fn pngs(bytes: &[&[u8]]) -> Vec<LodImage> {
+        bytes
+            .iter()
+            .map(|b| LodImage {
+                bytes: b.to_vec(),
+                mime: "image/png".to_string(),
+            })
+            .collect()
+    }
+
     #[test]
     fn collider_strip_sibling_survives() {
         let glb = tri_glb();
@@ -806,18 +835,11 @@ mod tests {
         let patched = rebuild(&json, &bin);
         let cache = temp_cache("collider");
         stage(&cache, "hcollider", &patched);
-        let model = assemble(
-            &dummy_client(),
+        let model = asm(
             &entity(&[("m.glb", "hcollider")]),
-            &[Placement {
-                glb_hash: Some("hcollider".to_string()),
-                ..Default::default()
-            }],
-            1,
-            Some(&cache),
-            Default::default(),
-        )
-        .unwrap();
+            &[place("hcollider")],
+            &cache,
+        );
         assert_eq!(model.total_tris(), 1);
         assert_eq!(model.primitives.len(), 1);
         let s = summary_line(&model);
@@ -833,21 +855,16 @@ mod tests {
         stage(&cache, "hcube", &glb);
         let s2 = std::f64::consts::FRAC_1_SQRT_2;
         let placement = Placement {
-            glb_hash: Some("hcube".to_string()),
-            glb_file: None,
             position: [3.0, 4.0, 5.0],
             rotation: [0.0, s2, 0.0, s2],
             scale: [1.0, 1.0, 1.0],
+            ..place("hcube")
         };
-        let model = assemble(
-            &dummy_client(),
+        let model = asm(
             &entity(&[("cube.glb", "hcube")]),
             std::slice::from_ref(&placement),
-            1,
-            Some(&cache),
-            Default::default(),
-        )
-        .unwrap();
+            &cache,
+        );
         assert_eq!(model.primitives.len(), 1);
         let out = &model.primitives[0];
         assert_eq!(out.positions.len(), cube.primitives[0].positions.len());
@@ -875,19 +892,14 @@ mod tests {
         let glb = emit_glb(&cube).unwrap();
         let cache = temp_cache("frame");
         stage(&cache, "hcube", &glb);
-        let model = assemble(
-            &dummy_client(),
+        let model = asm(
             &entity(&[("cube.glb", "hcube")]),
             &[Placement {
-                glb_hash: Some("hcube".to_string()),
                 position: [88.8968276977539, 0.2825070321559906, 13.414548873901368],
-                ..Default::default()
+                ..place("hcube")
             }],
-            1,
-            Some(&cache),
-            Default::default(),
-        )
-        .unwrap();
+            &cache,
+        );
         let (mn, mx) = model.bounds();
         let center = [
             (mn[0] + mx[0]) as f64 / 2.0,
@@ -906,32 +918,16 @@ mod tests {
         let cache = temp_cache("mirror");
         stage(&cache, "hcube", &glb);
         let ent = entity(&[("cube.glb", "hcube")]);
-        let plain = assemble(
-            &dummy_client(),
-            &ent,
-            &[Placement {
-                glb_hash: Some("hcube".to_string()),
-                ..Default::default()
-            }],
-            1,
-            Some(&cache),
-            Default::default(),
-        )
-        .unwrap();
+        let plain = asm(&ent, &[place("hcube")], &cache);
         assert!((signed_volume(&plain) - 1.0).abs() < 1e-4);
-        let mirrored = assemble(
-            &dummy_client(),
+        let mirrored = asm(
             &ent,
             &[Placement {
-                glb_hash: Some("hcube".to_string()),
                 scale: [-1.0, 1.0, 1.0],
-                ..Default::default()
+                ..place("hcube")
             }],
-            1,
-            Some(&cache),
-            Default::default(),
-        )
-        .unwrap();
+            &cache,
+        );
         assert!(
             (signed_volume(&mirrored) - 1.0).abs() < 1e-4,
             "signed volume {}",
@@ -950,27 +946,16 @@ mod tests {
     }
 
     fn textured_tri_glb(mat_name: &str, marker: f32, png: &[u8]) -> Vec<u8> {
-        emit_glb(&LodModel {
-            root_name: "t".to_string(),
-            primitives: vec![LodPrimitive {
-                positions: vec![[marker, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-                normals: vec![[0.0, 0.0, 1.0]; 3],
-                uvs: vec![[0.25, 0.5], [1.0, 0.0], [0.0, 1.0]],
-                indices: vec![0, 1, 2],
-                material: 0,
-                ..Default::default()
-            }],
-            materials: vec![LodMaterial {
+        emit_glb(&model_of(
+            "t",
+            vec![tri_prim(marker, [0.25, 0.5])],
+            vec![LodMaterial {
                 name: mat_name.to_string(),
                 image: Some(0),
                 ..base_material()
             }],
-            images: vec![LodImage {
-                bytes: png.to_vec(),
-                mime: "image/png".to_string(),
-            }],
-            log: Vec::new(),
-        })
+            pngs(&[png]),
+        ))
         .unwrap()
     }
 
@@ -986,33 +971,13 @@ mod tests {
         stage(&cache, "hplain", &glb);
         stage(&cache, "hxform", &with_xform);
         let ent = entity(&[("a.glb", "hplain"), ("b.glb", "hxform")]);
-        let mk = |h: &str| Placement {
-            glb_hash: Some(h.to_string()),
-            ..Default::default()
-        };
-        let plain = assemble(
-            &dummy_client(),
-            &ent,
-            &[mk("hplain")],
-            1,
-            Some(&cache),
-            Default::default(),
-        )
-        .unwrap();
+        let plain = asm(&ent, &[place("hplain")], &cache);
         let uv = plain.primitives[0].uvs[0];
         assert!(
             (uv[0] - 0.25).abs() < 1e-6 && (uv[1] - 0.5).abs() < 1e-6,
             "{uv:?}"
         );
-        let baked = assemble(
-            &dummy_client(),
-            &ent,
-            &[mk("hxform")],
-            1,
-            Some(&cache),
-            Default::default(),
-        )
-        .unwrap();
+        let baked = asm(&ent, &[place("hxform")], &cache);
         let uv = baked.primitives[0].uvs[0];
         assert!(
             (uv[0] - 0.6).abs() < 1e-5 && (uv[1] - 1.7).abs() < 1e-5,
@@ -1030,24 +995,7 @@ mod tests {
         stage(&cache, "ha", &a);
         stage(&cache, "hb", &b);
         let ent = entity(&[("a.glb", "ha"), ("b.glb", "hb")]);
-        let model = assemble(
-            &dummy_client(),
-            &ent,
-            &[
-                Placement {
-                    glb_hash: Some("ha".to_string()),
-                    ..Default::default()
-                },
-                Placement {
-                    glb_hash: Some("hb".to_string()),
-                    ..Default::default()
-                },
-            ],
-            1,
-            Some(&cache),
-            Default::default(),
-        )
-        .unwrap();
+        let model = asm(&ent, &[place("ha"), place("hb")], &cache);
         assert_eq!(model.images.len(), 1);
         assert_eq!(model.materials.len(), 1);
         assert_eq!(model.materials[0].name, "matA");
@@ -1060,17 +1008,10 @@ mod tests {
         let base_png = tiny_png(4);
         let mr_png = tiny_png(5);
         let nrm_png = tiny_png(6);
-        let src = emit_glb(&LodModel {
-            root_name: "truth".to_string(),
-            primitives: vec![LodPrimitive {
-                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-                normals: vec![[0.0, 0.0, 1.0]; 3],
-                uvs: vec![[0.25, 0.5], [1.0, 0.0], [0.0, 1.0]],
-                indices: vec![0, 1, 2],
-                material: 0,
-                ..Default::default()
-            }],
-            materials: vec![LodMaterial {
+        let src = emit_glb(&model_of(
+            "truth",
+            vec![tri_prim(0.0, [0.25, 0.5])],
+            vec![LodMaterial {
                 name: "Purple".to_string(),
                 base_color: [0.1854, 0.0007, 0.6921, 1.0],
                 image: Some(0),
@@ -1082,15 +1023,8 @@ mod tests {
                 emissive_strength: 2.0,
                 ..base_material()
             }],
-            images: [&base_png, &mr_png, &nrm_png]
-                .iter()
-                .map(|b| LodImage {
-                    bytes: b.to_vec(),
-                    mime: "image/png".to_string(),
-                })
-                .collect(),
-            log: Vec::new(),
-        })
+            pngs(&[&base_png, &mr_png, &nrm_png]),
+        ))
         .unwrap();
         let (mut json, bin) = chunks(&src);
         json["materials"][0]["pbrMetallicRoughness"]
@@ -1102,23 +1036,17 @@ mod tests {
         let cache = temp_cache("rawmat");
         stage(&cache, "htruth", &src);
         let ent = entity(&[("truth.glb", "htruth")]);
-        let place = Placement {
-            glb_hash: Some("htruth".to_string()),
-            ..Default::default()
-        };
+        let pl = [place("htruth")];
 
-        let raw = assemble(
-            &dummy_client(),
+        let raw = asm_lane(
             &ent,
-            std::slice::from_ref(&place),
-            1,
-            Some(&cache),
+            &pl,
+            &cache,
             model::MatLane {
                 raw_materials: true,
                 ..Default::default()
             },
-        )
-        .unwrap();
+        );
         let m = &raw.materials[0];
         assert_eq!(m.metallic, 1.0);
         assert_eq!(m.roughness, 0.9);
@@ -1147,15 +1075,7 @@ mod tests {
             serde_json::json!(2.0)
         );
 
-        let plain = assemble(
-            &dummy_client(),
-            &ent,
-            std::slice::from_ref(&place),
-            1,
-            Some(&cache),
-            Default::default(),
-        )
-        .unwrap();
+        let plain = asm(&ent, &pl, &cache);
         let m = &plain.materials[0];
         assert_eq!(m.metallic, 0.0);
         assert_eq!(m.roughness, 1.0);
@@ -1179,17 +1099,10 @@ mod tests {
         img.write_to(&mut cur, image::ImageFormat::Png).unwrap();
         let mr_png = cur.into_inner();
 
-        emit_glb(&LodModel {
-            root_name: "met".to_string(),
-            primitives: vec![LodPrimitive {
-                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-                normals: vec![[0.0, 0.0, 1.0]; 3],
-                uvs: vec![[0.25, 0.5], [1.0, 0.0], [0.0, 1.0]],
-                indices: vec![0, 1, 2],
-                material: 0,
-                ..Default::default()
-            }],
-            materials: vec![LodMaterial {
+        emit_glb(&model_of(
+            "met",
+            vec![tri_prim(0.0, [0.25, 0.5])],
+            vec![LodMaterial {
                 name: "Gold".to_string(),
                 image: Some(0),
                 metallic: 1.0,
@@ -1197,33 +1110,13 @@ mod tests {
                 mr_image: Some(1),
                 ..base_material()
             }],
-            images: [&base_png, &mr_png]
-                .iter()
-                .map(|b| LodImage {
-                    bytes: b.to_vec(),
-                    mime: "image/png".to_string(),
-                })
-                .collect(),
-            log: Vec::new(),
-        })
+            pngs(&[&base_png, &mr_png]),
+        ))
         .unwrap()
     }
 
     fn assemble_lane(cache: &Path, hash: &str, lane: model::MatLane) -> LodModel {
-        let ent = entity(&[("met.glb", hash)]);
-        let place = Placement {
-            glb_hash: Some(hash.to_string()),
-            ..Default::default()
-        };
-        assemble(
-            &dummy_client(),
-            &ent,
-            std::slice::from_ref(&place),
-            1,
-            Some(cache),
-            lane,
-        )
-        .unwrap()
+        asm_lane(&entity(&[("met.glb", hash)]), &[place(hash)], cache, lane)
     }
 
     #[test]
@@ -1311,19 +1204,7 @@ mod tests {
         stage(&cache, "ha", &a);
         stage(&cache, "hb", &b);
         let ent = entity(&[("a.glb", "ha"), ("b.glb", "hb")]);
-        let mk = |h: &str| Placement {
-            glb_hash: Some(h.to_string()),
-            ..Default::default()
-        };
-        let model = assemble(
-            &dummy_client(),
-            &ent,
-            &[mk("ha"), mk("hb")],
-            1,
-            Some(&cache),
-            Default::default(),
-        )
-        .unwrap();
+        let model = asm(&ent, &[place("ha"), place("hb")], &cache);
         assert_eq!(model.materials.len(), 2);
         assert_eq!(model.images.len(), 2);
         let names: HashSet<&str> = model.materials.iter().map(|m| m.name.as_str()).collect();
@@ -1339,19 +1220,10 @@ mod tests {
         stage(&cache, "htri", &glb);
         let ent = entity(&[("t.glb", "htri")]);
         let mk = |x: f64| Placement {
-            glb_hash: Some("htri".to_string()),
             position: [x, 0.0, 0.0],
-            ..Default::default()
+            ..place("htri")
         };
-        let model = assemble(
-            &dummy_client(),
-            &ent,
-            &[mk(0.0), mk(10.0), mk(20.0)],
-            1,
-            Some(&cache),
-            Default::default(),
-        )
-        .unwrap();
+        let model = asm(&ent, &[mk(0.0), mk(10.0), mk(20.0)], &cache);
         assert_eq!(model.total_tris(), 3);
         assert_eq!(model.primitives.len(), 3);
         let s = summary_line(&model);
@@ -1391,26 +1263,18 @@ mod tests {
                 "hspy",
             ),
         ]);
-        let model = assemble(
-            &dummy_client(),
+        let by_file = |f: &str| Placement {
+            glb_file: Some(f.to_string()),
+            ..Default::default()
+        };
+        let model = asm(
             &ent,
             &[
-                Placement {
-                    glb_file: Some(
-                        "models/wearables/second_floor/A/spy_suit_lower_body".to_string(),
-                    ),
-                    ..Default::default()
-                },
-                Placement {
-                    glb_file: Some("models/OK.glb".to_string()),
-                    ..Default::default()
-                },
+                by_file("models/wearables/second_floor/A/spy_suit_lower_body"),
+                by_file("models/OK.glb"),
             ],
-            1,
-            Some(&cache),
-            Default::default(),
-        )
-        .unwrap();
+            &cache,
+        );
         assert_eq!(model.total_tris(), 1);
         assert_eq!(model.primitives.len(), 1);
         let s = summary_line(&model);
@@ -1426,37 +1290,11 @@ mod tests {
     fn nul_padded_json_chunk_is_tolerated() {
         let glb = tri_glb();
         let (json, bin) = chunks(&glb);
-        let mut jb = serde_json::to_vec(&json).unwrap();
-        while !jb.len().is_multiple_of(4) {
-            jb.push(0);
-        }
-        jb.extend_from_slice(&[0, 0, 0, 0]);
-        let total = 12 + 8 + jb.len() + 8 + bin.len();
-        let mut padded = Vec::with_capacity(total);
-        padded.extend_from_slice(b"glTF");
-        padded.extend_from_slice(&2u32.to_le_bytes());
-        padded.extend_from_slice(&(total as u32).to_le_bytes());
-        padded.extend_from_slice(&(jb.len() as u32).to_le_bytes());
-        padded.extend_from_slice(b"JSON");
-        padded.extend_from_slice(&jb);
-        padded.extend_from_slice(&(bin.len() as u32).to_le_bytes());
-        padded.extend_from_slice(&[0x42, 0x49, 0x4E, 0x00]);
-        padded.extend_from_slice(&bin);
+        let padded = rebuild_pad(&json, &bin, 0, 4);
         assert!(crate::gltf::parse(&padded, ".glb", None, false, true).is_err());
         let cache = temp_cache("nulpad");
         stage(&cache, "hnul", &padded);
-        let model = assemble(
-            &dummy_client(),
-            &entity(&[("t.glb", "hnul")]),
-            &[Placement {
-                glb_hash: Some("hnul".to_string()),
-                ..Default::default()
-            }],
-            1,
-            Some(&cache),
-            Default::default(),
-        )
-        .unwrap();
+        let model = asm(&entity(&[("t.glb", "hnul")]), &[place("hnul")], &cache);
         assert_eq!(model.total_tris(), 1);
     }
 
@@ -1466,19 +1304,14 @@ mod tests {
         let glb = emit_glb(&cube).unwrap();
         let cache = temp_cache("reparse");
         stage(&cache, "hcube", &glb);
-        let model = assemble(
-            &dummy_client(),
+        let model = asm(
             &entity(&[("cube.glb", "hcube")]),
             &[Placement {
-                glb_hash: Some("hcube".to_string()),
                 position: [1.0, 2.0, 3.0],
-                ..Default::default()
+                ..place("hcube")
             }],
-            1,
-            Some(&cache),
-            Default::default(),
-        )
-        .unwrap();
+            &cache,
+        );
         let out = emit_glb(&model).unwrap();
         let back = model::from_glb_bytes(&out, &model.root_name).unwrap();
         assert_eq!(back.total_tris(), model.total_tris());
