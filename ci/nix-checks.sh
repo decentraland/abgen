@@ -29,8 +29,9 @@ nix build --keep-going --no-link --log-format raw --max-jobs 2 "${attrs[@]}" \
 assert_ran_tests() {
   local attr="$1" pattern="$2"
   # CARGO_TERM_COLOR=always wraps the summary in ANSI escapes; strip them
-  # or the pattern can never match a CI log.
-  nix log "$attr" | sed $'s/\x1b\\[[0-9;]*[A-Za-z]//g' | grep -qE "$pattern" \
+  # or the pattern can never match a CI log. No grep -q: under pipefail its
+  # early exit SIGPIPEs sed and fails the pipeline on a successful match.
+  nix log "$attr" | sed $'s/\x1b\\[[0-9;]*[A-Za-z]//g' | grep -E "$pattern" > /dev/null \
     || { echo "$attr built green but ran no tests ($pattern not in its log)" >&2; exit 1; }
 }
 while IFS= read -r name; do
