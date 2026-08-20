@@ -136,16 +136,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - lane: x86 tests
+          # One workspace-scale compile per lane: nextest's test-target
+          # build and abgen-all (behind native-smoke) each cost ~10 min on
+          # 4 cores, so pairing them serialized the verdict. Wall time is
+          # the slowest single lane.
+          - lane: x86 nextest
             runner: ubuntu-24.04
             system: x86_64-linux
             deps: .#checks.x86_64-linux.deps
-            attrs: nextest native-smoke
-          - lane: arm tests
+            attrs: nextest
+          - lane: x86 build + smoke
+            runner: ubuntu-24.04
+            system: x86_64-linux
+            deps: .#checks.x86_64-linux.deps
+            attrs: native-smoke
+          - lane: arm nextest
             runner: ubuntu-24.04-arm
             system: aarch64-linux
             deps: .#checks.aarch64-linux.deps
-            attrs: nextest lambda-tests native-smoke
+            attrs: nextest
+          - lane: arm lambda + smoke
+            runner: ubuntu-24.04-arm
+            system: aarch64-linux
+            deps: .#checks.aarch64-linux.deps
+            attrs: lambda-tests native-smoke
           - lane: arm lints
             runner: ubuntu-24.04-arm
             system: aarch64-linux
