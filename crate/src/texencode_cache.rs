@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Clone, Copy)]
 pub enum Kind {
@@ -11,7 +11,7 @@ pub enum Kind {
 }
 
 struct Store {
-    map: HashMap<[u8; 32], (Vec<u8>, i32)>,
+    map: HashMap<[u8; 32], (Arc<Vec<u8>>, i32)>,
     bytes: usize,
     hits: u64,
     misses: u64,
@@ -75,6 +75,42 @@ fn key(kind: Kind, pixels: &[u8], width: u32, height: u32, params: &[i64]) -> [u
     h.finalize()
 }
 
+/// Like `get_or_encode`, but hands back the cache's own buffer: hits and
+/// stored misses cost an `Arc` clone instead of copying the encoded chain.
+pub fn get_or_encode_shared(
+    kind: Kind,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    params: &[i64],
+    f: impl FnOnce() -> Option<(Vec<u8>, i32)>,
+) -> Option<(Arc<Vec<u8>>, i32)> {
+    if !enabled() {
+        return f().map(|(data, mips)| (Arc::new(data), mips));
+    }
+    let k = key(kind, pixels, width, height, params);
+    {
+        let mut s = lock();
+        if let Some((data, mips)) = s.map.get(&k) {
+            let out = (Arc::clone(data), *mips);
+            s.hits += 1;
+            return Some(out);
+        }
+        s.misses += 1;
+    }
+    let (data, mips) = f()?;
+    let len = data.len();
+    let data = Arc::new(data);
+    let mut s = lock();
+    if s.bytes + len <= max_bytes() {
+        if let std::collections::hash_map::Entry::Vacant(e) = s.map.entry(k) {
+            e.insert((Arc::clone(&data), mips));
+            s.bytes += len;
+        }
+    }
+    Some((data, mips))
+}
+
 pub fn get_or_encode(
     kind: Kind,
     pixels: &[u8],
@@ -83,29 +119,8 @@ pub fn get_or_encode(
     params: &[i64],
     f: impl FnOnce() -> Option<(Vec<u8>, i32)>,
 ) -> Option<(Vec<u8>, i32)> {
-    if !enabled() {
-        return f();
-    }
-    let k = key(kind, pixels, width, height, params);
-    {
-        let mut s = lock();
-        if let Some((data, mips)) = s.map.get(&k) {
-            let out = (data.clone(), *mips);
-            s.hits += 1;
-            return Some(out);
-        }
-        s.misses += 1;
-    }
-    let result = f()?;
-    let len = result.0.len();
-    let mut s = lock();
-    if s.bytes + len <= max_bytes() {
-        if let std::collections::hash_map::Entry::Vacant(e) = s.map.entry(k) {
-            e.insert((result.0.clone(), result.1));
-            s.bytes += len;
-        }
-    }
-    Some(result)
+    get_or_encode_shared(kind, pixels, width, height, params, f)
+        .map(|(data, mips)| (Arc::try_unwrap(data).unwrap_or_else(|a| (*a).clone()), mips))
 }
 
 pub fn stats() -> (u64, u64, usize, usize) {
@@ -179,6 +194,22 @@ mod tests {
         assert_eq!(a, b);
         let (h1, _, _, _) = stats();
         assert!(h1 > h0);
+    }
+
+    #[test]
+    fn shared_hit_returns_cache_buffer_without_copy() {
+        enable();
+        let pixels: Vec<u8> = (0..8u32 * 8 * 4).map(|i| (i * 3 % 253) as u8).collect();
+        let a = get_or_encode_shared(Kind::Bc7, &pixels, 8, 8, &[7], || {
+            Some((vec![10, 20, 30], 2))
+        })
+        .unwrap();
+        let b = get_or_encode_shared(Kind::Bc7, &pixels, 8, 8, &[7], || unreachable!()).unwrap();
+        assert!(Arc::ptr_eq(&a.0, &b.0), "hit must share the stored buffer");
+        assert_eq!((&*a.0, a.1), (&vec![10, 20, 30], 2));
+
+        let c = get_or_encode(Kind::Bc7, &pixels, 8, 8, &[7], || unreachable!()).unwrap();
+        assert_eq!(c, (vec![10, 20, 30], 2), "legacy view sees the same bytes");
     }
 
     #[test]

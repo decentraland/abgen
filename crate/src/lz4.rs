@@ -41,19 +41,27 @@ impl std::error::Error for Lz4Error {}
 
 const MAX_DECOMPRESS_BYTES: usize = 256 * 1024 * 1024;
 
+/// Match copies may overshoot the match end by up to 7 bytes; the buffer
+/// carries this much slack past `dst_size` so those stores stay in bounds.
+/// Every byte of `[0, dst_size)` is still written exactly by some later
+/// literal or match (`dp` advances contiguously to `dst_size`), so an
+/// overshoot never survives into the returned bytes.
+const WILDCOPY_SLACK: usize = 8;
+
 pub fn decompress(src: &[u8], dst_size: usize) -> Result<Vec<u8>, Lz4Error> {
     if dst_size > MAX_DECOMPRESS_BYTES {
         return Err(Lz4Error::Malformed(
             "decompressed size exceeds MAX_DECOMPRESS_BYTES",
         ));
     }
-    let mut dst = vec![0u8; dst_size];
+    let mut dst = vec![0u8; dst_size + WILDCOPY_SLACK];
     let mut sp = 0usize;
     let mut dp = 0usize;
     let slen = src.len();
 
     if slen == 0 {
         if dst_size == 0 {
+            dst.truncate(0);
             return Ok(dst);
         }
         return Err(Lz4Error::Malformed("empty input but non-zero output"));
@@ -130,8 +138,51 @@ pub fn decompress(src: &[u8], dst_size: usize) -> Result<Vec<u8>, Lz4Error> {
         }
 
         let mp = dp - offset;
-        for k in 0..match_len {
-            dst[dp + k] = dst[mp + k];
+        if offset >= 8 {
+            // Chunks of the source never overlap their destination at this
+            // offset, so 8-byte copies preserve byte-loop semantics.
+            let mut s = mp;
+            let mut d = dp;
+            let end = dp + match_len;
+            while d < end {
+                unsafe {
+                    let v = (dst.as_ptr().add(s) as *const u64).read_unaligned();
+                    (dst.as_mut_ptr().add(d) as *mut u64).write_unaligned(v);
+                }
+                s += 8;
+                d += 8;
+            }
+        } else if offset == 1 || offset == 2 || offset == 4 {
+            // 8 is a multiple of the offset, so a repeated 8-byte pattern
+            // keeps the phase a byte loop would produce.
+            let pat64 = match offset {
+                1 => 0x0101010101010101u64.wrapping_mul(dst[mp] as u64),
+                2 => {
+                    let p = (dst[mp] as u64) | ((dst[mp + 1] as u64) << 8);
+                    p | (p << 16) | (p << 32) | (p << 48)
+                }
+                _ => {
+                    let p = (dst[mp] as u64)
+                        | ((dst[mp + 1] as u64) << 8)
+                        | ((dst[mp + 2] as u64) << 16)
+                        | ((dst[mp + 3] as u64) << 24);
+                    p | (p << 32)
+                }
+            };
+            let mut d = dp;
+            let end = dp + match_len;
+            while d < end {
+                unsafe {
+                    (dst.as_mut_ptr().add(d) as *mut u64).write_unaligned(pat64.to_le());
+                }
+                d += 8;
+            }
+        } else {
+            // Offsets 3, 5, 6, 7 overlap within a word at a phase 8 doesn't
+            // preserve; they are rare enough that bytes are fine.
+            for k in 0..match_len {
+                dst[dp + k] = dst[mp + k];
+            }
         }
         dp += match_len;
     }
@@ -139,6 +190,7 @@ pub fn decompress(src: &[u8], dst_size: usize) -> Result<Vec<u8>, Lz4Error> {
     if dp != dst_size {
         return Err(Lz4Error::Malformed("decompressed size mismatch"));
     }
+    dst.truncate(dst_size);
     Ok(dst)
 }
 
@@ -230,6 +282,10 @@ struct HcCtx {
 
     base: u32,
     next_to_update: u32,
+
+    /// One past the highest index the tables may still refer to; the next
+    /// `prepare` rebases beyond it.
+    hi: u32,
 }
 
 impl HcCtx {
@@ -249,13 +305,33 @@ impl HcCtx {
             combo_table,
             base,
             next_to_update: base,
+            hi: base,
         }
     }
 
-    fn reset(&mut self) {
-        self.hash_table.fill(0);
-        self.combo_table.fill(0x0000FFFFu32);
-        self.base = 64 * 1024;
+    /// Make the context safe for a fresh buffer without clearing the tables.
+    ///
+    /// Rebasing `base` at least 64 KiB past every index the tables may still
+    /// hold keeps stale entries indistinguishable from a zeroed table: a
+    /// stale `hash_table` hit always yields `delta > LZ4_DISTANCE_MAX`,
+    /// which `insert` clamps and whose `sum` saturates to 0xFFFF — the exact
+    /// values the zero entries of a fresh table produce (`base` starts at
+    /// 64 KiB for the same reason) — and the search loops reject any stale
+    /// candidate on the `lowest_match_index` bound before dereferencing it.
+    /// Match discovery, and therefore compressed output, is bit-identical to
+    /// a fresh context (`hc_ctx_reuse_matches_fresh` pins this); the saving
+    /// is a 384 KiB memset per compressed chunk plus the cache eviction it
+    /// causes. The index space is u32, so once the headroom is spent the
+    /// tables are cleared for real and `base` starts over.
+    fn prepare(&mut self, src_len: usize) {
+        let rebased = self.hi as u64 + 64 * 1024;
+        if rebased + src_len as u64 > u32::MAX as u64 - 64 * 1024 {
+            self.hash_table.fill(0);
+            self.combo_table.fill(0x0000FFFFu32);
+            self.base = 64 * 1024;
+        } else {
+            self.base = rebased as u32;
+        }
         self.next_to_update = self.base;
     }
 
@@ -881,7 +957,7 @@ struct Opt {
 fn compress_optimal(buf: &[u8]) -> Vec<u8> {
     HC_CTX_POOL.with(|cell| {
         let mut ctx = cell.borrow_mut();
-        ctx.reset();
+        ctx.prepare(buf.len());
         compress_optimal_with_ctx(buf, &mut ctx)
     })
 }
@@ -889,6 +965,7 @@ fn compress_optimal(buf: &[u8]) -> Vec<u8> {
 fn compress_optimal_with_ctx(buf: &[u8], ctx: &mut HcCtx) -> Vec<u8> {
     let mut memo = PatternMemo::default();
     let src_size = buf.len();
+    ctx.hi = ctx.base.saturating_add(src_size as u32);
     let mut op: Vec<u8> = Vec::with_capacity(src_size + src_size / 255 + 16);
 
     let mut opt = vec![Opt::default(); LZ4_OPT_NUM + TRAILING_LITERALS];
@@ -1249,6 +1326,193 @@ mod hc_kernel_tests {
             assert_eq!(hex, want, "compress_hc output changed");
         } else {
             eprintln!("lz4 corpus digest: {hex}");
+        }
+    }
+
+    fn reuse_cases() -> Vec<Vec<u8>> {
+        let mut cases: Vec<Vec<u8>> = vec![Vec::new(), b"short".to_vec()];
+        for period in [1usize, 2, 3, 4, 5, 6, 7, 8, 11, 16] {
+            let mut v = vec![0u8; 96 * 1024];
+            for (i, b) in v.iter_mut().enumerate() {
+                *b = ((i % period) as u8).wrapping_mul(37).wrapping_add(period as u8);
+            }
+            // A few aperiodic bytes so matches end mid-word too.
+            v[1000] ^= 0x5A;
+            v[65535] ^= 0xA5;
+            cases.push(v);
+        }
+        let mut rnd = vec![0u8; 128 * 1024];
+        xorshift_fill(&mut rnd, 0xDEADBEEFCAFEF00D);
+        cases.push(rnd.clone());
+        let mut half = rnd[..64 * 1024].to_vec();
+        half.extend_from_slice(&rnd[..64 * 1024]);
+        cases.push(half);
+        cases
+    }
+
+    /// A reused (rebased) context must compress exactly like a fresh one:
+    /// `prepare` promises stale table entries are unobservable.
+    #[test]
+    fn hc_ctx_reuse_matches_fresh() {
+        let cases = reuse_cases();
+        // Two passes so every case also runs against a context left dirty by
+        // every other case.
+        for pass in 0..2 {
+            for (i, case) in cases.iter().enumerate() {
+                let reused = compress_hc(case);
+                let fresh = compress_optimal_with_ctx(case, &mut HcCtx::new());
+                assert_eq!(reused, fresh, "pass={pass} case={i}");
+                assert_eq!(decompress(&reused, case.len()).unwrap(), *case);
+            }
+        }
+        // Exhausted index headroom must take the hard-reset path and still
+        // produce identical bytes.
+        let case = &cases[3];
+        let fresh = compress_optimal_with_ctx(case, &mut HcCtx::new());
+        let mut ctx = HcCtx::new();
+        compress_optimal_with_ctx(case, &mut ctx);
+        ctx.hi = u32::MAX - 100;
+        ctx.prepare(case.len());
+        assert_eq!(ctx.base, 64 * 1024, "expected the hard-reset path");
+        assert_eq!(compress_optimal_with_ctx(case, &mut ctx), fresh);
+    }
+
+    /// Original byte-at-a-time decompressor, kept as the behavioral
+    /// reference for the wildcopy version.
+    fn decompress_ref(src: &[u8], dst_size: usize) -> Result<Vec<u8>, Lz4Error> {
+        if dst_size > MAX_DECOMPRESS_BYTES {
+            return Err(Lz4Error::Malformed(
+                "decompressed size exceeds MAX_DECOMPRESS_BYTES",
+            ));
+        }
+        let mut dst = vec![0u8; dst_size];
+        let mut sp = 0usize;
+        let mut dp = 0usize;
+        let slen = src.len();
+
+        if slen == 0 {
+            if dst_size == 0 {
+                return Ok(dst);
+            }
+            return Err(Lz4Error::Malformed("empty input but non-zero output"));
+        }
+
+        loop {
+            if sp >= slen {
+                return Err(Lz4Error::Malformed("truncated token"));
+            }
+            let token = src[sp] as u32;
+            sp += 1;
+
+            let mut lit_len = (token >> ML_BITS) as usize;
+            if lit_len == RUN_MASK as usize {
+                loop {
+                    if sp >= slen {
+                        return Err(Lz4Error::Malformed("truncated literal length"));
+                    }
+                    let b = src[sp];
+                    sp += 1;
+                    lit_len += b as usize;
+                    if b != 255 {
+                        break;
+                    }
+                }
+            }
+
+            if lit_len > 0 {
+                if sp + lit_len > slen {
+                    return Err(Lz4Error::Malformed("literal run exceeds input"));
+                }
+                if dp + lit_len > dst_size {
+                    return Err(Lz4Error::Malformed("literal run exceeds output"));
+                }
+                dst[dp..dp + lit_len].copy_from_slice(&src[sp..sp + lit_len]);
+                sp += lit_len;
+                dp += lit_len;
+            }
+
+            if sp == slen {
+                break;
+            }
+
+            if sp + 2 > slen {
+                return Err(Lz4Error::Malformed("truncated offset"));
+            }
+            let offset = (src[sp] as usize) | ((src[sp + 1] as usize) << 8);
+            sp += 2;
+            if offset == 0 {
+                return Err(Lz4Error::Malformed("zero offset"));
+            }
+            if offset > dp {
+                return Err(Lz4Error::Malformed("offset before output start"));
+            }
+
+            let mut match_len = (token & ML_MASK) as usize;
+            if match_len == ML_MASK as usize {
+                loop {
+                    if sp >= slen {
+                        return Err(Lz4Error::Malformed("truncated match length"));
+                    }
+                    let b = src[sp];
+                    sp += 1;
+                    match_len += b as usize;
+                    if b != 255 {
+                        break;
+                    }
+                }
+            }
+            match_len += MINMATCH as usize;
+
+            if dp + match_len > dst_size {
+                return Err(Lz4Error::Malformed("match copy exceeds output"));
+            }
+
+            let mp = dp - offset;
+            for k in 0..match_len {
+                dst[dp + k] = dst[mp + k];
+            }
+            dp += match_len;
+        }
+
+        if dp != dst_size {
+            return Err(Lz4Error::Malformed("decompressed size mismatch"));
+        }
+        Ok(dst)
+    }
+
+    /// The wildcopy decompressor must agree with the reference on valid
+    /// streams (every overlap offset), on truncations, and on corruptions.
+    #[test]
+    fn decompress_matches_reference() {
+        let mut streams: Vec<(Vec<u8>, usize)> = Vec::new();
+        for case in reuse_cases() {
+            let comp = compress_hc(&case);
+            streams.push((comp, case.len()));
+        }
+
+        for (comp, dst_size) in &streams {
+            let a = decompress(comp, *dst_size);
+            let b = decompress_ref(comp, *dst_size);
+            assert_eq!(a, b);
+            // Truncations must fail identically (or agree, near the tail).
+            for cut in [comp.len() / 3, comp.len() / 2, comp.len().saturating_sub(3)] {
+                let a = decompress(&comp[..cut], *dst_size);
+                let b = decompress_ref(&comp[..cut], *dst_size);
+                assert_eq!(a, b, "cut={cut}");
+            }
+            // Bit flips: same verdict and same bytes when both accept.
+            let mut x = 0x123456789ABCDEFu64;
+            for _ in 0..32 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let mut bad = comp.clone();
+                let pos = (x as usize) % bad.len();
+                bad[pos] ^= 1 << ((x >> 32) & 7);
+                let a = decompress(&bad, *dst_size);
+                let b = decompress_ref(&bad, *dst_size);
+                assert_eq!(a, b, "flip at {pos}");
+            }
         }
     }
 }

@@ -26,6 +26,7 @@ pub mod cabname;
 pub mod catalyst;
 pub mod clihelp;
 pub mod dates;
+pub mod decode_cache;
 pub mod detmath;
 pub mod draco;
 #[cfg(not(target_arch = "wasm32"))]
