@@ -408,7 +408,7 @@ pub(super) async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
 }
 
 pub(super) fn reason_of(resp: &axum::response::Response) -> Option<String> {
-    hdr(&resp, super::lodjit::REASON_HEADER).map(str::to_string)
+    hdr(resp, super::lodjit::REASON_HEADER).map(str::to_string)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
