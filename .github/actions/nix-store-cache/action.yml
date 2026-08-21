@@ -66,6 +66,31 @@ runs:
         key: nix-v5-${{ runner.os }}-${{ runner.arch }}-${{ inputs.flavor }}-${{ hashFiles('crate/**', 'lambda/**', 'template/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'flake.nix', 'flake.lock', 'nix/**', '.config/nextest.toml') }}
         restore-keys: nix-v5-${{ runner.os }}-${{ runner.arch }}-${{ inputs.flavor }}-
 
+    # actions/cache scoping is one-directional (main never sees PR
+    # entries) and the 10 GB pool LRU-evicts under churn; each newly
+    # packed cache is also uploaded as a repo-wide artifact under the same
+    # name, so any ref — main's post-merge run above all — can seed from
+    # it. The fork filter is mandatory: artifacts are repo-wide and fork
+    # PRs can upload arbitrary names.
+    - name: seed from artifact on cache miss
+      if: steps.restore.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        KEY: ${{ steps.restore.outputs.cache-primary-key }}
+      run: |
+        id=$(gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$KEY&per_page=10" \
+          --jq '[.artifacts[] | select(.expired == false and .workflow_run.head_repository_id == .workflow_run.repository_id)] | sort_by(.created_at) | last | .id // empty')
+        if [ -n "$id" ]; then
+          gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > /tmp/nixcache-seed.zip
+          unzip -qo /tmp/nixcache-seed.zip -d /var/tmp/abgen-nixcache
+          rm -f /tmp/nixcache-seed.zip
+          echo "ABGEN_NIXCACHE_ARTIFACT=hit" >> "$GITHUB_ENV"
+          echo "seeded binary cache from artifact $KEY"
+        else
+          echo "ABGEN_NIXCACHE_ARTIFACT=miss" >> "$GITHUB_ENV"
+        fi
+
     - name: expose cache facts to the save action
       shell: bash
       run: |

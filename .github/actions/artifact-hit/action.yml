@@ -1,0 +1,28 @@
+name: artifact hit
+description: >
+  Exact-name lookup of a non-expired artifact minted by a same-repo run.
+  Artifacts are visible repo-wide regardless of the creating ref — that is
+  what lets a verdict minted on a PR skip work on main, where actions/cache
+  scoping cannot reach. The head_repository_id filter is mandatory: fork
+  PRs execute their own copy of the workflow and can upload arbitrary
+  artifact names into this repo's namespace.
+inputs:
+  name:
+    description: exact artifact name
+    required: true
+outputs:
+  hit:
+    value: ${{ steps.q.outputs.hit }}
+runs:
+  using: composite
+  steps:
+    - id: q
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        n=$(gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=${{ inputs.name }}&per_page=10" \
+          --jq '[.artifacts[] | select(.expired == false and .workflow_run.head_repository_id == .workflow_run.repository_id)] | length' \
+          | awk '{s+=$1} END {print (s > 0) ? "true" : "false"}')
+        echo "hit=$n" >> "$GITHUB_OUTPUT"
+        echo "${{ inputs.name }}: hit=$n"

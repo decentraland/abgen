@@ -1,10 +1,16 @@
 name: tree hash
 description: >
-  Deny-list content hash of the checked-out tree for memoizing non-nix
-  lanes. Every tracked file participates except paths that provably cannot
-  affect a cargo build/test verdict, each with its argument below. The
-  failure mode of an omission here is an unnecessary run, never a false
-  skip — the opposite polarity of an allow-list.
+  Deny-list content hash of the checked-out tree for lane memoization.
+  Every tracked file participates except paths that provably cannot affect
+  the lane's verdict, each with its argument below. The failure mode of an
+  omission here is an unnecessary run, never a false skip — the opposite
+  polarity of an allow-list.
+inputs:
+  scope:
+    description: >
+      cargo = rustup lanes (windows/node): nix plumbing is irrelevant.
+      nix = nix lanes: only prose and recorded manifests are irrelevant.
+    default: cargo
 outputs:
   h:
     description: sha256 over the filtered git tree listing (mode, blob, path)
@@ -16,13 +22,21 @@ runs:
       shell: bash
       run: |
         # ci/artifact-hashes: consumed only by the release hash gate
-        # nix/, flake.*:      the nix lanes' world; cargo lanes use rustup
         # release.yml:        publishing orchestration, runs no tests
         # *.md:               prose
-        h=$(git ls-tree -r HEAD | awk -F'\t' '
-          $2 !~ /^ci\/artifact-hashes\// &&
-          $2 !~ /^nix\// &&
-          $2 != "flake.nix" && $2 != "flake.lock" &&
-          $2 != ".github/workflows/release.yml" &&
-          $2 !~ /\.md$/' | sha256sum | cut -c1-64)
+        # cargo scope only — nix/, flake.*: the nix lanes' world; cargo
+        # lanes use rustup
+        if [ "${{ inputs.scope }}" = "cargo" ]; then
+          h=$(git ls-tree -r HEAD | awk -F'\t' '
+            $2 !~ /^ci\/artifact-hashes\// &&
+            $2 !~ /^nix\// &&
+            $2 != "flake.nix" && $2 != "flake.lock" &&
+            $2 != ".github/workflows/release.yml" &&
+            $2 !~ /\.md$/' | sha256sum | cut -c1-64)
+        else
+          h=$(git ls-tree -r HEAD | awk -F'\t' '
+            $2 !~ /^ci\/artifact-hashes\// &&
+            $2 != ".github/workflows/release.yml" &&
+            $2 !~ /\.md$/' | sha256sum | cut -c1-64)
+        fi
         echo "h=$h" >> "$GITHUB_OUTPUT"

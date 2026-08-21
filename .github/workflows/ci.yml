@@ -10,6 +10,9 @@ on:
 
 permissions:
   contents: read
+  # Artifact lookup/download (the verdict markers and nix cache seeds) go
+  # through the REST API, which needs actions: read.
+  actions: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -58,19 +61,16 @@ jobs:
           fetch-depth: 0
       - id: hash
         uses: ./.github/actions/tree-hash
+      # Verdict artifacts, not cache markers: artifacts cross ref scopes,
+      # so a verdict minted on the PR skips the identical-tree run that a
+      # squash merge pushes to main.
       - id: memo
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: ./.github/actions/artifact-hit
         with:
-          path: .win-green-marker
-          key: windows-green-${{ steps.hash.outputs.h }}
-          lookup-only: true
-          # The save runs on windows-2025 while this lookup runs on linux;
-          # without the cross-OS flag on BOTH sides the cache versions never
-          # match and the marker is permanently invisible.
-          enableCrossOsArchive: true
+          name: windows-green-${{ steps.hash.outputs.h }}
       - id: decide
         run: |
-          if [ "${{ steps.memo.outputs.cache-hit }}" = "true" ]; then mode=skip
+          if [ "${{ steps.memo.outputs.hit }}" = "true" ]; then mode=skip
           elif [ "${{ github.event_name }}" != "pull_request" ]; then mode=full
           elif ! git diff --quiet ${{ github.event.pull_request.base.sha }}...HEAD -- 'Cargo.lock' 'Cargo.toml' 'rust-toolchain.toml' '.github/workflows/ci.yml' '.github/actions/rust-setup' 'ci/abgen-smoke.ps1' '.config/nextest.toml' 'crate/Cargo.toml' 'crate/build.rs' 'crate/third_party' 'crate/abgen-native' 'crate/dcl-contents' 'crate/src/abcdn' 'crate/src/builder' 'crate/src/export' 'crate/src/lodgen' 'crate/src/gpu' 'crate/src/live.rs' 'crate/src/jitcache.rs' 'crate/src/local_store.rs' 'crate/src/texencode_cache.rs' 'crate/src/tmppath.rs' 'crate/src/clihelp.rs' 'crate/src/ffi.rs' 'crate/src/worlds.rs' 'crate/src/lods.rs' 'crate/src/lz4.rs' 'crate/src/manifest.rs' 'crate/src/space.rs' 'crate/src/shader.rs' 'crate/src/lib.rs' 'crate/src/gltf/scene_build.rs' 'crate/src/unity/bundle_file.rs' 'crate/abgen-wasm/test/fixtures/normal-quad.glb'; then mode=full
           elif ! git diff --quiet ${{ github.event.pull_request.base.sha }}...HEAD -- '**/*.rs' 'Cargo.*' '**/Cargo.toml'; then mode=quick
@@ -120,21 +120,24 @@ jobs:
         if: needs.windows-gate.outputs.mode == 'full'
         shell: pwsh
         run: Set-Content -Path .win-green-marker -Value green
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: needs.windows-gate.outputs.mode == 'full'
         with:
+          name: windows-green-${{ needs.windows-gate.outputs.hash }}
           path: .win-green-marker
-          key: windows-green-${{ needs.windows-gate.outputs.hash }}
-          enableCrossOsArchive: true
+          retention-days: 30
 
-  # No gate job, no marker: the binary cache is the memoization. The cache
-  # key includes the source tree and the save runs after the checks, so an
-  # entry carries the check outputs; identical inputs substitute them
-  # (hash-verified) instead of testing. An output exists only because its
-  # exact derivation once built green, and actions/cache's scope chain
-  # (own ref -> base -> default) keeps fork PRs out. The key's file list
-  # is a cache NAME, not a correctness input — a wrong list only costs a
-  # prefix-fallback restore.
+  # Two memo layers, one trust story. (1) The binary cache: keys include
+  # the source tree and the save runs after the checks, so an entry
+  # carries the check outputs and identical inputs substitute them
+  # (hash-verified) instead of testing; actions/cache scoping keeps fork
+  # PRs out, but is one-directional — main cannot read PR entries. (2)
+  # Verdict artifacts bridge that: a lane that passes uploads
+  # nix-green-<lane>-<treehash> (deny-list tree hash, nix scope), and any
+  # identical-tree run — in particular main's after a squash merge — skips
+  # on the artifact-hit lookup, which is fork-filtered. The cache key's
+  # file list is a NAME, not a correctness input; the verdict key's
+  # deny-list can only over-test.
   nix-ci:
     name: ${{ matrix.lane }}
     strategy:
@@ -148,59 +151,94 @@ jobs:
           - lane: x86 nextest
             runner: ubuntu-24.04
             system: x86_64-linux
+            marker: x86-nextest
             deps: .#checks.x86_64-linux.deps-checkfast
             attrs: nextest
             flavor: checkfast
           - lane: x86 build + smoke
             runner: ubuntu-24.04
             system: x86_64-linux
+            marker: x86-smoke
             deps: .#checks.x86_64-linux.deps
             attrs: native-smoke
           - lane: arm nextest
             runner: ubuntu-24.04-arm
             system: aarch64-linux
+            marker: arm-nextest
             deps: .#checks.aarch64-linux.deps-checkfast
             attrs: nextest
             flavor: checkfast
           # Own flavor, not checkfast: lanes sharing (os, arch, flavor)
           # race the save and first-save-wins would drop this lane's
           # outputs from the cache every time.
-          - lane: arm lambda + smoke
+          - lane: arm lambda
             runner: ubuntu-24.04-arm
             system: aarch64-linux
-            deps: .#checks.aarch64-linux.lambda-deps .#checks.aarch64-linux.deps
-            attrs: lambda-tests native-smoke
+            marker: arm-lambda
+            deps: .#checks.aarch64-linux.lambda-deps
+            attrs: lambda-tests
             flavor: lambda
-          - lane: arm lints
+          # native-smoke rides the build-flavor lane on each arch so that
+          # arch's build entry carries abgen-all and the release workflow's
+          # nix leg substitutes it instead of re-linking fat LTO.
+          - lane: arm lints + smoke
             runner: ubuntu-24.04-arm
             system: aarch64-linux
+            marker: arm-lints
             deps: .#checks.aarch64-linux.deps .#checks.aarch64-linux.wasm-deps
-            attrs: clippy fmt no-node-spawn wasm-check
+            attrs: clippy fmt no-node-spawn wasm-check native-smoke
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      # scope nix: only prose/manifests are denied — nix/, flake.* and the
+      # whole ci harness are inputs to this lane's verdict.
+      - id: th
+        uses: ./.github/actions/tree-hash
+        with:
+          scope: nix
+      - id: memo
+        uses: ./.github/actions/artifact-hit
+        with:
+          name: nix-green-${{ matrix.marker }}-${{ steps.th.outputs.h }}
+      - name: skip notice
+        if: steps.memo.outputs.hit == 'true'
+        run: echo "lane already green for tree ${{ steps.th.outputs.h }} (verdict artifact); skipping."
       # No standalone nix installer: the composite runs it with the
       # extra-conf this job needs; a prior bare install made that conf
       # silently a no-op.
       - uses: ./.github/actions/nix-store-cache
+        if: steps.memo.outputs.hit != 'true'
         with:
           flavor: ${{ matrix.flavor || 'build' }}
       - name: deps (dependency closures)
+        if: steps.memo.outputs.hit != 'true'
         run: nix build --no-link ${{ matrix.deps }}
       - name: checks (${{ matrix.attrs }})
+        if: steps.memo.outputs.hit != 'true'
         run: bash ci/nix-checks.sh ${{ matrix.system }} ${{ matrix.attrs }}
       # Save AFTER the checks so their outputs enter the cache — that is
       # the memoization. always(): a failed run still publishes its deps
       # progress so the retry is warm; the failed check has no output, so
-      # nothing false is ever cached.
+      # nothing false is ever cached. (On a verdict skip the composite
+      # never ran, so the save no-ops on its unset env.)
       - uses: ./.github/actions/nix-store-cache/save
         if: always()
         continue-on-error: true
+      # The verdict artifact: minted only after the checks step succeeded
+      # (implicit success()), readable by main's identical-tree run.
+      - name: write verdict
+        if: steps.memo.outputs.hit != 'true'
+        run: echo green > .lane-green
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: steps.memo.outputs.hit != 'true'
+        with:
+          name: nix-green-${{ matrix.marker }}-${{ steps.th.outputs.h }}
+          path: .lane-green
+          retention-days: 30
 
   node-addon:
     name: node addon
-    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -208,22 +246,20 @@ jobs:
       - id: hash
         uses: ./.github/actions/tree-hash
       - id: memo
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: ./.github/actions/artifact-hit
         with:
-          path: .node-green-marker
-          key: node-green-${{ steps.hash.outputs.h }}
-          lookup-only: true
+          name: node-green-${{ steps.hash.outputs.h }}
       - name: skip notice
-        if: steps.memo.outputs.cache-hit == 'true'
-        run: echo "node addon already green for input hash ${{ steps.hash.outputs.h }} (memoized marker); skipping."
+        if: steps.memo.outputs.hit == 'true'
+        run: echo "node addon already green for tree ${{ steps.hash.outputs.h }} (verdict artifact); skipping."
       - uses: ./.github/actions/rust-setup
-        if: steps.memo.outputs.cache-hit != 'true'
+        if: steps.memo.outputs.hit != 'true'
         with:
           workspaces: crate/abgen-node
           shared-key: abgen-node
           save-if: "false"
       - name: abgen-node (build + smoke)
-        if: steps.memo.outputs.cache-hit != 'true'
+        if: steps.memo.outputs.hit != 'true'
         working-directory: crate/abgen-node
         run: |
           npm ci --no-audit --no-fund
@@ -242,10 +278,11 @@ jobs:
           bash ../../ci/check-glibc-floor.sh 2.34 \
             target/release/libabgen_node.so
       - name: write green marker
-        if: steps.memo.outputs.cache-hit != 'true'
+        if: steps.memo.outputs.hit != 'true'
         run: echo green > .node-green-marker
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        if: steps.memo.outputs.cache-hit != 'true'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: steps.memo.outputs.hit != 'true'
         with:
+          name: node-green-${{ steps.hash.outputs.h }}
           path: .node-green-marker
-          key: node-green-${{ steps.hash.outputs.h }}
+          retention-days: 30

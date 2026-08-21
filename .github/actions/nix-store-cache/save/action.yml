@@ -45,3 +45,12 @@ runs:
       with:
         path: /var/tmp/abgen-nixcache
         key: ${{ env.ABGEN_NIXCACHE_KEY }}
+
+    # The repo-wide copy (see the restore side's seed step). Skipped when
+    # this run itself was seeded from the artifact — it already exists.
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      if: steps.pack.outputs.publish == 'true' && env.ABGEN_NIXCACHE_ARTIFACT != 'hit'
+      with:
+        name: ${{ env.ABGEN_NIXCACHE_KEY }}
+        path: /var/tmp/abgen-nixcache
+        retention-days: 7
