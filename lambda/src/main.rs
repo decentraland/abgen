@@ -100,7 +100,10 @@ fn init_tracing() {
         .map(|v| v.trim().eq_ignore_ascii_case("json"))
         .unwrap_or(false);
     if json_logs {
-        tracing_subscriber::fmt().json().with_env_filter(filter).init();
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .init();
     } else {
         // CloudWatch renders ANSI escapes literally.
         tracing_subscriber::fmt()
