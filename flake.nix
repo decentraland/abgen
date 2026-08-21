@@ -38,19 +38,27 @@
         fileset = buildFileset;
       };
 
-      # nix/checks.nix stays out of this list: check edits must not move
-      # buildId.
-      buildId = builtins.substring 0 12 (builtins.hashString "sha256"
+      # Two artifact ids, one per build class (docs/ci.md §4).
+      #
+      # srcId is exactly the compiler's inputs — buildSource already carries
+      # Cargo.lock and rust-toolchain.toml — so it rotates only when shipped
+      # bytes can. It is the id embedded in the binaries (logs, /status,
+      # --version) and keys the cargo/napi-class artifacts.
+      srcId = builtins.substring 0 12 (builtins.hashString "sha256"
+        (baseNameOf (builtins.unsafeDiscardStringContext buildSource.outPath)));
+
+      # Nix-class artifacts additionally depend on the nix build plumbing.
+      # nix/checks.nix stays out of this list: check edits must not move it.
+      nixId = builtins.substring 0 12 (builtins.hashString "sha256"
         (builtins.concatStringsSep "\n" [
-          (baseNameOf (builtins.unsafeDiscardStringContext buildSource.outPath))
-          (builtins.hashFile "sha256" ./rust-toolchain.toml)
+          srcId
           (builtins.hashFile "sha256" ./flake.lock)
           (builtins.hashFile "sha256" ./flake.nix)
           (builtins.hashFile "sha256" ./nix/build.nix)
         ]));
 
       buildEnv = {
-        ABGEN_BUILD_ID = buildId;
+        ABGEN_BUILD_ID = srcId;
         SOURCE_DATE_EPOCH = sourceDateEpoch;
       };
 
@@ -112,7 +120,7 @@
             nativeBuildInputs = nativeDeps;
 
             buildInputs = [ pkgs.libjpeg_turbo ];
-            ABGEN_BUILD_ID = buildId;
+            ABGEN_BUILD_ID = srcId;
             SOURCE_DATE_EPOCH = sourceDateEpoch;
             shellHook = ''
               export TURBOJPEG_LIB=${pkgs.libjpeg_turbo.out}/lib/libturbojpeg${sharedLibExt}
@@ -121,7 +129,9 @@
 
           packages.default = abgenPkg;
 
-          packages.buildId = buildId;
+          packages.srcId = srcId;
+
+          packages.nixId = nixId;
 
           packages.abgen-native = abgenNativePkg;
 

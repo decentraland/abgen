@@ -73,7 +73,7 @@ artifact manifests (§4) before a tag can ship.
 Three moments, in order:
 
 1. **Pin time** (commit): the table above. Changing any pin changes the
-   tree, which changes `buildId`.
+   tree, which changes the artifact ids below.
 2. **Build time** (deterministic outputs): `SOURCE_DATE_EPOCH=315532800`,
    `--remap-path-prefix $PWD=/build --remap-path-prefix $HOME=/home` (the
    nix sandbox gives this for free), `--no-insert-timestamp` on windows,
@@ -81,9 +81,20 @@ Three moments, in order:
    --mtime=@epoch | gzip -n`). `ci/build.sh` re-packs every archive and
    asserts the bytes are identical before it will emit them. Result: the
    tarball hash is a pure function of the tree.
-   - `buildId` = `nix eval --raw .#buildId`: a 12-hex content hash over
-     the filtered source tree + toolchain pins. Same tree ⇒ same buildId
-     on every runner; it is baked into the binaries and `BUILD-INFO.txt`.
+   - Two 12-hex artifact ids, one per build class, so a change only
+     invalidates the artifacts it can actually alter:
+     - `srcId` (`nix eval --raw .#srcId`) = hash of the filtered source
+       tree — exactly the compiler's inputs (`Cargo.lock` and
+       `rust-toolchain.toml` are in the tree). Keys the cargo and napi
+       artifacts, and is the id embedded in the binaries (`--version`,
+       logs, `/status`) — so the embedded stamp rotates only when the
+       bytes can. Full provenance (commit, epoch) rides in
+       `BUILD-INFO.txt`, not the bytes.
+     - `nixId` = hash of `srcId` + `flake.lock` + `flake.nix` +
+       `nix/build.nix`. Keys the nix-built archives and both images,
+       which additionally depend on that plumbing. Editing it (or
+       bumping nixpkgs) rebuilds the nix legs and leaves the other
+       eight artifacts untouched.
 3. **Record / verify** (artifact manifests): `ci/artifact-hashes/<target>.sha256`
    holds the sha256 of the two shipped tarballs per target. Recorded by a
    real build (`ci/hashes.sh record`, via the release workflow's
@@ -98,10 +109,10 @@ Three moments, in order:
 ## 5. The pipeline that falls out
 
 - **build once, on main**: every push to main builds all 11 outputs as
-  input-addressed workflow artifacts (`archives-<buildId>-<target>`,
-  `napi-<buildId>-<target>`, `image-<buildId>-<name>`). A leg whose
-  artifact for this buildId already exists is skipped at matrix-selection
-  time.
+  input-addressed workflow artifacts (`archives-<id>-<target>`,
+  `napi-<srcId>-<target>`, `image-<nixId>-<name>`, where `<id>` is the
+  class id from §4). A leg whose artifacts for this tree already exist
+  is skipped at matrix-selection time.
 - **tags publish, builds only if missing**: a tag looks up the same names
   (any completed run of this tree qualifies — the name embeds the tree
   hash and the manifest verify re-proves the bytes), waits for the
