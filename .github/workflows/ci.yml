@@ -162,12 +162,15 @@ jobs:
             deps: .#checks.aarch64-linux.deps-checkfast
             attrs: nextest
             flavor: checkfast
+          # Own flavor, not checkfast: lanes sharing (os, arch, flavor)
+          # race the save and first-save-wins would drop this lane's
+          # outputs from the cache every time.
           - lane: arm lambda + smoke
             runner: ubuntu-24.04-arm
             system: aarch64-linux
             deps: .#checks.aarch64-linux.lambda-deps .#checks.aarch64-linux.deps
             attrs: lambda-tests native-smoke
-            flavor: checkfast
+            flavor: lambda
           - lane: arm lints
             runner: ubuntu-24.04-arm
             system: aarch64-linux
