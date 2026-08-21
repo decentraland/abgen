@@ -9,8 +9,6 @@
 #   ABGEN_BUILD_ID      12-hex class id (.#srcId / .#nixId); eval'd if unset
 #   ABGEN_GIT_REV       commit; `git rev-parse HEAD` if unset
 #   BUILD_IMAGES        comma list of image attrs to also build (nix legs)
-#   ABGEN_RECORD_HASHES 1 = record the manifest instead of verifying
-#   ABGEN_HASH_SOFT     1 = manifest mismatch warns instead of failing
 #   ABGEN_DIST          output dir (default ./dist)
 set -euo pipefail
 
@@ -22,7 +20,8 @@ cd "$ROOT"
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-315532800}"
 export ABGEN_GIT_REV="${ABGEN_GIT_REV:-$(git rev-parse HEAD)}"
 DIST_DIR="${ABGEN_DIST:-$ROOT/dist}"
-RUST_PIN=1.97.1
+RUST_PIN="$(perl -ne 'print $1 if /^channel = "([^"]+)"/' rust-toolchain.toml)"
+[ -n "$RUST_PIN" ] || { echo "cannot read channel from rust-toolchain.toml" >&2; exit 1; }
 
 case "$TARGET" in
   x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu) BUILDER=nix ;;
@@ -77,23 +76,21 @@ sha256_of() {
   else shasum -a 256 -- "$1" | cut -d' ' -f1; fi
 }
 
-build_info() { # dir — the only remaining answer to "which commit is this"
+build_info() { # name — provenance rides BESIDE the archive, never inside:
+  # the tarball bytes stay a pure function of the tree, so two builds of
+  # one tree are byte-comparable regardless of which ref built them.
   {
     printf 'ABGEN_VERSION=%s\n' "$VERSION"
     printf 'ABGEN_TARGET=%s\n' "$TARGET"
     printf 'ABGEN_BUILD_ID=%s\n' "$ABGEN_BUILD_ID"
     printf 'ABGEN_GIT_REV=%s\n' "$ABGEN_GIT_REV"
     printf 'SOURCE_DATE_EPOCH=%s\n' "$SOURCE_DATE_EPOCH"
-  } > "$1/BUILD-INFO.txt"
+  } > "$1.BUILD-INFO.txt"
 }
 
-finish_archive() { # dir — build-info, pack, assert repro + BUILD-INFO present
+finish_archive() { # dir — build-info sidecar, pack, assert repro
   build_info "$1"
   pack "$1" "$1.tar.gz"
-  case "$(tar -tzf "$1.tar.gz")" in
-    *"/BUILD-INFO.txt"*) ;;
-    *) echo "BUILD-INFO.txt missing from $1.tar.gz" >&2; exit 1 ;;
-  esac
   local repack="$1.repack.tar.gz"
   pack "$1" "$repack"
   local a b
@@ -408,13 +405,8 @@ if [ "$BUILDER" = nix ] && [ -n "${BUILD_IMAGES:-}" ]; then
   done
 fi
 
-# manifest
-
-mode=verify
-[ "${ABGEN_RECORD_HASHES:-0}" = "1" ] && mode=record
-bash ci/hashes.sh "$mode" "$TARGET" "$dist.tar.gz" "$nat.tar.gz"
-
-mv "$dist.tar.gz" "$dist.tar.gz.sha256" "$nat.tar.gz" "$nat.tar.gz.sha256" "$DIST_DIR/"
+mv "$dist.tar.gz" "$dist.tar.gz.sha256" "$dist.BUILD-INFO.txt" \
+  "$nat.tar.gz" "$nat.tar.gz.sha256" "$nat.BUILD-INFO.txt" "$DIST_DIR/"
 rm -rf "$dist" "$nat"
 echo "done: $DIST_DIR"
 ls -l "$DIST_DIR"

@@ -8,33 +8,27 @@ name: release
 #              legs and images); legs whose artifacts already exist for
 #              this tree are skipped at matrix-selection time.
 # tag push   : wait for the commit's ci verdict, gather the same artifact
-#              names (any completed run of this tree qualifies — the name
-#              embeds the tree hash and the manifests re-prove the bytes),
-#              then publish: GitHub release, npm x2, ghcr multi-arch, ECR.
-# dispatch   : rehearse (dry_run), narrow (targets), or record manifests
-#              (record_hashes).
+#              names (same-repo runs only — the fetch is fork-filtered and
+#              the attestation binds what ships to this run), then
+#              publish: GitHub release, npm x2, ghcr multi-arch, ECR.
+# dispatch   : rehearse (dry_run) or narrow (targets).
+# schedule   : nightly reproducibility — rebuild all legs, byte-compare
+#              against the stored artifacts, upload nothing.
 
 on:
   push:
     tags: ["v*"]
     branches: [main]
-  # Pre-build on approved PRs (the auto-applied 'prebuild' label): the
-  # artifacts are input-addressed by tree, and a squash merge of an
-  # up-to-date PR lands the identical tree on main — so main's push run
-  # finds every artifact already built and skips all legs.
-  pull_request:
-    types: [labeled, synchronize, reopened]
-    branches: [main]
+  # Nightly: rebuild every leg and byte-compare against the stored
+  # artifacts — reproducibility is tested here, not gated at release.
+  schedule:
+    - cron: "23 5 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
         description: "Build and verify everything, publish nothing"
         type: boolean
         default: true
-      record_hashes:
-        description: "Record artifact hashes instead of verifying them"
-        type: boolean
-        default: false
       targets:
         description: "Comma-separated target triples to build (empty = all)"
         type: string
@@ -59,13 +53,6 @@ env:
 jobs:
   setup:
     name: build id + matrix
-    # Every other job needs setup, so this gate covers the graph: PR
-    # events run only for same-repo PRs carrying the 'prebuild' label
-    # (publish jobs are additionally tag-gated).
-    if: >-
-      github.event_name != 'pull_request' ||
-      (github.event.pull_request.head.repo.full_name == github.repository &&
-       contains(github.event.pull_request.labels.*.name, 'prebuild'))
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -100,19 +87,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           WANT: ${{ inputs.targets }}
-          RECORDING: ${{ inputs.record_hashes }}
+          REPRO: ${{ github.event_name == 'schedule' }}
           SKIP_NAPI: ${{ inputs.skip_napi }}
           SRC_ID: ${{ steps.eval.outputs.src_id }}
           NIX_ID: ${{ steps.eval.outputs.nix_id }}
         run: |
           set -eu
-          # The ids are tree-global: recording a filtered subset would leave
-          # the other targets' manifests describing a tree that no longer
-          # exists. Narrowing is for iteration, not recording.
-          if [ -n "${WANT:-}" ] && [ "${RECORDING:-false}" = "true" ]; then
-            echo "record_hashes needs the full matrix; drop 'targets'" >&2
-            exit 1
-          fi
 
           # BUILD_IMAGES couples each nix leg's images to its archives:
           # skipping a leg must mean every artifact it would produce exists.
@@ -147,8 +127,8 @@ jobs:
               | awk '{s+=$1} END {exit (s > 0) ? 0 : 1}'
           }
 
-          # Recording always rebuilds; otherwise skip legs whose artifacts
-          # for this exact tree already exist.
+          # The nightly repro always rebuilds (that is the point); otherwise
+          # skip legs whose artifacts for this exact tree already exist.
           filter_built() { # json kind -> json
             local json="$1" kind="$2" out="[]" entry t id names n
             while read -r entry; do
@@ -174,7 +154,7 @@ jobs:
             echo "$out"
           }
 
-          if [ "${RECORDING:-false}" = "true" ]; then
+          if [ "${REPRO:-false}" = "true" ]; then
             # jq -c: the literals above are multi-line, and GITHUB_OUTPUT
             # takes one line per value.
             sel=$(jq -c . <<<"$all"); napi_sel=$(jq -c . <<<"$napi_all")
@@ -227,31 +207,44 @@ jobs:
       - name: build, gate, package (ci/build.sh)
         env:
           BUILD_IMAGES: ${{ matrix.images || '' }}
-          ABGEN_RECORD_HASHES: ${{ inputs.record_hashes && '1' || '0' }}
-          # Hard only where bytes ship; main/branch mismatches warn (they
-          # publish nothing, and every buildId rotation would be red).
-          ABGEN_HASH_SOFT: ${{ startsWith(github.ref, 'refs/tags/') && '0' || '1' }}
         run: bash ci/build.sh ${{ matrix.target }}
 
-      - name: upload recorded hashes
-        if: ${{ inputs.record_hashes }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: hashes-${{ matrix.target }}
-          path: ci/artifact-hashes/${{ matrix.target }}.sha256
-          if-no-files-found: error
+      # Nightly: this tree's artifacts already exist — compare instead of
+      # upload. Byte inequality on the same tree means the build stopped
+      # being reproducible (or the stored artifact was not produced from
+      # this tree); either way, red.
+      - name: reproducibility compare (nightly)
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          name="archives-${ABGEN_BUILD_ID}-${{ matrix.target }}"
+          id="$(gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$name&per_page=100"             --jq '[.artifacts[] | select(.expired == false and .workflow_run.repository_id != null and .workflow_run.head_repository_id == .workflow_run.repository_id)] | sort_by(.updated_at) | last | .id // empty')"
+          [ -n "$id" ] || { echo "no stored artifact $name to compare against — first build of this tree"; exit 0; }
+          gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > /tmp/stored.zip
+          mkdir -p /tmp/stored && unzip -qo /tmp/stored.zip -d /tmp/stored
+          for f in dist/abgen-*.tar.gz; do
+            cmp "$f" "/tmp/stored/$(basename "$f")" || {
+              echo "NOT REPRODUCIBLE: $(basename "$f") differs from the stored artifact" >&2
+              exit 1
+            }
+            echo "reproducible: $(basename "$f")"
+          done
 
       - name: upload archives (input-addressed)
+        if: github.event_name != 'schedule'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: archives-${{ env.ABGEN_BUILD_ID }}-${{ matrix.target }}
           path: |
             dist/abgen-*.tar.gz
             dist/abgen-*.tar.gz.sha256
+            dist/abgen-*.BUILD-INFO.txt
           if-no-files-found: error
 
       - name: upload docker image (input-addressed)
-        if: contains(matrix.images || '', 'dockerImage')
+        if: github.event_name != 'schedule' && contains(matrix.images || '', 'dockerImage')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: image-${{ needs.setup.outputs.nix_id }}-docker-${{ matrix.target == 'x86_64-unknown-linux-gnu' && 'amd64' || 'arm64' }}
@@ -259,7 +252,7 @@ jobs:
           if-no-files-found: error
 
       - name: upload lambda image (input-addressed)
-        if: contains(matrix.images || '', 'lambdaImage')
+        if: github.event_name != 'schedule' && contains(matrix.images || '', 'lambdaImage')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: image-${{ needs.setup.outputs.nix_id }}-lambda-arm64
@@ -299,7 +292,27 @@ jobs:
           node-version: 24
       - name: build, smoke, gate (ci/napi.sh)
         run: bash ci/napi.sh ${{ matrix.target }}
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - name: reproducibility compare (nightly)
+        if: github.event_name == 'schedule'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          name="napi-${{ needs.setup.outputs.src_id }}-${{ matrix.target }}"
+          id="$(gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$name&per_page=100"             --jq '[.artifacts[] | select(.expired == false and .workflow_run.repository_id != null and .workflow_run.head_repository_id == .workflow_run.repository_id)] | sort_by(.updated_at) | last | .id // empty')"
+          [ -n "$id" ] || { echo "no stored artifact $name — first build of this tree"; exit 0; }
+          gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > stored.zip
+          mkdir -p stored && unzip -qo stored.zip -d stored
+          for f in dist/*.node; do
+            cmp "$f" "stored/$(basename "$f")" || {
+              echo "NOT REPRODUCIBLE: $(basename "$f") differs from the stored artifact" >&2
+              exit 1
+            }
+            echo "reproducible: $(basename "$f")"
+          done
+      - if: github.event_name != 'schedule'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: napi-${{ needs.setup.outputs.src_id }}-${{ matrix.target }}
           path: dist/*.node
@@ -386,7 +399,10 @@ jobs:
           done
           ls -l dist
 
-      - name: verify against the recorded manifests
+      # Trust is provenance, not recorded hashes: the artifacts came from
+      # same-repo runs (fork-filtered fetch), their sidecar sha256s must
+      # self-verify, and the attestation below binds them to this run.
+      - name: verify archive set
         run: |
           set -eu
           (cd dist && sha256sum -c ./*.sha256)
@@ -395,12 +411,6 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
             exit 1
           }
-          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
-                   x86_64-pc-windows-gnu aarch64-pc-windows-gnullvm \
-                   aarch64-apple-darwin x86_64-apple-darwin; do
-            bash ci/hashes.sh verify "$t" \
-              "dist/abgen-$version-$t.tar.gz" "dist/abgen-native-$version-$t.tar.gz"
-          done
           archives=(dist/*.tar.gz)
           test "${#archives[@]}" -eq 12
           (cd dist && cat ./*.sha256 > ../SHA256SUMS.txt)

@@ -46,8 +46,21 @@
       # srcId covers the cargo/napi legs' inputs — buildSource already
       # carries Cargo.lock and rust-toolchain.toml — so those artifacts
       # rotate only when their bytes can.
+      # Beyond buildSource, srcId folds in the build harness and the prose
+      # files packed into the archives: they all determine the shipped
+      # bytes, and release.yml skips whole legs on this id — an uncovered
+      # input would republish stale artifacts for a changed tree.
       srcId = builtins.substring 0 12 (builtins.hashString "sha256"
-        (baseNameOf (builtins.unsafeDiscardStringContext buildSource.outPath)));
+        (builtins.concatStringsSep "\n" [
+          (baseNameOf (builtins.unsafeDiscardStringContext buildSource.outPath))
+          (builtins.hashFile "sha256" ./ci/build.sh)
+          (builtins.hashFile "sha256" ./ci/napi.sh)
+          (builtins.hashFile "sha256" ./ci/stable-dlltool.sh)
+          (builtins.hashFile "sha256" ./ci/check-glibc-floor.sh)
+          (builtins.hashFile "sha256" ./LICENSE)
+          (builtins.hashFile "sha256" ./README.md)
+          (builtins.hashFile "sha256" ./unity/README.md)
+        ]));
 
       # The nix legs' bytes additionally depend on the nix build plumbing
       # (nixpkgs toolchain, glibc, this wiring), so their id — and their

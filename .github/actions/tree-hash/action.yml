@@ -21,21 +21,18 @@ runs:
     - id: h
       shell: bash
       run: |
-        # ci/artifact-hashes: consumed only by the release hash gate
         # release.yml:        publishing orchestration, runs no tests
         # *.md:               prose
         # cargo scope only — nix/, flake.*: the nix lanes' world; cargo
         # lanes use rustup
         if [ "${{ inputs.scope }}" = "cargo" ]; then
           h=$(git ls-tree -r HEAD | awk -F'\t' '
-            $2 !~ /^ci\/artifact-hashes\// &&
             $2 !~ /^nix\// &&
             $2 != "flake.nix" && $2 != "flake.lock" &&
             $2 != ".github/workflows/release.yml" &&
             $2 !~ /\.md$/' | sha256sum | cut -c1-64)
         else
           h=$(git ls-tree -r HEAD | awk -F'\t' '
-            $2 !~ /^ci\/artifact-hashes\// &&
             $2 != ".github/workflows/release.yml" &&
             $2 !~ /\.md$/' | sha256sum | cut -c1-64)
         fi
