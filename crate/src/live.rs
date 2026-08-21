@@ -731,11 +731,11 @@ impl Proxy {
             versions.push(self.fallback_version.as_str());
         }
         for ver in versions {
-            let mut keys: Vec<String> = Vec::new();
-            if naming::bundle_name_has_digest(file) {
-                keys.push(Self::asset_bundle_key(ver, file));
-            }
-            keys.push(Self::bundle_key(ver, cid, file));
+            // Entity kind is unknown at read time — shared prefix first, then entity-scoped.
+            let keys = [
+                Self::asset_bundle_key(ver, file),
+                Self::bundle_key(ver, cid, file),
+            ];
             for key in keys {
                 match Self::space_get_timed(space, &key) {
                     Ok(Some(b)) => return Some(b),
@@ -830,8 +830,8 @@ impl Proxy {
     }
 
     /// Prod layout: scenes go to the shared assets/ prefix, wearables/emotes entity-scoped.
-    pub fn space_put_bundle(&self, cid: &str, file: &str, scene: bool, bytes: &[u8]) {
-        let key = if scene {
+    pub fn space_put_bundle(&self, cid: &str, file: &str, shared_placement: bool, bytes: &[u8]) {
+        let key = if shared_placement {
             Self::asset_bundle_key(&self.version, file)
         } else {
             Self::bundle_key(&self.version, cid, file)
@@ -965,7 +965,7 @@ impl Proxy {
         let next = AtomicUsize::new(0);
         let hard_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
 
-        let scene_entity = ctx.scene.entity_type == "scene";
+        let shared_placement = ctx.scene.entity_type == "scene";
         let run_item = |it: &WorkItem| -> Result<()> {
             self.progress_update(cid, done.load(Ordering::Relaxed), total, &it.file);
             let stored_name = naming::fs_safe_component(&it.bundle_name);
@@ -991,7 +991,7 @@ impl Proxy {
                         }
                     }
                     if !existed {
-                        self.space_put_bundle(cid, &it.bundle_name, scene_entity, &bytes);
+                        self.space_put_bundle(cid, &it.bundle_name, shared_placement, &bytes);
                     }
                     built_m
                         .lock()
@@ -1722,7 +1722,9 @@ mod tests {
         assert_eq!(
             log,
             vec![
+                "GET /v41/assets/Qmhash_windows".to_string(),
                 "GET /v41/bafkcid/Qmhash_windows".to_string(),
+                "GET /v40/assets/Qmhash_windows".to_string(),
                 "GET /v40/bafkcid/Qmhash_windows".to_string(),
             ]
         );
@@ -1820,12 +1822,24 @@ mod tests {
     }
 
     #[test]
-    fn digests_off_scene_puts_still_canonical() {
-        let (host, seen) = super::stub::serve(vec![]);
+    fn digests_off_scene_bundles_round_trip_canonically() {
+        let (host, seen) = super::stub::serve(vec![(
+            "/v41/assets/Qmhash_windows".to_string(),
+            200,
+            b"SCENE".to_vec(),
+        )]);
         let proxy = stub_proxy(&host, false, "digests-off-put");
         proxy.space_put_bundle("bafkcid", "Qmhash_windows", true, b"B");
+        let got = proxy.space_get_bundle("bafkcid", "Qmhash_windows");
+        assert_eq!(got.as_deref(), Some(&b"SCENE"[..]));
         let log = seen.lock().unwrap().clone();
-        assert_eq!(log, vec!["PUT /v41/assets/Qmhash_windows".to_string()]);
+        assert_eq!(
+            log,
+            vec![
+                "PUT /v41/assets/Qmhash_windows".to_string(),
+                "GET /v41/assets/Qmhash_windows".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -1845,8 +1859,12 @@ mod tests {
     }
 
     #[test]
-    fn entity_kind_owns_placement_regardless_of_name() {
-        let (host, seen) = super::stub::serve(vec![]);
+    fn digest_named_wearable_puts_entity_scoped_and_reads_back_via_fallback() {
+        let (host, seen) = super::stub::serve(vec![(
+            "/v41/bafkwearable/Qmhash_0123456789abcdef0123456789abcdef_windows".to_string(),
+            200,
+            b"WEARABLE".to_vec(),
+        )]);
         let proxy = stub_proxy_reuse(&host, "kind-over-name");
         proxy.space_put_bundle(
             "bafkwearable",
@@ -1854,11 +1872,18 @@ mod tests {
             false,
             b"B",
         );
+        let got = proxy.space_get_bundle(
+            "bafkwearable",
+            "Qmhash_0123456789abcdef0123456789abcdef_windows",
+        );
+        assert_eq!(got.as_deref(), Some(&b"WEARABLE"[..]));
         let log = seen.lock().unwrap().clone();
         assert_eq!(
             log,
             vec![
-                "PUT /v41/bafkwearable/Qmhash_0123456789abcdef0123456789abcdef_windows".to_string()
+                "PUT /v41/bafkwearable/Qmhash_0123456789abcdef0123456789abcdef_windows".to_string(),
+                "GET /v41/assets/Qmhash_0123456789abcdef0123456789abcdef_windows".to_string(),
+                "GET /v41/bafkwearable/Qmhash_0123456789abcdef0123456789abcdef_windows".to_string(),
             ]
         );
     }
@@ -1878,7 +1903,7 @@ mod tests {
     }
 
     #[test]
-    fn digestless_names_never_touch_assets_on_read_or_probe() {
+    fn bare_names_read_shared_then_entity_scoped_and_never_probe() {
         let (host, seen) = super::stub::serve(vec![]);
         let proxy = stub_proxy_reuse(&host, "digestless-read");
         assert_eq!(proxy.space_get_bundle("bafkcid", "Qmhash_windows"), None);
@@ -1887,7 +1912,9 @@ mod tests {
         assert_eq!(
             log,
             vec![
+                "GET /v41/assets/Qmhash_windows".to_string(),
                 "GET /v41/bafkcid/Qmhash_windows".to_string(),
+                "GET /v40/assets/Qmhash_windows".to_string(),
                 "GET /v40/bafkcid/Qmhash_windows".to_string(),
             ]
         );
