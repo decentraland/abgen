@@ -732,7 +732,9 @@ impl Proxy {
         }
         for ver in versions {
             let mut keys: Vec<String> = Vec::new();
-            if self.asset_reuse && naming::bundle_name_has_digest(file) {
+            // Digest-less scene bundles are canonical too, and the entity type is
+            // unknown here — try assets/ for every name, then entity-scoped.
+            if self.asset_reuse {
                 keys.push(Self::asset_bundle_key(ver, file));
             }
             keys.push(Self::bundle_key(ver, cid, file));
@@ -828,8 +830,11 @@ impl Proxy {
         self.space_get_key(&format!("manifest/{stem}.json"))
     }
 
-    pub fn space_put_bundle(&self, cid: &str, file: &str, bytes: &[u8]) {
-        let key = if self.asset_reuse && naming::bundle_name_has_digest(file) {
+    /// Scene bundles all live on the shared assets/ prefix (prod layout — the
+    /// explorer requests every scene bundle there); wearables/emotes stay
+    /// entity-scoped.
+    pub fn space_put_bundle(&self, cid: &str, file: &str, scene: bool, bytes: &[u8]) {
+        let key = if self.asset_reuse && scene {
             Self::asset_bundle_key(&self.version, file)
         } else {
             Self::bundle_key(&self.version, cid, file)
@@ -963,6 +968,7 @@ impl Proxy {
         let next = AtomicUsize::new(0);
         let hard_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
 
+        let scene_entity = ctx.scene.entity_type == "scene";
         let run_item = |it: &WorkItem| -> Result<()> {
             self.progress_update(cid, done.load(Ordering::Relaxed), total, &it.file);
             let stored_name = naming::fs_safe_component(&it.bundle_name);
@@ -988,7 +994,7 @@ impl Proxy {
                         }
                     }
                     if !existed {
-                        self.space_put_bundle(cid, &it.bundle_name, &bytes);
+                        self.space_put_bundle(cid, &it.bundle_name, scene_entity, &bytes);
                     }
                     built_m
                         .lock()
@@ -1768,6 +1774,7 @@ mod tests {
         proxy.space_put_bundle(
             "bafkcid",
             "Qmhash_0123456789abcdef0123456789abcdef_windows",
+            true,
             b"B",
         );
         let got =
@@ -1814,9 +1821,25 @@ mod tests {
     fn legacy_mode_keeps_entity_scoped_puts() {
         let (host, seen) = super::stub::serve(vec![]);
         let proxy = stub_proxy(&host, false, "legacy-put");
-        proxy.space_put_bundle("bafkcid", "Qmhash_windows", b"B");
+        proxy.space_put_bundle("bafkcid", "Qmhash_windows", true, b"B");
         let log = seen.lock().unwrap().clone();
         assert_eq!(log, vec!["PUT /v41/bafkcid/Qmhash_windows".to_string()]);
+    }
+
+    #[test]
+    fn scene_digestless_puts_canonical_and_wearables_stay_entity_scoped() {
+        let (host, seen) = super::stub::serve(vec![]);
+        let proxy = stub_proxy_reuse(&host, "reuse-digestless");
+        proxy.space_put_bundle("bafkscene", "Qmhash_windows", true, b"B");
+        proxy.space_put_bundle("bafkwearable", "Qmhash_windows", false, b"B");
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec![
+                "PUT /v41/assets/Qmhash_windows".to_string(),
+                "PUT /v41/bafkwearable/Qmhash_windows".to_string(),
+            ]
+        );
     }
 
     #[test]
