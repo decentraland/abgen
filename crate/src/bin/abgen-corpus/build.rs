@@ -358,7 +358,7 @@ pub(crate) fn derive_one_entity(
             c.hash.clone()
         };
         let digest_naming =
-            toggles.asset_reuse && is_glb && entity_type.as_deref() == Some("scene");
+            toggles.deps_digest && is_glb && entity_type.as_deref() == Some("scene");
         let bundle_name = if digest_naming {
             let digest = store.fetch_mmap(&c.hash).ok().and_then(|bytes| {
                 abgen::naming::deps_digest_for_glb(
@@ -609,14 +609,14 @@ pub(crate) fn load_entity_json(store: &LocalContentStore, cid: &str) -> Option<s
 mod tests {
     use super::*;
 
-    fn toggles(asset_reuse: bool, magenta_missing: bool) -> EffectiveToggles {
+    fn toggles(deps_digest: bool, magenta_missing: bool) -> EffectiveToggles {
         EffectiveToggles {
             collection_mode: false,
             real_textures: false,
             v38_compat: false,
             v38_timestamp: 0,
             magenta_missing,
-            asset_reuse,
+            deps_digest,
         }
     }
 
@@ -645,7 +645,7 @@ mod tests {
         "images":[{"uri":"t.png"}],"buffers":[{"uri":"a.bin"}]}"#;
 
     #[test]
-    fn derive_names_glbs_canonically_in_asset_reuse_mode() {
+    fn derive_names_glbs_canonically_in_deps_digest_mode() {
         let store = store_with_entity(
             "canonical",
             serde_json::json!([
