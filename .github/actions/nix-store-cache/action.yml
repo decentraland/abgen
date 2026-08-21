@@ -38,8 +38,6 @@ runs:
 
     - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
       with:
-        # No FlakeHub: with determinate left on, jobs holding an OIDC token
-        # (the ECR image job) try a FlakeHub login and warn on every run.
         determinate: false
         extra-conf: |
           max-jobs = auto
@@ -56,10 +54,6 @@ runs:
       shell: bash
       run: nix path-info --all | LC_ALL=C sort > /var/tmp/abgen-nix-base.txt
 
-    # Source tree in the key so an entry carries the check outputs built
-    # from exactly these sources. The file list is a cache NAME, not a
-    # correctness input: a miss falls back to the newest same-flavor entry
-    # and nix rebuilds precisely what differs.
     - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
       id: restore
       with:
@@ -67,12 +61,6 @@ runs:
         key: nix-v5-${{ runner.os }}-${{ runner.arch }}-${{ inputs.flavor }}-${{ hashFiles('crate/**', 'lambda/**', 'template/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'flake.nix', 'flake.lock', 'nix/**', '.config/nextest.toml') }}
         restore-keys: nix-v5-${{ runner.os }}-${{ runner.arch }}-${{ inputs.flavor }}-
 
-    # actions/cache scoping is one-directional (main never sees PR
-    # entries) and the 10 GB pool LRU-evicts under churn; each newly
-    # packed cache is also uploaded as a repo-wide artifact under the same
-    # name, so any ref — main's post-merge run above all — can seed from
-    # it. The fork filter is mandatory: artifacts are repo-wide and fork
-    # PRs can upload arbitrary names.
     - name: seed from artifact on cache miss
       if: steps.restore.outputs.cache-hit != 'true'
       shell: bash

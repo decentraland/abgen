@@ -28,6 +28,7 @@ runs:
         # carrying them tripled the entry size — which is what thrashed
         # the 10 GB pool. Locally-built and our-cache-substituted paths
         # stay, keeping each entry self-contained.
+        # unsigned paths only: cache.nixos.org's signed closure re-fetches faster upstream
         nix path-info --all --json \
           | jq -r 'if type == "object" then to_entries[] | select((.value.signatures // []) | length == 0) | .key else .[] | select((.signatures // []) | length == 0) | .path end' \
           | LC_ALL=C sort > /var/tmp/abgen-nix-local.txt
@@ -47,6 +48,7 @@ runs:
         # path so both sides share one cache version. The fresh dir is a
         # superset of everything this run substituted, so the substituter
         # keeps working for the rest of the job.
+        # actions/cache versions by path: publish the exact path restore uses
         rm -rf /var/tmp/abgen-nixcache
         mv /var/tmp/abgen-nixcache-out /var/tmp/abgen-nixcache
         echo "publish=true" >> "$GITHUB_OUTPUT"
@@ -57,8 +59,6 @@ runs:
         path: /var/tmp/abgen-nixcache
         key: ${{ env.ABGEN_NIXCACHE_KEY }}
 
-    # The repo-wide copy (see the restore side's seed step). Skipped when
-    # this run itself was seeded from the artifact — it already exists.
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       if: steps.pack.outputs.publish == 'true' && env.ABGEN_NIXCACHE_ARTIFACT != 'hit'
       with:

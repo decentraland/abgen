@@ -1,15 +1,4 @@
 #!/usr/bin/env bash
-# One release target, end to end: toolchain, build, gates, deterministic
-# packaging, smoke. Runs the same on a laptop and in CI; see docs/ci.md
-# for the derivation of every step.
-#
-#   ci/build.sh <target-triple>
-#
-# Env:
-#   ABGEN_BUILD_ID      12-hex class id (.#srcId / .#nixId); eval'd if unset
-#   ABGEN_GIT_REV       commit; `git rev-parse HEAD` if unset
-#   BUILD_IMAGES        comma list of image attrs to also build (nix legs)
-#   ABGEN_DIST          output dir (default ./dist)
 set -euo pipefail
 
 TARGET="${1:?usage: build.sh <target-triple>}"
@@ -32,11 +21,6 @@ esac
 
 nixf() { nix --extra-experimental-features 'nix-command flakes' "$@"; }
 
-# identity
-
-# The id is per class — srcId for cargo legs, nixId for nix legs — so the
-# embedded stamp and BUILD-INFO name exactly the inputs that produced the
-# bytes. Without it, crate/build.rs falls back to a dev stamp.
 if [ -z "${ABGEN_BUILD_ID:-}" ]; then
   case "$BUILDER" in
     nix) ABGEN_BUILD_ID="$(nixf eval --raw .#nixId)" ;;
@@ -55,8 +39,6 @@ VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p; /^version = "/q' Cargo.toml)"
 
 echo "target: $TARGET  builder: $BUILDER  version: $VERSION"
 echo "build id: $ABGEN_BUILD_ID  rev: $ABGEN_GIT_REV  epoch: $SOURCE_DATE_EPOCH"
-
-# packaging helpers
 
 pack() { # dir out.tar.gz — deterministic bytes: sorted, epoch-stamped, gzip -n
   local tar=tar
@@ -77,8 +59,6 @@ sha256_of() {
 }
 
 build_info() { # name — provenance rides BESIDE the archive, never inside:
-  # the tarball bytes stay a pure function of the tree, so two builds of
-  # one tree are byte-comparable regardless of which ref built them.
   {
     printf 'ABGEN_VERSION=%s\n' "$VERSION"
     printf 'ABGEN_TARGET=%s\n' "$TARGET"
@@ -103,13 +83,8 @@ finish_archive() { # dir — build-info sidecar, pack, assert repro
   echo "packed $1.tar.gz ($a)"
 }
 
-# toolchain (cargo legs)
-
 if [ "$BUILDER" = cargo ]; then
-  # Reproduce what the nix sandbox gives for free: fixed /build and /home
-  # so no runner path is baked into the bytes. $HOME before $PWD is
-  # load-bearing — $PWD nests inside $HOME and the LAST matching gcc
-  # prefix-map wins.
+  # fixed /build,/home mirror the nix sandbox; the prefix-map ORDER is load-bearing ($PWD nests inside $HOME, last match wins)
   RUSTFLAGS="--remap-path-prefix $PWD=/build --remap-path-prefix $HOME=/home"
   export CFLAGS="-ffile-prefix-map=$HOME=/home -ffile-prefix-map=$PWD=/build"
   export CXXFLAGS="-ffile-prefix-map=$HOME=/home -ffile-prefix-map=$PWD=/build"
@@ -125,8 +100,6 @@ if [ "$BUILDER" = cargo ]; then
     rustup default "$RUST_PIN"
     rustup target add "$TARGET"
   else
-    # A nix-toolchained dev box: use the cargo on PATH, but hold it to the
-    # same pin — a different compiler cannot reproduce the manifests.
     have="$(rustc --version | awk '{print $2}')"
     [ "$have" = "$RUST_PIN" ] || {
       echo "rustc on PATH is $have, the pin is $RUST_PIN (no rustup to fix it)" >&2
@@ -140,10 +113,7 @@ if [ "$BUILDER" = cargo ]; then
       sudo apt-get install -y --no-install-recommends \
         g++-mingw-w64-x86-64-posix cmake
     fi
-    # A search dir holding ONLY libstdc++.a so `-lstdc++` cannot resolve to
-    # an import library (three build scripts emit dylib-kind stdc++ links
-    # too early in argv for any other lever to retract). Its bytes ship
-    # inside abgen.dll, so log the digest as a build input.
+    # a dir with ONLY libstdc++.a: -lstdc++ must never resolve to an import library; these bytes ship inside abgen.dll
     STDCXX_A="$(x86_64-w64-mingw32-g++-posix -print-file-name=libstdc++.a)"
     case "$STDCXX_A" in
       /*) ;;
@@ -165,13 +135,10 @@ EOF
     export CXX_x86_64_pc_windows_gnu=x86_64-w64-mingw32-g++-posix
     export AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar
     export ABGEN_REAL_DLLTOOL=x86_64-w64-mingw32-dlltool
-    # +crt-static swaps -lgcc_s for the static unwinder, the -L forces the
-    # static libstdc++, and the dlltool wrapper gives rustc's raw-dylib
-    # import libs a content-addressed temp path (raw dlltool bakes its
-    # per-invocation path into the symbols — nondeterministic).
     RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,--no-insert-timestamp"
     RUSTFLAGS="$RUSTFLAGS -C target-feature=+crt-static -C link-arg=-static-libgcc"
     RUSTFLAGS="$RUSTFLAGS -L native=/opt/mingw-static-cxx"
+    # raw dlltool bakes its per-invocation tmp path into import-lib symbols — the wrapper makes it content-addressed
     RUSTFLAGS="$RUSTFLAGS -C dlltool=$PWD/ci/stable-dlltool.sh"
   fi
 
@@ -183,7 +150,6 @@ EOF
         "https://github.com/mstorsjo/llvm-mingw/releases/download/20260616/$LLVM_MINGW.tar.xz"
       echo "$LLVM_MINGW_SHA  /tmp/llvm-mingw.tar.xz" | sha256sum -c
       sudo tar -xJf /tmp/llvm-mingw.tar.xz -C /opt && rm /tmp/llvm-mingw.tar.xz
-      # No import-lib fallback for the statically linked runtimes.
       sudo rm "/opt/$LLVM_MINGW/aarch64-w64-mingw32/lib/libc++.dll.a" \
               "/opt/$LLVM_MINGW/aarch64-w64-mingw32/lib/libunwind.dll.a"
     fi
@@ -207,17 +173,11 @@ EOF
   export RUSTFLAGS
 fi
 
-# build
-
 REL="target/$TARGET/release"
 
 if [ "$BUILDER" = nix ]; then
-  # All artifacts in one sandboxed derivation: SOURCE_DATE_EPOCH and path
-  # remapping only hold inside the sandbox. Quiet unless it fails.
   nixf build .#abgen-native \
     || nixf build .#abgen-native --print-build-logs
-  # Stage where every later step looks, so gates and packaging are
-  # target-relative and identical across all six legs.
   mkdir -p "$REL"
   install -m755 result/bin/abgen "$REL/abgen"
   install -m755 result/bin/abgen-host "$REL/abgen-host"
@@ -227,8 +187,6 @@ else
   cargo build --release --locked --target "$TARGET" --bin abgen
   cargo build --release --locked --target "$TARGET" -p abgen-native
 fi
-
-# gates
 
 if [ "$TARGET" = x86_64-pc-windows-gnu ]; then
   rc=0
@@ -244,8 +202,6 @@ if [ "$TARGET" = x86_64-pc-windows-gnu ]; then
   [ "$rc" -eq 0 ] || exit 1
   echo "windows-gnu artifacts are self-contained"
 fi
-
-# package
 
 mkdir -p "$DIST_DIR"
 BIN=abgen
@@ -263,18 +219,11 @@ case "$TARGET" in
   *) [ "$RUN_ARCH" = "$WANT_ARCH" ] && CAN_SMOKE=true ;;
 esac
 
-# CLI archive: abgen-<version>-<target>. Version-named and free of any
-# git-ref bytes, so the archive a main push builds is byte-identical to
-# the one the tag publishes: promotion is a file copy.
 dist="abgen-$VERSION-$TARGET"
 rm -rf "$dist"
 mkdir -p "$dist"
-# No template/ or shader/: those assets are compiled into the binary, and
-# a shipped ABGEN_ROOT directory would only add a way to fail.
 cp LICENSE README.md "$dist/"
 if [ "$BUILDER" = nix ]; then
-  # Bundle loader + libs behind an entry script: a nix ELF's PT_INTERP is
-  # an absolute /nix/store path, so unbundled it runs only on the builder.
   mkdir -p "$dist/bin" "$dist/lib"
   install -m755 result/bin/abgen "$dist/bin/abgen.bin"
   for lib in $(ldd result/bin/abgen | awk '$3 ~ /^\// {print $3}'); do
@@ -312,7 +261,6 @@ if [ "$CAN_SMOKE" = true ]; then
   echo "smoke: abgen --version + /readyz ok"
 fi
 
-# native archive: abgen-native-<version>-<target> (Unity lib + host).
 nat="abgen-native-$VERSION-$TARGET"
 rm -rf "$nat"
 mkdir -p "$nat/lib" "$nat/include"
@@ -324,15 +272,12 @@ for f in libabgen.so libabgen.dylib abgen.dll; do
 done
 test -n "$(ls -A "$nat/lib")" || { echo "no native library built" >&2; exit 1; }
 
-# The dlopen'd library runs on the host process's glibc: its highest
-# verneed is the oldest distro it loads on. Gate the copy that ships.
 if [ -f "$nat/lib/libabgen.so" ]; then
+  # highest verneed = oldest distro the dlopen'd lib loads on
   bash ci/check-glibc-floor.sh 2.34 "$nat/lib/libabgen.so"
 fi
 
 if [ "$BUILDER" = nix ]; then
-  # abgen-host ships its own glibc + loader (it re-execs itself, so the
-  # wrapper must forward the real binary explicitly).
   hb="$REL/abgen-host"
   mkdir -p "$nat/bin" "$nat/host-lib"
   install -m755 "$hb" "$nat/bin/abgen-host.bin"
@@ -365,11 +310,8 @@ if [ "$CAN_SMOKE" = true ]; then
   got="$("/tmp/abgen-natsmoke/$nat/abgen-host" --version)"
   test -n "$got" || { echo "abgen-host printed no version" >&2; exit 1; }
   echo "native smoke: abgen-host $got"
-  # Drive the memory-limit path: empty stdin makes the re-executed image
-  # fail its request read (EXIT_PROTOCOL 64); darwin has no per-process
-  # rlimit, so the helper refuses the flag instead (EXIT_LIMIT 65).
-  # Anything else — notably ld.so's exit 1 — means the cap never bound.
   set +e
+  # empty stdin -> EXIT_PROTOCOL 64 (linux re-exec path); darwin has no per-process rlimit -> EXIT_LIMIT 65; ld.so exit 1 = cap never bound
   "/tmp/abgen-natsmoke/$nat/abgen-host" --max-memory-mb 512 </dev/null
   rc=$?
   set -e
@@ -392,8 +334,6 @@ if [ "$CAN_SMOKE" = true ]; then
     echo "native smoke: bundled loader present"
   fi
 fi
-
-# images
 
 if [ "$BUILDER" = nix ] && [ -n "${BUILD_IMAGES:-}" ]; then
   for image in $(echo "$BUILD_IMAGES" | tr ',' ' '); do

@@ -13,7 +13,6 @@
   outputs = { self, nixpkgs, crane, rust-overlay }:
     let
       lib = nixpkgs.lib;
-      # No x86_64-darwin: the pinned nixpkgs throws on import for it.
       systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
 
       sourceDateEpoch = "315532800";
@@ -23,8 +22,6 @@
           ./Cargo.toml
           ./Cargo.lock
           ./rust-toolchain.toml
-          # nextest writes the junit report the in-drv zero-test guard
-          # asserts on; the config must be visible inside the check drvs.
           ./.config/nextest.toml
           ./crate
           ./template
@@ -41,18 +38,7 @@
         fileset = buildFileset;
       };
 
-      # Two artifact ids, one per build class (docs/ci.md §4). Rule: every
-      # binary embeds the id that keys its own artifact, so the stamp in
-      # logs//status/--version names exactly the inputs that produced the
-      # bytes.
-      #
-      # srcId covers the cargo/napi legs' inputs — buildSource already
-      # carries Cargo.lock and rust-toolchain.toml — so those artifacts
-      # rotate only when their bytes can.
-      # Beyond buildSource, srcId folds in the build harness and the prose
-      # files packed into the archives: they all determine the shipped
-      # bytes, and release.yml skips whole legs on this id — an uncovered
-      # input would republish stale artifacts for a changed tree.
+      # srcId must cover everything that determines shipped bytes: release.yml skips whole legs on it
       srcId = builtins.substring 0 12 (builtins.hashString "sha256"
         (builtins.concatStringsSep "\n" [
           (baseNameOf (builtins.unsafeDiscardStringContext buildSource.outPath))
@@ -65,10 +51,6 @@
           (builtins.hashFile "sha256" ./unity/README.md)
         ]));
 
-      # The nix legs' bytes additionally depend on the nix build plumbing
-      # (nixpkgs toolchain, glibc, this wiring), so their id — and their
-      # embedded stamp via buildEnv below — covers it. nix/checks.nix stays
-      # out of this list: check edits must not move it.
       nixId = builtins.substring 0 12 (builtins.hashString "sha256"
         (builtins.concatStringsSep "\n" [
           srcId
@@ -193,9 +175,6 @@
                 "ABGEN_ROOT=/opt/abgen"
                 "ABGEN_CACHE_DIR=/tmp/abgen-cache"
                 "OUT_ROOT=/tmp/abgen-out"
-                # The binary is fail-open when this is unset; the image is
-                # where the guard is armed. A Lambda function env var with
-                # the same name overrides this list.
                 "ALLOWED_CONTENT_SERVER_HOSTS=peer.decentraland.org"
                 "TURBOJPEG_LIB=${pkgs.libjpeg_turbo.out}/lib/libturbojpeg${sharedLibExt}"
                 "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"

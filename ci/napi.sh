@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# One @dcl/abgen-node napi leg: build the platform .node, smoke it when
-# the runner can execute it, gate the glibc floor on linux, stage into
-# dist/. Assumes node and a rust toolchain with <target> are installed
-# (the workflow's setup-node + rust-setup, or a local dev environment).
 set -euo pipefail
 
 TARGET="${1:?usage: napi.sh <target-triple>}"
@@ -13,17 +9,12 @@ DIST_DIR="${ABGEN_DIST:-$ROOT/dist}"
 cd "$ROOT/crate/abgen-node"
 
 npm ci --no-audit --no-fund
-# --cargo-flags, never '-- --locked': napi's build command has an optional
-# positional (the copy destination), so a post--- token silently redirects
-# the .node into a directory named './--locked' and cargo never sees the
-# flag.
+# --cargo-flags, never '-- --locked': napi's positional is a copy destination
 npx napi build --platform --release --target "$TARGET" --cargo-flags=--locked
 
 node_bin="$(ls ./*.node)"
 [ -n "$node_bin" ] || { echo "napi build produced no .node file" >&2; exit 1; }
 
-# napi regenerates the JS bindings; the committed ones must match, or the
-# published package pairs a fresh .node with stale typings.
 git diff --exit-code -- index.js index.d.ts \
   || { echo "index.js/index.d.ts are stale; run 'napi build --platform --release' and commit them" >&2; exit 1; }
 
@@ -38,8 +29,6 @@ if [ "$run_arch" = "$want_arch" ]; then
   echo "napi smoke ok"
 fi
 
-# The addon is dlopen'd into node and bound by the host's glibc exactly
-# like libabgen.so is by Unity's.
 case "$TARGET" in
   *-unknown-linux-gnu) bash "$HERE/check-glibc-floor.sh" 2.34 $node_bin ;;
 esac

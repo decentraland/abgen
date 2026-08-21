@@ -10,10 +10,7 @@ let
     CARGO_PROFILE = "checkfast";
   };
   abgenRoot = ''export ABGEN_ROOT="$PWD"'';
-  # The zero-test guard lives INSIDE the derivation: a green output with
-  # zero tests cannot exist, so neither the binary cache nor a verdict
-  # artifact can ever memoize that state (the doCheck=false class went
-  # unnoticed for weeks when this was a post-hoc log grep).
+  # in-drv: a green zero-test output must not exist, so no cache can memoize it
   assertRanTests = ''
     junit=target/nextest/default/junit.xml
     [ -f "$junit" ] || { echo "nextest junit report missing - no tests ran" >&2; exit 1; }
@@ -43,9 +40,6 @@ let
   };
 
   archDependent = {
-    # The crane dependency closure as a first-class attr: the pipeline's
-    # deps stage builds exactly this, then publishes the binary cache, so a
-    # failure in any later stage never costs the next run its warm deps.
     deps = cargoArtifacts;
     deps-checkfast = cargoArtifactsCheckfast;
 
@@ -75,21 +69,10 @@ let
       '';
   };
 
-  # server-off config. The lambda binary ships and runs on aarch64 only, so
-  # its test lane follows the prod arch; the config stays covered fleet-wide
-  # (aarch64-linux in CI, darwin locally) without a second server-off
-  # workspace compile+test on the slower x86 lane. Folding it into nextest
-  # is rejected: feature unification differs, a merged compile would not
-  # test the no-server config the mac/windows legs ship.
+  # aarch64-only like prod; folding into nextest rejected: feature unification differs
   lambdaTests = {
-    # the pipeline's deps stage builds it, then publishes the binary cache.
     lambda-deps = lambdaCargoArtifacts;
 
-    # lambdaCargoArtifacts, not the workspace closure: the `-p` selection
-    # resolves shared deps to narrower feature sets, so workspace
-    # artifacts never matched and every run recompiled the deps here.
-    # nextest (not cargo test): same selection and features, plus the
-    # junit report the in-drv guard asserts on.
     lambda-tests = craneLib.cargoNextest (commonArgs // {
       cargoArtifacts = lambdaCargoArtifacts;
       CARGO_PROFILE = "checkfast";
@@ -103,8 +86,6 @@ let
     });
   };
 in
-# Arch-independent checks ride the aarch64 lane: those runners are ~1.8x
-# faster per stage, which rebalances the two pipelines' critical paths.
 archDependent
 // lib.optionalAttrs (system != "x86_64-linux") lambdaTests
 // lib.optionalAttrs (system == "aarch64-linux") archIndependent

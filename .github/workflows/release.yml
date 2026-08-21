@@ -1,26 +1,9 @@
 name: release
 
-# Thin scheduler around ci/build.sh and ci/napi.sh — every build step that
-# matters runs identically on a laptop. Derivation: docs/ci.md.
-#
-# main push  : build everything once as input-addressed artifacts
-#              (<kind>-<id>-... — srcId for cargo/napi legs, nixId for nix
-#              legs and images); legs whose artifacts already exist for
-#              this tree are skipped at matrix-selection time.
-# tag push   : wait for the commit's ci verdict, gather the same artifact
-#              names (same-repo runs only — the fetch is fork-filtered and
-#              the attestation binds what ships to this run), then
-#              publish: GitHub release, npm x2, ghcr multi-arch, ECR.
-# dispatch   : rehearse (dry_run) or narrow (targets).
-# schedule   : nightly reproducibility — rebuild all legs, byte-compare
-#              against the stored artifacts, upload nothing.
-
 on:
   push:
     tags: ["v*"]
     branches: [main]
-  # Nightly: rebuild every leg and byte-compare against the stored
-  # artifacts — reproducibility is tested here, not gated at release.
   schedule:
     - cron: "23 5 * * *"
   workflow_dispatch:
@@ -177,8 +160,6 @@ jobs:
     name: ${{ matrix.target }}
     needs: setup
     if: needs.setup.outputs.has_targets == 'true'
-    # PR-triggered prebuild legs must not inherit the workflow-level
-    # contents: write.
     permissions:
       contents: read
       actions: read
@@ -209,10 +190,6 @@ jobs:
           BUILD_IMAGES: ${{ matrix.images || '' }}
         run: bash ci/build.sh ${{ matrix.target }}
 
-      # Nightly: this tree's artifacts already exist — compare instead of
-      # upload. Byte inequality on the same tree means the build stopped
-      # being reproducible (or the stored artifact was not produced from
-      # this tree); either way, red.
       - name: reproducibility compare (nightly)
         if: github.event_name == 'schedule'
         env:
@@ -263,8 +240,6 @@ jobs:
     name: abgen-node ${{ matrix.target }}
     needs: setup
     if: needs.setup.outputs.has_napi == 'true'
-    # PR-triggered prebuild legs must not inherit the workflow-level
-    # contents: write.
     permissions:
       contents: read
       actions: read
@@ -281,8 +256,6 @@ jobs:
       - uses: ./.github/actions/rust-setup
         with:
           targets: ${{ matrix.target }}
-          # linux legs cache: x86 primes ci's node-addon job (same
-          # shared-key); saves only from main, restorable by every PR.
           cache: ${{ matrix.cache || 'false' }}
           workspaces: crate/abgen-node
           shared-key: abgen-node
@@ -318,9 +291,6 @@ jobs:
           path: dist/*.node
           if-no-files-found: error
 
-  # Building races ahead of the test verdict; SHIPPING is what gates on
-  # it. A tag's commit already ran ci when it landed on main — this waits
-  # for that verdict and fails closed if it is missing or red.
   ci-green:
     name: ci green gate
     if: startsWith(github.ref, 'refs/tags/')
@@ -401,9 +371,6 @@ jobs:
           done
           ls -l dist
 
-      # Trust is provenance, not recorded hashes: the artifacts came from
-      # same-repo runs (fork-filtered fetch), their sidecar sha256s must
-      # self-verify, and the attestation below binds them to this run.
       - name: verify archive set
         run: |
           set -eu
@@ -555,7 +522,6 @@ jobs:
   ecr-publish:
     name: push lambda image to ECR
     needs: [setup, build, ci-green]
-    # Separate job: `environment` is job-level and gates the credentials.
     if: >-
       !cancelled() &&
       startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true &&
