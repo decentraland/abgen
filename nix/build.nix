@@ -5,6 +5,12 @@ let
     pname = "abgen";
     version = repoVersion;
     src = buildSource;
+    # Explicit so crane never derives it from `src`: its fallback scans src
+    # for Cargo.lock and .cargo/config.toml at EVAL time, and when src is
+    # the dummy tree (a derivation, in the deps closures) that scan builds
+    # the derivation during evaluation — IFD, which breaks cross-system
+    # eval and `nix eval` purity. Vendoring from buildSource is pure.
+    cargoVendorDir = craneLib.vendorCargoDeps { src = buildSource; };
     nativeBuildInputs = with pkgs; [ cmake pkg-config git ];
     doCheck = false;
     env.SOURCE_DATE_EPOCH = sourceDateEpoch;

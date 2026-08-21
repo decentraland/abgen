@@ -32,6 +32,10 @@ runs:
         extra-conf: |
           max-jobs = auto
           cores = 0
+          # Evaluation must never build: IFD would break cross-system eval
+          # and hide build work inside eval steps. Enforced here so a crane
+          # arg regression fails loudly instead of quietly re-introducing it.
+          allow-import-from-derivation = false
           extra-substituters = file:///var/tmp/abgen-nixcache
           # Our nars are unsigned (produced by this repo's own CI, the same
           # trust domain as the code). Integrity still holds: nix checks
