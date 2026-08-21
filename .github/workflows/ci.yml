@@ -185,6 +185,15 @@ jobs:
         with:
           flavor: gate
           extra-conf: extra-platforms = aarch64-linux
+      - name: rebase cache baseline past flake inputs
+        run: |
+          # Flake input sources re-download in seconds but bloat the gate
+          # cache entry ~6x (nixpkgs alone is ~250 MB unpacked), and a fat
+          # entry thrashes the repo's 10 GB pool. Fetch them now and fold
+          # them into the composite's save baseline so the published delta
+          # is only what the eval actually builds (the IFD outputs).
+          nix flake archive --json > /dev/null
+          nix path-info --all | LC_ALL=C sort > /var/tmp/abgen-nix-base.txt
       - id: memo
         env:
           GH_TOKEN: ${{ github.token }}
