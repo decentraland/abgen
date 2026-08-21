@@ -100,14 +100,14 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
     }
     if crate::clihelp::env_bool("ABGEN_DEPS_DIGEST", true) {
         tracing::info!(
-            "asset-reuse mode ON (default): canonical glb names \
-             ({{hash}}_{{depsdigest}}_{{platform}}), shared {{version}}/assets/ space layout, \
-             pre-build probe"
+            "deps-digest naming ON (default): canonical scene glb names \
+             ({{hash}}_{{depsdigest}}_{{platform}}), pre-build reuse probe"
         );
     } else {
         tracing::warn!(
-            "asset-reuse mode DISABLED (ABGEN_DEPS_DIGEST=0): legacy {{hash}}_{{platform}} \
-             names + entity-scoped space keys — only for parity against pre-v49 references"
+            "deps-digest naming DISABLED (ABGEN_DEPS_DIGEST=0): bare {{hash}}_{{platform}} \
+             glb names, no reuse probe — for consumers that request bundles by bare \
+             content hash, or pre-v49 parity"
         );
     }
 

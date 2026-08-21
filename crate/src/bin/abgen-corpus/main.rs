@@ -81,7 +81,7 @@ pub(crate) struct EffectiveToggles {
     pub(crate) v38_timestamp: i64,
     pub(crate) magenta_missing: bool,
 
-    pub(crate) asset_reuse: bool,
+    pub(crate) deps_digest: bool,
 }
 
 const BIN_NAME: &str = "abgen-corpus";
@@ -536,7 +536,7 @@ fn run() -> Result<()> {
                 v38_compat: set_v38 || (!parity_mode && BuildOpts::env_v38_compat()),
                 v38_timestamp: BuildOpts::env_v38_timestamp(),
                 magenta_missing: BuildOpts::env_magenta_missing(),
-                asset_reuse: !no_deps_digest && abgen::clihelp::env_bool("ABGEN_DEPS_DIGEST", true),
+                deps_digest: !no_deps_digest && abgen::clihelp::env_bool("ABGEN_DEPS_DIGEST", true),
             }
         }
         Err(msg) => {
