@@ -1841,6 +1841,72 @@ mod tests {
     }
 
     #[test]
+    fn entity_kind_owns_placement_regardless_of_name() {
+        let (host, seen) = super::stub::serve(vec![]);
+        let proxy = stub_proxy_reuse(&host, "kind-over-name");
+        proxy.space_put_bundle(
+            "bafkwearable",
+            "Qmhash_0123456789abcdef0123456789abcdef_windows",
+            false,
+            b"B",
+        );
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec![
+                "PUT /v41/bafkwearable/Qmhash_0123456789abcdef0123456789abcdef_windows".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_mode_keeps_entity_scoped_puts_for_digest_names_too() {
+        let (host, seen) = super::stub::serve(vec![]);
+        let proxy = stub_proxy(&host, false, "legacy-digest-put");
+        proxy.space_put_bundle(
+            "bafkcid",
+            "Qmhash_0123456789abcdef0123456789abcdef_windows",
+            true,
+            b"B",
+        );
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec!["PUT /v41/bafkcid/Qmhash_0123456789abcdef0123456789abcdef_windows".to_string()]
+        );
+    }
+
+    #[test]
+    fn read_only_space_skips_scene_bundle_puts() {
+        let (host, seen) = super::stub::serve(vec![]);
+        let proxy = super::stub::stub_proxy_at_reuse(
+            &host,
+            "http://127.0.0.1:9",
+            true,
+            &temp_cache("ro-scene-put"),
+            true,
+        );
+        proxy.space_put_bundle("bafkscene", "Qmhash_windows", true, b"B");
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn digestless_names_never_touch_assets_on_read_or_probe() {
+        let (host, seen) = super::stub::serve(vec![]);
+        let proxy = stub_proxy_reuse(&host, "digestless-read");
+        assert_eq!(proxy.space_get_bundle("bafkcid", "Qmhash_windows"), None);
+        assert!(!proxy.space_probe_asset("Qmhash_windows"));
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec![
+                "GET /v41/bafkcid/Qmhash_windows".to_string(),
+                "GET /v40/bafkcid/Qmhash_windows".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn bounded_reserve_evicts_only_past_cap() {
         let mut m: HashMap<String, u32> = HashMap::new();
         m.insert("a".to_string(), 1);
