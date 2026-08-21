@@ -1,26 +1,14 @@
 name: nix + binary cache
 description: >
-  Install nix and wire a file:// binary cache, restored from the Actions
-  cache (own-ref scope) or seeded from a same-repo artifact, as a
-  substituter. Trust domain: repo write access — the same people who can
-  change the code can populate the cache; fork PRs are excluded by cache
-  scoping and the artifact fork filter. nix hash-verifies every NAR
-  against its narinfo and rebuilds anything missing or corrupt, so a
-  damaged, torn or stale entry can cost minutes — never a red job. There is no store DB and
+  Install nix and wire a content-addressed file:// binary cache, restored
+  from the Actions cache, as a substituter. Unlike the old /nix snapshot,
+  nothing here is trusted: nix hash-verifies every path it pulls from the
+  cache and rebuilds anything missing or corrupt, so a damaged, torn or
+  stale entry can cost minutes — never a red job. There is no store DB and
   no eval cache in the artifact, which removes every past poisoning mode at
   the design level. Jobs that should publish the cache end with the sibling
   save action. runner.arch is part of the key so x86_64 and aarch64 stores
   never cross.
-
-inputs:
-  flavor:
-    description: >
-      Which closure family this job consumes (build = release-profile;
-      checkfast = the test-lane profile; lambda = the lambda-selection
-      closure). INVARIANT: at most one saving lane per (os, arch, flavor)
-      — first-save-wins silently drops a second saver's outputs, which is
-      why the arm lambda lane has its own flavor.
-    default: build
 
 runs:
   using: composite
@@ -38,49 +26,31 @@ runs:
 
     - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
       with:
+        # No FlakeHub: with determinate left on, jobs holding an OIDC token
+        # (the ECR image job) try a FlakeHub login and warn on every run.
         determinate: false
         extra-conf: |
           max-jobs = auto
           cores = 0
-          # Evaluation must never build: IFD would break cross-system eval
-          # and hide build work inside eval steps. Enforced here so a crane
-          # arg regression fails loudly instead of quietly re-introducing it.
-          allow-import-from-derivation = false
-          # trusted=1 scopes the unsigned-nar allowance to OUR store only;
-          # cache.nixos.org keeps full signature checking.
-          extra-substituters = file:///var/tmp/abgen-nixcache?trusted=1
+          extra-substituters = file:///var/tmp/abgen-nixcache
+          # Our nars are unsigned (produced by this repo's own CI, the same
+          # trust domain as the code). Integrity still holds: nix checks
+          # every NAR against its narinfo hash before use.
+          require-sigs = false
 
     - name: record installer store baseline
       shell: bash
+      # Everything present now came from the installer; the save action
+      # publishes only the delta beyond this, so the nix closure itself is
+      # never cached.
       run: nix path-info --all | LC_ALL=C sort > /var/tmp/abgen-nix-base.txt
 
     - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
       id: restore
       with:
         path: /var/tmp/abgen-nixcache
-        key: nix-v5-${{ runner.os }}-${{ runner.arch }}-${{ inputs.flavor }}-${{ hashFiles('crate/**', 'lambda/**', 'template/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'flake.nix', 'flake.lock', 'nix/**', '.config/nextest.toml') }}
-        restore-keys: nix-v5-${{ runner.os }}-${{ runner.arch }}-${{ inputs.flavor }}-
-
-    - name: seed from artifact on cache miss
-      if: steps.restore.outputs.cache-hit != 'true'
-      shell: bash
-      env:
-        GH_TOKEN: ${{ github.token }}
-        KEY: ${{ steps.restore.outputs.cache-primary-key }}
-      run: |
-        # Fail-open on every path: an API error or missing permission is a
-        # miss (slower run), never a red job.
-        id=$(gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$KEY&per_page=100" \
-          --jq '[.artifacts[] | select(.expired == false and .size_in_bytes > 0 and .workflow_run.repository_id != null and .workflow_run.head_repository_id == .workflow_run.repository_id)] | sort_by(.updated_at) | last | .id // empty' \
-          2>/dev/null || true)
-        if [ -n "$id" ] && gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > /tmp/nixcache-seed.zip 2>/dev/null; then
-          unzip -qo /tmp/nixcache-seed.zip -d /var/tmp/abgen-nixcache
-          rm -f /tmp/nixcache-seed.zip
-          echo "ABGEN_NIXCACHE_ARTIFACT=hit" >> "$GITHUB_ENV"
-          echo "seeded binary cache from artifact $KEY"
-        else
-          echo "ABGEN_NIXCACHE_ARTIFACT=miss" >> "$GITHUB_ENV"
-        fi
+        key: nix-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'Cargo.lock', '**/Cargo.toml', 'flake.nix', 'rust-toolchain.toml', 'nix/*.nix', 'crate/abgen-wasm/toolchain/flake.lock', 'crate/abgen-wasm/toolchain/flake.nix') }}
+        restore-keys: nix-v3-${{ runner.os }}-${{ runner.arch }}-
 
     - name: expose cache facts to the save action
       shell: bash

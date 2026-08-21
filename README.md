@@ -196,10 +196,10 @@ output is promoted into the serving root, so rejected bundles are never servable
 The container image is built straight from the pinned Nix flake - `nix build .#dockerImage`
 (`dockerTools.buildLayeredImage`, `tini` init, no base OS) - producing an image that runs `abgen` as an
 unprivileged user on `:5147` with `template/` and `shader/` baked in and `ABGEN_ROOT`/`ABGEN_OUT_ROOT`
-preset. The `build` job in [`.github/workflows/release.yml`](.github/workflows/release.yml) builds
-that image (via `ci/build.sh`) and `ghcr-publish` pushes it to `ghcr.io/decentraland/abgen:<tag>` (and `:latest`) on every `v*` tag.
+preset. The `image` job in [`.github/workflows/release.yml`](.github/workflows/release.yml) builds
+that image and pushes it to `ghcr.io/decentraland/abgen:<tag>` (and `:latest`) on every `v*` tag.
 The workspace also ships an AWS Lambda consumer in `lambda/` (the `abgen-lambda` bin);
-`nix build .#lambdaImage` produces its container image, which the `ecr-publish` job pushes to ECR
+`nix build .#lambdaImage` produces its container image, which the `lambda-image-push` job pushes to ECR
 on the same tags - see [lambda/README.md](lambda/README.md). The org
 services-pipeline that publishes the same service to quay (service-name `abgen`) is configured
 externally in the private `decentraland/definitions` repo, not in this tree. Cutting a release -

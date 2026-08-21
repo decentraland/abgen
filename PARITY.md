@@ -9,9 +9,9 @@ The deterministic profile's output is bit-identical across rebuilds and compile 
 gates:
 
 - **Native reproducibility.** With the deterministic profile selected, 32 representative bundles
-  reproduce bit-for-bit against a frozen baseline. Release archives are byte-pure functions of the
-  source tree; a nightly CI pass rebuilds every target and byte-compares against the stored
-  artifacts, and shipped bytes carry GitHub build-provenance attestations.
+  reproduce bit-for-bit against a frozen baseline. Release binaries carry a committed sha256 manifest
+  (`ci/artifact-hashes/`) that every later build re-verifies against, on other runners and at other
+  commits, and a tag refuses to publish if any artifact disagrees.
 - **Cross-target parity.** The native converter (with `ABGEN_JPEG_GLB_9C=1`) and the WebAssembly build
   agree on 56/56 measured bundle hashes. The wasm self-gate independently compares 26 windows/mac/webgl
   bundle hashes across 8 format fixtures (JPEG, crunched DXT5 normals, Draco, gamma,

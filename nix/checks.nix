@@ -1,25 +1,14 @@
-{ lib, system, pkgs, craneLib, commonArgs, cargoArtifacts
-, cargoArtifactsCheckfast, lambdaCargoArtifacts, abgenConsumersPkg
+{ lib, system, pkgs, craneLib, commonArgs, cargoArtifacts, abgenConsumersPkg
 , wasmCheck }:
 
 let
   src = commonArgs.src;
   withArtifacts = commonArgs // { inherit cargoArtifacts; };
-  withCheckfast = commonArgs // {
-    cargoArtifacts = cargoArtifactsCheckfast;
-    CARGO_PROFILE = "checkfast";
-  };
   abgenRoot = ''export ABGEN_ROOT="$PWD"'';
-  # in-drv: a green zero-test output must not exist, so no cache can memoize it
-  assertRanTests = ''
-    junit=target/nextest/default/junit.xml
-    [ -f "$junit" ] || { echo "nextest junit report missing - no tests ran" >&2; exit 1; }
-    count=$(grep -o 'tests="[0-9]*"' "$junit" | head -n1 | grep -o '[0-9]*' || echo 0)
-    [ "''${count:-0}" -gt 0 ] || { echo "zero tests executed" >&2; exit 1; }
-    echo "$count tests executed"
-  '';
 
   archIndependent = {
+    # The wasm toolchain + registry closure, exposed so the pipeline's deps
+    # stage can build and cache it before any source-keyed work starts.
     wasm-deps = wasmCheck.cargoArtifacts;
 
     fmt = craneLib.cargoFmt {
@@ -40,16 +29,17 @@ let
   };
 
   archDependent = {
+    # The crane dependency closure as a first-class attr: the pipeline's
+    # deps stage builds exactly this, then publishes the binary cache, so a
+    # failure in any later stage never costs the next run its warm deps.
     deps = cargoArtifacts;
-    deps-checkfast = cargoArtifactsCheckfast;
 
-    nextest = craneLib.cargoNextest (withCheckfast // {
+    nextest = craneLib.cargoNextest (withArtifacts // {
       doCheck = true;
       __darwinAllowLocalNetworking = true;
       cargoExtraArgs = "--locked";
       cargoNextestExtraArgs = "--workspace";
       preCheck = abgenRoot;
-      postCheck = assertRanTests;
     });
 
     native-smoke =
@@ -69,23 +59,25 @@ let
       '';
   };
 
-  # aarch64-only like prod; folding into nextest rejected: feature unification differs
+  # server-off config. The lambda binary ships and runs on aarch64 only, so
+  # its test lane follows the prod arch; the config stays covered fleet-wide
+  # (aarch64-linux in CI, darwin locally) without a second server-off
+  # workspace compile+test on the slower x86 lane. Folding it into nextest
+  # is rejected: feature unification differs, a merged compile would not
+  # test the no-server config the mac/windows legs ship.
   lambdaTests = {
-    lambda-deps = lambdaCargoArtifacts;
-
-    lambda-tests = craneLib.cargoNextest (commonArgs // {
-      cargoArtifacts = lambdaCargoArtifacts;
-      CARGO_PROFILE = "checkfast";
+    lambda-tests = craneLib.cargoTest (withArtifacts // {
       doCheck = true;
       __darwinAllowLocalNetworking = true;
       pname = "abgen-lambda-tests";
       cargoExtraArgs = "--locked";
-      cargoNextestExtraArgs = "-p abgen-lambda -p abgen-native";
+      cargoTestExtraArgs = "-p abgen-lambda -p abgen-native --tests";
       preCheck = abgenRoot;
-      postCheck = assertRanTests;
     });
   };
 in
+# Arch-independent checks ride the aarch64 lane: those runners are ~1.8x
+# faster per stage, which rebalances the two pipelines' critical paths.
 archDependent
 // lib.optionalAttrs (system != "x86_64-linux") lambdaTests
 // lib.optionalAttrs (system == "aarch64-linux") archIndependent

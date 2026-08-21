@@ -62,4 +62,7 @@ unity/Packages/org.decentraland.abgen/Runtime/Plugins/**/*.so
 /abgen-v*.tar.gz*
 /abgen-native-v*/
 /abgen-native-v*.tar.gz*
-/dist/
+ci/formal/*.vo
+ci/formal/*.vok
+ci/formal/*.vos
+ci/formal/*.glob

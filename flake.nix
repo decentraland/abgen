@@ -13,6 +13,7 @@
   outputs = { self, nixpkgs, crane, rust-overlay }:
     let
       lib = nixpkgs.lib;
+      # No x86_64-darwin: the pinned nixpkgs throws on import for it.
       systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
 
       sourceDateEpoch = "315532800";
@@ -22,7 +23,6 @@
           ./Cargo.toml
           ./Cargo.lock
           ./rust-toolchain.toml
-          ./.config/nextest.toml
           ./crate
           ./template
           ./lambda/Cargo.toml
@@ -38,29 +38,19 @@
         fileset = buildFileset;
       };
 
-      # srcId must cover everything that determines shipped bytes: release.yml skips whole legs on it
-      srcId = builtins.substring 0 12 (builtins.hashString "sha256"
+      # nix/checks.nix stays out of this list: check edits must not move
+      # buildId.
+      buildId = builtins.substring 0 12 (builtins.hashString "sha256"
         (builtins.concatStringsSep "\n" [
           (baseNameOf (builtins.unsafeDiscardStringContext buildSource.outPath))
-          (builtins.hashFile "sha256" ./ci/build.sh)
-          (builtins.hashFile "sha256" ./ci/napi.sh)
-          (builtins.hashFile "sha256" ./ci/stable-dlltool.sh)
-          (builtins.hashFile "sha256" ./ci/check-glibc-floor.sh)
-          (builtins.hashFile "sha256" ./LICENSE)
-          (builtins.hashFile "sha256" ./README.md)
-          (builtins.hashFile "sha256" ./unity/README.md)
-        ]));
-
-      nixId = builtins.substring 0 12 (builtins.hashString "sha256"
-        (builtins.concatStringsSep "\n" [
-          srcId
+          (builtins.hashFile "sha256" ./rust-toolchain.toml)
           (builtins.hashFile "sha256" ./flake.lock)
           (builtins.hashFile "sha256" ./flake.nix)
           (builtins.hashFile "sha256" ./nix/build.nix)
         ]));
 
       buildEnv = {
-        ABGEN_BUILD_ID = nixId;
+        ABGEN_BUILD_ID = buildId;
         SOURCE_DATE_EPOCH = sourceDateEpoch;
       };
 
@@ -122,7 +112,7 @@
             nativeBuildInputs = nativeDeps;
 
             buildInputs = [ pkgs.libjpeg_turbo ];
-            ABGEN_BUILD_ID = srcId;
+            ABGEN_BUILD_ID = buildId;
             SOURCE_DATE_EPOCH = sourceDateEpoch;
             shellHook = ''
               export TURBOJPEG_LIB=${pkgs.libjpeg_turbo.out}/lib/libturbojpeg${sharedLibExt}
@@ -131,9 +121,7 @@
 
           packages.default = abgenPkg;
 
-          packages.srcId = srcId;
-
-          packages.nixId = nixId;
+          packages.buildId = buildId;
 
           packages.abgen-native = abgenNativePkg;
 
@@ -175,6 +163,9 @@
                 "ABGEN_ROOT=/opt/abgen"
                 "ABGEN_CACHE_DIR=/tmp/abgen-cache"
                 "OUT_ROOT=/tmp/abgen-out"
+                # The binary is fail-open when this is unset; the image is
+                # where the guard is armed. A Lambda function env var with
+                # the same name overrides this list.
                 "ALLOWED_CONTENT_SERVER_HOSTS=peer.decentraland.org"
                 "TURBOJPEG_LIB=${pkgs.libjpeg_turbo.out}/lib/libturbojpeg${sharedLibExt}"
                 "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
@@ -185,9 +176,7 @@
 
           checks = import ./nix/checks.nix {
             inherit lib system pkgs craneLib wasmCheck;
-            inherit (build) commonArgs cargoArtifacts cargoArtifactsCheckfast
-              lambdaCargoArtifacts
-              abgenConsumersPkg;
+            inherit (build) commonArgs cargoArtifacts abgenConsumersPkg;
           };
 
         });
