@@ -13,7 +13,11 @@ DIST_DIR="${ABGEN_DIST:-$ROOT/dist}"
 cd "$ROOT/crate/abgen-node"
 
 npm ci --no-audit --no-fund
-npx napi build --platform --release --target "$TARGET" -- --locked
+# --cargo-flags, never '-- --locked': napi's build command has an optional
+# positional (the copy destination), so a post--- token silently redirects
+# the .node into a directory named './--locked' and cargo never sees the
+# flag.
+npx napi build --platform --release --target "$TARGET" --cargo-flags=--locked
 
 node_bin="$(ls ./*.node)"
 [ -n "$node_bin" ] || { echo "napi build produced no .node file" >&2; exit 1; }

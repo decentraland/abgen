@@ -227,7 +227,12 @@ jobs:
         working-directory: crate/abgen-node
         run: |
           npm ci --no-audit --no-fund
-          npx napi build --platform --release -- --locked
+          # --cargo-flags, never '-- --locked': the post--- token becomes
+          # napi's copy-destination positional, the .node lands in a dir
+          # named './--locked', and the smoke then silently loads the
+          # PUBLISHED addon via the optionalDependencies fallback.
+          npx napi build --platform --release --cargo-flags=--locked
+          ls ./*.node
           git diff --exit-code -- index.js index.d.ts \
             || { echo "index.js/index.d.ts are stale; run 'napi build --platform --release' and commit them" >&2; exit 1; }
           node test/smoke.mjs
