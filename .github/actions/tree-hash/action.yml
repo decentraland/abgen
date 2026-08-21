@@ -1,0 +1,30 @@
+name: tree hash
+description: >
+  Deny-list content hash of the checked-out tree for memoizing non-nix
+  lanes. Every tracked file participates except paths that provably cannot
+  affect a cargo build/test verdict, each with its argument below. The
+  failure mode of an omission here is an unnecessary run, never a false
+  skip — the opposite polarity of an allow-list.
+outputs:
+  h:
+    description: sha256 over the filtered git tree listing (mode, blob, path)
+    value: ${{ steps.h.outputs.h }}
+runs:
+  using: composite
+  steps:
+    - id: h
+      shell: bash
+      run: |
+        # ci/artifact-hashes: consumed only by the release hash gate
+        # ci/formal:          Rocq models, never executed by CI lanes
+        # nix/, flake.*:      the nix lanes' world; cargo lanes use rustup
+        # release.yml:        publishing orchestration, runs no tests
+        # *.md:               prose
+        h=$(git ls-tree -r HEAD | awk -F'\t' '
+          $2 !~ /^ci\/artifact-hashes\// &&
+          $2 !~ /^ci\/formal\// &&
+          $2 !~ /^nix\// &&
+          $2 != "flake.nix" && $2 != "flake.lock" &&
+          $2 != ".github/workflows/release.yml" &&
+          $2 !~ /\.md$/' | sha256sum | cut -c1-64)
+        echo "h=$h" >> "$GITHUB_OUTPUT"

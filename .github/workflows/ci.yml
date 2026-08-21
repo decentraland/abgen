@@ -56,8 +56,12 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           fetch-depth: 0
+      # Deny-list hash: every tracked file counts except a short justified
+      # exclusion list (see the action). Forgetting an input in the old
+      # allow-list meant a silent false skip; forgetting a deny-list entry
+      # means an unnecessary run.
       - id: hash
-        run: echo "h=${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.github/workflows/ci.yml', '.github/actions/rust-setup/**', 'ci/abgen-smoke.ps1', '.config/nextest.toml', 'crate/Cargo.toml', 'crate/build.rs', 'crate/third_party/**', 'crate/abgen-native/**', 'crate/dcl-contents/**', 'crate/src/abcdn/**', 'crate/src/builder/**', 'crate/src/export/**', 'crate/src/lodgen/**', 'crate/src/gpu/**', 'crate/src/live.rs', 'crate/src/jitcache.rs', 'crate/src/local_store.rs', 'crate/src/texencode_cache.rs', 'crate/src/tmppath.rs', 'crate/src/clihelp.rs', 'crate/src/ffi.rs', 'crate/src/worlds.rs', 'crate/src/lods.rs', 'crate/src/lz4.rs', 'crate/src/manifest.rs', 'crate/src/space.rs', 'crate/src/shader.rs', 'crate/src/lib.rs', 'crate/src/gltf/scene_build.rs', 'crate/src/unity/bundle_file.rs', 'crate/abgen-wasm/test/fixtures/normal-quad.glb') }}" >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/tree-hash
       - id: memo
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -135,68 +139,75 @@ jobs:
   # Image artifacts are produced by the release workflow's build legs,
   # which start on the same push in parallel with all of this; publishing
   # is what gates on green, not building.
-  # Windows-gate pattern for the nix lanes: a PR pays only for the lanes
-  # its diff can affect. Pushes to main and schedules always run everything.
-  # crate  -> workspace tests/build (crate/, template/, roots, nix build wiring)
-  # lambda -> the lambda test config (also affected by crate/)
-  # lint   -> anything lintable at all (rust/nix/toml sources)
+  # A lane's marker is keyed on the derivation hashes of exactly the check
+  # attrs it builds, plus the two harness files that sit outside the drvs
+  # (this workflow and ci/nix-checks.sh). Nix computes drv hashes from the
+  # real input closure — sources, toolchain, flake inputs, check definitions
+  # — so "same key" means "same derivations", and hermeticity gives "same
+  # verdict" (ci/formal/MemoModel.v: drv_key_skip_sound; the hand-listed
+  # hashFiles key this replaces is allowlist_false_green there). This also
+  # subsumes diff-based path gating: a PR that cannot affect a lane leaves
+  # its drvs equal to main's, so main's marker skips it.
   nix-gate:
     name: nix gate
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
-      run_crate: ${{ steps.decide.outputs.crate }}
-      run_lambda: ${{ steps.decide.outputs.lambda }}
-      run_lint: ${{ steps.decide.outputs.lint }}
-      # Hash of every input the nix lanes actually consume. Pushes that
-      # leave it unchanged (hash-manifest records, workflow edits, docs)
-      # skip lanes that are already green for it, windows-marker style.
-      inputs_hash: ${{ steps.hash.outputs.h }}
       skip_x86-nextest: ${{ steps.memo.outputs.m_x86-nextest }}
       skip_x86-smoke: ${{ steps.memo.outputs.m_x86-smoke }}
       skip_arm-nextest: ${{ steps.memo.outputs.m_arm-nextest }}
       skip_arm-lambda: ${{ steps.memo.outputs.m_arm-lambda }}
       skip_arm-lints: ${{ steps.memo.outputs.m_arm-lints }}
+      key_x86-nextest: ${{ steps.memo.outputs.k_x86-nextest }}
+      key_x86-smoke: ${{ steps.memo.outputs.k_x86-smoke }}
+      key_arm-nextest: ${{ steps.memo.outputs.k_arm-nextest }}
+      key_arm-lambda: ${{ steps.memo.outputs.k_arm-lambda }}
+      key_arm-lints: ${{ steps.memo.outputs.k_arm-lints }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      # crane's dummy-source cleaning is import-from-derivation: computing
+      # an aarch64-linux drvPath must BUILD trivial IFD drvs for that
+      # platform. qemu binfmt lets this x86 gate do so; the outputs are
+      # pure textual transforms, so the resulting drv hashes are the same
+      # ones the arm lanes see natively.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         with:
-          fetch-depth: 0
-      - id: hash
-        run: echo "h=${{ hashFiles('crate/**', 'lambda/**', 'template/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'flake.nix', 'flake.lock', 'nix/**', 'ci/nix-checks.sh', '.config/nextest.toml') }}" >> "$GITHUB_OUTPUT"
+          platforms: arm64
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
+        with:
+          extra-conf: extra-platforms = aarch64-linux
       - id: memo
         env:
           GH_TOKEN: ${{ github.token }}
-          H: ${{ steps.hash.outputs.h }}
         run: |
-          keys="$(gh api "/repos/$GITHUB_REPOSITORY/actions/caches?key=nix-green-&per_page=100" \
+          nix eval --json .#checks --apply 'checks: {
+            "x86-nextest" = [ checks.x86_64-linux.nextest.drvPath ];
+            "x86-smoke"   = [ checks.x86_64-linux.native-smoke.drvPath ];
+            "arm-nextest" = [ checks.aarch64-linux.nextest.drvPath ];
+            "arm-lambda"  = [ checks.aarch64-linux.lambda-tests.drvPath
+                              checks.aarch64-linux.native-smoke.drvPath ];
+            "arm-lints"   = [ checks.aarch64-linux.clippy.drvPath
+                              checks.aarch64-linux.fmt.drvPath
+                              checks.aarch64-linux.no-node-spawn.drvPath
+                              checks.aarch64-linux.wasm-check.drvPath ];
+          }' > /tmp/lane-drvs.json
+          harness=$(sha256sum .github/workflows/ci.yml ci/nix-checks.sh | sha256sum | cut -c1-16)
+          # The caches API sees every scope: identical drvs => identical
+          # verdict, so a marker minted on any branch is valid on all.
+          keys="$(gh api "/repos/$GITHUB_REPOSITORY/actions/caches?key=nix-green2-&per_page=100" \
             --jq '.actions_caches[].key' 2>/dev/null || true)"
           for lane in x86-nextest x86-smoke arm-nextest arm-lambda arm-lints; do
-            if printf '%s\n' "$keys" | grep -qx "nix-green-$lane-$H"; then
+            k=$({ jq -r --arg l "$lane" '.[$l][]' /tmp/lane-drvs.json; echo "$harness"; } \
+              | sha256sum | cut -c1-32)
+            echo "k_$lane=$k" >> "$GITHUB_OUTPUT"
+            if printf '%s\n' "$keys" | grep -qx "nix-green2-$lane-$k"; then
               echo "m_$lane=true" >> "$GITHUB_OUTPUT"
-              echo "$lane: green marker for $H — skip"
+              echo "$lane: drv key $k already green — skip"
             else
               echo "m_$lane=false" >> "$GITHUB_OUTPUT"
+              echo "$lane: drv key $k — run"
             fi
           done
-      - id: decide
-        run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            printf 'crate=true\nlambda=true\nlint=true\n' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          base="${{ github.event.pull_request.base.sha }}"
-          changed() { ! git diff --quiet "$base"...HEAD -- "$@"; }
-          crate=false; lambda=false; lint=false
-          changed 'crate' 'template' 'Cargo.lock' 'Cargo.toml' \
-            'rust-toolchain.toml' 'nix/build.nix' 'flake.nix' 'flake.lock' \
-            '.config/nextest.toml' && crate=true
-          changed 'lambda' && lambda=true
-          # crate changes reach the lambda tests too (shared workspace).
-          [ "$crate" = "true" ] && lambda=true
-          changed '**/*.rs' '**/*.toml' 'nix' 'flake.nix' 'flake.lock' \
-            'ci/nix-checks.sh' && lint=true
-          printf 'crate=%s\nlambda=%s\nlint=%s\n' "$crate" "$lambda" "$lint" >> "$GITHUB_OUTPUT"
-          echo "crate=$crate lambda=$lambda lint=$lint"
 
   nix-ci:
     name: ${{ matrix.lane }}
@@ -215,7 +226,6 @@ jobs:
             system: x86_64-linux
             deps: .#checks.x86_64-linux.deps-checkfast
             attrs: nextest
-            gate: run_crate
             marker: x86-nextest
             flavor: checkfast
           - lane: x86 build + smoke
@@ -223,14 +233,12 @@ jobs:
             system: x86_64-linux
             deps: .#checks.x86_64-linux.deps
             attrs: native-smoke
-            gate: run_crate
             marker: x86-smoke
           - lane: arm nextest
             runner: ubuntu-24.04-arm
             system: aarch64-linux
             deps: .#checks.aarch64-linux.deps-checkfast
             attrs: nextest
-            gate: run_crate
             marker: arm-nextest
             flavor: checkfast
           - lane: arm lambda + smoke
@@ -238,7 +246,6 @@ jobs:
             system: aarch64-linux
             deps: .#checks.aarch64-linux.deps-checkfast
             attrs: lambda-tests native-smoke
-            gate: run_lambda
             marker: arm-lambda
             flavor: checkfast
           - lane: arm lints
@@ -246,46 +253,45 @@ jobs:
             system: aarch64-linux
             deps: .#checks.aarch64-linux.deps .#checks.aarch64-linux.wasm-deps
             attrs: clippy fmt no-node-spawn wasm-check
-            gate: run_lint
             marker: arm-lints
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - name: skip notice
-        if: needs.nix-gate.outputs[matrix.gate] != 'true' || needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] == 'true'
-        run: echo "skipping (gate=${{ needs.nix-gate.outputs[matrix.gate] }}, green-marker=${{ needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] }})"
+        if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] == 'true'
+        run: echo "lane already green for drv key ${{ needs.nix-gate.outputs[format('key_{0}', matrix.marker)] }} (memoized marker); skipping."
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-        if: needs.nix-gate.outputs[matrix.gate] == 'true' && needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
+        if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
       # No standalone nix installer: the composite runs it with the
       # extra-conf this job needs; a prior bare install made that conf
       # silently a no-op.
       - uses: ./.github/actions/nix-store-cache
-        if: needs.nix-gate.outputs[matrix.gate] == 'true' && needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
+        if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
         with:
           flavor: ${{ matrix.flavor || 'build' }}
       - name: deps (dependency closures)
-        if: needs.nix-gate.outputs[matrix.gate] == 'true' && needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
+        if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
         run: nix build --no-link ${{ matrix.deps }}
       # Publish immediately and from any branch: the composite no-ops
       # unless the exact key is new, so this fires once per input rotation
       # (lanes sharing a key race; first save wins, the rest skip).
       - uses: ./.github/actions/nix-store-cache/save
-        if: needs.nix-gate.outputs[matrix.gate] == 'true' && needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
+        if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
         continue-on-error: true
       - name: checks (${{ matrix.attrs }})
-        if: needs.nix-gate.outputs[matrix.gate] == 'true' && needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
+        if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
         run: bash ci/nix-checks.sh ${{ matrix.system }} ${{ matrix.attrs }}
       - name: write green marker
-        if: needs.nix-gate.outputs[matrix.gate] == 'true' && needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
+        if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
         run: echo green > .nix-green-marker
-      # Identical inputs => identical verdict (the checks are hermetic),
-      # so a marker minted anywhere skips the lane everywhere. Lookup
-      # goes through the caches API, which sees every scope.
+      # Identical derivations => identical verdict (hermeticity), so a
+      # marker minted anywhere skips the lane everywhere. Lookup goes
+      # through the caches API, which sees every scope.
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        if: needs.nix-gate.outputs[matrix.gate] == 'true' && needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
+        if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
         with:
           path: .nix-green-marker
-          key: nix-green-${{ matrix.marker }}-${{ needs.nix-gate.outputs.inputs_hash }}
+          key: nix-green2-${{ matrix.marker }}-${{ needs.nix-gate.outputs[format('key_{0}', matrix.marker)] }}
 
   node-addon:
     name: node addon
@@ -295,7 +301,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       - id: hash
-        run: echo "h=${{ hashFiles('crate/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'ci/check-glibc-floor.sh', '.github/workflows/ci.yml', '.github/actions/rust-setup/**') }}" >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/tree-hash
       - id: memo
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
