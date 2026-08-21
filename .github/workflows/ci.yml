@@ -173,8 +173,11 @@ jobs:
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         with:
           platforms: arm64
-      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
+      # The gate flavor of the binary cache holds those IFD outputs (63
+      # tiny drvs, ~6 min to rebuild under qemu, seconds to substitute).
+      - uses: ./.github/actions/nix-store-cache
         with:
+          flavor: gate
           extra-conf: extra-platforms = aarch64-linux
       - id: memo
         env:
@@ -208,6 +211,8 @@ jobs:
               echo "$lane: drv key $k — run"
             fi
           done
+      - uses: ./.github/actions/nix-store-cache/save
+        continue-on-error: true
 
   nix-ci:
     name: ${{ matrix.lane }}

@@ -14,10 +14,13 @@ inputs:
   flavor:
     description: >
       Which deps closure this job consumes (build = release-profile deps;
-      checkfast = the test-lane profile). Separate entries per flavor keep
-      the first-save-wins race from caching one flavor's closure under the
-      other's key.
+      checkfast = the test-lane profile; gate = the nix-gate's IFD
+      outputs). Separate entries per flavor keep the first-save-wins race
+      from caching one flavor's closure under the other's key.
     default: build
+  extra-conf:
+    description: extra nix.conf lines appended to the installer's set
+    default: ""
 
 runs:
   using: composite
@@ -46,6 +49,7 @@ runs:
           # trust domain as the code). Integrity still holds: nix checks
           # every NAR against its narinfo hash before use.
           require-sigs = false
+          ${{ inputs.extra-conf }}
 
     - name: record installer store baseline
       shell: bash
