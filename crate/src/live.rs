@@ -732,9 +732,7 @@ impl Proxy {
         }
         for ver in versions {
             let mut keys: Vec<String> = Vec::new();
-            // Digest-less scene bundles are canonical too, and the entity type is
-            // unknown here — try assets/ for every name, then entity-scoped.
-            if self.asset_reuse {
+            if self.asset_reuse && naming::bundle_name_has_digest(file) {
                 keys.push(Self::asset_bundle_key(ver, file));
             }
             keys.push(Self::bundle_key(ver, cid, file));
@@ -1838,26 +1836,6 @@ mod tests {
             vec![
                 "PUT /v41/assets/Qmhash_windows".to_string(),
                 "PUT /v41/bafkwearable/Qmhash_windows".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn reuse_mode_gets_digestless_from_assets_then_entity_scoped() {
-        let (host, seen) = super::stub::serve(vec![(
-            "/v41/bafkcid/Qmhash_windows".to_string(),
-            200,
-            b"PREFIX_MIGRATION".to_vec(),
-        )]);
-        let proxy = stub_proxy_reuse(&host, "reuse-get-digestless");
-        let got = proxy.space_get_bundle("bafkcid", "Qmhash_windows");
-        assert_eq!(got.as_deref(), Some(&b"PREFIX_MIGRATION"[..]));
-        let log = seen.lock().unwrap().clone();
-        assert_eq!(
-            log,
-            vec![
-                "GET /v41/assets/Qmhash_windows".to_string(),
-                "GET /v41/bafkcid/Qmhash_windows".to_string(),
             ]
         );
     }
