@@ -342,6 +342,36 @@ if [ "$BUILDER" = nix ] && [ -n "${BUILD_IMAGES:-}" ]; then
     cp -L image-result "$DIST_DIR/$image-$TARGET.tar.gz"
     rm -f image-result
     echo "image: $DIST_DIR/$image-$TARGET.tar.gz"
+
+    # boot smoke: the binaries are smoked above, but only running the
+    # CONTAINER proves entrypoint/env/layout survive image assembly
+    command -v docker > /dev/null || { echo "image smoke: no docker, skipped"; continue; }
+    tag="$(docker load < "$DIST_DIR/$image-$TARGET.tar.gz" | sed -n 's/^Loaded image: //p')"
+    test -n "$tag" || { echo "image smoke: docker load produced no tag" >&2; exit 1; }
+    case "$image" in
+      dockerImage)
+        cid="$(docker run -d -p 127.0.0.1::5147 "$tag")"
+        port="$(docker port "$cid" 5147/tcp | head -n1 | cut -d: -f2)"
+        ok=false
+        for _ in $(seq 1 30); do
+          curl -fsS "http://127.0.0.1:$port/readyz" > /dev/null 2>&1 && { ok=true; break; }
+          sleep 1
+        done
+        [ "$ok" = true ] || docker logs "$cid" | tail -n 40 >&2 || true
+        docker rm -f "$cid" > /dev/null
+        [ "$ok" = true ] || { echo "image smoke: /readyz never answered" >&2; exit 1; }
+        echo "image smoke: $tag serves /readyz"
+        ;;
+      lambdaImage)
+        # no shell in the image and the entrypoint needs the AWS runtime
+        # API, so assert the config instead of booting
+        ep="$(docker inspect --format '{{join .Config.Entrypoint " "}}' "$tag")"
+        case "$ep" in
+          */abgen-lambda) echo "image smoke: $tag entrypoint $ep" ;;
+          *) echo "image smoke: unexpected lambda entrypoint: $ep" >&2; exit 1 ;;
+        esac
+        ;;
+    esac
   done
 fi
 
