@@ -218,7 +218,6 @@ pub fn require_signer(
     validate_signature(&chain, &payload, &ts, FIVE_MINUTES, now)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,7 +238,10 @@ mod tests {
 
         let payload = build_payload("GET", "/", "1700000000000", metadata);
 
-        assert!(payload.ends_with(metadata), "metadata was rewritten: {payload}");
+        assert!(
+            payload.ends_with(metadata),
+            "metadata was rewritten: {payload}"
+        );
     }
 
     #[test]
