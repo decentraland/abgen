@@ -47,8 +47,27 @@ pub enum AuthChainError {
     EipNotImplemented,
 }
 
+/// Builds the string the auth-chain signature is checked against.
+///
+/// Only the method and path are lowercased. The timestamp and metadata are interpolated verbatim,
+/// so the metadata's bytes -- and with them its casing -- are covered by the signature.
+///
+/// Folding the whole payload, as this did previously, left the metadata's casing outside the
+/// signature: two spellings of the same metadata shared one valid signature, so a key or value
+/// could be renamed or re-cased between signing and delivery and still verify. Nothing here reads
+/// the metadata beyond building this payload, so that was latent rather than exploitable, but it
+/// meant any future read of a metadata field would have been reading something unsigned.
+///
+/// Matches `createPayload` in `@dcl/crypto-middleware` 6.x, so a client signs one payload that
+/// every Decentraland verifier reconstructs identically.
 pub fn build_payload(method: &str, path: &str, timestamp: &str, metadata: &str) -> String {
-    format!("{}:{}:{}:{}", method, path, timestamp, metadata).to_lowercase()
+    format!(
+        "{}:{}:{}:{}",
+        method.to_lowercase(),
+        path.to_lowercase(),
+        timestamp,
+        metadata
+    )
 }
 
 fn signed_fetch_path<'a>(headers: &HeaderMap, fallback: &'a str) -> std::borrow::Cow<'a, str> {
@@ -197,4 +216,41 @@ pub fn require_signer(
     let payload = build_payload(method, path, &ts, &metadata);
     let now = chrono::Utc::now().timestamp();
     validate_signature(&chain, &payload, &ts, FIVE_MINUTES, now)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_payload_lowercases_the_method_and_path() {
+        assert_eq!(
+            build_payload("POST", "/Registry/Status", "1700000000000", "{}"),
+            "post:/registry/status:1700000000000:{}"
+        );
+    }
+
+    #[test]
+    fn build_payload_leaves_the_metadata_verbatim() {
+        // The point of the format: a client and a verifier that disagree about metadata casing
+        // would disagree about the signature, so the casing cannot drift after signing.
+        let metadata = r#"{"sceneId":"QmAbC","signer":"dcl:explorer"}"#;
+
+        let payload = build_payload("GET", "/", "1700000000000", metadata);
+
+        assert!(
+            payload.ends_with(metadata),
+            "metadata was rewritten: {payload}"
+        );
+    }
+
+    #[test]
+    fn build_payload_distinguishes_metadata_that_differs_only_in_case() {
+        // Under the previous fold these two collapsed to the same string, which is what let a
+        // re-spelled field ride an otherwise valid signature.
+        let lower = build_payload("GET", "/", "1700000000000", r#"{"signer":"dcl:explorer"}"#);
+        let upper = build_payload("GET", "/", "1700000000000", r#"{"Signer":"dcl:explorer"}"#);
+
+        assert_ne!(lower, upper);
+    }
 }

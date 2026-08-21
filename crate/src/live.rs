@@ -217,7 +217,7 @@ pub struct Proxy {
     v38_timestamp: i64,
     magenta_missing: bool,
     jit_cache: OnceLock<Arc<crate::jitcache::JitDiskCache>>,
-    asset_reuse: bool,
+    deps_digest: bool,
     build_progress: Mutex<HashMap<String, BuildProgress>>,
     /// Content is immutable per hash, so a standalone image's decode verdict
     /// holds for every platform and repeat conversion in this process.
@@ -731,11 +731,11 @@ impl Proxy {
             versions.push(self.fallback_version.as_str());
         }
         for ver in versions {
-            let mut keys: Vec<String> = Vec::new();
-            if self.asset_reuse && naming::bundle_name_has_digest(file) {
-                keys.push(Self::asset_bundle_key(ver, file));
-            }
-            keys.push(Self::bundle_key(ver, cid, file));
+            // Entity kind is unknown at read time — shared prefix first, then entity-scoped.
+            let keys = [
+                Self::asset_bundle_key(ver, file),
+                Self::bundle_key(ver, cid, file),
+            ];
             for key in keys {
                 match Self::space_get_timed(space, &key) {
                     Ok(Some(b)) => return Some(b),
@@ -750,7 +750,8 @@ impl Proxy {
     }
 
     fn space_probe_asset(&self, file: &str) -> bool {
-        if !self.asset_reuse || !naming::bundle_name_has_digest(file) {
+        // Digest-carrying names are self-describing; bare names are never probed.
+        if !naming::bundle_name_has_digest(file) {
             return false;
         }
         let Some(space) = self.space.as_ref() else {
@@ -828,8 +829,9 @@ impl Proxy {
         self.space_get_key(&format!("manifest/{stem}.json"))
     }
 
-    pub fn space_put_bundle(&self, cid: &str, file: &str, bytes: &[u8]) {
-        let key = if self.asset_reuse && naming::bundle_name_has_digest(file) {
+    /// Prod layout: scenes go to the shared assets/ prefix, wearables/emotes entity-scoped.
+    pub fn space_put_bundle(&self, cid: &str, file: &str, shared_placement: bool, bytes: &[u8]) {
+        let key = if shared_placement {
             Self::asset_bundle_key(&self.version, file)
         } else {
             Self::bundle_key(&self.version, cid, file)
@@ -897,7 +899,7 @@ impl Proxy {
                 c.hash.clone()
             };
             let bare_name = format!("{case_hash}_{platform}");
-            let digest_naming = self.asset_reuse && is_glb && ctx.scene.entity_type == "scene";
+            let digest_naming = self.deps_digest && is_glb && ctx.scene.entity_type == "scene";
             let bundle_name = if digest_naming {
                 match ctx.deps_digests.get(&c.hash) {
                     Some(d) => format!("{case_hash}_{d}_{platform}"),
@@ -963,6 +965,7 @@ impl Proxy {
         let next = AtomicUsize::new(0);
         let hard_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
 
+        let shared_placement = ctx.scene.entity_type == "scene";
         let run_item = |it: &WorkItem| -> Result<()> {
             self.progress_update(cid, done.load(Ordering::Relaxed), total, &it.file);
             let stored_name = naming::fs_safe_component(&it.bundle_name);
@@ -988,7 +991,7 @@ impl Proxy {
                         }
                     }
                     if !existed {
-                        self.space_put_bundle(cid, &it.bundle_name, &bytes);
+                        self.space_put_bundle(cid, &it.bundle_name, shared_placement, &bytes);
                     }
                     built_m
                         .lock()
@@ -1286,7 +1289,8 @@ pub struct ProxyConfig {
     pub fallback_version: String,
     pub use_space: bool,
 
-    pub asset_reuse: bool,
+    /// Digest names for scene glbs + pre-build reuse probe; naming only, never placement.
+    pub deps_digest: bool,
 
     pub template_root: Option<String>,
 }
@@ -1303,7 +1307,7 @@ impl Default for ProxyConfig {
             magenta_missing: false,
             fallback_version: "v41".to_string(),
             use_space: false,
-            asset_reuse: true,
+            deps_digest: true,
             template_root: None,
         }
     }
@@ -1320,7 +1324,7 @@ impl Proxy {
         let v38_compat = !cfg.parity || BuildOpts::env_v38_compat();
         let v38_timestamp = BuildOpts::env_v38_timestamp();
         let magenta_missing = cfg.magenta_missing || BuildOpts::env_magenta_missing();
-        let asset_reuse = crate::clihelp::env_bool("ABGEN_DEPS_DIGEST", cfg.asset_reuse);
+        let deps_digest = crate::clihelp::env_bool("ABGEN_DEPS_DIGEST", cfg.deps_digest);
         if let Some(root) = cfg.template_root.as_deref().filter(|s| !s.is_empty()) {
             let env_root = std::env::var("ABGEN_ROOT").unwrap_or_default();
             if env_root.trim() != root {
@@ -1392,7 +1396,7 @@ impl Proxy {
             v38_timestamp,
             magenta_missing,
             jit_cache: OnceLock::new(),
-            asset_reuse,
+            deps_digest,
             build_progress: Mutex::new(HashMap::new()),
             decode_ok: Mutex::new(HashMap::new()),
         })
@@ -1425,7 +1429,7 @@ pub mod stub {
         catalyst_url: &str,
         read_only: bool,
         cache_dir: &std::path::Path,
-        asset_reuse: bool,
+        deps_digest: bool,
     ) -> Arc<super::Proxy> {
         let space = crate::space::Space::with_static_creds(
             "http",
@@ -1442,7 +1446,7 @@ pub mod stub {
             cache_dir: cache_dir.to_string_lossy().into_owned(),
             version: "v41".to_string(),
             fallback_version: "v40".to_string(),
-            asset_reuse,
+            deps_digest,
             ..Default::default()
         };
         super::Proxy::new_with_space(cfg, Some(Arc::new(space)))
@@ -1718,7 +1722,9 @@ mod tests {
         assert_eq!(
             log,
             vec![
+                "GET /v41/assets/Qmhash_windows".to_string(),
                 "GET /v41/bafkcid/Qmhash_windows".to_string(),
+                "GET /v40/assets/Qmhash_windows".to_string(),
                 "GET /v40/bafkcid/Qmhash_windows".to_string(),
             ]
         );
@@ -1758,7 +1764,7 @@ mod tests {
     }
 
     #[test]
-    fn asset_reuse_puts_and_gets_shared_assets_layout() {
+    fn scene_digest_bundles_put_and_get_shared_assets_layout() {
         let (host, seen) = super::stub::serve(vec![(
             "/v40/assets/Qmhash_0123456789abcdef0123456789abcdef_windows".to_string(),
             200,
@@ -1768,6 +1774,7 @@ mod tests {
         proxy.space_put_bundle(
             "bafkcid",
             "Qmhash_0123456789abcdef0123456789abcdef_windows",
+            true,
             b"B",
         );
         let got =
@@ -1786,7 +1793,7 @@ mod tests {
     }
 
     #[test]
-    fn asset_reuse_probe_heads_shared_key() {
+    fn probe_heads_shared_key_for_digest_names() {
         let (host, seen) = super::stub::serve(vec![(
             "/v41/assets/Qmhit_0123456789abcdef0123456789abcdef_windows".to_string(),
             200,
@@ -1804,19 +1811,113 @@ mod tests {
             ]
         );
 
+        // The name decides probing, not the proxy's naming flag.
         let (host2, seen2) = super::stub::serve(vec![]);
-        let legacy = stub_proxy(&host2, false, "legacy-probe");
-        assert!(!legacy.space_probe_asset("Qmhit_0123456789abcdef0123456789abcdef_windows"));
-        assert!(seen2.lock().unwrap().is_empty());
+        let digests_off = stub_proxy(&host2, false, "digests-off-probe");
+        assert!(!digests_off.space_probe_asset("Qmhit_0123456789abcdef0123456789abcdef_windows"));
+        assert_eq!(
+            seen2.lock().unwrap().clone(),
+            vec!["HEAD /v41/assets/Qmhit_0123456789abcdef0123456789abcdef_windows".to_string()]
+        );
     }
 
     #[test]
-    fn legacy_mode_keeps_entity_scoped_puts() {
-        let (host, seen) = super::stub::serve(vec![]);
-        let proxy = stub_proxy(&host, false, "legacy-put");
-        proxy.space_put_bundle("bafkcid", "Qmhash_windows", b"B");
+    fn digests_off_scene_bundles_round_trip_canonically() {
+        let (host, seen) = super::stub::serve(vec![(
+            "/v41/assets/Qmhash_windows".to_string(),
+            200,
+            b"SCENE".to_vec(),
+        )]);
+        let proxy = stub_proxy(&host, false, "digests-off-put");
+        proxy.space_put_bundle("bafkcid", "Qmhash_windows", true, b"B");
+        let got = proxy.space_get_bundle("bafkcid", "Qmhash_windows");
+        assert_eq!(got.as_deref(), Some(&b"SCENE"[..]));
         let log = seen.lock().unwrap().clone();
-        assert_eq!(log, vec!["PUT /v41/bafkcid/Qmhash_windows".to_string()]);
+        assert_eq!(
+            log,
+            vec![
+                "PUT /v41/assets/Qmhash_windows".to_string(),
+                "GET /v41/assets/Qmhash_windows".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scene_digestless_puts_canonical_and_wearables_stay_entity_scoped() {
+        let (host, seen) = super::stub::serve(vec![]);
+        let proxy = stub_proxy_reuse(&host, "reuse-digestless");
+        proxy.space_put_bundle("bafkscene", "Qmhash_windows", true, b"B");
+        proxy.space_put_bundle("bafkwearable", "Qmhash_windows", false, b"B");
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec![
+                "PUT /v41/assets/Qmhash_windows".to_string(),
+                "PUT /v41/bafkwearable/Qmhash_windows".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn digest_named_wearable_puts_entity_scoped_and_reads_back_via_fallback() {
+        let (host, seen) = super::stub::serve(vec![(
+            "/v41/bafkwearable/Qmhash_0123456789abcdef0123456789abcdef_windows".to_string(),
+            200,
+            b"WEARABLE".to_vec(),
+        )]);
+        let proxy = stub_proxy_reuse(&host, "kind-over-name");
+        proxy.space_put_bundle(
+            "bafkwearable",
+            "Qmhash_0123456789abcdef0123456789abcdef_windows",
+            false,
+            b"B",
+        );
+        let got = proxy.space_get_bundle(
+            "bafkwearable",
+            "Qmhash_0123456789abcdef0123456789abcdef_windows",
+        );
+        assert_eq!(got.as_deref(), Some(&b"WEARABLE"[..]));
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec![
+                "PUT /v41/bafkwearable/Qmhash_0123456789abcdef0123456789abcdef_windows".to_string(),
+                "GET /v41/assets/Qmhash_0123456789abcdef0123456789abcdef_windows".to_string(),
+                "GET /v41/bafkwearable/Qmhash_0123456789abcdef0123456789abcdef_windows".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_only_space_skips_scene_bundle_puts() {
+        let (host, seen) = super::stub::serve(vec![]);
+        let proxy = super::stub::stub_proxy_at_reuse(
+            &host,
+            "http://127.0.0.1:9",
+            true,
+            &temp_cache("ro-scene-put"),
+            true,
+        );
+        proxy.space_put_bundle("bafkscene", "Qmhash_windows", true, b"B");
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bare_names_read_shared_then_entity_scoped_and_never_probe() {
+        let (host, seen) = super::stub::serve(vec![]);
+        let proxy = stub_proxy_reuse(&host, "digestless-read");
+        assert_eq!(proxy.space_get_bundle("bafkcid", "Qmhash_windows"), None);
+        assert!(!proxy.space_probe_asset("Qmhash_windows"));
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec![
+                "GET /v41/assets/Qmhash_windows".to_string(),
+                "GET /v41/bafkcid/Qmhash_windows".to_string(),
+                "GET /v40/assets/Qmhash_windows".to_string(),
+                "GET /v40/bafkcid/Qmhash_windows".to_string(),
+            ]
+        );
     }
 
     #[test]
