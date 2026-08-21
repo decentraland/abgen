@@ -11,7 +11,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.17.1"
+version = "0.17.2"
 
 # Fat LTO buys kernel runtime; panic stays "unwind" — catch_unwind is
 # the per-asset isolation and must keep working.
