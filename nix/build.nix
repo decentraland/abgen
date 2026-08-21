@@ -5,6 +5,12 @@ let
     pname = "abgen";
     version = repoVersion;
     src = buildSource;
+    # Explicit so crane never derives it from `src`: its fallback scans src
+    # for Cargo.lock and .cargo/config.toml at EVAL time, and when src is
+    # the dummy tree (a derivation, in the deps closures) that scan builds
+    # the derivation during evaluation — IFD, which breaks cross-system
+    # eval and `nix eval` purity. Vendoring from buildSource is pure.
+    cargoVendorDir = craneLib.vendorCargoDeps { src = buildSource; };
     nativeBuildInputs = with pkgs; [ cmake pkg-config git ];
     doCheck = false;
     env.SOURCE_DATE_EPOCH = sourceDateEpoch;
@@ -63,6 +69,22 @@ let
     CARGO_PROFILE = "checkfast";
   });
 
+  # lambda-tests selects `-p abgen-lambda -p abgen-native`, and resolver v2
+  # unifies features over the selected packages only — ~20 shared deps
+  # (serde, syn, tracing, chrono, http, ...) resolve narrower there than in
+  # the workspace-wide closure above, which cascades into a near-full dep
+  # recompile inside the check on every run. Prime that exact configuration
+  # too — under the checkfast profile, which is what lambda-tests compiles
+  # with; like the main closure it rotates only with lockfile/toolchain.
+  lambdaCargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+    inherit dummySrc;
+    pname = "abgen-lambda";
+    version = "0";
+    doCheck = true;
+    CARGO_PROFILE = "checkfast";
+    cargoExtraArgs = "--locked -p abgen-lambda -p abgen-native";
+  });
+
   abgenAll = craneLib.buildPackage (commonArgs // {
     inherit cargoArtifacts;
     pname = "abgen-all";
@@ -89,6 +111,7 @@ let
   });
 in
 {
-  inherit commonArgs cargoArtifacts cargoArtifactsCheckfast abgenAll abgenPkg
+  inherit commonArgs cargoArtifacts cargoArtifactsCheckfast
+    lambdaCargoArtifacts abgenAll abgenPkg
     abgenConsumersPkg abgenCorpusPkg;
 }

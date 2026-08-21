@@ -13,14 +13,11 @@ description: >
 inputs:
   flavor:
     description: >
-      Which deps closure this job consumes (build = release-profile deps;
-      checkfast = the test-lane profile; gate = the nix-gate's IFD
-      outputs). Separate entries per flavor keep the first-save-wins race
-      from caching one flavor's closure under the other's key.
+      Which closure family this job consumes (build = release-profile;
+      checkfast = the test-lane profile). Separate entries per flavor keep
+      the first-save-wins race from caching one flavor's closure under the
+      other's key.
     default: build
-  extra-conf:
-    description: extra nix.conf lines appended to the installer's set
-    default: ""
 
 runs:
   using: composite
@@ -44,12 +41,15 @@ runs:
         extra-conf: |
           max-jobs = auto
           cores = 0
+          # Evaluation must never build: IFD would break cross-system eval
+          # and hide build work inside eval steps. Enforced here so a crane
+          # arg regression fails loudly instead of quietly re-introducing it.
+          allow-import-from-derivation = false
           extra-substituters = file:///var/tmp/abgen-nixcache
           # Our nars are unsigned (produced by this repo's own CI, the same
           # trust domain as the code). Integrity still holds: nix checks
           # every NAR against its narinfo hash before use.
           require-sigs = false
-          ${{ inputs.extra-conf }}
 
     - name: record installer store baseline
       shell: bash
@@ -58,12 +58,19 @@ runs:
       # never cached.
       run: nix path-info --all | LC_ALL=C sort > /var/tmp/abgen-nix-base.txt
 
+    # The key includes the source tree: an entry then carries the check
+    # outputs built from exactly these sources, which is what lets a
+    # re-run of unchanged inputs substitute its checks instead of running
+    # them. The file list is a cache NAME, not a correctness input — a
+    # miss falls back to the newest same-flavor entry and nix rebuilds
+    # precisely what differs. Superseded entries stop being accessed and
+    # age out via LRU; the live working set stays under the 10 GB pool.
     - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
       id: restore
       with:
         path: /var/tmp/abgen-nixcache
-        key: nix-v4-${{ runner.os }}-${{ runner.arch }}-${{ inputs.flavor }}-${{ hashFiles('flake.lock', 'Cargo.lock', '**/Cargo.toml', 'flake.nix', 'rust-toolchain.toml', 'nix/*.nix', 'crate/abgen-wasm/toolchain/flake.lock', 'crate/abgen-wasm/toolchain/flake.nix') }}
-        restore-keys: nix-v4-${{ runner.os }}-${{ runner.arch }}-${{ inputs.flavor }}-
+        key: nix-v5-${{ runner.os }}-${{ runner.arch }}-${{ inputs.flavor }}-${{ hashFiles('crate/**', 'lambda/**', 'template/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'flake.nix', 'flake.lock', 'nix/**', '.config/nextest.toml') }}
+        restore-keys: nix-v5-${{ runner.os }}-${{ runner.arch }}-${{ inputs.flavor }}-
 
     - name: expose cache facts to the save action
       shell: bash

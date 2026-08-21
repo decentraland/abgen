@@ -133,121 +133,23 @@ jobs:
           key: windows-green-${{ needs.windows-gate.outputs.hash }}
           enableCrossOsArchive: true
 
-  # Everything races in parallel off the shared binary cache: each lane
-  # restores, builds its deps closures, publishes the cache immediately
-  # (no-op unless the key is new), then runs only its slice of the checks.
+  # Everything races in parallel off the shared binary cache, and the
+  # cache IS the memoization — there is no gate job and no marker. Each
+  # lane's cache key includes the source tree, so an entry carries the
+  # deps closures AND the built check outputs; on identical inputs nix
+  # substitutes the check outputs (hash-verified) and the lane finishes in
+  # ~2 min without compiling or testing anything. Soundness is nix's own
+  # store discipline: an output exists only because its exact derivation
+  # once built green (ci/formal/MemoModel.v protocol_skip_sound, with nix
+  # itself enforcing mint-after-pass), and trust is actions/cache's native
+  # scope chain (own ref -> base -> default), which a fork PR cannot
+  # poison. The key's file list is a cache NAME, not a correctness input:
+  # a wrong list only costs a prefix-fallback restore and some rebuilding.
   # Image artifacts are produced by the release workflow's build legs,
   # which start on the same push in parallel with all of this; publishing
   # is what gates on green, not building.
-  # A lane's marker is keyed on the derivation hashes of exactly the check
-  # attrs it builds, plus the two harness files that sit outside the drvs
-  # (this workflow and ci/nix-checks.sh). Nix computes drv hashes from the
-  # real input closure — sources, toolchain, flake inputs, check definitions
-  # — so "same key" means "same derivations", and hermeticity gives "same
-  # verdict" (ci/formal/MemoModel.v: protocol_skip_sound, with the trust
-  # base A1-A2/P1-P4 mapped to this file in its header; the hand-listed
-  # hashFiles key this replaces is allowlist_false_green there). This also
-  # subsumes diff-based path gating: a PR that cannot affect a lane leaves
-  # its drvs equal to main's, so main's marker skips it.
-  nix-gate:
-    name: nix gate
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    outputs:
-      skip_x86-nextest: ${{ steps.memo.outputs.m_x86-nextest }}
-      skip_x86-smoke: ${{ steps.memo.outputs.m_x86-smoke }}
-      skip_arm-nextest: ${{ steps.memo.outputs.m_arm-nextest }}
-      skip_arm-lambda: ${{ steps.memo.outputs.m_arm-lambda }}
-      skip_arm-lints: ${{ steps.memo.outputs.m_arm-lints }}
-      key_x86-nextest: ${{ steps.memo.outputs.k_x86-nextest }}
-      key_x86-smoke: ${{ steps.memo.outputs.k_x86-smoke }}
-      key_arm-nextest: ${{ steps.memo.outputs.k_arm-nextest }}
-      key_arm-lambda: ${{ steps.memo.outputs.k_arm-lambda }}
-      key_arm-lints: ${{ steps.memo.outputs.k_arm-lints }}
-      attrs_x86-nextest: ${{ steps.memo.outputs.a_x86-nextest }}
-      attrs_x86-smoke: ${{ steps.memo.outputs.a_x86-smoke }}
-      attrs_arm-nextest: ${{ steps.memo.outputs.a_arm-nextest }}
-      attrs_arm-lambda: ${{ steps.memo.outputs.a_arm-lambda }}
-      attrs_arm-lints: ${{ steps.memo.outputs.a_arm-lints }}
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-      # crane's dummy-source cleaning is import-from-derivation: computing
-      # an aarch64-linux drvPath must BUILD trivial IFD drvs for that
-      # platform. qemu binfmt lets this x86 gate do so; the outputs are
-      # pure textual transforms, so the resulting drv hashes are the same
-      # ones the arm lanes see natively.
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-        with:
-          platforms: arm64
-      # The gate flavor of the binary cache holds those IFD outputs (63
-      # tiny drvs, ~6 min to rebuild under qemu, seconds to substitute).
-      - uses: ./.github/actions/nix-store-cache
-        with:
-          flavor: gate
-          extra-conf: extra-platforms = aarch64-linux
-      - name: rebase cache baseline past flake inputs
-        run: |
-          # Flake input sources re-download in seconds but bloat the gate
-          # cache entry ~6x (nixpkgs alone is ~250 MB unpacked), and a fat
-          # entry thrashes the repo's 10 GB pool. Fetch them now and fold
-          # them into the composite's save baseline so the published delta
-          # is only what the eval actually builds (the IFD outputs).
-          nix flake archive --json > /dev/null
-          nix path-info --all | LC_ALL=C sort > /var/tmp/abgen-nix-base.txt
-      - id: memo
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # Single source of truth for lane -> check attrs: this mapping is
-          # what gets keyed AND what the lanes are told to build (the
-          # attrs_* outputs), so key and work cannot drift apart
-          # (MemoModel.v assumption P2/A4).
-          lane_system() { case "$1" in x86-*) echo x86_64-linux;; arm-*) echo aarch64-linux;; esac; }
-          lane_attrs() { case "$1" in
-            x86-nextest) echo "nextest";;
-            x86-smoke)   echo "native-smoke";;
-            arm-nextest) echo "nextest";;
-            arm-lambda)  echo "lambda-tests native-smoke";;
-            arm-lints)   echo "clippy fmt no-node-spawn wasm-check";;
-          esac; }
-          lanes="x86-nextest x86-smoke arm-nextest arm-lambda arm-lints"
-          expr='checks: {'
-          for lane in $lanes; do
-            sys=$(lane_system "$lane"); drvs=""
-            for a in $(lane_attrs "$lane"); do drvs="$drvs checks.\"$sys\".\"$a\".drvPath"; done
-            expr="$expr \"$lane\" = [$drvs ];"
-          done
-          expr="$expr }"
-          nix eval --json .#checks --apply "$expr" > /tmp/lane-drvs.json
-          harness=$(sha256sum .github/workflows/ci.yml ci/nix-checks.sh | sha256sum | cut -c1-16)
-          # The caches API sees every scope — including a fork PR's, whose
-          # run executes the FORK's copy of this workflow and could mint
-          # arbitrary keys into its own merge-ref scope. Trust therefore
-          # only markers minted from same-repo branch runs (repo writers,
-          # refs/heads/*) or from this very ref (an author faking their own
-          # PR green is already possible by editing the workflow, and is
-          # the reviewer's lookout — it cannot leak to other refs).
-          keys="$(gh api "/repos/$GITHUB_REPOSITORY/actions/caches?key=nix-green2-&per_page=100" \
-            --jq '.actions_caches[] | select(((.ref // "") | startswith("refs/heads/")) or (.ref // "") == env.GITHUB_REF) | .key' 2>/dev/null || true)"
-          for lane in $lanes; do
-            k=$({ jq -r --arg l "$lane" '.[$l][]' /tmp/lane-drvs.json; echo "$harness"; } \
-              | sha256sum | cut -c1-32)
-            echo "k_$lane=$k" >> "$GITHUB_OUTPUT"
-            echo "a_$lane=$(lane_attrs "$lane")" >> "$GITHUB_OUTPUT"
-            if printf '%s\n' "$keys" | grep -qx "nix-green2-$lane-$k"; then
-              echo "m_$lane=true" >> "$GITHUB_OUTPUT"
-              echo "$lane: drv key $k already green — skip"
-            else
-              echo "m_$lane=false" >> "$GITHUB_OUTPUT"
-              echo "$lane: drv key $k — run"
-            fi
-          done
-      - uses: ./.github/actions/nix-store-cache/save
-        continue-on-error: true
-
   nix-ci:
     name: ${{ matrix.lane }}
-    needs: nix-gate
     strategy:
       fail-fast: false
       matrix:
@@ -255,76 +157,60 @@ jobs:
           # One workspace-scale compile per lane: nextest's test-target
           # build and abgen-all (behind native-smoke) each cost ~10 min on
           # 4 cores, so pairing them serialized the verdict. Wall time is
-          # the slowest single lane. `gate` names the nix-gate output that
-          # decides whether the lane runs for this diff.
+          # the slowest single lane.
           - lane: x86 nextest
             runner: ubuntu-24.04
             system: x86_64-linux
             deps: .#checks.x86_64-linux.deps-checkfast
-            marker: x86-nextest
+            attrs: nextest
             flavor: checkfast
           - lane: x86 build + smoke
             runner: ubuntu-24.04
             system: x86_64-linux
             deps: .#checks.x86_64-linux.deps
-            marker: x86-smoke
+            attrs: native-smoke
           - lane: arm nextest
             runner: ubuntu-24.04-arm
             system: aarch64-linux
             deps: .#checks.aarch64-linux.deps-checkfast
-            marker: arm-nextest
+            attrs: nextest
             flavor: checkfast
+          # lambda-deps primes the exact -p abgen-lambda -p abgen-native
+          # feature resolution (narrower than the workspace closure — the
+          # workspace artifacts never matched and 84 deps recompiled in the
+          # check); deps covers native-smoke's release-profile abgen-all.
           - lane: arm lambda + smoke
             runner: ubuntu-24.04-arm
             system: aarch64-linux
-            deps: .#checks.aarch64-linux.deps-checkfast
-            marker: arm-lambda
+            deps: .#checks.aarch64-linux.lambda-deps .#checks.aarch64-linux.deps
+            attrs: lambda-tests native-smoke
             flavor: checkfast
           - lane: arm lints
             runner: ubuntu-24.04-arm
             system: aarch64-linux
             deps: .#checks.aarch64-linux.deps .#checks.aarch64-linux.wasm-deps
-            marker: arm-lints
+            attrs: clippy fmt no-node-spawn wasm-check
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
-      - name: skip notice
-        if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] == 'true'
-        run: echo "lane already green for drv key ${{ needs.nix-gate.outputs[format('key_{0}', matrix.marker)] }} (memoized marker); skipping."
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-        if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
       # No standalone nix installer: the composite runs it with the
       # extra-conf this job needs; a prior bare install made that conf
       # silently a no-op.
       - uses: ./.github/actions/nix-store-cache
-        if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
         with:
           flavor: ${{ matrix.flavor || 'build' }}
       - name: deps (dependency closures)
-        if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
         run: nix build --no-link ${{ matrix.deps }}
-      # Publish immediately and from any branch: the composite no-ops
-      # unless the exact key is new, so this fires once per input rotation
-      # (lanes sharing a key race; first save wins, the rest skip).
+      - name: checks (${{ matrix.attrs }})
+        run: bash ci/nix-checks.sh ${{ matrix.system }} ${{ matrix.attrs }}
+      # Save AFTER the checks so their outputs enter the cache — that is
+      # the memoization. always(): a failed run still publishes its deps
+      # progress so the retry is warm; the failed check has no output, so
+      # nothing false is ever cached.
       - uses: ./.github/actions/nix-store-cache/save
-        if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
+        if: always()
         continue-on-error: true
-      # The attr list comes from the gate — the exact set that was keyed —
-      # so the marker can never assert more than the lane built.
-      - name: checks (${{ needs.nix-gate.outputs[format('attrs_{0}', matrix.marker)] }})
-        if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
-        run: bash ci/nix-checks.sh ${{ matrix.system }} ${{ needs.nix-gate.outputs[format('attrs_{0}', matrix.marker)] }}
-      - name: write green marker
-        if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
-        run: echo green > .nix-green-marker
-      # Identical derivations => identical verdict (hermeticity), so a
-      # marker minted anywhere skips the lane everywhere. Lookup goes
-      # through the caches API, which sees every scope.
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
-        with:
-          path: .nix-green-marker
-          key: nix-green2-${{ matrix.marker }}-${{ needs.nix-gate.outputs[format('key_{0}', matrix.marker)] }}
 
   node-addon:
     name: node addon

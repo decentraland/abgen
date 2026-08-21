@@ -38,19 +38,31 @@
         fileset = buildFileset;
       };
 
-      # nix/checks.nix stays out of this list: check edits must not move
-      # buildId.
-      buildId = builtins.substring 0 12 (builtins.hashString "sha256"
+      # Two artifact ids, one per build class (docs/ci.md §4). Rule: every
+      # binary embeds the id that keys its own artifact, so the stamp in
+      # logs//status/--version names exactly the inputs that produced the
+      # bytes.
+      #
+      # srcId covers the cargo/napi legs' inputs — buildSource already
+      # carries Cargo.lock and rust-toolchain.toml — so those artifacts
+      # rotate only when their bytes can.
+      srcId = builtins.substring 0 12 (builtins.hashString "sha256"
+        (baseNameOf (builtins.unsafeDiscardStringContext buildSource.outPath)));
+
+      # The nix legs' bytes additionally depend on the nix build plumbing
+      # (nixpkgs toolchain, glibc, this wiring), so their id — and their
+      # embedded stamp via buildEnv below — covers it. nix/checks.nix stays
+      # out of this list: check edits must not move it.
+      nixId = builtins.substring 0 12 (builtins.hashString "sha256"
         (builtins.concatStringsSep "\n" [
-          (baseNameOf (builtins.unsafeDiscardStringContext buildSource.outPath))
-          (builtins.hashFile "sha256" ./rust-toolchain.toml)
+          srcId
           (builtins.hashFile "sha256" ./flake.lock)
           (builtins.hashFile "sha256" ./flake.nix)
           (builtins.hashFile "sha256" ./nix/build.nix)
         ]));
 
       buildEnv = {
-        ABGEN_BUILD_ID = buildId;
+        ABGEN_BUILD_ID = nixId;
         SOURCE_DATE_EPOCH = sourceDateEpoch;
       };
 
@@ -112,7 +124,7 @@
             nativeBuildInputs = nativeDeps;
 
             buildInputs = [ pkgs.libjpeg_turbo ];
-            ABGEN_BUILD_ID = buildId;
+            ABGEN_BUILD_ID = srcId;
             SOURCE_DATE_EPOCH = sourceDateEpoch;
             shellHook = ''
               export TURBOJPEG_LIB=${pkgs.libjpeg_turbo.out}/lib/libturbojpeg${sharedLibExt}
@@ -121,7 +133,9 @@
 
           packages.default = abgenPkg;
 
-          packages.buildId = buildId;
+          packages.srcId = srcId;
+
+          packages.nixId = nixId;
 
           packages.abgen-native = abgenNativePkg;
 
@@ -177,6 +191,7 @@
           checks = import ./nix/checks.nix {
             inherit lib system pkgs craneLib wasmCheck;
             inherit (build) commonArgs cargoArtifacts cargoArtifactsCheckfast
+              lambdaCargoArtifacts
               abgenConsumersPkg;
           };
 

@@ -19,31 +19,35 @@
      .github/actions/tree-hash; an omitted entry shrinks skips only.
 
    Axioms (the trust base — what Rocq cannot see), and where each is
-   discharged in the implementation:
+   discharged in the implementation.
 
-   A1 hermetic: the lane verdict depends on the repo only through Inputs =
-      (check drv closures + harness files). Backed by the nix build
-      sandbox; the harness files (.github/workflows/ci.yml,
-      ci/nix-checks.sh) are folded into the key because they run outside
-      it. Residual: nondeterministic (flaky) tests violate A1 — but they
-      equally defeat nix's own store-level memoization.
-   A2 collision_free: sha256 truncated to 128 bits is injective on the
-      keys ever minted (birthday bound ~2^64).
-   P1 mint-after-pass (the MintStep rule): marker steps carry GitHub's
-      implicit success() — their `if:` uses no status-check function — and
-      are ordered after the checks step, so a marker is written only in a
-      run whose checks succeeded.
-   P2 key = work: the gate's lane_attrs mapping is single-sourced — the
-      same list is keyed and exported as the attrs_* outputs the lanes
-      build, so the key cannot cover less than the lane runs. (An empty
-      output degrades to building every check: a superset, still sound.)
-   P3 gate determinism: the key is a pure locked flake eval; IFD contents
-      are pinned by the hash-verified first-write binary cache.
-   P4 store writes are trusted: the scope-blind caches-API lookup filters
-      to refs/heads/* (repo writers) or the current ref, so a fork PR
-      minting keys into its own merge-ref scope cannot poison other refs.
-      windows/node lookups use actions/cache's native scope chain, which
-      enforces the same. *)
+   For the nix lanes, the protocol's enforcer is nix itself: memoization
+   is binary-cache substitution of the check outputs, with no gate job
+   and no marker. The mapping:
+
+   A1 hermetic: the verdict is the build result of the check derivations
+      — nix's sandbox contract. Residual: nondeterministic (flaky) tests
+      violate A1, but they equally defeat any memoization including nix's
+      own local store.
+   A2 collision_free: the key IS the derivation output path (nix store
+      hashing); nothing weaker is layered on top.
+   P1 mint-after-pass (MintStep): a NAR enters the binary cache only via
+      the save step copying outputs of derivations that built
+      successfully; a failed check has no output to cache.
+   P2 key = work: trivial — nix builds exactly the derivations whose
+      outputs it looks up.
+   P3 determinism: pure locked flake eval, IFD banned
+      (allow-import-from-derivation = false in the composite).
+   P4 store writes are trusted: the cache blob is restored through
+      actions/cache's native scope chain (own ref -> base -> default),
+      which a fork PR cannot write into; nix additionally hash-verifies
+      every NAR against its narinfo before use.
+
+   The windows and node lanes have no derivations; they keep the marker
+   protocol with a deny-list tree-hash key (denylist_skip_sound below,
+   with the per-entry irrelevance arguments in
+   .github/actions/tree-hash), GitHub's implicit success() on the mint
+   steps as P1, and actions/cache scoping as P4. *)
 
 Section DrvKey.
   Variable Input : Type.          (* full repo state *)
