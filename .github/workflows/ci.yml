@@ -95,7 +95,7 @@ jobs:
         run: curl.exe -LsSf https://get.nexte.st/0.9.143/windows-tar | tar -xzf - -C $env:USERPROFILE\.cargo\bin
       - name: skip notice
         if: needs.windows-gate.outputs.mode == 'skip'
-        run: echo "windows suite already green for input hash ${{ needs.windows-gate.outputs.hash }} (memoized marker); skipping."
+        run: echo "windows suite already green for tree ${{ needs.windows-gate.outputs.hash }} (verdict artifact); skipping."
       - name: quick tests + smoke
         if: needs.windows-gate.outputs.mode == 'quick'
         shell: pwsh
@@ -118,15 +118,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pwsh -NoProfile -ExecutionPolicy Bypass -File ci/abgen-smoke.ps1 -Tree $env:GITHUB_WORKSPACE
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: write green marker
+      - name: write verdict
         if: needs.windows-gate.outputs.mode == 'full'
         shell: pwsh
-        run: Set-Content -Path .win-green-marker -Value green
+        run: Set-Content -Path .win-green -Value green
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: needs.windows-gate.outputs.mode == 'full'
         with:
           name: windows-green-${{ needs.windows-gate.outputs.hash }}
-          path: .win-green-marker
+          path: .win-green
           retention-days: 30
 
   # Two memo layers, one trust story. (1) The binary cache: keys include
@@ -267,12 +267,12 @@ jobs:
       - name: abgen-node (build + smoke, ci/napi.sh)
         if: steps.memo.outputs.hit != 'true'
         run: bash ci/napi.sh x86_64-unknown-linux-gnu
-      - name: write green marker
+      - name: write verdict
         if: steps.memo.outputs.hit != 'true'
-        run: echo green > .node-green-marker
+        run: echo green > .node-green
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: steps.memo.outputs.hit != 'true'
         with:
           name: node-green-${{ steps.hash.outputs.h }}
-          path: .node-green-marker
+          path: .node-green
           retention-days: 30

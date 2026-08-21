@@ -16,9 +16,10 @@ inputs:
   flavor:
     description: >
       Which closure family this job consumes (build = release-profile;
-      checkfast = the test-lane profile). Separate entries per flavor keep
-      the first-save-wins race from caching one flavor's closure under the
-      other's key.
+      checkfast = the test-lane profile; lambda = the lambda-selection
+      closure). INVARIANT: at most one saving lane per (os, arch, flavor)
+      — first-save-wins silently drops a second saver's outputs, which is
+      why the arm lambda lane has its own flavor.
     default: build
 
 runs:

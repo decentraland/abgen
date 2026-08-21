@@ -85,9 +85,10 @@ let
     # the pipeline's deps stage builds it, then publishes the binary cache.
     lambda-deps = lambdaCargoArtifacts;
 
-    # workspace closure: the `-p` selection resolves shared deps to
-    # narrower feature sets, so the workspace artifacts never matched and
-    # nextest (not cargo test): same -p selection and features, plus the
+    # lambdaCargoArtifacts, not the workspace closure: the `-p` selection
+    # resolves shared deps to narrower feature sets, so workspace
+    # artifacts never matched and every run recompiled the deps here.
+    # nextest (not cargo test): same selection and features, plus the
     # junit report the in-drv guard asserts on.
     lambda-tests = craneLib.cargoNextest (commonArgs // {
       cargoArtifacts = lambdaCargoArtifacts;

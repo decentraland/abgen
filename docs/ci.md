@@ -2,7 +2,7 @@
 
 Start from what ships, derive what must be built, then what must be
 downloaded, then which hashes pin each step. Everything below is executed
-by three scripts (`ci/build.sh`, `ci/napi.sh`, `ci/hashes.sh`) that run
+by two scripts (`ci/build.sh`, `ci/napi.sh`) that run
 identically on a laptop and in a workflow; the workflows are thin
 schedulers around them.
 
@@ -97,19 +97,17 @@ Three moments, in order:
        leaves the other nine artifacts untouched.
      - Neither id can cover runner-provided tails (the mac runner's
        Xcode clang, apt's mingw): if those drift, the id stays but the
-       bytes move — which is precisely what the manifest verify in §3
-       exists to catch. Commit-level provenance rides in
-       `BUILD-INFO.txt`, not the bytes.
-3. **Record / verify** (artifact manifests): `ci/artifact-hashes/<target>.sha256`
-   holds the sha256 of the two shipped tarballs per target. Recorded by a
-   real build (`ci/hashes.sh record`, via the release workflow's
-   `record_hashes` dispatch — never hand-edited), then every later build
-   of the same tree must reproduce those exact bytes: soft-warn on
-   branches and main (nothing ships there), **hard-fail on tags**.
-   Because archives are named by version (not git ref) and contain no
-   ref-dependent bytes, the artifact a main push built *is* the artifact
-   the tag publishes — promotion is a file copy, verified against the
-   manifest, with no repack step.
+       bytes move — which is what the nightly comparison below catches.
+       Commit-level provenance rides in the `BUILD-INFO.txt` sidecar and
+       the GitHub attestation, never inside the archive bytes.
+3. **Nightly reproducibility**: a scheduled release run rebuilds every
+   leg from scratch and byte-compares the outputs against the stored
+   artifacts for the same tree, uploading nothing. Inequality means the
+   build stopped being reproducible (or a stored artifact was not
+   produced from this tree) — red either way. There are no committed
+   hash manifests: shipping trust is the fork-filtered same-repo
+   artifact fetch plus `attest-build-provenance` binding the published
+   bytes to the tag run.
 
 ## 5. The pipeline that falls out
 
@@ -118,16 +116,21 @@ Three moments, in order:
   `napi-<srcId>-<target>`, `image-<nixId>-<name>`, where `<id>` is the
   class id from §4). A leg whose artifacts for this tree already exist
   is skipped at matrix-selection time.
-- **tags publish, builds only if missing**: a tag looks up the same names
-  (any completed run of this tree qualifies — the name embeds the tree
-  hash and the manifest verify re-proves the bytes), waits for the
-  commit's ci verdict, then attaches archives + SHA256SUMS + provenance
-  attestations to the GitHub release, publishes both npm packages, and
-  pushes the images (ghcr multi-arch manifest; ECR behind the `biz`
-  environment).
+- **tags publish, builds only if missing**: a tag looks up the same
+  names (same-repo runs only — every artifact fetch filters on the
+  creating run's head repository), waits for the commit's ci verdict,
+  then attaches archives + SHA256SUMS + provenance attestations to the
+  GitHub release, publishes both npm packages, and pushes the images
+  (ghcr multi-arch manifest; ECR behind the `biz` environment).
+- **ci is memoized by artifacts too**: lanes that pass upload
+  `{nix,windows,node}-green-<treehash>` verdict artifacts (deny-list
+  tree hash, `.github/actions/tree-hash`), and the nix binary cache is
+  mirrored as a repo-wide artifact under its own key — so main's
+  post-squash-merge run, which can never read PR-scoped actions/cache
+  entries, skips or substitutes instead of rebuilding.
 - **local = CI**: `ci/build.sh <triple>` and `ci/napi.sh <triple>` run
-  the identical path on a laptop; hashes recorded locally will match CI
-  exactly when the toolchain matches (that's what §2 pins).
+  the identical path on a laptop; the bytes match CI exactly when the
+  toolchain matches (that's what §2 pins).
 
 ## 6. Testing the scripts
 
@@ -135,5 +138,4 @@ Three moments, in order:
   leg incl. packaging, repro re-pack assert, and native smoke.
 - `nix build .#abgen-native .#dockerImage` on either Linux arch: the
   entire class-nix leg minus staging.
-- `ci/hashes.sh record/verify` round-trips on any files.
 - Workflows: `actionlint`.
