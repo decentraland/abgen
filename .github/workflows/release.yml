@@ -161,7 +161,9 @@ jobs:
           }
 
           if [ "${RECORDING:-false}" = "true" ]; then
-            sel="$all"; napi_sel="$napi_all"
+            # jq -c: the literals above are multi-line, and GITHUB_OUTPUT
+            # takes one line per value.
+            sel=$(jq -c . <<<"$all"); napi_sel=$(jq -c . <<<"$napi_all")
           else
             sel=$(filter_built "$all" archives)
             napi_sel=$(filter_built "$napi_all" napi)
