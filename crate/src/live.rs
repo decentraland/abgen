@@ -750,8 +750,7 @@ impl Proxy {
     }
 
     fn space_probe_asset(&self, file: &str) -> bool {
-        // Digest-carrying names are self-describing, so reuse is safe whenever
-        // one is requested — bare names are never probed.
+        // Digest-carrying names are self-describing; bare names are never probed.
         if !naming::bundle_name_has_digest(file) {
             return false;
         }
@@ -830,9 +829,7 @@ impl Proxy {
         self.space_get_key(&format!("manifest/{stem}.json"))
     }
 
-    /// Scene bundles all live on the shared assets/ prefix (prod layout — the
-    /// explorer requests every scene bundle there); wearables/emotes stay
-    /// entity-scoped.
+    /// Prod layout: scenes go to the shared assets/ prefix, wearables/emotes entity-scoped.
     pub fn space_put_bundle(&self, cid: &str, file: &str, scene: bool, bytes: &[u8]) {
         let key = if scene {
             Self::asset_bundle_key(&self.version, file)
@@ -1292,10 +1289,7 @@ pub struct ProxyConfig {
     pub fallback_version: String,
     pub use_space: bool,
 
-    /// Digest-carrying scene glb names (`{hash}_{depsdigest}_{platform}`) plus the
-    /// pre-build reuse probe; off = bare `{hash}_{platform}` names, no probing (for
-    /// consumers that request by bare content hash). Naming only — space placement
-    /// is always scene→assets/, wearables/emotes→entity-scoped.
+    /// Digest names for scene glbs + pre-build reuse probe; naming only, never placement.
     pub deps_digest: bool,
 
     pub template_root: Option<String>,
@@ -1815,8 +1809,7 @@ mod tests {
             ]
         );
 
-        // The digest in the name is what makes reuse safe — the naming flag on
-        // the probing proxy is irrelevant.
+        // The name decides probing, not the proxy's naming flag.
         let (host2, seen2) = super::stub::serve(vec![]);
         let digests_off = stub_proxy(&host2, false, "digests-off-probe");
         assert!(!digests_off.space_probe_asset("Qmhit_0123456789abcdef0123456789abcdef_windows"));
