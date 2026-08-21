@@ -20,7 +20,7 @@ fn build_id() -> String {
     assert!(
         given.len() == BUILD_ID_LEN && hex,
         "ABGEN_BUILD_ID must be exactly {BUILD_ID_LEN} lowercase hex characters, got {given:?}. \
-         It is a content id over the source tree (`nix eval --raw .#buildId`), never a git rev; \
+         It is a content id over the source tree (`nix eval --raw .#srcId`, or .#nixId for nix legs), never a git rev; \
          a variable-width value reintroduces the cross-commit drift this replaced."
     );
     given

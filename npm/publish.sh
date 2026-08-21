@@ -43,7 +43,7 @@ publish_pkg() {
 
 for spec in "${TARGETS[@]}"; do
   read -r target os cpu pkg <<<"$spec"
-  tar="$ARTIFACTS/abgen-v${VERSION}-${target}.tar.gz"
+  tar="$ARTIFACTS/abgen-${VERSION}-${target}.tar.gz"
   [ -f "$tar" ] || { echo "missing release archive: $tar" >&2; exit 1; }
   dir="$WORK/$pkg"
   mkdir -p "$dir"

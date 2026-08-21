@@ -235,7 +235,7 @@ extra dimensions.
 it on an aarch64-linux machine: Graviton is ~20% cheaper and abgen is
 CPU-portable). The binary implements the Lambda runtime API itself, so no
 AWS base image is needed; the result is a `docker-archive` tarball — push it
-to ECR with skopeo (see the `lambda-image-push` job in
+to ECR with skopeo (see the `ecr-publish` job in
 `.github/workflows/release.yml`) and point the
 function at the image.
 

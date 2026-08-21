@@ -5,6 +5,8 @@ let
     pname = "abgen";
     version = repoVersion;
     src = buildSource;
+    # explicit: crane's fallback scans src (a drv in the deps closures) at eval time — IFD
+    cargoVendorDir = craneLib.vendorCargoDeps { src = buildSource; };
     nativeBuildInputs = with pkgs; [ cmake pkg-config git ];
     doCheck = false;
     env.SOURCE_DATE_EPOCH = sourceDateEpoch;
@@ -48,7 +50,27 @@ let
   cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
     inherit dummySrc;
     version = "0";
+    doCheck = false;
+    cargoCheckExtraArgs = "--all-targets";
+  });
+
+  # lto off + cgu 16: 4.9x faster test compiles, identical verdicts
+  cargoArtifactsCheckfast = craneLib.buildDepsOnly (commonArgs // {
+    inherit dummySrc;
+    pname = "abgen-checkfast";
+    version = "0";
     doCheck = true;
+    CARGO_PROFILE = "checkfast";
+  });
+
+  # the -p selection resolves narrower features than the workspace closure
+  lambdaCargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+    inherit dummySrc;
+    pname = "abgen-lambda";
+    version = "0";
+    doCheck = true;
+    CARGO_PROFILE = "checkfast";
+    cargoExtraArgs = "--locked -p abgen-lambda -p abgen-native";
   });
 
   abgenAll = craneLib.buildPackage (commonArgs // {
@@ -77,6 +99,7 @@ let
   });
 in
 {
-  inherit commonArgs cargoArtifacts abgenAll abgenPkg abgenConsumersPkg
-    abgenCorpusPkg;
+  inherit commonArgs cargoArtifacts cargoArtifactsCheckfast
+    lambdaCargoArtifacts abgenAll abgenPkg
+    abgenConsumersPkg abgenCorpusPkg;
 }
