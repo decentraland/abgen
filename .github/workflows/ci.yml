@@ -144,7 +144,8 @@ jobs:
   # (this workflow and ci/nix-checks.sh). Nix computes drv hashes from the
   # real input closure — sources, toolchain, flake inputs, check definitions
   # — so "same key" means "same derivations", and hermeticity gives "same
-  # verdict" (ci/formal/MemoModel.v: drv_key_skip_sound; the hand-listed
+  # verdict" (ci/formal/MemoModel.v: protocol_skip_sound, with the trust
+  # base A1-A2/P1-P4 mapped to this file in its header; the hand-listed
   # hashFiles key this replaces is allowlist_false_green there). This also
   # subsumes diff-based path gating: a PR that cannot affect a lane leaves
   # its drvs equal to main's, so main's marker skips it.
@@ -163,6 +164,11 @@ jobs:
       key_arm-nextest: ${{ steps.memo.outputs.k_arm-nextest }}
       key_arm-lambda: ${{ steps.memo.outputs.k_arm-lambda }}
       key_arm-lints: ${{ steps.memo.outputs.k_arm-lints }}
+      attrs_x86-nextest: ${{ steps.memo.outputs.a_x86-nextest }}
+      attrs_x86-smoke: ${{ steps.memo.outputs.a_x86-smoke }}
+      attrs_arm-nextest: ${{ steps.memo.outputs.a_arm-nextest }}
+      attrs_arm-lambda: ${{ steps.memo.outputs.a_arm-lambda }}
+      attrs_arm-lints: ${{ steps.memo.outputs.a_arm-lints }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       # crane's dummy-source cleaning is import-from-derivation: computing
@@ -183,26 +189,42 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          nix eval --json .#checks --apply 'checks: {
-            "x86-nextest" = [ checks.x86_64-linux.nextest.drvPath ];
-            "x86-smoke"   = [ checks.x86_64-linux.native-smoke.drvPath ];
-            "arm-nextest" = [ checks.aarch64-linux.nextest.drvPath ];
-            "arm-lambda"  = [ checks.aarch64-linux.lambda-tests.drvPath
-                              checks.aarch64-linux.native-smoke.drvPath ];
-            "arm-lints"   = [ checks.aarch64-linux.clippy.drvPath
-                              checks.aarch64-linux.fmt.drvPath
-                              checks.aarch64-linux.no-node-spawn.drvPath
-                              checks.aarch64-linux.wasm-check.drvPath ];
-          }' > /tmp/lane-drvs.json
+          # Single source of truth for lane -> check attrs: this mapping is
+          # what gets keyed AND what the lanes are told to build (the
+          # attrs_* outputs), so key and work cannot drift apart
+          # (MemoModel.v assumption P2/A4).
+          lane_system() { case "$1" in x86-*) echo x86_64-linux;; arm-*) echo aarch64-linux;; esac; }
+          lane_attrs() { case "$1" in
+            x86-nextest) echo "nextest";;
+            x86-smoke)   echo "native-smoke";;
+            arm-nextest) echo "nextest";;
+            arm-lambda)  echo "lambda-tests native-smoke";;
+            arm-lints)   echo "clippy fmt no-node-spawn wasm-check";;
+          esac; }
+          lanes="x86-nextest x86-smoke arm-nextest arm-lambda arm-lints"
+          expr='checks: {'
+          for lane in $lanes; do
+            sys=$(lane_system "$lane"); drvs=""
+            for a in $(lane_attrs "$lane"); do drvs="$drvs checks.\"$sys\".\"$a\".drvPath"; done
+            expr="$expr \"$lane\" = [$drvs ];"
+          done
+          expr="$expr }"
+          nix eval --json .#checks --apply "$expr" > /tmp/lane-drvs.json
           harness=$(sha256sum .github/workflows/ci.yml ci/nix-checks.sh | sha256sum | cut -c1-16)
-          # The caches API sees every scope: identical drvs => identical
-          # verdict, so a marker minted on any branch is valid on all.
+          # The caches API sees every scope — including a fork PR's, whose
+          # run executes the FORK's copy of this workflow and could mint
+          # arbitrary keys into its own merge-ref scope. Trust therefore
+          # only markers minted from same-repo branch runs (repo writers,
+          # refs/heads/*) or from this very ref (an author faking their own
+          # PR green is already possible by editing the workflow, and is
+          # the reviewer's lookout — it cannot leak to other refs).
           keys="$(gh api "/repos/$GITHUB_REPOSITORY/actions/caches?key=nix-green2-&per_page=100" \
-            --jq '.actions_caches[].key' 2>/dev/null || true)"
-          for lane in x86-nextest x86-smoke arm-nextest arm-lambda arm-lints; do
+            --jq '.actions_caches[] | select(((.ref // "") | startswith("refs/heads/")) or (.ref // "") == env.GITHUB_REF) | .key' 2>/dev/null || true)"
+          for lane in $lanes; do
             k=$({ jq -r --arg l "$lane" '.[$l][]' /tmp/lane-drvs.json; echo "$harness"; } \
               | sha256sum | cut -c1-32)
             echo "k_$lane=$k" >> "$GITHUB_OUTPUT"
+            echo "a_$lane=$(lane_attrs "$lane")" >> "$GITHUB_OUTPUT"
             if printf '%s\n' "$keys" | grep -qx "nix-green2-$lane-$k"; then
               echo "m_$lane=true" >> "$GITHUB_OUTPUT"
               echo "$lane: drv key $k already green — skip"
@@ -230,34 +252,29 @@ jobs:
             runner: ubuntu-24.04
             system: x86_64-linux
             deps: .#checks.x86_64-linux.deps-checkfast
-            attrs: nextest
             marker: x86-nextest
             flavor: checkfast
           - lane: x86 build + smoke
             runner: ubuntu-24.04
             system: x86_64-linux
             deps: .#checks.x86_64-linux.deps
-            attrs: native-smoke
             marker: x86-smoke
           - lane: arm nextest
             runner: ubuntu-24.04-arm
             system: aarch64-linux
             deps: .#checks.aarch64-linux.deps-checkfast
-            attrs: nextest
             marker: arm-nextest
             flavor: checkfast
           - lane: arm lambda + smoke
             runner: ubuntu-24.04-arm
             system: aarch64-linux
             deps: .#checks.aarch64-linux.deps-checkfast
-            attrs: lambda-tests native-smoke
             marker: arm-lambda
             flavor: checkfast
           - lane: arm lints
             runner: ubuntu-24.04-arm
             system: aarch64-linux
             deps: .#checks.aarch64-linux.deps .#checks.aarch64-linux.wasm-deps
-            attrs: clippy fmt no-node-spawn wasm-check
             marker: arm-lints
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -283,9 +300,11 @@ jobs:
       - uses: ./.github/actions/nix-store-cache/save
         if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
         continue-on-error: true
-      - name: checks (${{ matrix.attrs }})
+      # The attr list comes from the gate — the exact set that was keyed —
+      # so the marker can never assert more than the lane built.
+      - name: checks (${{ needs.nix-gate.outputs[format('attrs_{0}', matrix.marker)] }})
         if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
-        run: bash ci/nix-checks.sh ${{ matrix.system }} ${{ matrix.attrs }}
+        run: bash ci/nix-checks.sh ${{ matrix.system }} ${{ needs.nix-gate.outputs[format('attrs_{0}', matrix.marker)] }}
       - name: write green marker
         if: needs.nix-gate.outputs[format('skip_{0}', matrix.marker)] != 'true'
         run: echo green > .nix-green-marker
