@@ -16,13 +16,11 @@ runs:
       shell: bash
       run: |
         # ci/artifact-hashes: consumed only by the release hash gate
-        # ci/formal:          Rocq models, never executed by CI lanes
         # nix/, flake.*:      the nix lanes' world; cargo lanes use rustup
         # release.yml:        publishing orchestration, runs no tests
         # *.md:               prose
         h=$(git ls-tree -r HEAD | awk -F'\t' '
           $2 !~ /^ci\/artifact-hashes\// &&
-          $2 !~ /^ci\/formal\// &&
           $2 !~ /^nix\// &&
           $2 != "flake.nix" && $2 != "flake.lock" &&
           $2 != ".github/workflows/release.yml" &&

@@ -188,9 +188,6 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.setup.outputs.targets) }}
     env:
-      # Each leg's stamp, BUILD-INFO and artifact name all use its class
-      # id: srcId for cargo legs, nixId for nix legs (whose sandboxed
-      # compile takes the same value from the flake's buildEnv).
       ABGEN_BUILD_ID: ${{ matrix.builder == 'nix' && needs.setup.outputs.nix_id || needs.setup.outputs.src_id }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
@@ -259,8 +256,6 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.setup.outputs.napi_targets) }}
     env:
-      # The addon is a pure function of the source + pinned toolchains, so
-      # it carries the source id.
       ABGEN_BUILD_ID: ${{ needs.setup.outputs.src_id }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0

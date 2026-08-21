@@ -56,10 +56,6 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           fetch-depth: 0
-      # Deny-list hash: every tracked file counts except a short justified
-      # exclusion list (see the action). Forgetting an input in the old
-      # allow-list meant a silent false skip; forgetting a deny-list entry
-      # means an unnecessary run.
       - id: hash
         uses: ./.github/actions/tree-hash
       - id: memo
@@ -124,8 +120,6 @@ jobs:
         if: needs.windows-gate.outputs.mode == 'full'
         shell: pwsh
         run: Set-Content -Path .win-green-marker -Value green
-      # Cache saves from PR branches are scoped to that branch; the
-      # globally visible marker is minted by full runs on main pushes.
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         if: needs.windows-gate.outputs.mode == 'full'
         with:
@@ -133,21 +127,14 @@ jobs:
           key: windows-green-${{ needs.windows-gate.outputs.hash }}
           enableCrossOsArchive: true
 
-  # Everything races in parallel off the shared binary cache, and the
-  # cache IS the memoization — there is no gate job and no marker. Each
-  # lane's cache key includes the source tree, so an entry carries the
-  # deps closures AND the built check outputs; on identical inputs nix
-  # substitutes the check outputs (hash-verified) and the lane finishes in
-  # ~2 min without compiling or testing anything. Soundness is nix's own
-  # store discipline: an output exists only because its exact derivation
-  # once built green (ci/formal/MemoModel.v protocol_skip_sound, with nix
-  # itself enforcing mint-after-pass), and trust is actions/cache's native
-  # scope chain (own ref -> base -> default), which a fork PR cannot
-  # poison. The key's file list is a cache NAME, not a correctness input:
-  # a wrong list only costs a prefix-fallback restore and some rebuilding.
-  # Image artifacts are produced by the release workflow's build legs,
-  # which start on the same push in parallel with all of this; publishing
-  # is what gates on green, not building.
+  # No gate job, no marker: the binary cache is the memoization. The cache
+  # key includes the source tree and the save runs after the checks, so an
+  # entry carries the check outputs; identical inputs substitute them
+  # (hash-verified) instead of testing. An output exists only because its
+  # exact derivation once built green, and actions/cache's scope chain
+  # (own ref -> base -> default) keeps fork PRs out. The key's file list
+  # is a cache NAME, not a correctness input — a wrong list only costs a
+  # prefix-fallback restore.
   nix-ci:
     name: ${{ matrix.lane }}
     strategy:
@@ -175,10 +162,6 @@ jobs:
             deps: .#checks.aarch64-linux.deps-checkfast
             attrs: nextest
             flavor: checkfast
-          # lambda-deps primes the exact -p abgen-lambda -p abgen-native
-          # feature resolution (narrower than the workspace closure — the
-          # workspace artifacts never matched and 84 deps recompiled in the
-          # check); deps covers native-smoke's release-profile abgen-all.
           - lane: arm lambda + smoke
             runner: ubuntu-24.04-arm
             system: aarch64-linux
@@ -233,9 +216,6 @@ jobs:
       - uses: ./.github/actions/rust-setup
         if: steps.memo.outputs.cache-hit != 'true'
         with:
-          # Pure consumer of the cache the release napi linux legs save from
-          # main pushes (same shared-key); PR-scoped saves would be quota
-          # waste.
           workspaces: crate/abgen-node
           shared-key: abgen-node
           save-if: "false"

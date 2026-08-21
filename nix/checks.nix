@@ -5,9 +5,6 @@
 let
   src = commonArgs.src;
   withArtifacts = commonArgs // { inherit cargoArtifacts; };
-  # Test checks compile under the checkfast profile (lto off, cgu 16):
-  # 4.9x faster workspace test compiles, byte-identical verdicts. Clippy
-  # and the shipped packages stay on release-profile artifacts.
   withCheckfast = commonArgs // {
     cargoArtifacts = cargoArtifactsCheckfast;
     CARGO_PROFILE = "checkfast";
@@ -15,8 +12,6 @@ let
   abgenRoot = ''export ABGEN_ROOT="$PWD"'';
 
   archIndependent = {
-    # The wasm toolchain + registry closure, exposed so the pipeline's deps
-    # stage can build and cache it before any source-keyed work starts.
     wasm-deps = wasmCheck.cargoArtifacts;
 
     fmt = craneLib.cargoFmt {
@@ -75,14 +70,11 @@ let
   # is rejected: feature unification differs, a merged compile would not
   # test the no-server config the mac/windows legs ship.
   lambdaTests = {
-    # The lambda-config closure as its own attr, same contract as `deps`:
     # the pipeline's deps stage builds it, then publishes the binary cache.
     lambda-deps = lambdaCargoArtifacts;
 
-    # lambdaCargoArtifacts (checkfast lambda-selection closure), not the
     # workspace closure: the `-p` selection resolves shared deps to
     # narrower feature sets, so the workspace artifacts never matched and
-    # every run recompiled the deps in here.
     lambda-tests = craneLib.cargoTest (commonArgs // {
       cargoArtifacts = lambdaCargoArtifacts;
       CARGO_PROFILE = "checkfast";

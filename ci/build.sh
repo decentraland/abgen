@@ -33,7 +33,7 @@ esac
 
 nixf() { nix --extra-experimental-features 'nix-command flakes' "$@"; }
 
-# ---------------------------------------------------------------- identity
+# identity
 
 # The id is per class — srcId for cargo legs, nixId for nix legs — so the
 # embedded stamp and BUILD-INFO name exactly the inputs that produced the
@@ -57,7 +57,7 @@ VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p; /^version = "/q' Cargo.toml)"
 echo "target: $TARGET  builder: $BUILDER  version: $VERSION"
 echo "build id: $ABGEN_BUILD_ID  rev: $ABGEN_GIT_REV  epoch: $SOURCE_DATE_EPOCH"
 
-# ------------------------------------------------------- packaging helpers
+# packaging helpers
 
 pack() { # dir out.tar.gz — deterministic bytes: sorted, epoch-stamped, gzip -n
   local tar=tar
@@ -106,7 +106,7 @@ finish_archive() { # dir — build-info, pack, assert repro + BUILD-INFO present
   echo "packed $1.tar.gz ($a)"
 }
 
-# ------------------------------------------------- toolchain (cargo legs)
+# toolchain (cargo legs)
 
 if [ "$BUILDER" = cargo ]; then
   # Reproduce what the nix sandbox gives for free: fixed /build and /home
@@ -210,7 +210,7 @@ EOF
   export RUSTFLAGS
 fi
 
-# ------------------------------------------------------------------ build
+# build
 
 REL="target/$TARGET/release"
 
@@ -231,7 +231,7 @@ else
   cargo build --release --locked --target "$TARGET" -p abgen-native
 fi
 
-# ------------------------------------------------------------------ gates
+# gates
 
 if [ "$TARGET" = x86_64-pc-windows-gnu ]; then
   rc=0
@@ -248,7 +248,7 @@ if [ "$TARGET" = x86_64-pc-windows-gnu ]; then
   echo "windows-gnu artifacts are self-contained"
 fi
 
-# ---------------------------------------------------------------- package
+# package
 
 mkdir -p "$DIST_DIR"
 BIN=abgen
@@ -266,7 +266,7 @@ case "$TARGET" in
   *) [ "$RUN_ARCH" = "$WANT_ARCH" ] && CAN_SMOKE=true ;;
 esac
 
-# --- CLI archive: abgen-<version>-<target>. Version-named and free of any
+# CLI archive: abgen-<version>-<target>. Version-named and free of any
 # git-ref bytes, so the archive a main push builds is byte-identical to
 # the one the tag publishes: promotion is a file copy.
 dist="abgen-$VERSION-$TARGET"
@@ -315,7 +315,7 @@ if [ "$CAN_SMOKE" = true ]; then
   echo "smoke: abgen --version + /readyz ok"
 fi
 
-# --- native archive: abgen-native-<version>-<target> (Unity lib + host).
+# native archive: abgen-native-<version>-<target> (Unity lib + host).
 nat="abgen-native-$VERSION-$TARGET"
 rm -rf "$nat"
 mkdir -p "$nat/lib" "$nat/include"
@@ -396,7 +396,7 @@ if [ "$CAN_SMOKE" = true ]; then
   fi
 fi
 
-# ----------------------------------------------------------------- images
+# images
 
 if [ "$BUILDER" = nix ] && [ -n "${BUILD_IMAGES:-}" ]; then
   for image in $(echo "$BUILD_IMAGES" | tr ',' ' '); do
@@ -408,7 +408,7 @@ if [ "$BUILDER" = nix ] && [ -n "${BUILD_IMAGES:-}" ]; then
   done
 fi
 
-# --------------------------------------------------------------- manifest
+# manifest
 
 mode=verify
 [ "${ABGEN_RECORD_HASHES:-0}" = "1" ] && mode=record
