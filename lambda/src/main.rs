@@ -53,6 +53,8 @@ fn main() {
                  \x20    ABGEN_REDIS_URL, ABGEN_REDIS_TTL_SECONDS,\n\
                  \x20    ABGEN_HTTP_SECRET (required by the Function URL POST path),\n\
                  \x20    ABGEN_EMF_NAMESPACE (CloudWatch EMF metrics on stdout),\n\
+                 \x20    ABGEN_LOG_FORMAT (json for JSON logs), RUST_LOG (filter,\n\
+                 \x20    default abgen=info,abgen_lambda=info),\n\
                  \x20    ENABLE_LODS (off: LOD jobs are acked and skipped; on: levels 0+1\n\
                  \x20    are regenerated from the scene and written to LOD/<level>/ and\n\
                  \x20    lods-unity/manifests/ — the deployment's FBX sources are unused)"
@@ -71,6 +73,7 @@ fn main() {
 }
 
 fn init() {
+    init_tracing();
     emf::init();
     abgen::builder::require_templates().unwrap_or_else(|e| {
         eprintln!(
@@ -87,6 +90,24 @@ fn init() {
     }
     if abgen::rediscache::enabled() {
         eprintln!("init: redis hit-cache enabled (ABGEN_REDIS_URL)");
+    }
+}
+
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "abgen=info,abgen_lambda=info".into());
+    let json_logs = std::env::var("ABGEN_LOG_FORMAT")
+        .map(|v| v.trim().eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    if json_logs {
+        tracing_subscriber::fmt().json().with_env_filter(filter).init();
+    } else {
+        // CloudWatch renders ANSI escapes literally.
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_ansi(false)
+            .init();
     }
 }
 
