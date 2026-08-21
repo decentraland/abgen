@@ -6,7 +6,7 @@
 #   ci/build.sh <target-triple>
 #
 # Env:
-#   ABGEN_BUILD_ID      12-hex source id (.#srcId); evaluated if unset
+#   ABGEN_BUILD_ID      12-hex class id (.#srcId / .#nixId); eval'd if unset
 #   ABGEN_GIT_REV       commit; `git rev-parse HEAD` if unset
 #   BUILD_IMAGES        comma list of image attrs to also build (nix legs)
 #   ABGEN_RECORD_HASHES 1 = record the manifest instead of verifying
@@ -35,16 +35,20 @@ nixf() { nix --extra-experimental-features 'nix-command flakes' "$@"; }
 
 # ---------------------------------------------------------------- identity
 
-# Without a build id, crate/build.rs falls back to `git rev-parse` and the
-# binaries become per-commit again; fail here, not at hash-verify time.
+# The id is per class — srcId for cargo legs, nixId for nix legs — so the
+# embedded stamp and BUILD-INFO name exactly the inputs that produced the
+# bytes. Without it, crate/build.rs falls back to a dev stamp.
 if [ -z "${ABGEN_BUILD_ID:-}" ]; then
-  ABGEN_BUILD_ID="$(nixf eval --raw .#srcId)"
+  case "$BUILDER" in
+    nix) ABGEN_BUILD_ID="$(nixf eval --raw .#nixId)" ;;
+    *)   ABGEN_BUILD_ID="$(nixf eval --raw .#srcId)" ;;
+  esac
 fi
 case "$ABGEN_BUILD_ID" in
-  *[!0-9a-f]*) echo "srcId is not lowercase hex: $ABGEN_BUILD_ID" >&2; exit 1 ;;
+  *[!0-9a-f]*) echo "build id is not lowercase hex: $ABGEN_BUILD_ID" >&2; exit 1 ;;
 esac
 [ "${#ABGEN_BUILD_ID}" -eq 12 ] \
-  || { echo "srcId must be 12 chars: $ABGEN_BUILD_ID" >&2; exit 1; }
+  || { echo "build id must be 12 chars: $ABGEN_BUILD_ID" >&2; exit 1; }
 export ABGEN_BUILD_ID
 
 VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p; /^version = "/q' Cargo.toml)"

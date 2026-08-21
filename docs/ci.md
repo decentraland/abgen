@@ -82,19 +82,24 @@ Three moments, in order:
    asserts the bytes are identical before it will emit them. Result: the
    tarball hash is a pure function of the tree.
    - Two 12-hex artifact ids, one per build class, so a change only
-     invalidates the artifacts it can actually alter:
+     invalidates the artifacts it can actually alter. Rule: **every
+     binary embeds the id that keys its own artifact**, so the stamp in
+     `--version`/logs/`/status` names exactly the inputs that produced
+     the bytes, and it rotates only when the bytes can.
      - `srcId` (`nix eval --raw .#srcId`) = hash of the filtered source
-       tree — exactly the compiler's inputs (`Cargo.lock` and
-       `rust-toolchain.toml` are in the tree). Keys the cargo and napi
-       artifacts, and is the id embedded in the binaries (`--version`,
-       logs, `/status`) — so the embedded stamp rotates only when the
-       bytes can. Full provenance (commit, epoch) rides in
-       `BUILD-INFO.txt`, not the bytes.
+       tree — the cargo/napi legs' inputs (`Cargo.lock` and
+       `rust-toolchain.toml` are in the tree). Keys and stamps the 4
+       cargo archives and 5 napi artifacts.
      - `nixId` = hash of `srcId` + `flake.lock` + `flake.nix` +
-       `nix/build.nix`. Keys the nix-built archives and both images,
-       which additionally depend on that plumbing. Editing it (or
-       bumping nixpkgs) rebuilds the nix legs and leaves the other
-       eight artifacts untouched.
+       `nix/build.nix` — the nix legs additionally depend on that
+       plumbing (nixpkgs toolchain, glibc). Keys and stamps the 2 nix
+       archives and both images. A nixpkgs bump rebuilds those and
+       leaves the other nine artifacts untouched.
+     - Neither id can cover runner-provided tails (the mac runner's
+       Xcode clang, apt's mingw): if those drift, the id stays but the
+       bytes move — which is precisely what the manifest verify in §3
+       exists to catch. Commit-level provenance rides in
+       `BUILD-INFO.txt`, not the bytes.
 3. **Record / verify** (artifact manifests): `ci/artifact-hashes/<target>.sha256`
    holds the sha256 of the two shipped tarballs per target. Recorded by a
    real build (`ci/hashes.sh record`, via the release workflow's

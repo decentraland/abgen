@@ -38,17 +38,21 @@
         fileset = buildFileset;
       };
 
-      # Two artifact ids, one per build class (docs/ci.md §4).
+      # Two artifact ids, one per build class (docs/ci.md §4). Rule: every
+      # binary embeds the id that keys its own artifact, so the stamp in
+      # logs//status/--version names exactly the inputs that produced the
+      # bytes.
       #
-      # srcId is exactly the compiler's inputs — buildSource already carries
-      # Cargo.lock and rust-toolchain.toml — so it rotates only when shipped
-      # bytes can. It is the id embedded in the binaries (logs, /status,
-      # --version) and keys the cargo/napi-class artifacts.
+      # srcId covers the cargo/napi legs' inputs — buildSource already
+      # carries Cargo.lock and rust-toolchain.toml — so those artifacts
+      # rotate only when their bytes can.
       srcId = builtins.substring 0 12 (builtins.hashString "sha256"
         (baseNameOf (builtins.unsafeDiscardStringContext buildSource.outPath)));
 
-      # Nix-class artifacts additionally depend on the nix build plumbing.
-      # nix/checks.nix stays out of this list: check edits must not move it.
+      # The nix legs' bytes additionally depend on the nix build plumbing
+      # (nixpkgs toolchain, glibc, this wiring), so their id — and their
+      # embedded stamp via buildEnv below — covers it. nix/checks.nix stays
+      # out of this list: check edits must not move it.
       nixId = builtins.substring 0 12 (builtins.hashString "sha256"
         (builtins.concatStringsSep "\n" [
           srcId
@@ -58,7 +62,7 @@
         ]));
 
       buildEnv = {
-        ABGEN_BUILD_ID = srcId;
+        ABGEN_BUILD_ID = nixId;
         SOURCE_DATE_EPOCH = sourceDateEpoch;
       };
 

@@ -188,11 +188,10 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.setup.outputs.targets) }}
     env:
-      # The embedded stamp is always srcId; the nix legs take it from the
-      # flake's buildEnv (this env never enters the sandbox). Artifact
-      # names key per class below.
-      ABGEN_BUILD_ID: ${{ needs.setup.outputs.src_id }}
-      CLASS_ID: ${{ matrix.builder == 'nix' && needs.setup.outputs.nix_id || needs.setup.outputs.src_id }}
+      # Each leg's stamp, BUILD-INFO and artifact name all use its class
+      # id: srcId for cargo legs, nixId for nix legs (whose sandboxed
+      # compile takes the same value from the flake's buildEnv).
+      ABGEN_BUILD_ID: ${{ matrix.builder == 'nix' && needs.setup.outputs.nix_id || needs.setup.outputs.src_id }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       - if: matrix.builder == 'nix'
@@ -227,7 +226,7 @@ jobs:
       - name: upload archives (input-addressed)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: archives-${{ env.CLASS_ID }}-${{ matrix.target }}
+          name: archives-${{ env.ABGEN_BUILD_ID }}-${{ matrix.target }}
           path: |
             dist/abgen-*.tar.gz
             dist/abgen-*.tar.gz.sha256
@@ -259,6 +258,10 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.setup.outputs.napi_targets) }}
+    env:
+      # The addon is a pure function of the source + pinned toolchains, so
+      # it carries the source id.
+      ABGEN_BUILD_ID: ${{ needs.setup.outputs.src_id }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       - uses: ./.github/actions/rust-setup
