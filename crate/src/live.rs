@@ -1843,6 +1843,26 @@ mod tests {
     }
 
     #[test]
+    fn reuse_mode_gets_digestless_from_assets_then_entity_scoped() {
+        let (host, seen) = super::stub::serve(vec![(
+            "/v41/bafkcid/Qmhash_windows".to_string(),
+            200,
+            b"PREFIX_MIGRATION".to_vec(),
+        )]);
+        let proxy = stub_proxy_reuse(&host, "reuse-get-digestless");
+        let got = proxy.space_get_bundle("bafkcid", "Qmhash_windows");
+        assert_eq!(got.as_deref(), Some(&b"PREFIX_MIGRATION"[..]));
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec![
+                "GET /v41/assets/Qmhash_windows".to_string(),
+                "GET /v41/bafkcid/Qmhash_windows".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn bounded_reserve_evicts_only_past_cap() {
         let mut m: HashMap<String, u32> = HashMap::new();
         m.insert("a".to_string(), 1);
