@@ -64,6 +64,10 @@ jobs:
           path: .win-green-marker
           key: windows-green-${{ steps.hash.outputs.h }}
           lookup-only: true
+          # The save runs on windows-2025 while this lookup runs on linux;
+          # without the cross-OS flag on BOTH sides the cache versions never
+          # match and the marker is permanently invisible.
+          enableCrossOsArchive: true
       - id: decide
         run: |
           if [ "${{ steps.memo.outputs.cache-hit }}" = "true" ]; then mode=skip
@@ -123,6 +127,7 @@ jobs:
         with:
           path: .win-green-marker
           key: windows-green-${{ needs.windows-gate.outputs.hash }}
+          enableCrossOsArchive: true
 
   # Everything races in parallel off the shared binary cache: each lane
   # restores, builds its deps closures, publishes the cache immediately
@@ -289,7 +294,19 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - id: hash
+        run: echo "h=${{ hashFiles('crate/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'ci/check-glibc-floor.sh', '.github/workflows/ci.yml', '.github/actions/rust-setup/**') }}" >> "$GITHUB_OUTPUT"
+      - id: memo
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .node-green-marker
+          key: node-green-${{ steps.hash.outputs.h }}
+          lookup-only: true
+      - name: skip notice
+        if: steps.memo.outputs.cache-hit == 'true'
+        run: echo "node addon already green for input hash ${{ steps.hash.outputs.h }} (memoized marker); skipping."
       - uses: ./.github/actions/rust-setup
+        if: steps.memo.outputs.cache-hit != 'true'
         with:
           # Pure consumer of the cache the release napi linux legs save from
           # main pushes (same shared-key); PR-scoped saves would be quota
@@ -298,6 +315,7 @@ jobs:
           shared-key: abgen-node
           save-if: "false"
       - name: abgen-node (build + smoke)
+        if: steps.memo.outputs.cache-hit != 'true'
         working-directory: crate/abgen-node
         run: |
           npm ci --no-audit --no-fund
@@ -310,3 +328,11 @@ jobs:
           # crate/abgen-node now that the step runs there.
           bash ../../ci/check-glibc-floor.sh 2.34 \
             target/release/libabgen_node.so
+      - name: write green marker
+        if: steps.memo.outputs.cache-hit != 'true'
+        run: echo green > .node-green-marker
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        if: steps.memo.outputs.cache-hit != 'true'
+        with:
+          path: .node-green-marker
+          key: node-green-${{ steps.hash.outputs.h }}
