@@ -5,6 +5,8 @@ on:
 
 permissions:
   contents: read
+  # The nix-store-cache composite's artifact seed lists artifacts.
+  actions: read
 
 concurrency:
   group: lambda-e2e

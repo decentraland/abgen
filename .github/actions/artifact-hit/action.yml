@@ -20,9 +20,14 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
+        NAME: ${{ inputs.name }}
       run: |
-        n=$(gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=${{ inputs.name }}&per_page=10" \
-          --jq '[.artifacts[] | select(.expired == false and .workflow_run.head_repository_id == .workflow_run.repository_id)] | length' \
-          | awk '{s+=$1} END {print (s > 0) ? "true" : "false"}')
-        echo "hit=$n" >> "$GITHUB_OUTPUT"
-        echo "${{ inputs.name }}: hit=$n"
+        # Fail-open: an API error is a miss (the lane runs), never a red
+        # job. NAME goes through env, never template-interpolated into the
+        # script (this action holds a token).
+        n=$(gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$NAME&per_page=100" \
+          --jq '[.artifacts[] | select(.expired == false and .size_in_bytes > 0 and .workflow_run.repository_id != null and .workflow_run.head_repository_id == .workflow_run.repository_id)] | length' \
+          2>/dev/null || echo 0)
+        hit=false; [ "${n:-0}" -gt 0 ] && hit=true
+        echo "hit=$hit" >> "$GITHUB_OUTPUT"
+        echo "$NAME: hit=$hit"

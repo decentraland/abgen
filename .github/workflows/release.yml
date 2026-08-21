@@ -123,7 +123,7 @@ jobs:
 
           exists() { # artifact name -> 0 if a non-expired one exists
             gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$1&per_page=10" \
-              --jq '[.artifacts[] | select(.expired == false and .workflow_run.head_repository_id == .workflow_run.repository_id)] | length' \
+              --jq '[.artifacts[] | select(.expired == false and .size_in_bytes > 0 and .workflow_run.repository_id != null and .workflow_run.head_repository_id == .workflow_run.repository_id)] | length' \
               | awk '{s+=$1} END {exit (s > 0) ? 0 : 1}'
           }
 
@@ -335,16 +335,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # ANY successful run for this sha counts: the newest run may be a
+          # cancelled rerun or the nightly — neither invalidates a green
+          # verdict this commit already earned.
           for _ in $(seq 1 40); do
-            run="$(gh api "/repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&per_page=1" \
-              --jq '"\(.workflow_runs[0].status // "none") \(.workflow_runs[0].conclusion // "")"')"
-            status="${run%% *}"; conclusion="${run#* }"
-            [ "$conclusion" = "success" ] && exit 0
-            if [ "$status" = "completed" ]; then
-              echo "ci for $GITHUB_SHA concluded: ${conclusion:-none}" >&2
+            runs="$(gh api "/repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&per_page=100" \
+              --jq '[.workflow_runs[].conclusion // "pending"]')"
+            echo "$runs" | jq -e 'index("success") != null' > /dev/null && exit 0
+            if echo "$runs" | jq -e 'length > 0 and all(.[]; . != "pending" and . != "")' > /dev/null; then
+              echo "ci for $GITHUB_SHA concluded without a green run: $runs" >&2
               exit 1
             fi
-            echo "ci for $GITHUB_SHA: $status — waiting"
+            echo "ci for $GITHUB_SHA: $runs — waiting"
             sleep 60
           done
           echo "timed out waiting for the ci verdict" >&2
@@ -382,7 +384,7 @@ jobs:
           fetch() { # name dest-dir — newest non-expired artifact by exact name
             local id
             id="$(gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$1&per_page=10" \
-              --jq '[.artifacts[] | select(.expired == false and .workflow_run.head_repository_id == .workflow_run.repository_id)] | sort_by(.created_at) | last | .id // empty' \
+              --jq '[.artifacts[] | select(.expired == false and .size_in_bytes > 0 and .workflow_run.repository_id != null and .workflow_run.head_repository_id == .workflow_run.repository_id)] | sort_by(.updated_at) | last | .id // empty' \
               | head -1)"
             test -n "$id" || { echo "no artifact named $1 for this tree" >&2; return 1; }
             gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > /tmp/a.zip
@@ -446,7 +448,7 @@ jobs:
       needs.ci-green.result == 'success' &&
       needs.napi.result != 'failure' && needs.napi.result != 'cancelled'
     permissions:
-      contents: write
+      contents: read
       id-token: write
       actions: read
     env:
@@ -466,7 +468,7 @@ jobs:
           for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
                    aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc; do
             id="$(gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=napi-$SRC_ID-$t&per_page=10" \
-              --jq '[.artifacts[] | select(.expired == false and .workflow_run.head_repository_id == .workflow_run.repository_id)] | sort_by(.created_at) | last | .id // empty' \
+              --jq '[.artifacts[] | select(.expired == false and .size_in_bytes > 0 and .workflow_run.repository_id != null and .workflow_run.head_repository_id == .workflow_run.repository_id)] | sort_by(.updated_at) | last | .id // empty' \
               | head -1)"
             test -n "$id" || { echo "no napi artifact for $t" >&2; exit 1; }
             gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > /tmp/n.zip
@@ -515,7 +517,7 @@ jobs:
           set -eu
           for arch in amd64 arm64; do
             id="$(gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=image-$NIX_ID-docker-$arch&per_page=10" \
-              --jq '[.artifacts[] | select(.expired == false and .workflow_run.head_repository_id == .workflow_run.repository_id)] | sort_by(.created_at) | last | .id // empty' \
+              --jq '[.artifacts[] | select(.expired == false and .size_in_bytes > 0 and .workflow_run.repository_id != null and .workflow_run.head_repository_id == .workflow_run.repository_id)] | sort_by(.updated_at) | last | .id // empty' \
               | head -1)"
             test -n "$id" || { echo "no docker image artifact for $arch" >&2; exit 1; }
             gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > i.zip
@@ -575,7 +577,7 @@ jobs:
         run: |
           set -eu
           id="$(gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=image-$NIX_ID-lambda-arm64&per_page=10" \
-            --jq '[.artifacts[] | select(.expired == false and .workflow_run.head_repository_id == .workflow_run.repository_id)] | sort_by(.created_at) | last | .id // empty' \
+            --jq '[.artifacts[] | select(.expired == false and .size_in_bytes > 0 and .workflow_run.repository_id != null and .workflow_run.head_repository_id == .workflow_run.repository_id)] | sort_by(.updated_at) | last | .id // empty' \
             | head -1)"
           test -n "$id" || { echo "::error::no lambda image artifact to push" >&2; exit 1; }
           gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > i.zip

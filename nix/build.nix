@@ -51,10 +51,15 @@ let
     '';
   };
 
+  # doCheck = false: nothing consumes this closure's test artifacts any
+  # more (the test lanes ride the checkfast/lambda closures), and with
+  # [profile.release] lto = "fat", cgu = 1 the dummy test link is exactly
+  # the cost the split exists to avoid. --all-targets keeps clippy warm.
   cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
     inherit dummySrc;
     version = "0";
-    doCheck = true;
+    doCheck = false;
+    cargoCheckExtraArgs = "--all-targets";
   });
 
   # Deps for the checkfast profile (lto off, codegen-units 16): the test

@@ -10,6 +10,17 @@ let
     CARGO_PROFILE = "checkfast";
   };
   abgenRoot = ''export ABGEN_ROOT="$PWD"'';
+  # The zero-test guard lives INSIDE the derivation: a green output with
+  # zero tests cannot exist, so neither the binary cache nor a verdict
+  # artifact can ever memoize that state (the doCheck=false class went
+  # unnoticed for weeks when this was a post-hoc log grep).
+  assertRanTests = ''
+    junit=target/nextest/default/junit.xml
+    [ -f "$junit" ] || { echo "nextest junit report missing - no tests ran" >&2; exit 1; }
+    count=$(grep -o 'tests="[0-9]*"' "$junit" | head -n1 | grep -o '[0-9]*' || echo 0)
+    [ "''${count:-0}" -gt 0 ] || { echo "zero tests executed" >&2; exit 1; }
+    echo "$count tests executed"
+  '';
 
   archIndependent = {
     wasm-deps = wasmCheck.cargoArtifacts;
@@ -44,6 +55,7 @@ let
       cargoExtraArgs = "--locked";
       cargoNextestExtraArgs = "--workspace";
       preCheck = abgenRoot;
+      postCheck = assertRanTests;
     });
 
     native-smoke =
@@ -75,15 +87,18 @@ let
 
     # workspace closure: the `-p` selection resolves shared deps to
     # narrower feature sets, so the workspace artifacts never matched and
-    lambda-tests = craneLib.cargoTest (commonArgs // {
+    # nextest (not cargo test): same -p selection and features, plus the
+    # junit report the in-drv guard asserts on.
+    lambda-tests = craneLib.cargoNextest (commonArgs // {
       cargoArtifacts = lambdaCargoArtifacts;
       CARGO_PROFILE = "checkfast";
       doCheck = true;
       __darwinAllowLocalNetworking = true;
       pname = "abgen-lambda-tests";
       cargoExtraArgs = "--locked";
-      cargoTestExtraArgs = "-p abgen-lambda -p abgen-native --tests";
+      cargoNextestExtraArgs = "-p abgen-lambda -p abgen-native";
       preCheck = abgenRoot;
+      postCheck = assertRanTests;
     });
   };
 in

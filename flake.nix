@@ -23,6 +23,9 @@
           ./Cargo.toml
           ./Cargo.lock
           ./rust-toolchain.toml
+          # nextest writes the junit report the in-drv zero-test guard
+          # asserts on; the config must be visible inside the check drvs.
+          ./.config/nextest.toml
           ./crate
           ./template
           ./lambda/Cargo.toml
