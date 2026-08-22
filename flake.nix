@@ -23,6 +23,8 @@
           ./Cargo.toml
           ./Cargo.lock
           ./rust-toolchain.toml
+          # nextest junit config: the in-drv zero-test guard asserts on it
+          ./.config/nextest.toml
           ./crate
           ./template
           ./lambda/Cargo.toml
@@ -176,7 +178,8 @@
 
           checks = import ./nix/checks.nix {
             inherit lib system pkgs craneLib wasmCheck;
-            inherit (build) commonArgs cargoArtifacts abgenConsumersPkg;
+            inherit (build) commonArgs cargoArtifacts cargoArtifactsCheckfast
+              lambdaCargoArtifacts abgenConsumersPkg;
           };
 
         });

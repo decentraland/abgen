@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -57,20 +58,20 @@ jobs:
         with:
           fetch-depth: 0
       - id: hash
-        run: echo "h=${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.github/workflows/ci.yml', '.github/actions/rust-setup/**', 'ci/abgen-smoke.ps1', '.config/nextest.toml', 'crate/Cargo.toml', 'crate/build.rs', 'crate/third_party/**', 'crate/abgen-native/**', 'crate/dcl-contents/**', 'crate/src/abcdn/**', 'crate/src/builder/**', 'crate/src/export/**', 'crate/src/lodgen/**', 'crate/src/gpu/**', 'crate/src/live.rs', 'crate/src/jitcache.rs', 'crate/src/local_store.rs', 'crate/src/texencode_cache.rs', 'crate/src/tmppath.rs', 'crate/src/clihelp.rs', 'crate/src/ffi.rs', 'crate/src/worlds.rs', 'crate/src/lods.rs', 'crate/src/lz4.rs', 'crate/src/manifest.rs', 'crate/src/space.rs', 'crate/src/shader.rs', 'crate/src/lib.rs', 'crate/src/gltf/scene_build.rs', 'crate/src/unity/bundle_file.rs', 'crate/abgen-wasm/test/fixtures/normal-quad.glb') }}" >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/tree-hash
       - id: memo
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: ./.github/actions/artifact-hit
         with:
-          path: .win-green-marker
-          key: windows-green-${{ steps.hash.outputs.h }}
-          lookup-only: true
+          name: windows-green-${{ steps.hash.outputs.h }}
       - id: decide
         run: |
-          if [ "${{ steps.memo.outputs.cache-hit }}" = "true" ]; then mode=skip
+          if [ "${{ steps.memo.outputs.hit }}" = "true" ]; then mode=skip
           elif [ "${{ github.event_name }}" != "pull_request" ]; then mode=full
           elif ! git diff --quiet ${{ github.event.pull_request.base.sha }}...HEAD -- 'Cargo.lock' 'Cargo.toml' 'rust-toolchain.toml' '.github/workflows/ci.yml' '.github/actions/rust-setup' 'ci/abgen-smoke.ps1' '.config/nextest.toml' 'crate/Cargo.toml' 'crate/build.rs' 'crate/third_party' 'crate/abgen-native' 'crate/dcl-contents' 'crate/src/abcdn' 'crate/src/builder' 'crate/src/export' 'crate/src/lodgen' 'crate/src/gpu' 'crate/src/live.rs' 'crate/src/jitcache.rs' 'crate/src/local_store.rs' 'crate/src/texencode_cache.rs' 'crate/src/tmppath.rs' 'crate/src/clihelp.rs' 'crate/src/ffi.rs' 'crate/src/worlds.rs' 'crate/src/lods.rs' 'crate/src/lz4.rs' 'crate/src/manifest.rs' 'crate/src/space.rs' 'crate/src/shader.rs' 'crate/src/lib.rs' 'crate/src/gltf/scene_build.rs' 'crate/src/unity/bundle_file.rs' 'crate/abgen-wasm/test/fixtures/normal-quad.glb'; then mode=full
           elif ! git diff --quiet ${{ github.event.pull_request.base.sha }}...HEAD -- '**/*.rs' 'Cargo.*' '**/Cargo.toml'; then mode=quick
-          else mode=quick; fi
+          # nothing rust-adjacent in the diff: the tree hash still guards
+          # correctness (any relevant change lands in the first branch).
+          else mode=skip; fi
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
   windows:
@@ -89,7 +90,7 @@ jobs:
         run: curl.exe -LsSf https://get.nexte.st/0.9.143/windows-tar | tar -xzf - -C $env:USERPROFILE\.cargo\bin
       - name: skip notice
         if: needs.windows-gate.outputs.mode == 'skip'
-        run: echo "windows suite already green for input hash ${{ needs.windows-gate.outputs.hash }} (memoized marker); skipping."
+        run: echo "windows suite already green for tree ${{ needs.windows-gate.outputs.hash }} (verdict artifact); skipping."
       - name: quick tests + smoke
         if: needs.windows-gate.outputs.mode == 'quick'
         shell: pwsh
@@ -112,154 +113,135 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pwsh -NoProfile -ExecutionPolicy Bypass -File ci/abgen-smoke.ps1 -Tree $env:GITHUB_WORKSPACE
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: write green marker
+      - name: write verdict
         if: needs.windows-gate.outputs.mode == 'full'
         shell: pwsh
-        run: Set-Content -Path .win-green-marker -Value green
-      # Cache saves from PR branches are scoped to that branch; the
-      # globally visible marker is minted by full runs on main pushes.
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        run: Set-Content -Path .win-green -Value green
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: needs.windows-gate.outputs.mode == 'full'
         with:
-          path: .win-green-marker
-          key: windows-green-${{ needs.windows-gate.outputs.hash }}
-
-  # Everything races in parallel off the shared binary cache: each lane
-  # restores, builds its deps closures, publishes the cache immediately
-  # (no-op unless the key is new), then runs only its slice of the checks.
-  # Image artifacts are produced by the release workflow's build legs,
-  # which start on the same push in parallel with all of this; publishing
-  # is what gates on green, not building.
-  # Windows-gate pattern for the nix lanes: a PR pays only for the lanes
-  # its diff can affect. Pushes to main and schedules always run everything.
-  # crate  -> workspace tests/build (crate/, template/, roots, nix build wiring)
-  # lambda -> the lambda test config (also affected by crate/)
-  # lint   -> anything lintable at all (rust/nix/toml sources)
-  nix-gate:
-    name: nix gate
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      run_crate: ${{ steps.decide.outputs.crate }}
-      run_lambda: ${{ steps.decide.outputs.lambda }}
-      run_lint: ${{ steps.decide.outputs.lint }}
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-        with:
-          fetch-depth: 0
-      - id: decide
-        run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            printf 'crate=true\nlambda=true\nlint=true\n' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          base="${{ github.event.pull_request.base.sha }}"
-          changed() { ! git diff --quiet "$base"...HEAD -- "$@"; }
-          crate=false; lambda=false; lint=false
-          changed 'crate' 'template' 'Cargo.lock' 'Cargo.toml' \
-            'rust-toolchain.toml' 'nix/build.nix' 'flake.nix' 'flake.lock' \
-            '.config/nextest.toml' && crate=true
-          changed 'lambda' && lambda=true
-          # crate changes reach the lambda tests too (shared workspace).
-          [ "$crate" = "true" ] && lambda=true
-          changed '**/*.rs' '**/*.toml' 'nix' 'flake.nix' 'flake.lock' \
-            'ci/nix-checks.sh' && lint=true
-          printf 'crate=%s\nlambda=%s\nlint=%s\n' "$crate" "$lambda" "$lint" >> "$GITHUB_OUTPUT"
-          echo "crate=$crate lambda=$lambda lint=$lint"
+          name: windows-green-${{ needs.windows-gate.outputs.hash }}
+          path: .win-green
+          retention-days: 30
 
   nix-ci:
     name: ${{ matrix.lane }}
-    needs: nix-gate
     strategy:
       fail-fast: false
       matrix:
         include:
-          # One workspace-scale compile per lane: nextest's test-target
-          # build and abgen-all (behind native-smoke) each cost ~10 min on
-          # 4 cores, so pairing them serialized the verdict. Wall time is
-          # the slowest single lane. `gate` names the nix-gate output that
-          # decides whether the lane runs for this diff.
           - lane: x86 nextest
             runner: ubuntu-24.04
             system: x86_64-linux
-            deps: .#checks.x86_64-linux.deps
+            marker: x86-nextest
+            deps: .#checks.x86_64-linux.deps-checkfast
             attrs: nextest
-            gate: run_crate
+            flavor: checkfast
           - lane: x86 build + smoke
             runner: ubuntu-24.04
             system: x86_64-linux
+            marker: x86-smoke
             deps: .#checks.x86_64-linux.deps
             attrs: native-smoke
-            gate: run_crate
           - lane: arm nextest
             runner: ubuntu-24.04-arm
             system: aarch64-linux
-            deps: .#checks.aarch64-linux.deps
+            marker: arm-nextest
+            deps: .#checks.aarch64-linux.deps-checkfast
             attrs: nextest
-            gate: run_crate
-          - lane: arm lambda + smoke
+            flavor: checkfast
+          - lane: arm lambda
             runner: ubuntu-24.04-arm
             system: aarch64-linux
-            deps: .#checks.aarch64-linux.deps
-            attrs: lambda-tests native-smoke
-            gate: run_lambda
-          - lane: arm lints
+            marker: arm-lambda
+            deps: .#checks.aarch64-linux.lambda-deps
+            attrs: lambda-tests
+            # one saver per (os,arch,flavor): sharing checkfast dropped this lane's outputs
+            flavor: lambda
+          - lane: arm lints + smoke
             runner: ubuntu-24.04-arm
             system: aarch64-linux
+            marker: arm-lints
             deps: .#checks.aarch64-linux.deps .#checks.aarch64-linux.wasm-deps
-            attrs: clippy fmt no-node-spawn wasm-check
-            gate: run_lint
+            attrs: clippy fmt no-node-spawn wasm-check native-smoke
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
-      - name: skip notice
-        if: needs.nix-gate.outputs[matrix.gate] != 'true'
-        run: echo "diff cannot affect this lane (${{ matrix.gate }}=false); skipping."
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-        if: needs.nix-gate.outputs[matrix.gate] == 'true'
-      # No standalone nix installer: the composite runs it with the
-      # extra-conf this job needs; a prior bare install made that conf
-      # silently a no-op.
+      - id: th
+        uses: ./.github/actions/tree-hash
+        with:
+          scope: nix
+      - id: memo
+        uses: ./.github/actions/artifact-hit
+        with:
+          name: nix-green-${{ matrix.marker }}-${{ steps.th.outputs.h }}
+      - name: skip notice
+        if: steps.memo.outputs.hit == 'true'
+        run: echo "lane already green for tree ${{ steps.th.outputs.h }} (verdict artifact); skipping."
       - uses: ./.github/actions/nix-store-cache
-        if: needs.nix-gate.outputs[matrix.gate] == 'true'
+        if: steps.memo.outputs.hit != 'true'
+        with:
+          flavor: ${{ matrix.flavor || 'build' }}
       - name: deps (dependency closures)
-        if: needs.nix-gate.outputs[matrix.gate] == 'true'
+        if: steps.memo.outputs.hit != 'true'
         run: nix build --no-link ${{ matrix.deps }}
-      # Publish immediately and from any branch: the composite no-ops
-      # unless the exact key is new, so this fires once per input rotation
-      # (lanes sharing a key race; first save wins, the rest skip).
-      - uses: ./.github/actions/nix-store-cache/save
-        if: needs.nix-gate.outputs[matrix.gate] == 'true'
-        continue-on-error: true
       - name: checks (${{ matrix.attrs }})
-        if: needs.nix-gate.outputs[matrix.gate] == 'true'
+        if: steps.memo.outputs.hit != 'true'
         run: bash ci/nix-checks.sh ${{ matrix.system }} ${{ matrix.attrs }}
+      # not always(): a cancelled mid-pack save must not own an immutable key
+      - uses: ./.github/actions/nix-store-cache/save
+        if: success() || failure()
+        continue-on-error: true
+      - name: write verdict
+        if: steps.memo.outputs.hit != 'true'
+        run: echo green > .lane-green
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: steps.memo.outputs.hit != 'true'
+        with:
+          name: nix-green-${{ matrix.marker }}-${{ steps.th.outputs.h }}
+          path: .lane-green
+          retention-days: 30
 
   node-addon:
     name: node addon
-    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-      - uses: ./.github/actions/rust-setup
+      - id: hash
+        uses: ./.github/actions/tree-hash
+      - id: memo
+        uses: ./.github/actions/artifact-hit
         with:
-          # Pure consumer of the cache the release napi linux legs save from
-          # main pushes (same shared-key); PR-scoped saves would be quota
-          # waste.
+          name: node-green-${{ steps.hash.outputs.h }}
+      - name: skip notice
+        if: steps.memo.outputs.hit == 'true'
+        run: echo "node addon already green for tree ${{ steps.hash.outputs.h }} (verdict artifact); skipping."
+      - uses: ./.github/actions/rust-setup
+        if: steps.memo.outputs.hit != 'true'
+        with:
           workspaces: crate/abgen-node
           shared-key: abgen-node
           save-if: "false"
       - name: abgen-node (build + smoke)
+        if: steps.memo.outputs.hit != 'true'
         working-directory: crate/abgen-node
         run: |
           npm ci --no-audit --no-fund
-          npx napi build --platform --release -- --locked
+          # --cargo-flags, never '-- --locked': napi's positional is a copy destination
+          npx napi build --platform --release --cargo-flags=--locked
+          ls ./*.node
           git diff --exit-code -- index.js index.d.ts \
             || { echo "index.js/index.d.ts are stale; run 'napi build --platform --release' and commit them" >&2; exit 1; }
           node test/smoke.mjs
-          # The addon is dlopen'd into node and so is bound by the host's
-          # glibc exactly like libabgen.so is by Unity's. Paths are relative to
-          # crate/abgen-node now that the step runs there.
-          bash ../../ci/check-glibc-floor.sh 2.34 \
-            target/release/libabgen_node.so
+          bash ../../ci/check-glibc-floor.sh 2.34 target/release/libabgen_node.so
+      - name: write verdict
+        if: steps.memo.outputs.hit != 'true'
+        run: echo green > .node-green
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: steps.memo.outputs.hit != 'true'
+        with:
+          name: node-green-${{ steps.hash.outputs.h }}
+          path: .node-green
+          retention-days: 30
