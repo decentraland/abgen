@@ -14,10 +14,12 @@
 //! The encode cache also has an on-disk backing ([`crate::texencode_cache`]'s
 //! `disk` submodule) that survives across process runs, keyed by the same
 //! content hash plus the encoder's crate version + `ABGEN_BUILD_ID` so a
-//! stale build can never serve a hit. It rides the same enable/disable
-//! switch as the in-memory cache and is on by default wherever that is:
-//!   - `ABGEN_DISK_CACHE` (default on, `0`/`false` disables it) is the
-//!     escape hatch.
+//! stale build can never serve a hit:
+//!   - `ABGEN_DISK_CACHE` is the escape hatch. It defaults on for any build
+//!     stamped with a real content-addressed `ABGEN_BUILD_ID` (everything
+//!     `flake.nix`/`release.yml` produce) and off for dev builds, whose
+//!     fixed `devbuild0000` stamp would let two different source trees share
+//!     one key space; `0`/`false` disables it, `1`/`true` forces it on.
 //!   - `ABGEN_DISK_CACHE_DIR` overrides the cache directory (default
 //!     `$XDG_CACHE_HOME/abgen/texencode`, else the platform cache dir —
 //!     `~/Library/Caches/abgen/texencode` on macOS, `~/.cache/abgen/texencode`

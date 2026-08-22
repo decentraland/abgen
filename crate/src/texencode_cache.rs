@@ -96,11 +96,13 @@ fn key(kind: Kind, pixels: &[u8], width: u32, height: u32, params: &[i64]) -> [u
 /// probabilistically (not on every write — a full directory walk per write
 /// would undercut the point of the cache) after a successful insert.
 ///
-/// Default on wherever the in-memory cache is enabled (`ABGEN_DISK_CACHE=0`
-/// is the escape hatch); default off under `cfg(test)` so the unit test
-/// suite never touches a developer's real cache directory — tests that
-/// exercise it opt back in explicitly and point `ABGEN_DISK_CACHE_DIR` at a
-/// throwaway directory.
+/// Default on for any build carrying a real content-addressed
+/// `ABGEN_BUILD_ID` — i.e. everything `flake.nix`/`release.yml` produce
+/// (`ABGEN_DISK_CACHE=0` is the escape hatch). Default *off* for dev builds,
+/// whose fixed `devbuild0000` stamp does not pin the encoder, which also
+/// keeps `cargo test` (unit and integration alike) off a developer's real
+/// cache directory. Tests that exercise it opt back in explicitly and point
+/// `ABGEN_DISK_CACHE_DIR` at a throwaway directory.
 #[cfg(not(target_arch = "wasm32"))]
 mod disk {
     use std::fs;
@@ -116,11 +118,33 @@ mod disk {
 
     static WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
 
+    /// The placeholder `build.rs` stamps when `ABGEN_BUILD_ID` is unset. It
+    /// is a fixed string, not a content id, so it does *not* pin the
+    /// encoder: every working tree that builds without an explicit build id
+    /// stamps `devbuild0000` and would share one on-disk key space.
+    const DEV_BUILD_ID: &str = "devbuild0000";
+
+    /// True when this binary carries a real content-addressed build id.
+    /// Every build whose output ships has one — `flake.nix` and
+    /// `release.yml` both stamp `nix eval --raw .#buildId` — so the fast
+    /// path is still the default everywhere it matters.
+    pub(super) fn build_id_pins_encoder() -> bool {
+        env!("ABGEN_BUILD_ID") != DEV_BUILD_ID
+    }
+
     fn enabled() -> bool {
-        // Never touch real disk from the unit test binary by default: a
-        // developer running `cargo test` should not find abgen writing
-        // into their actual OS cache directory.
-        crate::clihelp::env_bool("ABGEN_DISK_CACHE", !cfg!(test))
+        // Default on only where the build id actually pins the encoder.
+        // `build.rs` stamps every un-stamped build `devbuild0000`, so all
+        // locally built binaries — `abgen-host`, the `live` server, the
+        // bench — share one key space no matter what the source tree says.
+        // A developer who edits the encoder and rebuilds would then get the
+        // *previous* build's bytes served straight off disk, which is the
+        // exact "stale build can never serve a hit" invariant this key is
+        // supposed to provide. `cfg!(test)` cannot express this either:
+        // `crate/tests/*.rs` link this library compiled *without*
+        // `cfg(test)`. Keying off the build id covers every case at once.
+        // `ABGEN_DISK_CACHE=1` opts back in explicitly.
+        crate::clihelp::env_bool("ABGEN_DISK_CACHE", build_id_pins_encoder())
     }
 
     fn max_bytes() -> u64 {
@@ -559,6 +583,23 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Under a dev build the disk cache must default off: `devbuild0000` is
+    /// a fixed stamp, so an entry written by one source tree is
+    /// indistinguishable from one written by another, and a cross-run hit
+    /// would serve a previous build's bytes.
+    ///
+    /// Asserted on the pure predicate rather than `disk::enabled()`, because
+    /// `enabled()` reads a process-global env var that the opt-in test above
+    /// concurrently sets.
+    #[test]
+    fn disk_cache_defaults_off_when_build_id_is_the_dev_placeholder() {
+        assert_eq!(
+            disk::build_id_pins_encoder(),
+            env!("ABGEN_BUILD_ID") != "devbuild0000",
+            "the disk cache's default must track whether the build id pins the encoder"
+        );
     }
 
     #[test]
