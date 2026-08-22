@@ -3,8 +3,9 @@
 //! The encode cache already dedupes the *encode* of identical pixels, so on
 //! the second platform of a conversion the remaining repeated cost is
 //! decoding every source image again. This cache keys the decoded RGBA by
-//! the source bytes' digest and hands out shared buffers, bounded by bytes
-//! and cleared per entity by the same guard that clears the encode cache.
+//! the decode parameters plus the source bytes' digest and hands out shared
+//! buffers, bounded by bytes and cleared per entity by the same guard that
+//! clears the encode cache.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,11 +74,23 @@ fn make_room(s: &mut Store, incoming: usize, budget: usize) {
     }
 }
 
-pub fn get_or_decode(raw: &[u8], f: impl FnOnce() -> Option<RgbaImage>) -> Option<Arc<RgbaImage>> {
+/// `params` names the decode path and its parameters: identical bytes decoded
+/// under different semantics (builder gamma handling vs GLB-embedded decode)
+/// must not share an entry.
+pub fn get_or_decode(
+    params: &[u8],
+    raw: &[u8],
+    f: impl FnOnce() -> Option<RgbaImage>,
+) -> Option<Arc<RgbaImage>> {
     if !enabled() {
         return f().map(Arc::new);
     }
-    let k = crate::hashes::sha256(raw);
+    let k = {
+        let mut h = crate::hashes::Sha256::new();
+        h.update(params);
+        h.update(raw);
+        h.finalize()
+    };
     {
         let mut s = lock();
         s.stamp += 1;
@@ -131,12 +144,12 @@ mod tests {
         clear();
         let raw = b"decode-cache-test-input-1".to_vec();
         let mut calls = 0u32;
-        let a = get_or_decode(&raw, || {
+        let a = get_or_decode(b"src", &raw, || {
             calls += 1;
             Some(img(4, 4, 1))
         })
         .unwrap();
-        let b = get_or_decode(&raw, || {
+        let b = get_or_decode(b"src", &raw, || {
             calls += 1;
             Some(img(4, 4, 2))
         })
@@ -145,7 +158,13 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(a.as_raw(), b.as_raw());
 
-        let miss = get_or_decode(b"other-input", || None);
+        let other = get_or_decode(b"glb", &raw, || Some(img(4, 4, 3))).unwrap();
+        assert!(
+            !Arc::ptr_eq(&a, &other),
+            "same bytes under different params must not share an entry"
+        );
+
+        let miss = get_or_decode(b"src", b"other-input", || None);
         assert!(miss.is_none());
     }
 
