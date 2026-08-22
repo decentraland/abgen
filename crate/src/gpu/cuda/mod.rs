@@ -14,6 +14,19 @@ type DevPtr = u64;
 
 const CUDA_ERROR_NOT_READY: CuResult = 600;
 
+static CUBIN: &[u8] = include_bytes!("../kernel.cubin");
+const CUBIN_SM: (i32, i32) = (8, 6);
+const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
+const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: i32 = 76;
+
+fn should_use_cubin(
+    cubin_len: usize,
+    ptx_override_set: bool,
+    device_cc: Option<(i32, i32)>,
+) -> bool {
+    cubin_len > 0 && !ptx_override_set && device_cc == Some(CUBIN_SM)
+}
+
 fn jit_cache_dir_ok(p: &std::path::Path) -> bool {
     if std::fs::create_dir_all(p).is_err() {
         return false;
@@ -89,6 +102,7 @@ fn sort_perm_into(sigs: &[u8], out: &mut [u32]) {
 
 type FnInit = unsafe extern "C" fn(u32) -> CuResult;
 type FnDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> CuResult;
+type FnDeviceGetAttribute = unsafe extern "C" fn(*mut i32, i32, i32) -> CuResult;
 type FnCtxCreate = unsafe extern "C" fn(*mut *mut c_void, u32, i32) -> CuResult;
 type FnCtxSetCurrent = unsafe extern "C" fn(*mut c_void) -> CuResult;
 type FnModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> CuResult;
@@ -249,6 +263,7 @@ impl Gpu {
         }
         let init: FnInit = sym(lib, c"cuInit")?;
         let device_get: FnDeviceGet = sym(lib, c"cuDeviceGet")?;
+        let device_get_attribute: FnDeviceGetAttribute = sym(lib, c"cuDeviceGetAttribute")?;
         let ctx_create: FnCtxCreate = sym(lib, c"cuCtxCreate_v2")?;
         let module_load_data: FnModuleLoadData = sym(lib, c"cuModuleLoadData")?;
         let module_load_data_ex: FnModuleLoadDataEx = sym(lib, c"cuModuleLoadDataEx")?;
@@ -291,31 +306,53 @@ impl Gpu {
         let mut ctx: *mut c_void = std::ptr::null_mut();
         g.check(ctx_create(&mut ctx, 0, dev))?;
         g.ctx = ctx;
-        let ptx = match std::env::var("ABGEN_GPU_PTX") {
-            Ok(ptx_path) => std::fs::read(&ptx_path)
-                .map_err(|e| anyhow!("failed to read PTX at {ptx_path}: {e}"))?,
-            Err(_) => include_bytes!("../kernel.ptx").to_vec(),
-        };
-        let ptx_c = CString::new(ptx).map_err(|_| anyhow!("PTX contains NUL byte"))?;
-        let mut module: *mut c_void = std::ptr::null_mut();
-        let maxreg: u32 = std::env::var("ABGEN_GPU_MAXREG")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(128);
-        if maxreg > 0 {
-            let mut opts = [0i32];
-            let mut vals = [maxreg as usize as *mut c_void];
-            g.check(module_load_data_ex(
-                &mut module,
-                ptx_c.as_ptr().cast(),
-                1,
-                opts.as_mut_ptr(),
-                vals.as_mut_ptr(),
-            ))
-            .map_err(|e| anyhow!("PTX JIT load (maxreg={maxreg}) failed: {e}"))?;
+        let ptx_override = std::env::var("ABGEN_GPU_PTX").ok();
+        let mut cc_major: i32 = -1;
+        let mut cc_minor: i32 = -1;
+        let device_cc = if device_get_attribute(
+            &mut cc_major,
+            CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            dev,
+        ) == 0
+            && device_get_attribute(
+                &mut cc_minor,
+                CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                dev,
+            ) == 0
+        {
+            Some((cc_major, cc_minor))
         } else {
-            g.check(module_load_data(&mut module, ptx_c.as_ptr().cast()))
-                .map_err(|e| anyhow!("PTX JIT load failed: {e}"))?;
+            None
+        };
+        let mut module: *mut c_void = std::ptr::null_mut();
+        let loaded_from_cubin = should_use_cubin(CUBIN.len(), ptx_override.is_some(), device_cc)
+            && module_load_data(&mut module, CUBIN.as_ptr().cast()) == 0;
+        if !loaded_from_cubin {
+            let ptx = match &ptx_override {
+                Some(ptx_path) => std::fs::read(ptx_path)
+                    .map_err(|e| anyhow!("failed to read PTX at {ptx_path}: {e}"))?,
+                None => include_bytes!("../kernel.ptx").to_vec(),
+            };
+            let ptx_c = CString::new(ptx).map_err(|_| anyhow!("PTX contains NUL byte"))?;
+            let maxreg: u32 = std::env::var("ABGEN_GPU_MAXREG")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(128);
+            if maxreg > 0 {
+                let mut opts = [0i32];
+                let mut vals = [maxreg as usize as *mut c_void];
+                g.check(module_load_data_ex(
+                    &mut module,
+                    ptx_c.as_ptr().cast(),
+                    1,
+                    opts.as_mut_ptr(),
+                    vals.as_mut_ptr(),
+                ))
+                .map_err(|e| anyhow!("PTX JIT load (maxreg={maxreg}) failed: {e}"))?;
+            } else {
+                g.check(module_load_data(&mut module, ptx_c.as_ptr().cast()))
+                    .map_err(|e| anyhow!("PTX JIT load failed: {e}"))?;
+            }
         }
         let mut f_encode: *mut c_void = std::ptr::null_mut();
         g.check(module_get_function(
@@ -716,3 +753,37 @@ mod slab;
 
 pub use chain::tex_geometry;
 pub(crate) use chain::{encode_bc7_mip_chain_gpu, gpu_ready};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_use_cubin_requires_nonempty_cubin() {
+        assert!(!should_use_cubin(0, false, Some(CUBIN_SM)));
+        assert!(should_use_cubin(1, false, Some(CUBIN_SM)));
+    }
+
+    #[test]
+    fn should_use_cubin_requires_exact_arch_match() {
+        assert!(should_use_cubin(1, false, Some((8, 6))));
+        assert!(!should_use_cubin(1, false, Some((8, 0))));
+        assert!(!should_use_cubin(1, false, Some((9, 0))));
+        assert!(!should_use_cubin(1, false, Some((7, 5))));
+    }
+
+    #[test]
+    fn should_use_cubin_requires_known_arch() {
+        assert!(!should_use_cubin(1, false, None));
+    }
+
+    #[test]
+    fn should_use_cubin_respects_ptx_override_escape_hatch() {
+        assert!(!should_use_cubin(1, true, Some(CUBIN_SM)));
+    }
+
+    #[test]
+    fn embedded_cubin_placeholder_is_absent_in_this_checkout() {
+        assert!(CUBIN.is_empty() || CUBIN.starts_with(b"\x7fELF"));
+    }
+}

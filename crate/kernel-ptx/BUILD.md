@@ -20,6 +20,42 @@ llvm-bitcode-linker. `.cargo/config.toml` sets the nvptx target,
 embedded in the host lives at `../src/gpu/kernel.ptx` (`include_bytes!`);
 `ABGEN_GPU_PTX` overrides it at runtime.
 
+## Cubin (skip driver JIT at cold start)
+
+The PTX above is JIT-compiled by the driver on every process start; on a
+1.6MB module that costs multi-second cold starts (e.g. Lambda). A
+precompiled cubin for sm_86 removes that JIT: the host loader
+(`../src/gpu/cuda/mod.rs`) embeds `../src/gpu/kernel.cubin` via
+`include_bytes!` and, when the running device's compute capability is
+exactly 8.6, loads it directly with `cuModuleLoadData` (a cubin, unlike PTX,
+skips JIT entirely). Any other device, an empty/placeholder cubin, or
+`ABGEN_GPU_PTX` set falls back to the PTX JIT path above unconditionally -
+no env var turns the cubin path on, runtime capability detection does.
+
+`kernel.cubin` requires `ptxas` from a CUDA toolkit (not part of this
+flake's nightly rustc devShell) and is intentionally checked in empty in
+trees that have not regenerated it - `include_bytes!` still compiles, the
+loader treats a zero-length cubin as absent and always takes the PTX path.
+
+Refresh (needs a CUDA toolkit with `ptxas` on PATH, e.g. `nix develop
+.#gpu` at the repo root or any host with CUDA installed):
+
+```
+cd crates/abgen/kernel-ptx
+nix develop path:. --command cargo build --release
+cp target/nvptx64-nvidia-cuda/release/abgen_gpu_kernel_ptx.ptx ../src/gpu/kernel.ptx
+ptxas -arch=sm_86 -O3 -o ../src/gpu/kernel.cubin ../src/gpu/kernel.ptx
+```
+
+If `CUBIN_SM` in `../src/gpu/cuda/mod.rs` ever moves off sm_86 (i.e.
+`target-cpu` above changes), update the `-arch=sm_86` flag and the
+`CUBIN_SM` constant together - they must stay in lockstep or the loader
+silently falls back to PTX JIT forever.
+
+After regenerating either artifact, re-run `abgen-verify gpu diff --gpu` at
+the combos in the verification record below (cubin and PTX must both be
+byte-identical to the oracle) before updating `PTX-PROVENANCE.txt`.
+
 ## Run
 
 ```
