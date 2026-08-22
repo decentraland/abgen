@@ -81,20 +81,15 @@ fn fetch_jobs() -> usize {
 fn corpus_file_jobs() -> usize {
     static JOBS: OnceLock<usize> = OnceLock::new();
     *JOBS.get_or_init(|| {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        // Specific knob wins over the generic one; default stays min(cores, 4)
-        // because peak RSS scales with in-flight files.
-        let from = |k: &str| {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&n| n > 0)
-        };
-        from("ABGEN_JIT_FILE_CONCURRENCY")
-            .or_else(|| from("ABGEN_FILE_CONCURRENCY"))
-            .unwrap_or_else(|| cores.min(4))
+        // Specific knob wins over the generic one; the generic knob and the
+        // memory/core-scaled default live in
+        // clihelp::default_file_concurrency, shared with
+        // export::convert's file-level parallelism.
+        std::env::var("ABGEN_JIT_FILE_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(crate::clihelp::default_file_concurrency)
     })
 }
 

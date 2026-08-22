@@ -1,10 +1,44 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use crate::builder::{build_bundle, BuildOpts};
 use crate::export::{HostInfo, Input, Kind, Sink};
 use crate::hashes::sha256_hex;
 use crate::naming;
 use crate::validate::{validate_bundle_parsed, Severity, ValidateCtx};
+
+/// Records every event a file's conversion emits, in call order, instead of
+/// forwarding it straight to the real sink. Lets `convert` run several
+/// files' `convert_one` concurrently while still flushing to the real sink
+/// in input order — the on-wire event stream stays identical to the serial
+/// loop's, byte for byte.
+#[derive(Default)]
+struct BufferedSink {
+    events: Mutex<Vec<(Kind, Vec<u8>)>>,
+}
+
+impl BufferedSink {
+    fn into_events(self) -> Vec<(Kind, Vec<u8>)> {
+        self.events.into_inner().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Sink for BufferedSink {
+    fn emit(&self, kind: Kind, bytes: &[u8]) {
+        let mut g = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        g.push((kind, bytes.to_vec()));
+    }
+}
+
+/// How many files `convert` converts at once. Delegates to
+/// [`crate::clihelp::default_file_concurrency`], the same runtime-scaled
+/// default (and `ABGEN_FILE_CONCURRENCY` override) `live::corpus_file_jobs`
+/// uses for the JIT path, so both hosts agree on how many cores/how much
+/// memory justifies running that many files at once.
+fn file_concurrency() -> usize {
+    crate::clihelp::default_file_concurrency()
+}
 
 fn ext_of(name: &str) -> String {
     match name.rsplit('.').next() {
@@ -209,6 +243,20 @@ fn convert_one(
 }
 
 pub fn convert(input: Input, sink: &dyn Sink, host: HostInfo) -> crate::Result<()> {
+    convert_with_jobs(input, sink, host, file_concurrency())
+}
+
+/// `convert`'s body, with the file-level worker count passed in explicitly
+/// instead of read from [`file_concurrency`] — lets tests exercise the
+/// serial and parallel dispatch paths deterministically in one process,
+/// where `file_concurrency`'s cached, env/runtime-derived value can't be
+/// changed after the first call.
+fn convert_with_jobs(
+    input: Input,
+    sink: &dyn Sink,
+    host: HostInfo,
+    jobs: usize,
+) -> crate::Result<()> {
     let target = target_of(&input.platform, sink);
     let entity_type = entity_type_of(&input);
     let (content_by_file, bytes_by_hash) = content_maps(&input.files);
@@ -240,10 +288,50 @@ pub fn convert(input: Input, sink: &dyn Sink, host: HostInfo) -> crate::Result<(
     let mut built: Vec<String> = Vec::new();
     let mut failures = 0usize;
 
-    for (name, data) in glbs {
-        match convert_one(&ctx, name, data, true, sink) {
-            Some(bundle) => built.push(bundle),
-            None => failures += 1,
+    let jobs = jobs.clamp(1, glbs.len().max(1));
+    if jobs <= 1 {
+        for (name, data) in glbs {
+            match convert_one(&ctx, name, data, true, sink) {
+                Some(bundle) => built.push(bundle),
+                None => failures += 1,
+            }
+        }
+    } else {
+        // Bounded file-level parallelism: each of `jobs` worker threads
+        // pulls the next unclaimed file index and converts it into its own
+        // BufferedSink, so files run concurrently. Results are collected
+        // into per-index slots and flushed to `sink` in original input
+        // order afterward, so the event stream and `built`/`failures`
+        // bookkeeping match the serial loop exactly.
+        let next = AtomicUsize::new(0);
+        let slots: Vec<Mutex<Option<(Option<String>, Vec<(Kind, Vec<u8>)>)>>> =
+            (0..glbs.len()).map(|_| Mutex::new(None)).collect();
+        std::thread::scope(|s| {
+            for _ in 0..jobs {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((name, data)) = glbs.get(i) else {
+                        break;
+                    };
+                    let buf = BufferedSink::default();
+                    let bundle = convert_one(&ctx, name, data, true, &buf);
+                    *slots[i].lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((bundle, buf.into_events()));
+                });
+            }
+        });
+        for slot in slots {
+            let (bundle, events) = slot
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("every file index is claimed by exactly one worker");
+            for (kind, bytes) in events {
+                sink.emit(kind, &bytes);
+            }
+            match bundle {
+                Some(b) => built.push(b),
+                None => failures += 1,
+            }
         }
     }
 
@@ -693,7 +781,7 @@ fn bake_lod(job: &LodJob, sink: &dyn Sink) -> crate::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::export::{parse_input, CollectingSink, HostInfo, InputBuilder};
+    use crate::export::{parse_input, Collected, CollectingSink, HostInfo, InputBuilder};
 
     const TEST_HOST: HostInfo = HostInfo::new("v-abgen-test", "test://inline");
 
@@ -762,5 +850,64 @@ mod tests {
             o.iter().map(|(n, d)| (n.clone(), sha256_hex(d))).collect()
         };
         assert_eq!(digest(&a), digest(&b));
+    }
+
+    /// A distinct-content tiny glTF per tag, so a multi-file scene produces
+    /// distinct bundle names instead of deduping to one.
+    fn tiny_gltf_tagged(tag: &str) -> Vec<u8> {
+        let base = String::from_utf8(tiny_gltf()).expect("tiny_gltf is utf8");
+        base.replace("\"tri\"", &format!("\"tri_{tag}\""))
+            .into_bytes()
+    }
+
+    fn convert_multi_glb(jobs: usize) -> (Collected, usize) {
+        let n = 5;
+        let mut b = InputBuilder::new();
+        for i in 0..n {
+            b = b.file(
+                format!("models/m{i}.gltf"),
+                tiny_gltf_tagged(&format!("{i}")),
+            );
+        }
+        let blob = b
+            .file(
+                "scene.json",
+                br#"{"scene":{"base":"0,0","parcels":["0,0"]}}"#.to_vec(),
+            )
+            .platform("windows")
+            .build();
+        let input = parse_input(&blob).expect("request parses");
+        let sink = CollectingSink::new();
+        convert_with_jobs(input, &sink, TEST_HOST, jobs).expect("convert");
+        (sink.take(), n)
+    }
+
+    /// The whole point of file-level parallelism is that it must be
+    /// invisible from the outside: same bundles, same bytes, same manifest,
+    /// and — because `convert` buffers each file's events and flushes them
+    /// in input order — the exact same JSON event sequence, whether the
+    /// files run one at a time or `jobs` at a time.
+    #[test]
+    fn concurrency_does_not_change_output_or_event_order() {
+        let (serial, n) = convert_multi_glb(1);
+        let (parallel, _) = convert_multi_glb(8);
+
+        assert!(serial.errors.is_empty(), "{:?}", serial.errors);
+        assert!(parallel.errors.is_empty(), "{:?}", parallel.errors);
+        assert_eq!(serial.outputs.len(), n, "expected one bundle per model");
+
+        assert_eq!(
+            serial.events, parallel.events,
+            "event stream diverged between jobs=1 and jobs=8"
+        );
+        let digest = |o: &[(String, Vec<u8>)]| -> Vec<(String, String)> {
+            o.iter().map(|(n, d)| (n.clone(), sha256_hex(d))).collect()
+        };
+        assert_eq!(
+            digest(&serial.outputs),
+            digest(&parallel.outputs),
+            "output bundle names/bytes diverged between jobs=1 and jobs=8"
+        );
+        assert_eq!(serial.manifest, parallel.manifest);
     }
 }
