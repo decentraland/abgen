@@ -29,9 +29,6 @@ runs:
       shell: bash
       run: |
         mkdir -p /var/tmp/abgen-nixcache
-        # A dir without nix-cache-info is not a valid binary cache; Priority
-        # 10 beats cache.nixos.org (40) so local nars win the substituter
-        # race.
         [ -f /var/tmp/abgen-nixcache/nix-cache-info ] ||
           printf 'StoreDir: /nix/store\nPriority: 10\n' \
             > /var/tmp/abgen-nixcache/nix-cache-info
@@ -42,12 +39,7 @@ runs:
         extra-conf: |
           max-jobs = auto
           cores = 0
-          # Evaluation must never build: IFD would break cross-system eval
-          # and hide build work inside eval steps. Enforced here so a crane
-          # arg regression fails loudly instead of quietly re-introducing it.
           allow-import-from-derivation = false
-          # trusted=1 scopes the unsigned-nar allowance to OUR store only;
-          # cache.nixos.org keeps full signature checking.
           extra-substituters = file:///var/tmp/abgen-nixcache?trusted=1
 
     - name: record installer store baseline
@@ -68,8 +60,6 @@ runs:
         GH_TOKEN: ${{ github.token }}
         KEY: ${{ steps.restore.outputs.cache-primary-key }}
       run: |
-        # Fail-open on every path: an API error or missing permission is a
-        # miss (slower run), never a red job.
         id=$(gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$KEY&per_page=100" \
           --jq '[.artifacts[] | select(.expired == false and .size_in_bytes > 0 and .workflow_run.repository_id != null and .workflow_run.head_repository_id == .workflow_run.repository_id)] | sort_by(.updated_at) | last | .id // empty' \
           2>/dev/null || true)

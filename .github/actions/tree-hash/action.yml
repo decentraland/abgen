@@ -21,10 +21,6 @@ runs:
     - id: h
       shell: bash
       run: |
-        # release.yml:        publishing orchestration, runs no tests
-        # *.md:               prose
-        # cargo scope only — nix/, flake.*: the nix lanes' world; cargo
-        # lanes use rustup
         if [ "${{ inputs.scope }}" = "cargo" ]; then
           h=$(git ls-tree -r HEAD | awk -F'\t' '
             $2 !~ /^nix\// &&

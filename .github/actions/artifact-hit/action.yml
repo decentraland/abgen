@@ -22,9 +22,6 @@ runs:
         GH_TOKEN: ${{ github.token }}
         NAME: ${{ inputs.name }}
       run: |
-        # Fail-open: an API error is a miss (the lane runs), never a red
-        # job. NAME goes through env, never template-interpolated into the
-        # script (this action holds a token).
         n=$(gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$NAME&per_page=100" \
           --jq '[.artifacts[] | select(.expired == false and .size_in_bytes > 0 and .workflow_run.repository_id != null and .workflow_run.head_repository_id == .workflow_run.repository_id)] | length' \
           2>/dev/null || echo 0)
