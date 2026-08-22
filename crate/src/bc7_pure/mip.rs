@@ -1054,8 +1054,9 @@ fn box_halve_neon_serial(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, u
     (out, nw, nh)
 }
 
-#[cfg(all(test, target_arch = "aarch64"))]
+#[cfg(test)]
 fn box_halve_serial(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
+    #[cfg(target_arch = "aarch64")]
     if w > 1 && h > 1 {
         return box_halve_neon_serial(arr, w, h);
     }
@@ -1066,7 +1067,7 @@ fn box_halve_serial(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize)
 /// except the f32 ingest loop and the box_halve calls use the pre-parallelization
 /// bodies. `level_to_blocks` and the block-compress stage are untouched by the
 /// row-parallel change, so they are called as-is (shared with the real function).
-#[cfg(all(test, target_arch = "aarch64"))]
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn encode_bc7_mip_chain_with_profile_uncached_serial(
     rgba: &[u8],
@@ -1249,7 +1250,7 @@ fn encode_rgba32_mip_chain_serial(
     (parts, mip_count)
 }
 
-#[cfg(all(test, target_arch = "aarch64"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1265,6 +1266,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn neon_box_halve_matches_scalar() {
         let mut rng = Rng(0xdead_beef_cafe_f00d);
