@@ -47,11 +47,6 @@
           (builtins.hashFile "sha256" ./nix/build.nix)
         ]));
 
-      buildEnv = {
-        ABGEN_BUILD_ID = buildId;
-        SOURCE_DATE_EPOCH = sourceDateEpoch;
-      };
-
       rustChannel = (builtins.fromTOML
         (builtins.readFile ./rust-toolchain.toml)).toolchain.channel;
 
@@ -61,6 +56,14 @@
         let
           pkgs = import nixpkgs { inherit system; };
           craneLib = crane.mkLib pkgs;
+
+          buildEnv = {
+            ABGEN_BUILD_ID = buildId;
+            SOURCE_DATE_EPOCH = sourceDateEpoch;
+          } // lib.optionalAttrs (system == "aarch64-linux") {
+            # Graviton2 floor; matches -mcpu=neoverse-n1 in the C codec build.rs.
+            RUSTFLAGS = "-C target-cpu=neoverse-n1";
+          };
 
           _toolchainMatches = lib.assertMsg (pkgs.rustc.version == rustChannel) ''
             toolchain mismatch: rust-toolchain.toml pins ${rustChannel} but this
