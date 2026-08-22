@@ -65,6 +65,16 @@ fn lock() -> std::sync::MutexGuard<'static, Store> {
     store().lock().unwrap_or_else(|e| e.into_inner())
 }
 
+pub(crate) fn content_key(
+    kind: Kind,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    params: &[i64],
+) -> [u8; 32] {
+    key(kind, pixels, width, height, params)
+}
+
 fn key(kind: Kind, pixels: &[u8], width: u32, height: u32, params: &[i64]) -> [u8; 32] {
     let mut h = crate::hashes::Sha256::new();
     // Fold in the encoder build id so a stale on-disk entry from a previous

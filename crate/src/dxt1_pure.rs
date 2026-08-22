@@ -24,7 +24,87 @@ fn unpack_565(c: u16) -> [u8; 3] {
     ]
 }
 
+/// Detects a solid-RGB block: 16 pixels whose R,G,B bytes are all equal
+/// (alpha is never read by either encoder path, so it is excluded from the
+/// comparison via the `0x00FF_FFFF` mask; R is byte 0, the LE low byte).
+#[inline]
+fn solid_rgb(rgba: &[u8; 64]) -> Option<(u8, u8, u8)> {
+    let w0 = u32::from_le_bytes([rgba[0], rgba[1], rgba[2], rgba[3]]) & 0x00FF_FFFF;
+    for i in 1..16 {
+        let w = u32::from_le_bytes([
+            rgba[i * 4],
+            rgba[i * 4 + 1],
+            rgba[i * 4 + 2],
+            rgba[i * 4 + 3],
+        ]) & 0x00FF_FFFF;
+        if w != w0 {
+            return None;
+        }
+    }
+    Some((rgba[0], rgba[1], rgba[2]))
+}
+
+/// Step-by-step specialization of `encode_block_scalar` for a solid-RGB
+/// block; see the DXT1 determinism proof in the module docs / task guideline
+/// for why every branch below is forced.
+fn encode_block_solid(r: u8, g: u8, b: u8) -> [u8; BLOCK_SIZE] {
+    let mut c0 = pack_565(r, g, b);
+    let mut c1 = c0;
+
+    if c1 > 0 {
+        c1 -= 1;
+    } else {
+        c0 += 1;
+    }
+    // c0 > c1 always holds here, so the swap in the general path never fires.
+
+    let ep0 = unpack_565(c0);
+    let ep1 = unpack_565(c1);
+    let palette: [[u8; 3]; 4] = [
+        ep0,
+        ep1,
+        [
+            ((2u16 * ep0[0] as u16 + ep1[0] as u16) / 3) as u8,
+            ((2u16 * ep0[1] as u16 + ep1[1] as u16) / 3) as u8,
+            ((2u16 * ep0[2] as u16 + ep1[2] as u16) / 3) as u8,
+        ],
+        [
+            ((ep0[0] as u16 + 2u16 * ep1[0] as u16) / 3) as u8,
+            ((ep0[1] as u16 + 2u16 * ep1[1] as u16) / 3) as u8,
+            ((ep0[2] as u16 + 2u16 * ep1[2] as u16) / 3) as u8,
+        ],
+    ];
+
+    let mut best = 0u32;
+    let mut best_err = i32::MAX;
+    for (k, pc) in palette.iter().enumerate() {
+        let dr = r as i32 - pc[0] as i32;
+        let dg = g as i32 - pc[1] as i32;
+        let db = b as i32 - pc[2] as i32;
+        let e = dr * dr + dg * dg + db * db;
+        if e < best_err {
+            best_err = e;
+            best = k as u32;
+        }
+    }
+    let bits = 0x5555_5555u32.wrapping_mul(best);
+
+    let mut out = [0u8; BLOCK_SIZE];
+    out[0] = (c0 & 0xFF) as u8;
+    out[1] = ((c0 >> 8) & 0xFF) as u8;
+    out[2] = (c1 & 0xFF) as u8;
+    out[3] = ((c1 >> 8) & 0xFF) as u8;
+    out[4] = (bits & 0xFF) as u8;
+    out[5] = ((bits >> 8) & 0xFF) as u8;
+    out[6] = ((bits >> 16) & 0xFF) as u8;
+    out[7] = ((bits >> 24) & 0xFF) as u8;
+    out
+}
+
 fn encode_block(rgba: &[u8; 64]) -> [u8; BLOCK_SIZE] {
+    if let Some((r, g, b)) = solid_rgb(rgba) {
+        return encode_block_solid(r, g, b);
+    }
     #[cfg(target_arch = "aarch64")]
     {
         neon::encode_block_neon(rgba)
@@ -988,6 +1068,80 @@ mod tests {
             let sc = encode_block_scalar(blk);
             let ne = neon::encode_block_neon(blk);
             assert_eq!(sc, ne, "block {bi} diverged: scalar {sc:?} vs neon {ne:?}");
+        }
+    }
+
+    fn solid_block(r: u8, g: u8, b: u8, alpha_varies: bool) -> [u8; 64] {
+        let mut blk = [0u8; 64];
+        for i in 0..16 {
+            blk[i * 4] = r;
+            blk[i * 4 + 1] = g;
+            blk[i * 4 + 2] = b;
+            blk[i * 4 + 3] = if alpha_varies { (i * 16) as u8 } else { 255 };
+        }
+        blk
+    }
+
+    #[test]
+    fn solid_fast_path_matches_scalar_and_neon() {
+        let boundary: [u8; 14] = [0, 1, 3, 4, 7, 8, 131, 132, 247, 248, 251, 252, 254, 255];
+        for &r in &boundary {
+            for &g in &boundary {
+                for &b in &boundary {
+                    let blk = solid_block(r, g, b, false);
+                    let fast = encode_block_solid(r, g, b);
+                    let sc = encode_block_scalar(&blk);
+                    assert_eq!(fast, sc, "boundary mismatch r={r} g={g} b={b}");
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        let ne = neon::encode_block_neon(&blk);
+                        assert_eq!(fast, ne, "boundary NEON mismatch r={r} g={g} b={b}");
+                    }
+                }
+            }
+        }
+
+        let mut s = 0x51D0_1234_ABCD_EF00u64;
+        for _ in 0..4096 {
+            let r = (xorshift(&mut s) & 0xFF) as u8;
+            let g = (xorshift(&mut s) & 0xFF) as u8;
+            let b = (xorshift(&mut s) & 0xFF) as u8;
+            let blk = solid_block(r, g, b, false);
+            let fast = encode_block_solid(r, g, b);
+            let sc = encode_block_scalar(&blk);
+            assert_eq!(fast, sc, "random mismatch r={r} g={g} b={b}");
+            #[cfg(target_arch = "aarch64")]
+            {
+                let ne = neon::encode_block_neon(&blk);
+                assert_eq!(fast, ne, "random NEON mismatch r={r} g={g} b={b}");
+            }
+        }
+
+        // Solid RGB with per-pixel varying alpha must still hit the fast path
+        // (alpha is never read by either encoder) and match the scalar output.
+        let blk = solid_block(0xAA, 0x55, 0x33, true);
+        let fast = encode_block(&blk);
+        let sc = encode_block_scalar(&blk);
+        assert_eq!(fast, sc, "alpha-varying solid block mismatch");
+        assert_eq!(fast, encode_block_solid(0xAA, 0x55, 0x33));
+    }
+
+    /// Exhaustive: every one of the 2^24 possible solid RGB colors, checked
+    /// against the unmodified scalar encoder. Release-mode only.
+    /// `cargo test --release --no-default-features --lib dxt1_pure -- --ignored`
+    #[test]
+    #[ignore]
+    fn solid_fast_path_matches_scalar_exhaustive() {
+        for r in 0u32..256 {
+            for g in 0u32..256 {
+                for b in 0u32..256 {
+                    let (r, g, b) = (r as u8, g as u8, b as u8);
+                    let blk = solid_block(r, g, b, false);
+                    let fast = encode_block_solid(r, g, b);
+                    let sc = encode_block_scalar(&blk);
+                    assert_eq!(fast, sc, "mismatch r={r} g={g} b={b}");
+                }
+            }
         }
     }
 }

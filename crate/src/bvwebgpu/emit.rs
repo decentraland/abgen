@@ -33,7 +33,7 @@ fn keep_raw(w: u32, h: u32, raw_len: usize) -> bool {
     w <= 2 || h <= 2 || encoded_dds_len(w, h) >= raw_len
 }
 
-fn encode_dds_bc7(rgba: &RgbaImage, srgb: bool, is_normal: bool) -> Result<Vec<u8>> {
+fn prepare_dds_bc7(rgba: &RgbaImage, srgb: bool, is_normal: bool) -> (Vec<u8>, u32, u32, bool) {
     let (w, h) = rgba.dimensions();
     let (tw, th) = crate::texprofile::bc7_target_size(w, h, super::BVW_TEXTURE_MAX);
     let mut buf = if (tw, th) != (w, h) {
@@ -52,16 +52,10 @@ fn encode_dds_bc7(rgba: &RgbaImage, srgb: bool, is_normal: bool) -> Result<Vec<u
         crate::alpha_bleed::alpha_bleed_inplace(&mut buf, tw, th);
     }
     let perceptual = srgb && !is_normal;
-    let (data, mips) = crate::bc7_pure::encode_bc7_mip_chain_with_profile(
-        &buf,
-        tw,
-        th,
-        None,
-        false,
-        srgb,
-        perceptual,
-        crate::bc7_pure::Bc7Profile::Basic,
-    );
+    (buf, tw, th, perceptual)
+}
+
+fn finish_dds_bc7(tw: u32, th: u32, data: Vec<u8>, mips: i32) -> Result<Vec<u8>> {
     let mut dds = ddsfile::Dds::new_dxgi(ddsfile::NewDxgiParams {
         height: th,
         width: tw,
@@ -79,6 +73,35 @@ fn encode_dds_bc7(rgba: &RgbaImage, srgb: bool, is_normal: bool) -> Result<Vec<u
     let mut out = Vec::new();
     dds.write(&mut out).map_err(|e| anyhow!("dds write: {e}"))?;
     Ok(out)
+}
+
+/// One `transform_glb` image, prepared for a batched BC7 encode: the
+/// downscaled+alpha-bled pixel buffer plus everything `finish_dds_bc7` and
+/// the root-mutation step need once the encode result comes back.
+struct PreparedBc7Image {
+    image_index: usize,
+    buf: Vec<u8>,
+    tw: u32,
+    th: u32,
+    srgb: bool,
+    perceptual: bool,
+    orig_w: u32,
+    orig_h: u32,
+}
+
+fn encode_dds_bc7(rgba: &RgbaImage, srgb: bool, is_normal: bool) -> Result<Vec<u8>> {
+    let (buf, tw, th, perceptual) = prepare_dds_bc7(rgba, srgb, is_normal);
+    let (data, mips) = crate::bc7_pure::encode_bc7_mip_chain_with_profile(
+        &buf,
+        tw,
+        th,
+        None,
+        false,
+        srgb,
+        perceptual,
+        crate::bc7_pure::Bc7Profile::Basic,
+    );
+    finish_dds_bc7(tw, th, data, mips)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -651,17 +674,49 @@ pub(crate) fn transform_glb(
         }
     }
 
+    let mut prepared: Vec<PreparedBc7Image> = Vec::new();
     for (i, plan) in plans.into_iter().enumerate() {
         let Some((rgba, srgb, is_normal)) = plan else {
             continue;
         };
-        let dds =
-            encode_dds_bc7(&rgba, srgb, is_normal).with_context(|| format!("encode image[{i}]"))?;
-        debug_assert_eq!(dds.len(), encoded_dds_len(rgba.width(), rgba.height()));
+        let (orig_w, orig_h) = rgba.dimensions();
+        let (buf, tw, th, perceptual) = prepare_dds_bc7(&rgba, srgb, is_normal);
+        prepared.push(PreparedBc7Image {
+            image_index: i,
+            buf,
+            tw,
+            th,
+            srgb,
+            perceptual,
+            orig_w,
+            orig_h,
+        });
+    }
+    let reqs: Vec<crate::bc7_pure::Bc7ChainRequest> = prepared
+        .iter()
+        .map(|p| crate::bc7_pure::Bc7ChainRequest {
+            rgba: &p.buf,
+            width: p.tw,
+            height: p.th,
+            mip_count: None,
+            flip: false,
+            srgb: p.srgb,
+            perceptual: p.perceptual,
+            profile: crate::bc7_pure::Bc7Profile::Basic,
+        })
+        .collect();
+    let results = crate::bc7_pure::encode_bc7_mip_chain_with_profile_batch(&reqs);
+    drop(reqs);
+
+    for (p, (data, mips)) in prepared.iter().zip(results) {
+        let dds = finish_dds_bc7(p.tw, p.th, data, mips)
+            .with_context(|| format!("encode image[{}]", p.image_index))?;
+        debug_assert_eq!(dds.len(), encoded_dds_len(p.orig_w, p.orig_h));
         let vidx = append_bytes_view(&mut root, &mut new_bin, &dds, Some("BC7_Data"));
-        root.images[i].buffer_view = Some(Index::new(vidx));
-        root.images[i].uri = None;
-        root.images[i].mime_type = Some(gltf_json::image::MimeType("image/vnd-ms.dds".into()));
+        root.images[p.image_index].buffer_view = Some(Index::new(vidx));
+        root.images[p.image_index].uri = None;
+        root.images[p.image_index].mime_type =
+            Some(gltf_json::image::MimeType("image/vnd-ms.dds".into()));
     }
 
     if let Some(p) = &mesh_plan {
@@ -799,6 +854,47 @@ pub(crate) mod tests {
         let zombie = &root.buffer_views[0];
         assert_eq!(zombie.byte_length.0, 0);
         assert_eq!(zombie.byte_offset.map(|o| o.0), Some(0));
+    }
+
+    #[test]
+    fn transform_glb_batch_matches_scalar_encode_per_image() {
+        let png0 = noise_png_bytes(16, 16);
+        let png1 = noise_png_bytes(32, 16);
+        let mut bin = png0.clone();
+        pad4(&mut bin, 0);
+        let off1 = bin.len();
+        bin.extend_from_slice(&png1);
+        let gltf = json!({
+            "images": [
+                {"bufferView": 0, "mimeType": "image/png"},
+                {"bufferView": 1, "mimeType": "image/png"}
+            ],
+            "textures": [{"source": 0}, {"source": 1}],
+            "materials": [
+                {"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}},
+                {"pbrMetallicRoughness": {"baseColorTexture": {"index": 1}}}
+            ],
+            "bufferViews": [
+                {"buffer": 0, "byteOffset": 0, "byteLength": png0.len()},
+                {"buffer": 0, "byteOffset": off1, "byteLength": png1.len()}
+            ]
+        });
+        let out = transform_glb(&mk_glb(gltf, &bin), ".glb", None, true).unwrap();
+        let (root, obin) = out_root_and_bin(&out);
+
+        for (idx, png) in [png0, png1].iter().enumerate() {
+            let dds = dds_of(&root, &obin, idx);
+            let img = image::load_from_memory(png).unwrap().to_rgba8();
+            let expected_dds_bytes = encode_dds_bc7(&img, true, false).unwrap();
+            let expected = ddsfile::Dds::read(std::io::Cursor::new(&expected_dds_bytes)).unwrap();
+            assert_eq!(dds.get_width(), expected.get_width());
+            assert_eq!(dds.get_height(), expected.get_height());
+            assert_eq!(
+                dds.get_num_mipmap_levels(),
+                expected.get_num_mipmap_levels()
+            );
+            assert_eq!(dds.data, expected.data);
+        }
     }
 
     #[test]

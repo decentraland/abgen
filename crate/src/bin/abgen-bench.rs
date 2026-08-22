@@ -67,10 +67,20 @@ impl Sink for TimingSink {
         }
     }
 
+    /// The digest/byte counts must be identical whether an output arrives
+    /// via `emit_output` or via a default-framed `emit(Kind::Output)`:
+    /// `split_output` is the exact inverse of `Sink::emit_output`'s default
+    /// framing (pinned by `export::tests::output_payload_roundtrips`).
     fn emit(&self, kind: Kind, bytes: &[u8]) {
         if kind == Kind::Output {
+            let len = export::split_output(bytes)
+                .map(|(_, data)| data.len())
+                .unwrap_or(bytes.len());
             if let Ok(mut n) = self.bytes_out.lock() {
-                *n += bytes.len() as u64;
+                *n += len as u64;
+            }
+            if let Ok(mut n) = self.bundles.lock() {
+                *n += 1;
             }
             return;
         }
@@ -115,8 +125,18 @@ impl Sink for HashSink {
         }
     }
 
+    /// The digest/byte counts must be identical whether an output arrives
+    /// via `emit_output` or via a default-framed `emit(Kind::Output)`:
+    /// `split_output` is the exact inverse of `Sink::emit_output`'s default
+    /// framing (pinned by `export::tests::output_payload_roundtrips`).
     fn emit(&self, kind: Kind, bytes: &[u8]) {
         if kind != Kind::Output {
+            return;
+        }
+        if let Some((name, data)) = export::split_output(bytes) {
+            if let Ok(mut p) = self.pairs.lock() {
+                p.push((name, hashes::sha256_hex(&data)));
+            }
             return;
         }
         let n = match self.anon.lock() {
@@ -466,5 +486,74 @@ fn main() {
         for (name, d) in files.iter().take(8) {
             println!("    {:>7.0}ms  {}", ms(**d), name);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hand-builds the frame `Sink::emit_output`'s default impl produces:
+    /// name_len LE u32 + name + data_len LE u32 + data (export/mod.rs:22-29).
+    fn frame(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut blob = Vec::with_capacity(8 + name.len() + data.len());
+        blob.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        blob.extend_from_slice(name.as_bytes());
+        blob.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        blob.extend_from_slice(data);
+        blob
+    }
+
+    #[test]
+    fn hash_sink_decodes_framed_outputs() {
+        let name = "abc_windows";
+        let data = [7u8, 8, 9];
+
+        let framed = HashSink::default();
+        framed.emit(Kind::Output, &frame(name, &data));
+        let framed_pairs = framed.pairs.into_inner().unwrap_or_default();
+
+        let direct = HashSink::default();
+        direct.emit_output(name, &data);
+        let direct_pairs = direct.pairs.into_inner().unwrap_or_default();
+
+        assert_eq!(
+            framed_pairs,
+            vec![(name.to_string(), hashes::sha256_hex(&data))]
+        );
+        assert_eq!(framed_pairs, direct_pairs);
+    }
+
+    #[test]
+    fn hash_sink_falls_back_on_malformed_blob() {
+        let sink = HashSink::default();
+        sink.emit(Kind::Output, b"junk");
+        let pairs = sink.pairs.into_inner().unwrap_or_default();
+        assert_eq!(
+            pairs,
+            vec![("!raw-output-1".to_string(), hashes::sha256_hex(b"junk"))]
+        );
+    }
+
+    #[test]
+    fn timing_sink_counts_bundle_bytes_not_framing() {
+        let name = "abc_windows";
+        let data = [1u8, 2, 3, 4, 5];
+
+        let framed = TimingSink::new();
+        framed.emit(Kind::Output, &frame(name, &data));
+
+        let direct = TimingSink::new();
+        direct.emit_output(name, &data);
+
+        assert_eq!(
+            *framed.bytes_out.lock().unwrap(),
+            *direct.bytes_out.lock().unwrap()
+        );
+        assert_eq!(*framed.bytes_out.lock().unwrap(), data.len() as u64);
+        assert_eq!(
+            *framed.bundles.lock().unwrap(),
+            *direct.bundles.lock().unwrap()
+        );
     }
 }

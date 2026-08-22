@@ -1,4 +1,5 @@
 use super::*;
+use rayon::prelude::*;
 
 fn is_psd(raw: &[u8]) -> bool {
     raw.len() >= 4 && &raw[0..4] == b"8BPS"
@@ -230,26 +231,31 @@ fn encode_dxt5_mip_chain_real_uncached(img: &RgbaImage, mips: i32, srgb: bool) -
     let (w, h) = (w as usize, h as usize);
     let src = img.as_raw();
     let mut flipped = vec![0u8; w * h * 4];
-    for y in 0..h {
-        flipped[y * w * 4..(y + 1) * w * 4]
-            .copy_from_slice(&src[(h - 1 - y) * w * 4..(h - y) * w * 4]);
-    }
+    flipped
+        .par_chunks_mut(w * 4)
+        .enumerate()
+        .for_each(|(y, dst)| {
+            dst.copy_from_slice(&src[(h - 1 - y) * w * 4..(h - y) * w * 4]);
+        });
     let mut cur: Vec<f32> = vec![0f32; w * h * 4];
-    for i in 0..(w * h) {
-        let r = flipped[i * 4];
-        let g = flipped[i * 4 + 1];
-        let b = flipped[i * 4 + 2];
-        if srgb {
-            cur[i * 4] = bc7_pure::srgb_to_linear_u8(r);
-            cur[i * 4 + 1] = bc7_pure::srgb_to_linear_u8(g);
-            cur[i * 4 + 2] = bc7_pure::srgb_to_linear_u8(b);
-        } else {
-            cur[i * 4] = r as f32;
-            cur[i * 4 + 1] = g as f32;
-            cur[i * 4 + 2] = b as f32;
+    cur.par_chunks_mut(w * 4).enumerate().for_each(|(y, dst)| {
+        let row = &flipped[y * w * 4..(y + 1) * w * 4];
+        for x in 0..w {
+            let r = row[x * 4];
+            let g = row[x * 4 + 1];
+            let b = row[x * 4 + 2];
+            if srgb {
+                dst[x * 4] = bc7_pure::srgb_to_linear_u8(r);
+                dst[x * 4 + 1] = bc7_pure::srgb_to_linear_u8(g);
+                dst[x * 4 + 2] = bc7_pure::srgb_to_linear_u8(b);
+            } else {
+                dst[x * 4] = r as f32;
+                dst[x * 4 + 1] = g as f32;
+                dst[x * 4 + 2] = b as f32;
+            }
+            dst[x * 4 + 3] = row[x * 4 + 3] as f32;
         }
-        cur[i * 4 + 3] = flipped[i * 4 + 3] as f32;
-    }
+    });
     let (mut cw, mut ch) = (w, h);
     let params = texpresso::Params {
         algorithm: texpresso::Algorithm::IterativeClusterFit,
@@ -261,18 +267,25 @@ fn encode_dxt5_mip_chain_real_uncached(img: &RgbaImage, mips: i32, srgb: bool) -
         let pw = cw.max(1);
         let ph = ch.max(1);
         let mut level_px = vec![0u8; pw * ph * 4];
-        for i in 0..(pw * ph) {
-            if srgb {
-                level_px[i * 4] = bc7_pure::linear_to_srgb_u8(cur[i * 4]);
-                level_px[i * 4 + 1] = bc7_pure::linear_to_srgb_u8(cur[i * 4 + 1]);
-                level_px[i * 4 + 2] = bc7_pure::linear_to_srgb_u8(cur[i * 4 + 2]);
-            } else {
-                level_px[i * 4] = bc7_pure::round_half_up_u8(cur[i * 4]);
-                level_px[i * 4 + 1] = bc7_pure::round_half_up_u8(cur[i * 4 + 1]);
-                level_px[i * 4 + 2] = bc7_pure::round_half_up_u8(cur[i * 4 + 2]);
-            }
-            level_px[i * 4 + 3] = bc7_pure::round_half_up_u8(cur[i * 4 + 3]);
-        }
+        level_px
+            .par_chunks_mut(pw * 4)
+            .enumerate()
+            .for_each(|(y, drow)| {
+                for x in 0..pw {
+                    let i = y * pw + x;
+                    let o = x * 4;
+                    if srgb {
+                        drow[o] = bc7_pure::linear_to_srgb_u8(cur[i * 4]);
+                        drow[o + 1] = bc7_pure::linear_to_srgb_u8(cur[i * 4 + 1]);
+                        drow[o + 2] = bc7_pure::linear_to_srgb_u8(cur[i * 4 + 2]);
+                    } else {
+                        drow[o] = bc7_pure::round_half_up_u8(cur[i * 4]);
+                        drow[o + 1] = bc7_pure::round_half_up_u8(cur[i * 4 + 1]);
+                        drow[o + 2] = bc7_pure::round_half_up_u8(cur[i * 4 + 2]);
+                    }
+                    drow[o + 3] = bc7_pure::round_half_up_u8(cur[i * 4 + 3]);
+                }
+            });
         let size = texpresso::Format::Bc3.compressed_size(pw, ph);
         let mut level = vec![0u8; size];
         texpresso::Format::Bc3.compress(&level_px, pw, ph, params, &mut level);
@@ -841,5 +854,116 @@ impl<'a> Builder<'a> {
             map! {"offset" => 0, "size" => 0, "path" => ""},
         );
         t
+    }
+}
+
+/// Serial reference for [`encode_dxt5_mip_chain_real_uncached`]: identical
+/// except the flip copy, the f32 ingest, and the per-mip quantize loop use
+/// their pre-parallelization row-at-a-time (but not `par_chunks_mut`) bodies.
+/// `bc7_pure::box_halve` and `texpresso::Format::Bc3::compress` are untouched
+/// by this change and shared with the real function.
+#[cfg(test)]
+fn encode_dxt5_mip_chain_real_uncached_serial(
+    img: &RgbaImage,
+    mips: i32,
+    srgb: bool,
+) -> (Vec<u8>, i32) {
+    let (w, h) = img.dimensions();
+    let (w, h) = (w as usize, h as usize);
+    let src = img.as_raw();
+    let mut flipped = vec![0u8; w * h * 4];
+    for y in 0..h {
+        flipped[y * w * 4..(y + 1) * w * 4]
+            .copy_from_slice(&src[(h - 1 - y) * w * 4..(h - y) * w * 4]);
+    }
+    let mut cur: Vec<f32> = vec![0f32; w * h * 4];
+    for i in 0..(w * h) {
+        let r = flipped[i * 4];
+        let g = flipped[i * 4 + 1];
+        let b = flipped[i * 4 + 2];
+        if srgb {
+            cur[i * 4] = bc7_pure::srgb_to_linear_u8(r);
+            cur[i * 4 + 1] = bc7_pure::srgb_to_linear_u8(g);
+            cur[i * 4 + 2] = bc7_pure::srgb_to_linear_u8(b);
+        } else {
+            cur[i * 4] = r as f32;
+            cur[i * 4 + 1] = g as f32;
+            cur[i * 4 + 2] = b as f32;
+        }
+        cur[i * 4 + 3] = flipped[i * 4 + 3] as f32;
+    }
+    let (mut cw, mut ch) = (w, h);
+    let params = texpresso::Params {
+        algorithm: texpresso::Algorithm::IterativeClusterFit,
+        weights: texpresso::COLOUR_WEIGHTS_PERCEPTUAL,
+        weigh_colour_by_alpha: false,
+    };
+    let mut parts: Vec<u8> = Vec::new();
+    for m in 0..mips {
+        let pw = cw.max(1);
+        let ph = ch.max(1);
+        let mut level_px = vec![0u8; pw * ph * 4];
+        for i in 0..(pw * ph) {
+            if srgb {
+                level_px[i * 4] = bc7_pure::linear_to_srgb_u8(cur[i * 4]);
+                level_px[i * 4 + 1] = bc7_pure::linear_to_srgb_u8(cur[i * 4 + 1]);
+                level_px[i * 4 + 2] = bc7_pure::linear_to_srgb_u8(cur[i * 4 + 2]);
+            } else {
+                level_px[i * 4] = bc7_pure::round_half_up_u8(cur[i * 4]);
+                level_px[i * 4 + 1] = bc7_pure::round_half_up_u8(cur[i * 4 + 1]);
+                level_px[i * 4 + 2] = bc7_pure::round_half_up_u8(cur[i * 4 + 2]);
+            }
+            level_px[i * 4 + 3] = bc7_pure::round_half_up_u8(cur[i * 4 + 3]);
+        }
+        let size = texpresso::Format::Bc3.compressed_size(pw, ph);
+        let mut level = vec![0u8; size];
+        texpresso::Format::Bc3.compress(&level_px, pw, ph, params, &mut level);
+        parts.extend_from_slice(&level);
+        if m < mips - 1 {
+            let (next, nw, nh) = bc7_pure::box_halve(&cur, cw, ch);
+            cur = next;
+            cw = nw;
+            ch = nh;
+        }
+    }
+    (parts, mips)
+}
+
+#[cfg(test)]
+mod row_parallel_tests {
+    use super::*;
+
+    fn lcg_image(w: u32, h: u32, mut seed: u32) -> RgbaImage {
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        for b in buf.iter_mut() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (seed >> 24) as u8;
+        }
+        RgbaImage::from_raw(w, h, buf).unwrap()
+    }
+
+    #[test]
+    fn dxt5_mip_chain_matches_serial() {
+        let img = lcg_image(64, 48, 0xdead_10cc);
+        for &srgb in &[false, true] {
+            let par = encode_dxt5_mip_chain_real_uncached(&img, 4, srgb);
+            let serial = encode_dxt5_mip_chain_real_uncached_serial(&img, 4, srgb);
+            assert_eq!(par, serial, "dxt5 mip chain mismatch srgb={srgb}");
+        }
+    }
+
+    #[test]
+    fn dxt5_mip_chain_thread_count_invariant() {
+        let img = lcg_image(64, 48, 0xfeed_face);
+        let global = encode_dxt5_mip_chain_real_uncached(&img, 4, true);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let single = pool.install(|| encode_dxt5_mip_chain_real_uncached(&img, 4, true));
+        assert_eq!(
+            global, single,
+            "dxt5 mip chain must be invariant to thread count"
+        );
     }
 }

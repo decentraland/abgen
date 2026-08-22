@@ -763,7 +763,6 @@ pub(crate) fn encode_bc7_mip_chain(
 /// One texture's inputs for [`encode_bc7_mip_chain_batch`]; same fields as
 /// the positional arguments of [`encode_bc7_mip_chain`].
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct MipChainJob<'a> {
     pub rgba: &'a [u8],
     pub width: u32,
@@ -789,7 +788,6 @@ pub(crate) struct MipChainJob<'a> {
 /// already does), and wgpu's single queue serializes access to any buffer a
 /// later job's write_buffer/dispatch reuses from the pool.
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn encode_bc7_mip_chain_batch(jobs: &[MipChainJob]) -> Result<Vec<(Vec<u8>, i32)>> {
     let g = gpu().map_err(|e| anyhow!("wgpu unavailable: {e}"))?;
     let eng = engine(g);

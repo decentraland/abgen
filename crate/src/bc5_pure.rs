@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 const BC5_BLOCK_SIZE: usize = 16;
 
 fn fix_range(min: &mut u8, max: &mut u8, steps: u8) {
@@ -162,11 +164,15 @@ mod neon {
         (vaddvq_u32(sum), best_i)
     }
 
-    pub(super) unsafe fn encode_bc4_channel(vals: &[u8; 16], block: &mut [u8]) {
-        encode_bc4_channel_v(vld1q_u8(vals.as_ptr()), block)
+    /// Full (non-early-out) NEON channel encoder; used both as the general
+    /// fast-path fallthrough and, unconditionally, to build the uniform-value
+    /// LUT (calling the early-out entry point there would recurse into the
+    /// not-yet-initialized `OnceLock`).
+    pub(super) unsafe fn encode_bc4_channel_full(vals: &[u8; 16], block: &mut [u8]) {
+        encode_bc4_channel_v_full(vld1q_u8(vals.as_ptr()), block)
     }
 
-    pub(super) unsafe fn encode_bc4_channel_v(v: uint8x16_t, block: &mut [u8]) {
+    pub(super) unsafe fn encode_bc4_channel_v_full(v: uint8x16_t, block: &mut [u8]) {
         let mut min7 = vminvq_u8(v);
         let mut max7 = vmaxvq_u8(v);
         let mut min5 = vminvq_u8(vbslq_u8(vceqzq_u8(v), vdupq_n_u8(u8::MAX), v));
@@ -193,6 +199,48 @@ mod neon {
             super::write_alpha_block(max7, min7, &idx, block);
         }
     }
+
+    pub(super) unsafe fn encode_bc4_channel(vals: &[u8; 16], block: &mut [u8]) {
+        encode_bc4_channel_v(vld1q_u8(vals.as_ptr()), block)
+    }
+
+    /// Uniform-channel early out: `vminvq_u8 == vmaxvq_u8` iff all 16 lanes
+    /// hold the same byte, in which case the LUT already holds the full
+    /// encoder's own byte-for-byte output for that value.
+    pub(super) unsafe fn encode_bc4_channel_v(v: uint8x16_t, block: &mut [u8]) {
+        if vminvq_u8(v) == vmaxvq_u8(v) {
+            let x = vgetq_lane_u8::<0>(v);
+            block.copy_from_slice(&super::bc4_channel_lut()[x as usize]);
+        } else {
+            encode_bc4_channel_v_full(v, block);
+        }
+    }
+}
+
+/// Pure dispatch of the full (non-early-out) channel encoder, used to build
+/// `bc4_channel_lut` and as the fallthrough for non-uniform channels.
+#[inline]
+fn encode_bc4_channel_full(vals: &[u8; 16], block: &mut [u8]) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        neon::encode_bc4_channel_full(vals, block)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    encode_bc4_channel_scalar(vals, block)
+}
+
+/// Exact per-value table of `encode_bc4_channel_full(&[v; 16], ..)`, i.e. the
+/// full encoder's own output for a uniform 16-byte channel; identical by
+/// construction. Built once (~13us) and reused for every uniform channel.
+fn bc4_channel_lut() -> &'static [[u8; 8]; 256] {
+    static LUT: OnceLock<Box<[[u8; 8]; 256]>> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t: Box<[[u8; 8]; 256]> = Box::new([[0u8; 8]; 256]);
+        for v in 0..=255u8 {
+            encode_bc4_channel_full(&[v; 16], &mut t[v as usize]);
+        }
+        t
+    })
 }
 
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
@@ -203,7 +251,14 @@ fn encode_bc4_channel(vals: &[u8; 16], block: &mut [u8]) {
         neon::encode_bc4_channel(vals, block)
     }
     #[cfg(not(target_arch = "aarch64"))]
-    encode_bc4_channel_scalar(vals, block)
+    {
+        let v0 = vals[0];
+        if vals.iter().all(|&x| x == v0) {
+            block.copy_from_slice(&bc4_channel_lut()[v0 as usize]);
+        } else {
+            encode_bc4_channel_full(vals, block);
+        }
+    }
 }
 
 /// BC5-compresses `padded` (RGBA, dimensions multiples of 4); the X channel is
@@ -791,6 +846,61 @@ mod tests {
             encode_bc4_channel(&vals, &mut simd);
             assert_eq!(scalar, simd, "NEON/scalar mismatch for {vals:?}");
         }
+    }
+
+    /// The uniform-channel LUT fast path (public dispatch on a solid 16-byte
+    /// channel) must match the full encoder's own output for every possible
+    /// value, both directly and through `compress_bc5_blocks` on a solid 4x4
+    /// block (which exercises the NEON `_v` entry on aarch64).
+    #[test]
+    fn uniform_channel_fast_path_matches_full() {
+        for v in 0..=255u8 {
+            let mut full = [0u8; 8];
+            let mut fast = [0u8; 8];
+            encode_bc4_channel_full(&[v; 16], &mut full);
+            encode_bc4_channel(&[v; 16], &mut fast);
+            assert_eq!(full, fast, "channel mismatch for v={v}");
+
+            let mut blk = vec![0u8; 4 * 4 * 4];
+            for px in blk.chunks_exact_mut(4) {
+                px[0] = v;
+                px[1] = v;
+                px[2] = 0;
+                px[3] = 255;
+            }
+            let mut ours = vec![0u8; BC5_BLOCK_SIZE];
+            compress_bc5_blocks(&blk, 4, 4, &mut ours);
+            assert_eq!(
+                &ours[0..8],
+                &full,
+                "compress_bc5_blocks X mismatch for v={v}"
+            );
+            assert_eq!(
+                &ours[8..16],
+                &full,
+                "compress_bc5_blocks Y mismatch for v={v}"
+            );
+        }
+    }
+
+    /// A block where channel X is uniform but Y is not must still match
+    /// texpresso byte-exactly (the fast path on X must not perturb Y).
+    #[test]
+    fn mixed_uniform_x_non_uniform_y_matches_texpresso() {
+        let mut blk = [0u8; 64];
+        for i in 0..16 {
+            blk[i * 4] = 77;
+            blk[i * 4 + 1] = (i * 17) as u8;
+            blk[i * 4 + 2] = 0;
+            blk[i * 4 + 3] = 255;
+        }
+        let mut ours = vec![0u8; BC5_BLOCK_SIZE];
+        compress_bc5_blocks(&blk, 4, 4, &mut ours);
+        assert_eq!(
+            ours,
+            texpresso_bc5(&blk, 4, 4),
+            "mismatch for mixed uniform/non-uniform block"
+        );
     }
 
     #[test]

@@ -248,17 +248,20 @@ impl Bundle {
         self.save_lz4_memo(None)
     }
 
-    pub fn save_lz4_memo(&self, memo: Option<&mut ChunkMemo>) -> Result<Vec<u8>> {
-        let mut file_data: Vec<u8> = Vec::new();
+    pub fn save_lz4_memo(&self, mut memo: Option<&mut ChunkMemo>) -> Result<Vec<u8>> {
+        use std::borrow::Cow;
+
+        let mut per_file: Vec<Cow<[u8]>> = Vec::with_capacity(self.files.len());
         let mut dir_nodes: Vec<DirNode> = Vec::new();
         let mut offset: i64 = 0;
+        let mut total_len: usize = 0;
         for entry in &self.files {
-            let bytes = match &entry.content {
-                FileContent::Serialized(sf) => sf.save(),
-                FileContent::Raw(b) => b.clone(),
+            let bytes: Cow<[u8]> = match &entry.content {
+                FileContent::Serialized(sf) => Cow::Owned(sf.save()),
+                FileContent::Raw(b) => Cow::Borrowed(b.as_slice()),
             };
             let len = bytes.len() as i64;
-            file_data.extend_from_slice(&bytes);
+            total_len += bytes.len();
             dir_nodes.push(DirNode {
                 offset,
                 size: len,
@@ -266,21 +269,26 @@ impl Bundle {
                 path: entry.name.clone(),
             });
             offset += len;
+            per_file.push(bytes);
         }
+        let mut file_data: Vec<u8> = Vec::with_capacity(total_len);
+        for b in &per_file {
+            file_data.extend_from_slice(b);
+        }
+        drop(per_file);
 
         let data_flag: u32 = 0x243;
         let block_info_flag: u16 = 3;
 
-        let (compressed_file_data, block_info) =
-            chunk_based_compress(&file_data, block_info_flag, memo);
+        let pieces = chunk_based_compress(&file_data, block_info_flag, memo.as_deref());
 
         let mut bw = Writer::new(true);
         bw.write_bytes(&[0u8; 16]);
-        bw.write_i32(block_info.len() as i32);
-        for b in &block_info {
-            bw.write_u32(b.uncompressed_size);
-            bw.write_u32(b.compressed_size);
-            bw.write_u16(b.flags);
+        bw.write_i32(pieces.len() as i32);
+        for (_, info, _) in &pieces {
+            bw.write_u32(info.uncompressed_size);
+            bw.write_u32(info.compressed_size);
+            bw.write_u16(info.flags);
         }
         bw.write_i32(dir_nodes.len() as i32);
         for node in &dir_nodes {
@@ -295,7 +303,23 @@ impl Bundle {
         let block_data = lz4hc_compress(&block_data_uncompressed);
         let compressed_block_data_size = block_data.len() as u32;
 
-        let mut w = Writer::new(true);
+        let compressed_len: usize = pieces.iter().map(|(b, _, _)| b.len()).sum();
+        let mut header_len = 8
+            + 4
+            + (self.version_player.len() + 1)
+            + (self.version_engine.len() + 1)
+            + 8
+            + 4
+            + 4
+            + 4;
+        if self.format_version >= 7 {
+            header_len = header_len.div_ceil(16) * 16;
+        }
+        let mut cap = header_len + block_data.len();
+        cap = cap.div_ceil(16) * 16;
+        cap += compressed_len;
+
+        let mut w = Writer::with_capacity(true, cap);
         w.write_cstr("UnityFS");
         w.write_u32(self.format_version);
         w.write_cstr(&self.version_player);
@@ -313,7 +337,15 @@ impl Bundle {
 
         w.write_bytes(&block_data);
         w.align_stream(16);
-        w.write_bytes(&compressed_file_data);
+
+        for (chunk_idx, (bytes, _info, fresh_comp)) in pieces.into_iter().enumerate() {
+            if let (Some(m), Some(comp)) = (memo.as_deref_mut(), fresh_comp) {
+                let start = chunk_idx * CHUNK_SIZE;
+                let end = (start + CHUNK_SIZE).min(file_data.len());
+                m.0.insert(file_data[start..end].to_vec(), comp);
+            }
+            w.write_bytes(&bytes);
+        }
 
         let end = w.buf.len() as i64;
         let size_bytes = end.to_be_bytes();
@@ -409,30 +441,35 @@ fn lz4hc_compress_cached(src: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Compresses `data` in parallel, chunk-by-chunk (already parallel via
+/// `par_chunks` before this change — this refactor only removes the
+/// intermediate `out` assembly copy, moving it into the caller which writes
+/// each piece directly into the final bundle Writer). Returns each piece
+/// paired with its `BlockInfo` (needed before the header can be written) and
+/// an optional freshly-compressed payload for the caller to memoize.
 fn chunk_based_compress(
     data: &[u8],
     block_info_flag: u16,
-    mut memo: Option<&mut ChunkMemo>,
-) -> (Vec<u8>, Vec<BlockInfo>) {
+    memo: Option<&ChunkMemo>,
+) -> Vec<(Vec<u8>, BlockInfo, Option<Vec<u8>>)> {
     let switch = (block_info_flag as u32) & COMPRESSION_MASK;
     if switch == 0 {
-        return (
+        return vec![(
             data.to_vec(),
-            vec![BlockInfo {
+            BlockInfo {
                 uncompressed_size: data.len() as u32,
                 compressed_size: data.len() as u32,
                 flags: block_info_flag,
-            }],
-        );
+            },
+            None,
+        )];
     }
 
     use rayon::prelude::*;
-    let lookup = memo.as_deref();
-    let pieces: Vec<(Vec<u8>, BlockInfo, Option<Vec<u8>>)> = data
-        .par_chunks(CHUNK_SIZE)
+    data.par_chunks(CHUNK_SIZE)
         .map(|chunk| {
-            let hit = lookup.and_then(|m| m.0.get(chunk)).cloned();
-            let fresh = hit.is_none() && lookup.is_some();
+            let hit = memo.and_then(|m| m.0.get(chunk)).cloned();
+            let fresh = hit.is_none() && memo.is_some();
             let comp = hit.unwrap_or_else(|| lz4hc_compress(chunk));
             let uncompressed_size = chunk.len() as u32;
 
@@ -459,26 +496,234 @@ fn chunk_based_compress(
                 }
             }
         })
-        .collect();
-
-    let total: usize = pieces.iter().map(|(b, _, _)| b.len()).sum();
-    let mut out = Vec::with_capacity(total);
-    let mut blocks = Vec::with_capacity(pieces.len());
-    for (chunk_idx, (bytes, info, fresh_comp)) in pieces.into_iter().enumerate() {
-        if let (Some(m), Some(comp)) = (memo.as_deref_mut(), fresh_comp) {
-            let start = chunk_idx * CHUNK_SIZE;
-            let end = (start + CHUNK_SIZE).min(data.len());
-            m.0.insert(data[start..end].to_vec(), comp);
-        }
-        out.extend_from_slice(&bytes);
-        blocks.push(info);
-    }
-    (out, blocks)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reference implementation of the compress step as it existed before
+    /// the copy-elimination refactor (round 4): assembles all compressed
+    /// pieces into an intermediate `out` buffer instead of writing them
+    /// straight into the caller's final Writer.
+    fn naive_chunk_based_compress(
+        data: &[u8],
+        block_info_flag: u16,
+        mut memo: Option<&mut ChunkMemo>,
+    ) -> (Vec<u8>, Vec<BlockInfo>) {
+        let switch = (block_info_flag as u32) & COMPRESSION_MASK;
+        if switch == 0 {
+            return (
+                data.to_vec(),
+                vec![BlockInfo {
+                    uncompressed_size: data.len() as u32,
+                    compressed_size: data.len() as u32,
+                    flags: block_info_flag,
+                }],
+            );
+        }
+
+        use rayon::prelude::*;
+        let lookup = memo.as_deref();
+        let pieces: Vec<(Vec<u8>, BlockInfo, Option<Vec<u8>>)> = data
+            .par_chunks(CHUNK_SIZE)
+            .map(|chunk| {
+                let hit = lookup.and_then(|m| m.0.get(chunk)).cloned();
+                let fresh = hit.is_none() && lookup.is_some();
+                let comp = hit.unwrap_or_else(|| lz4hc_compress(chunk));
+                let uncompressed_size = chunk.len() as u32;
+
+                if comp.len() > chunk.len() {
+                    (
+                        chunk.to_vec(),
+                        BlockInfo {
+                            uncompressed_size,
+                            compressed_size: uncompressed_size,
+                            flags: block_info_flag ^ (switch as u16),
+                        },
+                        fresh.then_some(comp),
+                    )
+                } else {
+                    let info = BlockInfo {
+                        uncompressed_size,
+                        compressed_size: comp.len() as u32,
+                        flags: block_info_flag,
+                    };
+                    if fresh {
+                        (comp.clone(), info, Some(comp))
+                    } else {
+                        (comp, info, None)
+                    }
+                }
+            })
+            .collect();
+
+        let total: usize = pieces.iter().map(|(b, _, _)| b.len()).sum();
+        let mut out = Vec::with_capacity(total);
+        let mut blocks = Vec::with_capacity(pieces.len());
+        for (chunk_idx, (bytes, info, fresh_comp)) in pieces.into_iter().enumerate() {
+            if let (Some(m), Some(comp)) = (memo.as_deref_mut(), fresh_comp) {
+                let start = chunk_idx * CHUNK_SIZE;
+                let end = (start + CHUNK_SIZE).min(data.len());
+                m.0.insert(data[start..end].to_vec(), comp);
+            }
+            out.extend_from_slice(&bytes);
+            blocks.push(info);
+        }
+        (out, blocks)
+    }
+
+    /// Reference implementation of `Bundle::save_lz4_memo` as it existed
+    /// before the copy-elimination refactor (round 4): clones every raw
+    /// entry, uses `SerializedFile`'s old data_w-buffer save, and the
+    /// `out`-assembling `naive_chunk_based_compress` above. Used to assert
+    /// the refactored save path is byte-identical.
+    fn naive_save_lz4(bundle: &Bundle, memo: Option<&mut ChunkMemo>) -> Result<Vec<u8>> {
+        let mut file_data: Vec<u8> = Vec::new();
+        let mut dir_nodes: Vec<DirNode> = Vec::new();
+        let mut offset: i64 = 0;
+        for entry in &bundle.files {
+            let bytes = match &entry.content {
+                FileContent::Serialized(sf) => crate::unity::serialized_file::naive_save(sf),
+                FileContent::Raw(b) => b.clone(),
+            };
+            let len = bytes.len() as i64;
+            file_data.extend_from_slice(&bytes);
+            dir_nodes.push(DirNode {
+                offset,
+                size: len,
+                flags: entry.flags,
+                path: entry.name.clone(),
+            });
+            offset += len;
+        }
+
+        let data_flag: u32 = 0x243;
+        let block_info_flag: u16 = 3;
+
+        let (compressed_file_data, block_info) =
+            naive_chunk_based_compress(&file_data, block_info_flag, memo);
+
+        let mut bw = Writer::new(true);
+        bw.write_bytes(&[0u8; 16]);
+        bw.write_i32(block_info.len() as i32);
+        for b in &block_info {
+            bw.write_u32(b.uncompressed_size);
+            bw.write_u32(b.compressed_size);
+            bw.write_u16(b.flags);
+        }
+        bw.write_i32(dir_nodes.len() as i32);
+        for node in &dir_nodes {
+            bw.write_i64(node.offset);
+            bw.write_i64(node.size);
+            bw.write_u32(node.flags);
+            bw.write_cstr(&node.path);
+        }
+        let block_data_uncompressed = bw.into_bytes();
+        let uncompressed_block_data_size = block_data_uncompressed.len() as u32;
+
+        let block_data = lz4hc_compress(&block_data_uncompressed);
+        let compressed_block_data_size = block_data.len() as u32;
+
+        let mut w = Writer::new(true);
+        w.write_cstr("UnityFS");
+        w.write_u32(bundle.format_version);
+        w.write_cstr(&bundle.version_player);
+        w.write_cstr(&bundle.version_engine);
+
+        let size_pos = w.position();
+        w.write_i64(0);
+        w.write_u32(compressed_block_data_size);
+        w.write_u32(uncompressed_block_data_size);
+        w.write_u32(data_flag);
+
+        if bundle.format_version >= 7 {
+            w.align_stream(16);
+        }
+
+        w.write_bytes(&block_data);
+        w.align_stream(16);
+        w.write_bytes(&compressed_file_data);
+
+        let end = w.buf.len() as i64;
+        let size_bytes = end.to_be_bytes();
+        w.buf[size_pos..size_pos + 8].copy_from_slice(&size_bytes);
+
+        Ok(w.into_bytes())
+    }
+
+    /// ~300KB of synthetic raw bytes: two `CHUNK_SIZE`-sized compressible
+    /// (repeating-pattern) chunks, followed by one `CHUNK_SIZE`-sized
+    /// incompressible chunk from a fixed LCG, so `comp.len() > chunk.len()`
+    /// for the last chunk and the stored-raw block-info branch is exercised.
+    fn synthetic_raw_payload() -> Vec<u8> {
+        let mut raw: Vec<u8> = Vec::with_capacity(3 * CHUNK_SIZE);
+        for _ in 0..2 {
+            for i in 0..CHUNK_SIZE {
+                raw.push((i % 4) as u8);
+            }
+        }
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        for _ in 0..CHUNK_SIZE {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            raw.push((x >> 56) as u8);
+        }
+        raw
+    }
+
+    #[test]
+    fn refactored_save_matches_naive() {
+        let path = template();
+        if !path.exists() {
+            eprintln!("template missing, skipping: {}", path.display());
+            return;
+        }
+
+        // (a) plain template roundtrip.
+        let bundle = Bundle::load(&path).expect("load template");
+        let refactored = bundle.save_lz4().expect("save_lz4");
+        let naive = naive_save_lz4(&bundle, None).expect("naive save_lz4");
+        assert_eq!(
+            refactored, naive,
+            "refactored save_lz4 must match naive reference byte-for-byte"
+        );
+
+        // (b) synthesize a bundle with an extra Raw entry big enough to
+        // exercise the stored-raw compression branch.
+        let mut synth = Bundle::load(&path).expect("load template for synth");
+        synth.files.push(BundleEntry {
+            name: "synthetic.raw".to_string(),
+            content: FileContent::Raw(synthetic_raw_payload()),
+            flags: 0,
+        });
+        let refactored2 = synth.save_lz4().expect("save_lz4 synth");
+        let naive2 = naive_save_lz4(&synth, None).expect("naive save_lz4 synth");
+        assert_eq!(
+            refactored2, naive2,
+            "refactored save_lz4 must match naive reference on synthesized bundle"
+        );
+
+        // (c) memoized save must be deterministic across repeated calls and
+        // still match the naive reference.
+        let mut memo = ChunkMemo::default();
+        let first = synth
+            .save_lz4_memo(Some(&mut memo))
+            .expect("save_lz4_memo pass1");
+        let second = synth
+            .save_lz4_memo(Some(&mut memo))
+            .expect("save_lz4_memo pass2");
+        assert_eq!(
+            first, second,
+            "memoized save_lz4_memo must be deterministic across repeated calls"
+        );
+        assert_eq!(
+            first, naive2,
+            "memoized save_lz4_memo must match naive reference"
+        );
+    }
 
     fn template() -> std::path::PathBuf {
         let root = std::env::var("ABGEN_ROOT")

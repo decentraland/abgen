@@ -1,5 +1,26 @@
 use super::templates::cab_node_name;
 use super::*;
+use crate::value::Map;
+
+/// Clones a `Value::Map`, replacing the top-level "image data" entry with an
+/// empty byte vector instead of cloning its (potentially multi-MB) contents.
+/// Used when the streamed texture's bytes are about to be discarded anyway.
+fn clone_map_dropping_image_data(tree: &Value) -> Value {
+    match tree {
+        Value::Map(m) => {
+            let mut out = Vec::with_capacity(m.0.len());
+            for (k, v) in m.0.iter() {
+                if k.as_str() == "image data" {
+                    out.push((k.clone(), Value::Bytes(Vec::new())));
+                } else {
+                    out.push((k.clone(), v.clone()));
+                }
+            }
+            Value::Map(Map(out))
+        }
+        other => other.clone(),
+    }
+}
 
 pub(super) enum ExternalsPolicy<'a> {
     ShaderRef {
@@ -116,14 +137,15 @@ pub(super) fn commit_objects(
         for (pid, sd) in &b.stream_data {
             if let Some((tn, tree)) = objects.get(pid) {
                 if tn == "Texture2D" {
-                    let mut tree = tree.clone();
+                    let mut tree = if sd.path.is_empty() {
+                        tree.clone()
+                    } else {
+                        clone_map_dropping_image_data(tree)
+                    };
                     tree.insert(
                         "m_StreamData",
                         map! {"offset" => sd.offset as i64, "size" => sd.size as i64, "path" => sd.path.clone()},
                     );
-                    if !sd.path.is_empty() {
-                        tree.insert("image data", Value::Bytes(Vec::new()));
-                    }
                     overrides.insert(*pid, tree);
                 }
             }
@@ -169,9 +191,20 @@ pub(super) fn commit_objects(
         }
     }
 
+    // Pass 1 (serial): register types in first-encounter order — this order
+    // is byte-load-bearing for the emitted SerializedFile — and collect the
+    // per-object work for pass 2. Any missing-node error is surfaced here so
+    // pass 2 can be infallible.
+    struct PendingObj<'a> {
+        path_id: i64,
+        type_id: i32,
+        class_id: i32,
+        type_name: &'a str,
+        tree: &'a Value,
+    }
     let mut used_types: Vec<SerializedType> = Vec::new();
     let mut type_index: HashMap<String, i32> = HashMap::new();
-    let mut out_objects: Vec<unity::Object> = Vec::new();
+    let mut pending: Vec<PendingObj> = Vec::with_capacity(objects.len());
     for (pid, (type_name, tree)) in objects.iter() {
         let tree = overrides.get(pid).unwrap_or(tree);
         if !type_index.contains_key(type_name) {
@@ -183,19 +216,42 @@ pub(super) fn commit_objects(
             used_types.push(st);
         }
         let tid = type_index[type_name];
-        let node = used_types[tid as usize]
-            .node
-            .as_ref()
-            .ok_or_else(|| anyhow!("type {type_name} has no node"))?;
-        let data = unity::write_typetree(tree, node, big_endian);
-        out_objects.push(unity::Object {
+        if used_types[tid as usize].node.is_none() {
+            return Err(anyhow!("type {type_name} has no node"));
+        }
+        pending.push(PendingObj {
             path_id: *pid,
             type_id: tid,
             class_id: used_types[tid as usize].class_id,
-            type_name: type_name.clone(),
-            data,
+            type_name,
+            tree,
         });
     }
+
+    // Pass 2 (parallel): write_typetree is a pure function of its arguments,
+    // so mapping it over an indexed parallel iterator and collecting yields
+    // the identical bytes in the identical (objects-iteration) order as the
+    // old serial loop.
+    let out_objects: Vec<unity::Object> = {
+        use rayon::prelude::*;
+        pending
+            .par_iter()
+            .map(|p| {
+                let node = used_types[p.type_id as usize]
+                    .node
+                    .as_ref()
+                    .expect("node presence checked in pass 1");
+                let data = unity::write_typetree(p.tree, node, big_endian);
+                unity::Object {
+                    path_id: p.path_id,
+                    type_id: p.type_id,
+                    class_id: p.class_id,
+                    type_name: p.type_name.to_string(),
+                    data,
+                }
+            })
+            .collect()
+    };
 
     let shcab = match &externals {
         ExternalsPolicy::ShaderRef { shader_cab, .. } => shader_cab.clone(),
