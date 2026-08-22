@@ -237,7 +237,7 @@ fn compress_group_into(group: &[[ColorI; 16]], cp: &Params, out: &mut [u8]) {
         for k in 0..opaque_n {
             lanes[k] = &group[opaque_idx[k]];
         }
-        let sub_plans = build_partition_plans(&lanes[..opaque_n], cp);
+        let sub_plans = build_partition_plans(&lanes[..opaque_n], cp, false);
         for (k, sub) in sub_plans.into_iter().enumerate() {
             plans[opaque_idx[k]] = sub;
         }
