@@ -7,16 +7,8 @@ pub(crate) struct QualStatus {
     pub reason: Option<String>,
 }
 
-pub(crate) type EncodeFn<'a> = &'a dyn Fn(
-    &[u8],
-    u32,
-    u32,
-    Option<i32>,
-    bool,
-    bool,
-    bool,
-    Bc7Profile,
-) -> Result<(Vec<u8>, i32)>;
+pub(crate) type EncodeFn<'a> = &'a (dyn Fn(&[u8], u32, u32, Option<i32>, bool, bool, bool, Bc7Profile) -> Result<(Vec<u8>, i32)>
+         + Sync);
 
 pub(crate) fn qualify_backend(backend: &'static str, encode: EncodeFn) -> QualStatus {
     let skip = !crate::clihelp::env_bool("ABGEN_GPU_QUALIFY", true);
@@ -43,68 +35,129 @@ pub(crate) fn qualify_backend_with(
         };
     }
     let sizes: [(u32, u32); 3] = [(64, 64), (128, 32), (37, 53)];
+
+    // Build the full case matrix up front (case order is significant: on
+    // failure we report the first case in this exact enumeration order,
+    // matching the previous sequential nested loops), then run the CPU
+    // oracle and the 24 backend encodes concurrently. Each case's oracle
+    // and backend encode are independent (same input texture, no shared
+    // mutable state), so this cannot change which case fails or its
+    // reported bytes/mip-count.
+    struct Case {
+        w: u32,
+        h: u32,
+        srgb: bool,
+        perceptual: bool,
+        profile: Bc7Profile,
+        label: String,
+        tex: Vec<u8>,
+    }
+    let mut cases = Vec::with_capacity(sizes.len() * 8);
     for &(w, h) in &sizes {
         let tex = crate::gpuhost::oracle::gen_texture(1, w, h);
         for srgb in [false, true] {
             for perceptual in [false, true] {
                 for profile in [Bc7Profile::Slow, Bc7Profile::Basic] {
-                    let case = format!(
+                    let label = format!(
                         "bc7-mip {w}x{h} srgb={srgb} perceptual={perceptual} profile={profile:?}"
                     );
-                    let (want, want_mips) = crate::bc7_pure::encode_bc7_mip_chain_with_profile(
-                        &tex,
+                    cases.push(Case {
                         w,
                         h,
-                        None,
-                        true,
                         srgb,
                         perceptual,
-                        oracle_profile(profile),
-                    );
-                    let (got, got_mips) =
-                        match encode(&tex, w, h, None, true, srgb, perceptual, profile) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                return QualStatus {
-                                    backend,
-                                    qualified: false,
-                                    reason: Some(format!("{case}: encode failed: {e:#}")),
-                                }
-                            }
-                        };
-                    if got_mips != want_mips {
-                        return QualStatus {
-                            backend,
-                            qualified: false,
-                            reason: Some(format!(
-                                "{case}: mip_count {got_mips} != oracle {want_mips}"
-                            )),
-                        };
-                    }
-                    if got != want {
-                        let n = got.len().min(want.len()) / 16;
-                        let mut divergent = 0usize;
-                        for i in 0..n {
-                            if got[i * 16..(i + 1) * 16] != want[i * 16..(i + 1) * 16] {
-                                divergent += 1;
-                            }
-                        }
-                        let mut reason = format!("{case}: divergent blocks {divergent} of {n}");
-                        if got.len() != want.len() {
-                            reason.push_str(&format!(
-                                " (length {} != oracle {})",
-                                got.len(),
-                                want.len()
-                            ));
-                        }
-                        return QualStatus {
-                            backend,
-                            qualified: false,
-                            reason: Some(reason),
-                        };
-                    }
+                        profile,
+                        label,
+                        tex: tex.clone(),
+                    });
                 }
             }
+        }
+    }
+
+    use rayon::prelude::*;
+    let oracles: Vec<(Vec<u8>, i32)> = cases
+        .par_iter()
+        .map(|c| {
+            crate::bc7_pure::encode_bc7_mip_chain_with_profile(
+                &c.tex,
+                c.w,
+                c.h,
+                None,
+                true,
+                c.srgb,
+                c.perceptual,
+                oracle_profile(c.profile),
+            )
+        })
+        .collect();
+
+    let mut backend_results: Vec<Option<Result<(Vec<u8>, i32)>>> =
+        (0..cases.len()).map(|_| None).collect();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(cases.len());
+        for (i, c) in cases.iter().enumerate() {
+            handles.push(scope.spawn(move || {
+                (
+                    i,
+                    encode(
+                        &c.tex,
+                        c.w,
+                        c.h,
+                        None,
+                        true,
+                        c.srgb,
+                        c.perceptual,
+                        c.profile,
+                    ),
+                )
+            }));
+        }
+        for h in handles {
+            let (i, r) = h.join().expect("qualify backend worker thread panicked");
+            backend_results[i] = Some(r);
+        }
+    });
+
+    for (i, c) in cases.iter().enumerate() {
+        let case = &c.label;
+        let (want, want_mips) = &oracles[i];
+        let (got, got_mips) = match backend_results[i].take().expect("case result collected") {
+            Ok(r) => r,
+            Err(e) => {
+                return QualStatus {
+                    backend,
+                    qualified: false,
+                    reason: Some(format!("{case}: encode failed: {e:#}")),
+                }
+            }
+        };
+        if got_mips != *want_mips {
+            return QualStatus {
+                backend,
+                qualified: false,
+                reason: Some(format!(
+                    "{case}: mip_count {got_mips} != oracle {want_mips}"
+                )),
+            };
+        }
+        if &got != want {
+            let n = got.len().min(want.len()) / 16;
+            let mut divergent = 0usize;
+            for blk in 0..n {
+                if got[blk * 16..(blk + 1) * 16] != want[blk * 16..(blk + 1) * 16] {
+                    divergent += 1;
+                }
+            }
+            let mut reason = format!("{case}: divergent blocks {divergent} of {n}");
+            if got.len() != want.len() {
+                reason.push_str(&format!(" (length {} != oracle {})", got.len(), want.len()));
+            }
+            return QualStatus {
+                backend,
+                qualified: false,
+                reason: Some(reason),
+            };
         }
     }
     QualStatus {
