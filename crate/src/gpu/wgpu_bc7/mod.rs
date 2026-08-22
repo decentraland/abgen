@@ -4,6 +4,9 @@ use crate::gpu::corelib::mips::{box_halve_dims, compute_default_mip_count, level
 use crate::gpu::wgpu::gpu;
 use crate::gpu::wgpu::{Gpu, BLOCKIFY_WGSL};
 use anyhow::{anyhow, ensure, Result};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::Mutex;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::OnceLock;
 
@@ -81,6 +84,109 @@ pub struct Engine {
     enc: [::wgpu::ComputePipeline; 3],
     opt: ::wgpu::Buffer,
     params: [::wgpu::Buffer; 4],
+    zero_prefix: ::wgpu::Buffer,
+    pools: Pools,
+}
+
+const META_BYTES: u64 = 16;
+const POOL_PER_CLASS: usize = 4;
+const STORAGE_POOL_USAGES: ::wgpu::BufferUsages = ::wgpu::BufferUsages::STORAGE
+    .union(::wgpu::BufferUsages::COPY_DST)
+    .union(::wgpu::BufferUsages::COPY_SRC);
+
+// Reuse pools keyed by size class. Cross-submission reuse is safe: all work goes
+// through the one queue, so later write_buffer/dispatches are ordered after
+// earlier reads. Buffers are recycled with stale contents; the only consumer
+// that relied on zero-init is the plan scratch, cleared in record_encode.
+#[derive(Default)]
+struct Pools {
+    storage: Mutex<HashMap<u64, Vec<::wgpu::Buffer>>>,
+    uniform: Mutex<Vec<::wgpu::Buffer>>,
+    readback: Mutex<HashMap<u64, Vec<::wgpu::Buffer>>>,
+}
+
+// Round up with <=1/16 slack so nearby sizes share a pool entry.
+fn size_class(bytes: u64) -> u64 {
+    let n = bytes.max(256);
+    let g = (n.next_power_of_two() / 16).max(256);
+    n.div_ceil(g) * g
+}
+
+impl Engine {
+    fn take_storage(&self, g: &Gpu, bytes: u64) -> ::wgpu::Buffer {
+        let class = size_class(bytes);
+        let pooled = self
+            .pools
+            .storage
+            .lock()
+            .unwrap()
+            .get_mut(&class)
+            .and_then(Vec::pop);
+        pooled.unwrap_or_else(|| {
+            g.device.create_buffer(&::wgpu::BufferDescriptor {
+                label: Some("pool-storage"),
+                size: class,
+                usage: STORAGE_POOL_USAGES,
+                mapped_at_creation: false,
+            })
+        })
+    }
+
+    fn put_storage(&self, b: ::wgpu::Buffer) {
+        let mut pool = self.pools.storage.lock().unwrap();
+        let v = pool.entry(b.size()).or_default();
+        if v.len() < POOL_PER_CLASS {
+            v.push(b);
+        }
+    }
+
+    fn take_meta(&self, g: &Gpu) -> ::wgpu::Buffer {
+        let pooled = self.pools.uniform.lock().unwrap().pop();
+        pooled.unwrap_or_else(|| {
+            g.device.create_buffer(&::wgpu::BufferDescriptor {
+                label: Some("meta"),
+                size: META_BYTES,
+                usage: ::wgpu::BufferUsages::UNIFORM | ::wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        })
+    }
+
+    fn put_metas(&self, bufs: Vec<::wgpu::Buffer>) {
+        let mut pool = self.pools.uniform.lock().unwrap();
+        for b in bufs {
+            if pool.len() < 64 {
+                pool.push(b);
+            }
+        }
+    }
+
+    fn take_readback(&self, g: &Gpu, bytes: u64) -> ::wgpu::Buffer {
+        let class = size_class(bytes);
+        let pooled = self
+            .pools
+            .readback
+            .lock()
+            .unwrap()
+            .get_mut(&class)
+            .and_then(Vec::pop);
+        pooled.unwrap_or_else(|| {
+            g.device.create_buffer(&::wgpu::BufferDescriptor {
+                label: Some("bc7-staging"),
+                size: class,
+                usage: ::wgpu::BufferUsages::MAP_READ | ::wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        })
+    }
+
+    fn put_readback(&self, b: ::wgpu::Buffer) {
+        let mut pool = self.pools.readback.lock().unwrap();
+        let v = pool.entry(b.size()).or_default();
+        if v.len() < POOL_PER_CLASS {
+            v.push(b);
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -114,15 +220,6 @@ fn storage_init(g: &Gpu, label: &str, data: &[u8]) -> ::wgpu::Buffer {
             contents: data,
             usage: ::wgpu::BufferUsages::STORAGE,
         })
-}
-
-fn storage_empty(g: &Gpu, label: &str, size: u64, extra: ::wgpu::BufferUsages) -> ::wgpu::Buffer {
-    g.device.create_buffer(&::wgpu::BufferDescriptor {
-        label: Some(label),
-        size,
-        usage: ::wgpu::BufferUsages::STORAGE | extra,
-        mapped_at_creation: false,
-    })
 }
 
 pub fn build_engine(g: &Gpu) -> Engine {
@@ -160,6 +257,8 @@ pub fn build_engine(g: &Gpu) -> Engine {
             .map(|c| make_pipeline(g, &bc7, "bc7_encode_blocks", &[("TRIAL_CLASS", c)])),
         opt,
         params,
+        zero_prefix: storage_init(g, "prefix0", &0u64.to_le_bytes()),
+        pools: Pools::default(),
     }
 }
 
@@ -219,18 +318,28 @@ fn flip_rgba(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
 struct Stage<'a> {
     pipeline: &'a ::wgpu::ComputePipeline,
     wg: u32,
+    // gid range [first, total): total is the exclusive end, as the shader guard
+    // is `gid >= job.total`.
+    first: u64,
     total: u64,
     n_items: u32,
     fone: bool,
-    bufs: &'a [(u32, &'a ::wgpu::Buffer)],
+    // (binding, buffer, bound bytes) — pooled buffers are class-sized, so each
+    // binding carries its exact logical size.
+    bufs: &'a [(u32, &'a ::wgpu::Buffer, u64)],
 }
 
-fn run_stage(g: &Gpu, enc: &mut ::wgpu::CommandEncoder, st: &Stage) {
-    use ::wgpu::util::DeviceExt;
+fn run_stage(
+    g: &Gpu,
+    eng: &Engine,
+    enc: &mut ::wgpu::CommandEncoder,
+    metas: &mut Vec<::wgpu::Buffer>,
+    st: &Stage,
+) {
     let max_wg = g.device.limits().max_compute_workgroups_per_dimension as u64;
     let chunk = max_wg * st.wg as u64;
     let layout = st.pipeline.get_bind_group_layout(0);
-    let mut base = 0u64;
+    let mut base = st.first;
     while base < st.total {
         let n = (st.total - base).min(chunk);
         let fone = if st.fone { 1.0f32.to_bits() } else { 0 };
@@ -238,21 +347,25 @@ fn run_stage(g: &Gpu, enc: &mut ::wgpu::CommandEncoder, st: &Stage) {
         for v in [st.n_items, st.total as u32, base as u32, fone] {
             meta.extend_from_slice(&v.to_le_bytes());
         }
-        let meta_buf = g
-            .device
-            .create_buffer_init(&::wgpu::util::BufferInitDescriptor {
-                label: Some("meta"),
-                contents: &meta,
-                usage: ::wgpu::BufferUsages::UNIFORM,
-            });
+        // One pooled meta buffer per dispatch: everything is recorded into a
+        // single submit, so a shared buffer could not hold per-stage values.
+        let meta_buf = eng.take_meta(g);
+        g.queue.write_buffer(&meta_buf, 0, &meta);
+        let bind = |buf, size| {
+            ::wgpu::BindingResource::Buffer(::wgpu::BufferBinding {
+                buffer: buf,
+                offset: 0,
+                size: std::num::NonZeroU64::new(size),
+            })
+        };
         let mut entries = vec![::wgpu::BindGroupEntry {
             binding: 0,
-            resource: meta_buf.as_entire_binding(),
+            resource: bind(&meta_buf, META_BYTES),
         }];
-        for (binding, buf) in st.bufs {
+        for (binding, buf, size) in st.bufs {
             entries.push(::wgpu::BindGroupEntry {
                 binding: *binding,
-                resource: buf.as_entire_binding(),
+                resource: bind(buf, *size),
             });
         }
         let bg = g.device.create_bind_group(&::wgpu::BindGroupDescriptor {
@@ -264,6 +377,8 @@ fn run_stage(g: &Gpu, enc: &mut ::wgpu::CommandEncoder, st: &Stage) {
         pass.set_pipeline(st.pipeline);
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(n.div_ceil(st.wg as u64) as u32, 1, 1);
+        drop(pass);
+        metas.push(meta_buf);
         base += n;
     }
 }
@@ -301,7 +416,7 @@ fn record_encode(
     srgb: bool,
     perceptual: bool,
     profile: Bc7Profile,
-) -> Result<(::wgpu::Buffer, i32)> {
+) -> Result<(::wgpu::Buffer, u64, i32)> {
     let w = width as usize;
     let h = height as usize;
     ensure!(width > 0 && height > 0, "empty texture {width}x{height}");
@@ -320,10 +435,10 @@ fn record_encode(
         (Bc7Profile::Basic, false) => 2,
         (Bc7Profile::Basic, true) => 3,
     };
-    let data = if flip {
-        flip_rgba(rgba, width, height)
+    let data: Cow<[u8]> = if flip {
+        Cow::Owned(flip_rgba(rgba, width, height))
     } else {
-        rgba.to_vec()
+        Cow::Borrowed(rgba)
     };
     let mut levels = Vec::with_capacity(mips as usize);
     let (mut cw, mut ch) = (w, h);
@@ -355,130 +470,237 @@ fn record_encode(
         limits.max_storage_buffer_binding_size,
         limits.max_buffer_size
     );
-    let base_buf = storage_init(g, "base-rgba", &data);
-    let pyr_buf = storage_empty(g, "pyr", total_px * 16, ::wgpu::BufferUsages::empty());
-    let staging = g.device.create_buffer(&::wgpu::BufferDescriptor {
-        label: Some("bc7-staging"),
-        size: num_blocks * 16,
-        usage: ::wgpu::BufferUsages::MAP_READ | ::wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let zero_prefix = storage_init(g, "prefix0", &0u64.to_le_bytes());
-    let lin_items = storage_init(g, "lin-items", &lin_item_bytes(0, 0, srgb));
+    // Whole-chain batching: one pooled blocks/scratch/out buffer set covers as
+    // many consecutive levels as the device limits allow (normally all of them);
+    // the greedy split only engages near the limits, and any single level fits
+    // by the ensure above. Level starts are padded to the 4-block plan group so
+    // the plan passes keep bc7_pure's per-level group composition (group results
+    // are not lane-independent; cross-level groups change bytes).
+    let pad4 = |nb: u64| nb.next_multiple_of(4);
+    let fits = |nb: u64| {
+        let need = (nb * 64).max(nb * PLAN_STRIDE as u64 * 4);
+        need <= limits.max_storage_buffer_binding_size && need <= limits.max_buffer_size
+    };
+    let mut segs: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    let mut acc = pad4(levels[0].nb);
+    for (i, l) in levels.iter().enumerate().skip(1) {
+        if fits(acc + pad4(l.nb)) {
+            acc += pad4(l.nb);
+        } else {
+            segs.push((start, i));
+            start = i;
+            acc = pad4(l.nb);
+        }
+    }
+    segs.push((start, levels.len()));
+    // Padded per-level block offset within its segment's buffers.
+    let mut poffs = vec![0u64; levels.len()];
+    for &(s, e) in &segs {
+        let mut off = 0u64;
+        for i in s..e {
+            poffs[i] = off;
+            off += pad4(levels[i].nb);
+        }
+    }
+    let base_buf = eng.take_storage(g, data.len() as u64);
+    g.queue.write_buffer(&base_buf, 0, &data);
+    let pyr_bytes = total_px * 16;
+    let pyr_buf = eng.take_storage(g, pyr_bytes);
+    let out_len = num_blocks * 16;
+    let staging = eng.take_readback(g, out_len);
+    let lin_items = eng.take_storage(g, 24);
+    g.queue
+        .write_buffer(&lin_items, 0, &lin_item_bytes(0, 0, srgb));
+    let halve_bufs = if mips > 1 {
+        let mut items = Vec::with_capacity((mips as usize - 1) * 24);
+        let mut prefixes = Vec::with_capacity((mips as usize - 1) * 8);
+        for i in 1..levels.len() {
+            let (src, dst) = (&levels[i - 1], &levels[i]);
+            items.extend_from_slice(&halve_item_bytes(
+                src.px_off,
+                dst.px_off,
+                src.w as u32,
+                src.h as u32,
+            ));
+            // gid space for halve is the dst pixel's pyramid offset.
+            prefixes.extend_from_slice(&dst.px_off.to_le_bytes());
+        }
+        let items_buf = eng.take_storage(g, items.len() as u64);
+        g.queue.write_buffer(&items_buf, 0, &items);
+        let prefix_buf = eng.take_storage(g, prefixes.len() as u64);
+        g.queue.write_buffer(&prefix_buf, 0, &prefixes);
+        Some((
+            items_buf,
+            items.len() as u64,
+            prefix_buf,
+            prefixes.len() as u64,
+        ))
+    } else {
+        None
+    };
+    let mut pack_items = Vec::with_capacity(levels.len() * 32);
+    let mut pack_prefixes = Vec::with_capacity(levels.len() * 8);
+    for (l, &poff) in levels.iter().zip(&poffs) {
+        // blk_off is the padded offset into the segment's blocks buffer; the
+        // gid space (and prefixes) stay global and unpadded.
+        pack_items.extend_from_slice(&pack_item_bytes(
+            l.px_off, poff, l.w as u32, l.h as u32, srgb,
+        ));
+        pack_prefixes.extend_from_slice(&l.blk_off.to_le_bytes());
+    }
+    let pack_items_buf = eng.take_storage(g, pack_items.len() as u64);
+    g.queue.write_buffer(&pack_items_buf, 0, &pack_items);
+    let pack_prefix_buf = eng.take_storage(g, pack_prefixes.len() as u64);
+    g.queue.write_buffer(&pack_prefix_buf, 0, &pack_prefixes);
     let params_buf = &eng.params[bucket];
+    let mut metas: Vec<::wgpu::Buffer> = Vec::new();
+    let mut recycle: Vec<::wgpu::Buffer> = Vec::new();
     let mut cmd = g.device.create_command_encoder(&Default::default());
     run_stage(
         g,
+        eng,
         &mut cmd,
+        &mut metas,
         &Stage {
             pipeline: &eng.lin,
             wg: 256,
+            first: 0,
             total: (levels[0].w * levels[0].h) as u64,
             n_items: 1,
             fone: false,
             bufs: &[
-                (1, &lin_items),
-                (4, &zero_prefix),
-                (5, &base_buf),
-                (6, &pyr_buf),
+                (1, &lin_items, 24),
+                (4, &eng.zero_prefix, 8),
+                (5, &base_buf, data.len() as u64),
+                (6, &pyr_buf, pyr_bytes),
             ],
         },
     );
-    for i in 1..levels.len() {
-        let src = &levels[i - 1];
-        let dst = &levels[i];
-        let item = storage_init(
-            g,
-            "halve-item",
-            &halve_item_bytes(src.px_off, dst.px_off, src.w as u32, src.h as u32),
-        );
-        run_stage(
-            g,
-            &mut cmd,
-            &Stage {
-                pipeline: &eng.halve,
-                wg: 256,
-                total: (dst.w * dst.h) as u64,
-                n_items: 1,
-                fone: false,
-                bufs: &[(3, &item), (4, &zero_prefix), (6, &pyr_buf)],
-            },
-        );
-    }
-    for l in &levels {
-        let blocks_l = storage_empty(g, "blocks-level", l.nb * 64, ::wgpu::BufferUsages::empty());
-        let scratch_l = storage_empty(
-            g,
-            "plan-scratch-level",
-            l.nb * PLAN_STRIDE as u64 * 4,
-            ::wgpu::BufferUsages::empty(),
-        );
-        let out_l = storage_empty(
-            g,
-            "bc7-out-level",
-            l.nb * 16,
-            ::wgpu::BufferUsages::COPY_SRC,
-        );
-        let pack_item = storage_init(
-            g,
-            "pack-item",
-            &pack_item_bytes(l.px_off, 0, l.w as u32, l.h as u32, srgb),
-        );
-        run_stage(
-            g,
-            &mut cmd,
-            &Stage {
-                pipeline: &eng.pack,
-                wg: 256,
-                total: l.nb,
-                n_items: 1,
-                fone: false,
-                bufs: &[
-                    (2, &pack_item),
-                    (4, &zero_prefix),
-                    (6, &pyr_buf),
-                    (7, &blocks_l),
-                ],
-            },
-        );
-        for pipe in &eng.plan {
+    if let Some((items_buf, items_len, prefix_buf, prefix_len)) = &halve_bufs {
+        for dst in &levels[1..] {
             run_stage(
                 g,
+                eng,
                 &mut cmd,
+                &mut metas,
                 &Stage {
-                    pipeline: pipe,
-                    wg: 64,
-                    total: l.nb.div_ceil(4),
-                    n_items: l.nb as u32,
-                    fone: true,
-                    bufs: &[(1, params_buf), (4, &blocks_l), (3, &scratch_l)],
-                },
-            );
-        }
-        for pipe in &eng.enc {
-            run_stage(
-                g,
-                &mut cmd,
-                &Stage {
-                    pipeline: pipe,
-                    wg: 64,
-                    total: l.nb,
-                    n_items: l.nb as u32,
-                    fone: true,
+                    pipeline: &eng.halve,
+                    wg: 256,
+                    first: dst.px_off,
+                    total: dst.px_off + (dst.w * dst.h) as u64,
+                    n_items: mips as u32 - 1,
+                    fone: false,
                     bufs: &[
-                        (1, params_buf),
-                        (2, &eng.opt),
-                        (4, &blocks_l),
-                        (5, &scratch_l),
-                        (3, &out_l),
+                        (3, items_buf, *items_len),
+                        (4, prefix_buf, *prefix_len),
+                        (6, &pyr_buf, pyr_bytes),
                     ],
                 },
             );
         }
-        cmd.copy_buffer_to_buffer(&out_l, 0, &staging, l.blk_off * 16, l.nb * 16);
+    }
+    for &(s, e) in &segs {
+        let seg_pnb: u64 = levels[s..e].iter().map(|l| pad4(l.nb)).sum();
+        let seg_nb_end = levels[e - 1].blk_off + levels[e - 1].nb;
+        let blocks_bytes = seg_pnb * 64;
+        let scratch_bytes = seg_pnb * PLAN_STRIDE as u64 * 4;
+        let seg_out_bytes = seg_pnb * 16;
+        let blocks = eng.take_storage(g, blocks_bytes);
+        let scratch = eng.take_storage(g, scratch_bytes);
+        let out = eng.take_storage(g, seg_out_bytes);
+        // Pooled scratch carries stale plan flags (the plan passes only write
+        // fields for their class); restore the fresh-buffer zero contract.
+        cmd.clear_buffer(&scratch, 0, Some(scratch_bytes));
+        run_stage(
+            g,
+            eng,
+            &mut cmd,
+            &mut metas,
+            &Stage {
+                pipeline: &eng.pack,
+                wg: 256,
+                first: levels[s].blk_off,
+                total: seg_nb_end,
+                n_items: levels.len() as u32,
+                fone: false,
+                bufs: &[
+                    (2, &pack_items_buf, pack_items.len() as u64),
+                    (4, &pack_prefix_buf, pack_prefixes.len() as u64),
+                    (6, &pyr_buf, pyr_bytes),
+                    (7, &blocks, blocks_bytes),
+                ],
+            },
+        );
+        for i in s..e {
+            let (nb, poff) = (levels[i].nb, poffs[i]);
+            for pipe in &eng.plan {
+                run_stage(
+                    g,
+                    eng,
+                    &mut cmd,
+                    &mut metas,
+                    &Stage {
+                        pipeline: pipe,
+                        wg: 64,
+                        first: poff / 4,
+                        total: poff / 4 + nb.div_ceil(4),
+                        n_items: (poff + nb) as u32,
+                        fone: true,
+                        bufs: &[
+                            (1, params_buf, params_buf.size()),
+                            (4, &blocks, blocks_bytes),
+                            (3, &scratch, scratch_bytes),
+                        ],
+                    },
+                );
+            }
+        }
+        for i in s..e {
+            let (nb, poff) = (levels[i].nb, poffs[i]);
+            for pipe in &eng.enc {
+                run_stage(
+                    g,
+                    eng,
+                    &mut cmd,
+                    &mut metas,
+                    &Stage {
+                        pipeline: pipe,
+                        wg: 64,
+                        first: poff,
+                        total: poff + nb,
+                        n_items: (poff + nb) as u32,
+                        fone: true,
+                        bufs: &[
+                            (1, params_buf, params_buf.size()),
+                            (2, &eng.opt, eng.opt.size()),
+                            (4, &blocks, blocks_bytes),
+                            (5, &scratch, scratch_bytes),
+                            (3, &out, seg_out_bytes),
+                        ],
+                    },
+                );
+            }
+            cmd.copy_buffer_to_buffer(&out, poff * 16, &staging, levels[i].blk_off * 16, nb * 16);
+        }
+        recycle.extend([blocks, scratch, out]);
     }
     g.queue.submit([cmd.finish()]);
-    Ok((staging, mips))
+    recycle.extend([
+        base_buf,
+        pyr_buf,
+        lin_items,
+        pack_items_buf,
+        pack_prefix_buf,
+    ]);
+    if let Some((items_buf, _, prefix_buf, _)) = halve_bufs {
+        recycle.extend([items_buf, prefix_buf]);
+    }
+    for b in recycle {
+        eng.put_storage(b);
+    }
+    eng.put_metas(metas);
+    Ok((staging, out_len, mips))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -495,10 +717,10 @@ pub(crate) fn encode_bc7_mip_chain(
 ) -> Result<(Vec<u8>, i32)> {
     let g = gpu().map_err(|e| anyhow!("wgpu unavailable: {e}"))?;
     let eng = engine(g);
-    let (staging, mips) = record_encode(
+    let (staging, out_len, mips) = record_encode(
         g, eng, rgba, width, height, mip_count, flip, srgb, perceptual, profile,
     )?;
-    let slice = staging.slice(..);
+    let slice = staging.slice(0..out_len);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(::wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
@@ -514,6 +736,7 @@ pub(crate) fn encode_bc7_mip_chain(
         .map_err(|e| anyhow!("wgpu mapped range failed: {e:?}"))?
         .to_vec();
     staging.unmap();
+    eng.put_readback(staging);
     Ok((out, mips))
 }
 
@@ -531,10 +754,10 @@ pub async fn encode_bc7_mip_chain_on(
     perceptual: bool,
     profile: Bc7Profile,
 ) -> Result<(Vec<u8>, i32)> {
-    let (staging, mips) = record_encode(
+    let (staging, out_len, mips) = record_encode(
         g, eng, rgba, width, height, mip_count, flip, srgb, perceptual, profile,
     )?;
-    let slice = staging.slice(..);
+    let slice = staging.slice(0..out_len);
     map_read(slice)
         .await
         .map_err(|e| anyhow!("wgpu readback map failed: {e:?}"))?;
@@ -543,6 +766,7 @@ pub async fn encode_bc7_mip_chain_on(
         .map_err(|e| anyhow!("wgpu mapped range failed: {e:?}"))?
         .to_vec();
     staging.unmap();
+    eng.put_readback(staging);
     Ok((out, mips))
 }
 
