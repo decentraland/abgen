@@ -59,6 +59,11 @@ jobs:
           fetch-depth: 0
       - id: hash
         uses: ./.github/actions/tree-hash
+      - id: basehash
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/tree-hash
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
       - id: memo
         uses: ./.github/actions/artifact-hit
         with:
@@ -67,9 +72,9 @@ jobs:
         run: |
           if [ "${{ steps.memo.outputs.hit }}" = "true" ]; then mode=skip
           elif [ "${{ github.event_name }}" != "pull_request" ]; then mode=full
-          elif ! git diff --quiet ${{ github.event.pull_request.base.sha }}...HEAD -- 'Cargo.lock' 'Cargo.toml' 'rust-toolchain.toml' '.github/workflows/ci.yml' '.github/actions/rust-setup' 'ci/abgen-smoke.ps1' '.config/nextest.toml' 'crate/Cargo.toml' 'crate/build.rs' 'crate/third_party' 'crate/abgen-native' 'crate/dcl-contents' 'crate/src/abcdn' 'crate/src/builder' 'crate/src/export' 'crate/src/lodgen' 'crate/src/gpu' 'crate/src/live.rs' 'crate/src/jitcache.rs' 'crate/src/local_store.rs' 'crate/src/texencode_cache.rs' 'crate/src/tmppath.rs' 'crate/src/clihelp.rs' 'crate/src/ffi.rs' 'crate/src/worlds.rs' 'crate/src/lods.rs' 'crate/src/lz4.rs' 'crate/src/manifest.rs' 'crate/src/space.rs' 'crate/src/shader.rs' 'crate/src/lib.rs' 'crate/src/gltf/scene_build.rs' 'crate/src/unity/bundle_file.rs' 'crate/abgen-wasm/test/fixtures/normal-quad.glb'; then mode=full
-          elif ! git diff --quiet ${{ github.event.pull_request.base.sha }}...HEAD -- '**/*.rs' 'Cargo.*' '**/Cargo.toml'; then mode=quick
-          else mode=skip; fi
+          elif [ "${{ steps.basehash.outputs.h }}" = "${{ steps.hash.outputs.h }}" ]; then mode=skip
+          elif ! git diff --quiet ${{ github.event.pull_request.base.sha }}...HEAD -- 'crate' 'Cargo.toml' 'Cargo.lock' 'rust-toolchain.toml' '.config' 'ci/abgen-smoke.ps1' '.github/workflows/ci.yml' '.github/actions/rust-setup'; then mode=full
+          else mode=quick; fi
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
   windows:

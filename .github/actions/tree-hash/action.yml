@@ -11,6 +11,9 @@ inputs:
       cargo = rustup lanes (windows/node): nix plumbing is irrelevant.
       nix = nix lanes: only prose and recorded manifests are irrelevant.
     default: cargo
+  ref:
+    description: commit to hash (any commit reachable from the checkout)
+    default: HEAD
 outputs:
   h:
     description: sha256 over the filtered git tree listing (mode, blob, path)
@@ -20,15 +23,17 @@ runs:
   steps:
     - id: h
       shell: bash
+      env:
+        REF: ${{ inputs.ref }}
       run: |
         if [ "${{ inputs.scope }}" = "cargo" ]; then
-          h=$(git ls-tree -r HEAD | awk -F'\t' '
+          h=$(git ls-tree -r "$REF" | awk -F'\t' '
             $2 !~ /^nix\// &&
             $2 != "flake.nix" && $2 != "flake.lock" &&
             $2 != ".github/workflows/release.yml" &&
             $2 !~ /\.md$/' | sha256sum | cut -c1-64)
         else
-          h=$(git ls-tree -r HEAD | awk -F'\t' '
+          h=$(git ls-tree -r "$REF" | awk -F'\t' '
             $2 != ".github/workflows/release.yml" &&
             $2 !~ /\.md$/' | sha256sum | cut -c1-64)
         fi
