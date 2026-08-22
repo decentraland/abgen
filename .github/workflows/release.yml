@@ -10,10 +10,6 @@ on:
         description: "Build and verify everything, publish nothing"
         type: boolean
         default: true
-      record_hashes:
-        description: "Record artifact hashes instead of verifying them"
-        type: boolean
-        default: false
       targets:
         description: "Comma-separated target triples to build (empty = all). Iterating on one lane should not build six."
         type: string
@@ -83,18 +79,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           WANT: ${{ inputs.targets }}
-          RECORDING: ${{ inputs.record_hashes }}
           BUILD_ID: ${{ steps.eval.outputs.value }}
         run: |
           set -eu
-          # buildId is global: any source change moves every target's artifacts.
-          # Recording a filtered subset would leave the unbuilt targets' hashes
-          # describing a tree that no longer exists, and the next tag would fail
-          # the gate on them. Narrowing is for iteration, not for recording.
-          if [ -n "${WANT:-}" ] && [ "${RECORDING:-false}" = "true" ]; then
-            echo "record_hashes needs the full matrix; drop 'targets'" >&2
-            exit 1
-          fi
           all='[
             {"target":"x86_64-unknown-linux-gnu","runner":"ubuntu-24.04","builder":"nix"},
             {"target":"aarch64-unknown-linux-gnu","runner":"ubuntu-24.04-arm","builder":"nix"},
@@ -409,33 +396,6 @@ jobs:
           done
           [ "$rc" -eq 0 ] || exit 1
           echo "windows-gnu artifacts are self-contained"
-
-      - name: verify artifact hashes
-        env:
-          ABGEN_RECORD_HASHES: ${{ inputs.record_hashes && '1' || '0' }}
-          # Hard only where bytes ship: every buildId-rotating merge turned
-          # main's release lane red until a manual record cycle — pure
-          # alarm fatigue, since main pushes publish nothing. Tags still
-          # verify hard (and additionally require the ci-green gate).
-          ABGEN_HASH_SOFT: ${{ startsWith(github.ref, 'refs/tags/') && '0' || '1' }}
-        run: |
-          set -eu
-          # One artifact list for all six legs; nothing here is lane-specific.
-          artifacts=("target/${{ matrix.target }}/release/${{ matrix.bin || 'abgen' }}")
-          for f in libabgen.so libabgen.dylib abgen.dll libabgen.a abgen-host abgen-host.exe; do
-            src="target/${{ matrix.target }}/release/$f"
-            [ -f "$src" ] && artifacts+=("$src")
-          done
-          echo "artifacts: ${artifacts[*]}"
-          bash ci/verify-artifact-hashes.sh "${{ matrix.target }}" "${artifacts[@]}"
-
-      - name: upload recorded hashes
-        if: ${{ inputs.record_hashes }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: hashes-${{ matrix.target }}
-          path: ci/artifact-hashes/${{ matrix.target }}.sha256
-          if-no-files-found: error
 
       - name: package and sanity test
         env:

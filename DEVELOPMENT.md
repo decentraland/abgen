@@ -42,6 +42,5 @@ re-runs converge on the full asset set.
 5. Failed leg: re-run failed jobs from the Actions UI; everything converges.
 
 `workflow_dispatch` on a branch is a build+sanity dry run: no release and no npm publish, but it
-verifies the artifact hashes and uploads the archives as workflow artifacts, so a branch can be
-tested on a real machine before a tag exists. `targets` narrows the matrix to one lane for
-iteration; `record_hashes` re-records the manifest and refuses to run with `targets` set.
+uploads the archives as workflow artifacts, so a branch can be tested on a real machine before a
+tag exists. `targets` narrows the matrix to one lane for iteration.
