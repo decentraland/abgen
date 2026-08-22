@@ -88,7 +88,7 @@ pub fn source_image_decodes(raw: &[u8]) -> bool {
 /// same source bytes decode to the same image, so the cache (when the host
 /// enables it) returns the shared buffer instead of decoding again.
 pub(super) fn decode_source_image(raw: &[u8]) -> Option<std::sync::Arc<RgbaImage>> {
-    crate::decode_cache::get_or_decode(raw, || decode_source_image_uncached(raw))
+    crate::decode_cache::get_or_decode(b"src", raw, || decode_source_image_uncached(raw))
 }
 
 fn decode_source_image_uncached(raw: &[u8]) -> Option<RgbaImage> {
