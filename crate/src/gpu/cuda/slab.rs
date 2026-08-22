@@ -333,7 +333,20 @@ impl SlabEngine {
             let hb = self.h_base[p].ensure(g, base_bytes, "h_base")?;
             let mut off = 0usize;
             for t in texs {
-                std::ptr::copy_nonoverlapping(t.rgba.as_ptr(), hb.add(off), t.rgba.len());
+                if t.flip {
+                    // deferred vertical flip: stage rows bottom-up
+                    let row = t.w as usize * 4;
+                    let h = t.h as usize;
+                    for y in 0..h {
+                        std::ptr::copy_nonoverlapping(
+                            t.rgba.as_ptr().add((h - 1 - y) * row),
+                            hb.add(off + y * row),
+                            row,
+                        );
+                    }
+                } else {
+                    std::ptr::copy_nonoverlapping(t.rgba.as_ptr(), hb.add(off), t.rgba.len());
+                }
                 off += t.rgba.len();
             }
             let stage_ms = t_stage.elapsed().as_secs_f64() * 1e3;
@@ -887,7 +900,23 @@ impl SlabEngine {
         };
         let g = self.g;
         if !pend.finalized {
-            self.finalize_desc(&mut pend)?;
+            // sig sort is only a warp-coherence hint (each desc carries its
+            // own out offset): if the sig readback isn't done yet, encoding
+            // the resident unsorted descs beats blocking on the round-trip
+            let q = (g.event_query)(self.ev_sig[pend.slot]);
+            if q == CUDA_ERROR_NOT_READY {
+                self.enqueue_encode_out(
+                    pend.slot,
+                    pend.ndescs,
+                    pend.o_blocks,
+                    pend.out_len,
+                    pend.bdim,
+                )?;
+                pend.finalized = true;
+            } else {
+                g.check(q)?;
+                self.finalize_desc(&mut pend)?;
+            }
         }
         let t_wait = std::time::Instant::now();
         g.check((g.event_synchronize)(self.ev_out[pend.slot]))?;
