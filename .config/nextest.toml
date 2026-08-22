@@ -4,3 +4,6 @@ default-filter = '''
   + package(dcl-contents)
   + (package(abgen) & kind(lib) & test(/^(abcdn|live|export|jitcache|local_store|texencode_cache|builder|lodgen|clihelp|ffi|worlds)::/))
 '''
+
+[profile.default.junit]
+path = "junit.xml"
