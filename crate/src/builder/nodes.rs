@@ -365,6 +365,12 @@ impl<'a> Builder<'a> {
             }
         }
 
+        // Every texture()/material() call for this GLB is done as of here,
+        // so every BC7 job that build_node/attach_primitive/material_orphan
+        // could have queued is now in self.pending_bc7. Resolve them all in
+        // one batch before anything below reads the finished bytes.
+        self.resolve_pending_bc7_textures();
+
         if emits_metadata_textasset(&self.root_hash, self.toggles.v38_compat) {
             let mut meta = self.base_clone("TextAsset");
             meta.insert("m_Name", "metadata");

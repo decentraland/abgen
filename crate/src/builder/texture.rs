@@ -385,7 +385,146 @@ pub(super) fn mean_color_image(img: &RgbaImage) -> RgbaImage {
     RgbaImage::from_raw(w, h, buf).expect("mean-color buffer size mismatch")
 }
 
+/// Inputs for one deferred per-pixel BC7 slow-profile encode: collected
+/// while building a Texture2D tree instead of encoding inline, so it can be
+/// routed through the cache-aware batch entry point
+/// ([`bc7_pure::encode_bc7_mip_chain_with_profile_batch`]) once every
+/// texture tree for the GLB has been built. Same fields as the arguments
+/// [`encode_texture_bc7`] would otherwise have passed straight through to a
+/// single-request encode.
+pub(super) struct Bc7JobInputs {
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    mip_count: i32,
+    srgb: bool,
+    perceptual: bool,
+}
+
+/// A [`Bc7JobInputs`] tied to the pid of the Texture2D object whose
+/// `m_MipCount` / `m_CompleteImageSize` / `image data` fields it fills in
+/// once the batch encode resolves it.
+pub(super) struct PendingBc7Texture {
+    pid: i64,
+    job: Bc7JobInputs,
+}
+
+/// Result of building one Texture2D tree: either fully finished (every
+/// path except the plain per-pixel BC7 slow encode), or missing the three
+/// encode-dependent fields pending a batched BC7 encode.
+pub(super) enum TexTree {
+    Done(Value),
+    Pending(Value, Bc7JobInputs),
+}
+
+impl TexTree {
+    /// Applies a mutation to the underlying tree regardless of which variant
+    /// this is, without disturbing a `Pending` job.
+    fn map_value(self, f: impl FnOnce(&mut Value)) -> Self {
+        match self {
+            TexTree::Done(mut v) => {
+                f(&mut v);
+                TexTree::Done(v)
+            }
+            TexTree::Pending(mut v, job) => {
+                f(&mut v);
+                TexTree::Pending(v, job)
+            }
+        }
+    }
+}
+
+/// Either the two encode-dependent bytes/mip-count are already known
+/// (every non-deferred format), or they're waiting on a batched BC7 encode.
+enum DataMips {
+    Ready(Vec<u8>, i32),
+    Deferred(Bc7JobInputs),
+}
+
+/// Prep half of [`encode_texture_bc7`]: the normal-map detection and
+/// packing, without the encode call. Kept in exact lockstep with
+/// `encode_texture_bc7`'s own inputs so the deferred batch call is
+/// byte-identical to calling that function directly.
+fn bc7_job_inputs(
+    img: &RgbaImage,
+    mip_count: i32,
+    srgb: bool,
+    normal_override: Option<bool>,
+) -> Bc7JobInputs {
+    let (width, height) = img.dimensions();
+    let rgba = img.as_raw();
+    let is_normal = normal_override.unwrap_or_else(|| !srgb && looks_like_normal_map(rgba));
+    let pixels = if is_normal {
+        pack_normal_map(rgba)
+    } else {
+        rgba.to_vec()
+    };
+    let perceptual = srgb && !is_normal;
+    Bc7JobInputs {
+        pixels,
+        width,
+        height,
+        mip_count,
+        srgb,
+        perceptual,
+    }
+}
+
 impl<'a> Builder<'a> {
+    /// Adds a Texture2D tree, queuing its BC7 job (if any) for the batched
+    /// resolve pass instead of encoding it inline.
+    fn add_tex_tree(&mut self, tree: TexTree, role: Role) -> i64 {
+        match tree {
+            TexTree::Done(v) => self.add("Texture2D", v, role),
+            TexTree::Pending(v, job) => {
+                let pid = self.add("Texture2D", v, role);
+                self.pending_bc7.push(PendingBc7Texture { pid, job });
+                pid
+            }
+        }
+    }
+
+    /// Batches every BC7 job queued by `add_tex_tree` through the
+    /// cache-aware batch entry point
+    /// ([`bc7_pure::encode_bc7_mip_chain_with_profile_batch`]), in the
+    /// order the jobs were queued (== input order, since `texture()` only
+    /// ever queues a job the first time a given texture is built), then
+    /// patches each job's Texture2D object with `m_MipCount`,
+    /// `m_CompleteImageSize`, and `image data` — exactly the fields the old
+    /// inline `encode_texture_bc7` call filled directly.
+    ///
+    /// Must run after every `texture()` / `material()` call for this GLB
+    /// has finished (so no more jobs can be queued) and before the bundle
+    /// is serialized.
+    pub(super) fn resolve_pending_bc7_textures(&mut self) {
+        let pending = std::mem::take(&mut self.pending_bc7);
+        if pending.is_empty() {
+            return;
+        }
+        let reqs: Vec<bc7_pure::Bc7ChainRequest> = pending
+            .iter()
+            .map(|p| bc7_pure::Bc7ChainRequest {
+                rgba: &p.job.pixels,
+                width: p.job.width,
+                height: p.job.height,
+                mip_count: Some(p.job.mip_count),
+                flip: true,
+                srgb: p.job.srgb,
+                perceptual: p.job.perceptual,
+                profile: bc7_pure::Bc7Profile::Slow,
+            })
+            .collect();
+        let results = bc7_pure::encode_bc7_mip_chain_with_profile_batch(&reqs);
+        drop(reqs);
+        for (p, (data, mips)) in pending.into_iter().zip(results) {
+            if let Some((_, tree)) = self.objects.get_mut(&p.pid) {
+                tree.insert("m_MipCount", mips);
+                tree.insert("m_CompleteImageSize", data.len() as i64);
+                tree.insert("image data", Value::Bytes(data));
+            }
+        }
+    }
+
     fn source_image(&mut self, scene: &Scene, idx: usize) -> texprofile::SourceImage {
         // Memoized: the alpha scan is O(pixels) and texture() runs per texture-ref.
         self.src_image_cache
@@ -591,10 +730,11 @@ impl<'a> Builder<'a> {
                 false,
             );
             if multi_sampler_uncompressed {
-                inglb_tree.insert("m_IsReadable", true);
+                inglb_tree = inglb_tree.map_value(|v| {
+                    v.insert("m_IsReadable", true);
+                });
             }
-            let inglb = self.add(
-                "Texture2D",
+            let inglb = self.add_tex_tree(
                 inglb_tree,
                 Role::Glb("Texture2D".into(), format!("textures/{name}")),
             );
@@ -613,7 +753,7 @@ impl<'a> Builder<'a> {
             Some(&src),
             !real_tex && !multi_sampler_uncompressed && self.lod.is_none(),
         );
-        let ext = self.add("Texture2D", ext_tree, Role::Tex(name.clone()));
+        let ext = self.add_tex_tree(ext_tree, Role::Tex(name.clone()));
         self.tex_pid.insert(key, ext);
         let entry_key = if self.lod.is_some() {
             let needs_alpha = scene.materials.iter().any(|m| {
@@ -650,9 +790,9 @@ impl<'a> Builder<'a> {
         wrap: Option<(i64, i64)>,
         src: Option<&texprofile::SourceImage>,
         force_inglb_stub: bool,
-    ) -> Value {
+    ) -> TexTree {
         let mut t = self.base_clone("Texture2D");
-        let (data, mips): (Vec<u8>, i32) = if prof.compressed {
+        let data_mips: DataMips = if prof.compressed {
             let (ow, oh) = img.dimensions();
             let max_size = texprofile::max_texture_size_for(self.target);
             let load_image_ok = src
@@ -691,7 +831,7 @@ impl<'a> Builder<'a> {
                     "m_StreamData",
                     map! {"offset" => 0, "size" => 0, "path" => ""},
                 );
-                return t;
+                return TexTree::Done(t);
             }
             if force_inglb_stub && prof.texture_format == texprofile::TF_BC7 {
                 let (data, mips) = encode_inglb_bc7_stub(
@@ -723,7 +863,7 @@ impl<'a> Builder<'a> {
                     "m_StreamData",
                     map! {"offset" => 0, "size" => 0, "path" => ""},
                 );
-                return t;
+                return TexTree::Done(t);
             }
             if stub_bc7 {
                 // stub_bc7 already implies texture_format == TF_BC7 (see its
@@ -732,12 +872,13 @@ impl<'a> Builder<'a> {
                 // Computing a mean-color source image and box-resizing it
                 // just to throw both away was dead work ahead of this
                 // return, so skip them entirely.
-                encode_inglb_bc7_stub(
+                let (data, mips) = encode_inglb_bc7_stub(
                     prof.target_w,
                     prof.target_h,
                     prof.mip_count,
                     prof.lightmap_format == 3,
-                )
+                );
+                DataMips::Ready(data, mips)
             } else {
                 let resized;
                 let src: &RgbaImage = if (prof.target_w, prof.target_h) != (ow, oh) {
@@ -756,20 +897,23 @@ impl<'a> Builder<'a> {
                     img
                 };
                 if prof.texture_format == texprofile::TF_DXT5 {
-                    encode_dxt5_mip_chain_real(src, prof.mip_count, prof.color_space == 1)
+                    let (data, mips) =
+                        encode_dxt5_mip_chain_real(src, prof.mip_count, prof.color_space == 1);
+                    DataMips::Ready(data, mips)
                 } else if prof.texture_format == texprofile::TF_DXT1 {
                     let (sw, sh) = src.dimensions();
-                    crate::dxt1_pure::encode_dxt1_mip_chain(
+                    let (data, mips) = crate::dxt1_pure::encode_dxt1_mip_chain(
                         src.as_raw(),
                         sw,
                         sh,
                         Some(prof.mip_count),
                         true,
                         prof.color_space == 1,
-                    )
+                    );
+                    DataMips::Ready(data, mips)
                 } else if prof.texture_format == texprofile::TF_DXT5_CRUNCHED {
                     let (sw, sh) = src.dimensions();
-                    crate::bc5_pure::encode_dxt5_crn_dual_use_mip_chain(
+                    let (data, mips) = crate::bc5_pure::encode_dxt5_crn_dual_use_mip_chain(
                         src.as_raw(),
                         sw,
                         sh,
@@ -782,19 +926,19 @@ impl<'a> Builder<'a> {
                             "crunch DXT5 compression failed for texture {name} ({sw}x{sh}, {} mips)",
                             prof.mip_count
                         )
-                    })
+                    });
+                    DataMips::Ready(data, mips)
                 } else {
-                    encode_texture_bc7(
+                    DataMips::Deferred(bc7_job_inputs(
                         src,
                         prof.mip_count,
                         prof.color_space == 1,
                         Some(prof.lightmap_format == 3),
-                        bc7_pure::Bc7Profile::Slow,
-                    )
+                    ))
                 }
             }
         } else if prof.texture_format == texprofile::TF_RGBA32 {
-            (dxt_unity::encode_rgba32(img, true), 1)
+            DataMips::Ready(dxt_unity::encode_rgba32(img, true), 1)
         } else if prof.texture_format == texprofile::TF_RGBA32_UNITY {
             let (ow, oh) = img.dimensions();
             let resized;
@@ -822,20 +966,18 @@ impl<'a> Builder<'a> {
                 prof.color_space == 1,
             );
             if force_inglb_stub {
-                (vec![0xcd_u8; data.len()], mips)
+                DataMips::Ready(vec![0xcd_u8; data.len()], mips)
             } else {
-                (data, mips)
+                DataMips::Ready(data, mips)
             }
         } else {
-            (dxt_unity::encode_rgb24(img, true), 1)
+            DataMips::Ready(dxt_unity::encode_rgb24(img, true), 1)
         };
 
         t.insert("m_Name", name);
         t.insert("m_Width", prof.target_w);
         t.insert("m_Height", prof.target_h);
         t.insert("m_TextureFormat", prof.texture_format);
-        t.insert("m_MipCount", mips);
-        t.insert("m_CompleteImageSize", data.len() as i64);
         t.insert("m_IsReadable", false);
         t.insert("m_ColorSpace", prof.color_space);
         t.insert("m_LightmapFormat", prof.lightmap_format);
@@ -848,12 +990,22 @@ impl<'a> Builder<'a> {
                 ts.insert("m_WrapV", wv);
             }
         }
-        t.insert("image data", Value::Bytes(data));
         t.insert(
             "m_StreamData",
             map! {"offset" => 0, "size" => 0, "path" => ""},
         );
-        t
+        match data_mips {
+            DataMips::Ready(data, mips) => {
+                t.insert("m_MipCount", mips);
+                t.insert("m_CompleteImageSize", data.len() as i64);
+                t.insert("image data", Value::Bytes(data));
+                TexTree::Done(t)
+            }
+            // m_MipCount, m_CompleteImageSize, and "image data" are filled
+            // in later by resolve_pending_bc7_textures, once the batch BC7
+            // encode this job was queued into has resolved.
+            DataMips::Deferred(job) => TexTree::Pending(t, job),
+        }
     }
 }
 
