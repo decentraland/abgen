@@ -5,6 +5,11 @@ renamed from the retired abgpugen name - internal mangled symbols only, the eigh
 unmangled .visible .entry kernels are unchanged)
 refresh: cd crates/abgen/kernel-ptx && nix develop path:. --command cargo build --release && cp target/nvptx64-nvidia-cuda/release/abgen_gpu_kernel_ptx.ptx ../src/gpu/kernel.ptx
 runtime override: ABGEN_GPU_PTX=<path>
+
+kernel.cubin: checked in empty (placeholder, no ptxas on this build host).
+The loader (gpu/cuda/mod.rs) treats a zero-length cubin as absent and always
+takes the PTX JIT path above. Refresh instructions (needs a CUDA toolkit
+with ptxas on PATH): see kernel-ptx/BUILD.md "Cubin" section.
 verification 2026-07-10 (abgen-verify gpu diff --gpu): byte-identical vs oracle at 512/seed3,
 8192/seed1, 16384/seed42, 32768/seed7 (all configs incl. mip chains, exit 0),
 matching the 2026-07-07 fold precedent that a names-only regen passes the full
