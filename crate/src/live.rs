@@ -84,13 +84,17 @@ fn corpus_file_jobs() -> usize {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        match std::env::var("ABGEN_JIT_FILE_CONCURRENCY")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            Some(n) if n > 0 => n,
-            _ => cores.min(4),
-        }
+        // Specific knob wins over the generic one; default stays min(cores, 4)
+        // because peak RSS scales with in-flight files.
+        let from = |k: &str| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+        };
+        from("ABGEN_JIT_FILE_CONCURRENCY")
+            .or_else(|| from("ABGEN_FILE_CONCURRENCY"))
+            .unwrap_or_else(|| cores.min(4))
     })
 }
 

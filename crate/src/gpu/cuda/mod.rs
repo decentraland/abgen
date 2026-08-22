@@ -12,6 +12,8 @@ use crate::gpu::corelib::mips::{box_halve_dims, level_block_dims, HalveItem, Lin
 type CuResult = i32;
 type DevPtr = u64;
 
+const CUDA_ERROR_NOT_READY: CuResult = 600;
+
 fn jit_cache_dir_ok(p: &std::path::Path) -> bool {
     if std::fs::create_dir_all(p).is_err() {
         return false;
@@ -129,6 +131,7 @@ type FnMemFreeHost = unsafe extern "C" fn(*mut c_void) -> CuResult;
 type FnEventCreate = unsafe extern "C" fn(*mut *mut c_void, u32) -> CuResult;
 type FnEventRecord = unsafe extern "C" fn(*mut c_void, *mut c_void) -> CuResult;
 type FnEventSynchronize = unsafe extern "C" fn(*mut c_void) -> CuResult;
+type FnEventQuery = unsafe extern "C" fn(*mut c_void) -> CuResult;
 type FnEventElapsedTime = unsafe extern "C" fn(*mut f32, *mut c_void, *mut c_void) -> CuResult;
 
 struct Gpu {
@@ -151,6 +154,7 @@ struct Gpu {
     event_create: FnEventCreate,
     event_record: FnEventRecord,
     event_synchronize: FnEventSynchronize,
+    event_query: FnEventQuery,
     event_elapsed: FnEventElapsedTime,
     func_encode: *mut c_void,
     func_encode_perm: *mut c_void,
@@ -269,6 +273,7 @@ impl Gpu {
             event_create: sym(lib, c"cuEventCreate")?,
             event_record: sym(lib, c"cuEventRecord")?,
             event_synchronize: sym(lib, c"cuEventSynchronize")?,
+            event_query: sym(lib, c"cuEventQuery")?,
             event_elapsed: sym(lib, c"cuEventElapsedTime")?,
             func_encode: std::ptr::null_mut(),
             func_encode_perm: std::ptr::null_mut(),
@@ -507,6 +512,7 @@ pub struct BlockifyTex {
     pub mip_count: i32,
     pub srgb: bool,
     pub bucket: usize,
+    pub flip: bool, // stage rows bottom-up (deferred vertical flip)
 }
 
 #[derive(Default)]

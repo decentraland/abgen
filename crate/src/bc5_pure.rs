@@ -215,45 +215,51 @@ pub(crate) fn compress_bc5_blocks(padded: &[u8], pw: usize, ph: usize, out: &mut
     let bh = ph / 4;
     debug_assert_eq!(out.len(), bw * bh * BC5_BLOCK_SIZE);
     debug_assert_eq!(padded.len(), pw * ph * 4);
+    // Fixed block-row chunking into a pre-sized slice (the
+    // bc7_pure::encode_blocks pattern): every 16-byte slot is written by
+    // block index, so output bytes are identical at any thread count.
+    use rayon::prelude::*;
+    out.par_chunks_mut(bw * BC5_BLOCK_SIZE)
+        .enumerate()
+        .for_each(|(by, row)| compress_bc5_block_row(padded, pw, bw, by, row));
+}
+
+fn compress_bc5_block_row(padded: &[u8], pw: usize, bw: usize, by: usize, row: &mut [u8]) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         use std::arch::aarch64::*;
-        for by in 0..bh {
-            for bx in 0..bw {
-                let s = ((by * 4) * pw + bx * 4) * 4;
-                let r0 = vld1q_u8(padded.as_ptr().add(s));
-                let r1 = vld1q_u8(padded.as_ptr().add(s + pw * 4));
-                let r2 = vld1q_u8(padded.as_ptr().add(s + pw * 8));
-                let r3 = vld1q_u8(padded.as_ptr().add(s + pw * 12));
-                let e01 = vuzp1q_u8(r0, r1);
-                let e23 = vuzp1q_u8(r2, r3);
-                let o01 = vuzp2q_u8(r0, r1);
-                let o23 = vuzp2q_u8(r2, r3);
-                let ch0 = vuzp1q_u8(e01, e23);
-                let ch1 = vuzp1q_u8(o01, o23);
-                let o = (by * bw + bx) * BC5_BLOCK_SIZE;
-                neon::encode_bc4_channel_v(ch0, &mut out[o..o + 8]);
-                neon::encode_bc4_channel_v(ch1, &mut out[o + 8..o + 16]);
-            }
+        for bx in 0..bw {
+            let s = ((by * 4) * pw + bx * 4) * 4;
+            let r0 = vld1q_u8(padded.as_ptr().add(s));
+            let r1 = vld1q_u8(padded.as_ptr().add(s + pw * 4));
+            let r2 = vld1q_u8(padded.as_ptr().add(s + pw * 8));
+            let r3 = vld1q_u8(padded.as_ptr().add(s + pw * 12));
+            let e01 = vuzp1q_u8(r0, r1);
+            let e23 = vuzp1q_u8(r2, r3);
+            let o01 = vuzp2q_u8(r0, r1);
+            let o23 = vuzp2q_u8(r2, r3);
+            let ch0 = vuzp1q_u8(e01, e23);
+            let ch1 = vuzp1q_u8(o01, o23);
+            let o = bx * BC5_BLOCK_SIZE;
+            neon::encode_bc4_channel_v(ch0, &mut row[o..o + 8]);
+            neon::encode_bc4_channel_v(ch1, &mut row[o + 8..o + 16]);
         }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
         let mut ch0 = [0u8; 16];
         let mut ch1 = [0u8; 16];
-        for by in 0..bh {
-            for bx in 0..bw {
-                for ty in 0..4 {
-                    let s = ((by * 4 + ty) * pw + bx * 4) * 4;
-                    for tx in 0..4 {
-                        ch0[ty * 4 + tx] = padded[s + tx * 4];
-                        ch1[ty * 4 + tx] = padded[s + tx * 4 + 1];
-                    }
+        for bx in 0..bw {
+            for ty in 0..4 {
+                let s = ((by * 4 + ty) * pw + bx * 4) * 4;
+                for tx in 0..4 {
+                    ch0[ty * 4 + tx] = padded[s + tx * 4];
+                    ch1[ty * 4 + tx] = padded[s + tx * 4 + 1];
                 }
-                let o = (by * bw + bx) * BC5_BLOCK_SIZE;
-                encode_bc4_channel(&ch0, &mut out[o..o + 8]);
-                encode_bc4_channel(&ch1, &mut out[o + 8..o + 16]);
             }
+            let o = bx * BC5_BLOCK_SIZE;
+            encode_bc4_channel(&ch0, &mut row[o..o + 8]);
+            encode_bc4_channel(&ch1, &mut row[o + 8..o + 16]);
         }
     }
 }

@@ -13,6 +13,34 @@ use crate::tangents::calculate_tangents;
 use anyhow::Result;
 use serde_json::Value as J;
 
+fn decode_glb_image(r: &[u8]) -> Option<image::RgbaImage> {
+    let is_jpeg = r.len() >= 2 && r[0] == 0xFF && r[1] == 0xD8;
+    if is_jpeg {
+        if std::env::var_os("ABGEN_JPEG_GLB_9C").is_some() {
+            if let Some((rgba, w, h)) = libjpeg9c::decode_rgba(r, true) {
+                if let Some(im) = image::RgbaImage::from_raw(w, h, rgba) {
+                    return Some(im);
+                }
+            }
+        }
+        if let Ok((rgba, w, h)) = crate::ffi::decode_jpeg_rgba(r) {
+            return image::RgbaImage::from_raw(w, h, rgba);
+        }
+    }
+    decode_image_rgba8_unity(r)
+}
+
+/// Cache-key tag for GLB decodes: distinct from the builder's source-image
+/// tag (different gamma/decoder semantics), and split on the process-wide
+/// JPEG decoder toggle so a flip can't serve stale pixels.
+fn glb_decode_params() -> &'static [u8] {
+    if std::env::var_os("ABGEN_JPEG_GLB_9C").is_some() {
+        b"glb9c"
+    } else {
+        b"glb"
+    }
+}
+
 pub(super) fn parse_impl(
     gltf: &J,
     buffers: &[Vec<u8>],
@@ -24,10 +52,11 @@ pub(super) fn parse_impl(
     let empty_vec: Vec<J> = Vec::new();
 
     let buffer_views = jarr(gltf, "bufferViews").cloned().unwrap_or_default();
-    let mut images: Vec<Option<image::RgbaImage>> = Vec::new();
+    let mut images: Vec<Option<std::sync::Arc<image::RgbaImage>>> = Vec::new();
     let mut image_embedded: Vec<bool> = Vec::new();
     let mut image_bytes: Vec<Option<Vec<u8>>> = Vec::new();
     let mut image_uri: Vec<Option<String>> = Vec::new();
+    let mut raws: Vec<(bool, Option<String>, Option<Vec<u8>>)> = Vec::new();
     for img in jarr(gltf, "images").unwrap_or(&empty_vec) {
         let has_uri = js(img, "uri").is_some();
         let bv_idx = ji(img, "bufferView");
@@ -58,24 +87,24 @@ pub(super) fn parse_impl(
         } else {
             None
         };
+        raws.push((embedded, external_uri, raw));
+    }
 
-        let pil = raw.as_ref().and_then(|r| {
-            let is_jpeg = r.len() >= 2 && r[0] == 0xFF && r[1] == 0xD8;
-            if is_jpeg {
-                if std::env::var_os("ABGEN_JPEG_GLB_9C").is_some() {
-                    if let Some((rgba, w, h)) = libjpeg9c::decode_rgba(r, true) {
-                        if let Some(im) = image::RgbaImage::from_raw(w, h, rgba) {
-                            return Some(im);
-                        }
-                    }
-                }
-                if let Ok((rgba, w, h)) = crate::ffi::decode_jpeg_rgba(r) {
-                    return image::RgbaImage::from_raw(w, h, rgba);
-                }
-            }
-            decode_image_rgba8_unity(r)
-        });
+    // Decode through the per-entity cache (later platform passes reuse the
+    // buffer) and across images in parallel; results land in glTF order.
+    let params = glb_decode_params();
+    let decoded: Vec<Option<std::sync::Arc<image::RgbaImage>>> = {
+        use rayon::prelude::*;
+        raws.par_iter()
+            .map(|(_, _, raw)| {
+                raw.as_ref().and_then(|r| {
+                    crate::decode_cache::get_or_decode(params, r, || decode_glb_image(r))
+                })
+            })
+            .collect()
+    };
 
+    for ((embedded, external_uri, raw), pil) in raws.into_iter().zip(decoded) {
         let (pil, raw, external_uri) = if pil.is_none() && magenta_missing {
             let nm = external_uri.as_deref().unwrap_or("embedded texture");
             let mag = crate::placeholder::missing_texture("MISSING:", nm, 256);
@@ -84,7 +113,7 @@ pub(super) fn parse_impl(
                 Ok(()) => Some(buf.into_inner()),
                 Err(_) => raw,
             };
-            (Some(mag), png, None)
+            (Some(std::sync::Arc::new(mag)), png, None)
         } else {
             (pil, raw, external_uri)
         };

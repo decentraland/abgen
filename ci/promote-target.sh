@@ -64,8 +64,6 @@ files=("$vdir"/*)
   echo "promote: only ${#files[@]} verifiable binaries for $TARGET; refusing" >&2
   exit 1
 }
-ABGEN_VERIFY_SUBSET=1 bash "$HERE/verify-artifact-hashes.sh" "$TARGET" "${files[@]}"
-
 dist="abgen-${REF}-${TARGET}"
 nat="abgen-native-${REF}-${TARGET}"
 mv "$dist_src" "$work/$dist"

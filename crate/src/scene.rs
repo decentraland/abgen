@@ -142,7 +142,7 @@ pub struct Scene {
     pub root_nodes: Vec<usize>,
     pub name: Option<String>,
     pub materials: Vec<Material>,
-    pub images: Vec<Option<RgbaImage>>,
+    pub images: Vec<Option<std::sync::Arc<RgbaImage>>>,
     pub image_embedded: Vec<bool>,
     pub image_bytes: Vec<Option<Vec<u8>>>,
     pub image_sampler: Vec<(Option<i64>, Option<i64>)>,

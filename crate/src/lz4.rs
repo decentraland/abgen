@@ -387,30 +387,49 @@ thread_local! {
     static HC_CTX_POOL: RefCell<HcCtx> = RefCell::new(HcCtx::new());
 }
 
+#[cfg(target_arch = "x86_64")]
+fn has_avx2() -> bool {
+    use std::sync::OnceLock;
+    static HAS_AVX2: OnceLock<bool> = OnceLock::new();
+    *HAS_AVX2.get_or_init(|| {
+        if std::env::var_os("ABGEN_LZ4_SCALAR").is_some() {
+            return false;
+        }
+        std::is_x86_feature_detected!("avx2")
+    })
+}
+
+/// Same layout trick as the NEON path: two overlapping 8-byte loads pack
+/// bytes [0..8) and [4..12) into one 16-byte vector, then per-128-lane
+/// shuffles expand the 8 overlapping little-endian u32 words.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hash_batch_8_avx2(buf: &[u8], pos0: usize, out: &mut [u32; 8]) {
+    use std::arch::x86_64::*;
+    debug_assert!(pos0 + 12 <= buf.len());
+    const SHR: i32 = (MINMATCH * 8) - LZ4HC_HASH_LOG as i32;
+    let lo = _mm_loadl_epi64(buf.as_ptr().add(pos0) as *const __m128i);
+    let hi = _mm_loadl_epi64(buf.as_ptr().add(pos0 + 4) as *const __m128i);
+    let bytes = _mm_unpacklo_epi64(lo, hi);
+    // Bytes 8..12 live in lanes 12..16 of the combined vector.
+    const IDX: [u8; 32] = [
+        0, 1, 2, 3, 1, 2, 3, 4, 2, 3, 4, 5, 3, 4, 5, 6, // words 0..4
+        4, 5, 6, 7, 5, 6, 7, 12, 6, 7, 12, 13, 7, 12, 13, 14, // words 4..8
+    ];
+    let dup = _mm256_broadcastsi128_si256(bytes);
+    let idx = _mm256_loadu_si256(IDX.as_ptr() as *const __m256i);
+    let words = _mm256_shuffle_epi8(dup, idx);
+    let prime = _mm256_set1_epi32(2654435761u32 as i32);
+    let hashed = _mm256_srli_epi32::<SHR>(_mm256_mullo_epi32(words, prime));
+    _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, hashed);
+}
+
 #[inline(always)]
 fn hash_batch_8(buf: &[u8], pos0: usize, out: &mut [u32; 8]) {
-    #[cfg(all(
-        any(target_arch = "x86_64", target_arch = "x86"),
-        target_feature = "avx2"
-    ))]
-    unsafe {
-        use std::arch::x86_64::*;
-        let v0 = read32(buf, pos0);
-        let v1 = read32(buf, pos0 + 1);
-        let v2 = read32(buf, pos0 + 2);
-        let v3 = read32(buf, pos0 + 3);
-        let v4 = read32(buf, pos0 + 4);
-        let v5 = read32(buf, pos0 + 5);
-        let v6 = read32(buf, pos0 + 6);
-        let v7 = read32(buf, pos0 + 7);
-        let words = _mm256_set_epi32(
-            v7 as i32, v6 as i32, v5 as i32, v4 as i32, v3 as i32, v2 as i32, v1 as i32, v0 as i32,
-        );
-        let prime = _mm256_set1_epi32(2654435761u32 as i32);
-        let prod = _mm256_mullo_epi32(words, prime);
-        const SHR: i32 = (MINMATCH * 8) - LZ4HC_HASH_LOG as i32;
-        let hashed = _mm256_srli_epi32::<SHR>(prod);
-        _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, hashed);
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        unsafe { hash_batch_8_avx2(buf, pos0, out) };
+        return;
     }
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -430,13 +449,7 @@ fn hash_batch_8(buf: &[u8], pos0: usize, out: &mut [u32; 8]) {
         vst1q_u32(out.as_mut_ptr(), h0);
         vst1q_u32(out.as_mut_ptr().add(4), h1);
     }
-    #[cfg(not(any(
-        all(
-            any(target_arch = "x86_64", target_arch = "x86"),
-            target_feature = "avx2"
-        ),
-        target_arch = "aarch64"
-    )))]
+    #[cfg(not(target_arch = "aarch64"))]
     {
         for k in 0..8 {
             out[k] = hash_ptr(buf, pos0 + k);

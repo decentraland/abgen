@@ -8,7 +8,9 @@ let
     cargoVendorDir = craneLib.vendorCargoDeps { src = buildSource; };
     nativeBuildInputs = with pkgs; [ cmake pkg-config git ];
     doCheck = false;
-    env.SOURCE_DATE_EPOCH = sourceDateEpoch;
+    # RUSTFLAGS must match buildEnv or the buildDepsOnly artifact cache is useless.
+    env = { SOURCE_DATE_EPOCH = sourceDateEpoch; }
+      // pkgs.lib.optionalAttrs (buildEnv ? RUSTFLAGS) { inherit (buildEnv) RUSTFLAGS; };
   };
 
   thirdPartySrc = builtins.path {
