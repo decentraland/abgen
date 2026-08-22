@@ -517,10 +517,14 @@ fn is_glb_or_gltf(data: &[u8], ext: &str) -> bool {
     data.len() >= 4 && &data[0..4] == b"glTF"
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BundleArtifact {
     pub data: Vec<u8>,
     pub image_uri: Vec<Option<String>>,
+    /// The in-memory `Bundle` this artifact's `data` was serialized from,
+    /// kept around so callers (e.g. `export::convert`) can validate it
+    /// directly without re-parsing the just-produced bytes.
+    pub bundle: Bundle,
 }
 
 #[derive(Clone, Debug)]
@@ -656,6 +660,7 @@ pub fn build_bundle(
         return Ok(BundleArtifact {
             data,
             image_uri: Vec::new(),
+            bundle,
         });
     }
 
@@ -835,12 +840,15 @@ pub fn build_bundle_multi(
         let mut out = vec![BundleArtifact {
             data,
             image_uri: Vec::new(),
+            bundle,
         }];
         for name in &bundle_names[1..] {
             let (mut sibling, _, _) = load_template()?;
+            let data = b.rebuild_for(name, &mut sibling, Some(&mut memo))?;
             out.push(BundleArtifact {
-                data: b.rebuild_for(name, &mut sibling, Some(&mut memo))?,
+                data,
                 image_uri: Vec::new(),
+                bundle: sibling,
             });
         }
         return Ok(out);
@@ -885,17 +893,21 @@ pub fn build_bundle_multi(
     b.finalize_pathids()?;
     b.commit(&mut bundle)?;
     let mut memo = unity::bundle_file::ChunkMemo::default();
+    let data = bundle_io::save_bundle_memo(&bundle, &mut memo)?;
     let mut out = vec![BundleArtifact {
-        data: bundle_io::save_bundle_memo(&bundle, &mut memo)?,
+        data,
         image_uri: image_uri.clone(),
+        bundle,
     }];
     for name in &bundle_names[1..] {
         b.retarget(name);
         let (mut sibling, _, _) = load_template()?;
         b.commit(&mut sibling)?;
+        let data = bundle_io::save_bundle_memo(&sibling, &mut memo)?;
         out.push(BundleArtifact {
-            data: bundle_io::save_bundle_memo(&sibling, &mut memo)?,
+            data,
             image_uri: image_uri.clone(),
+            bundle: sibling,
         });
     }
     Ok(out)
@@ -955,7 +967,14 @@ fn build_glb_with_overrides(
     let n_material_runs = b.material_entries.len();
     b.commit(&mut bundle)?;
     let data = bundle_io::save_bundle(&bundle)?;
-    Ok((BundleArtifact { data, image_uri }, n_material_runs))
+    Ok((
+        BundleArtifact {
+            data,
+            image_uri,
+            bundle,
+        },
+        n_material_runs,
+    ))
 }
 
 fn hash_matches(bytes: &[u8], expected: &str) -> bool {
