@@ -51,19 +51,19 @@ let
       postCheck = assertRanTests;
     });
 
-    native-smoke =
+    native-sanity =
       let
         libName = "libabgen${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
       in
-      pkgs.runCommandCC "abgen-native-smoke" { } ''
+      pkgs.runCommandCC "abgen-native-sanity" { } ''
         $CC -std=c11 -Wall -Wextra -Werror \
           -I ${src}/crate/abgen-native/include \
-          ${src}/crate/abgen-native/tests/smoke.c \
-          -o smoke \
+          ${src}/crate/abgen-native/tests/sanity.c \
+          -o sanity \
           ${abgenConsumersPkg}/lib/${libName} \
           -Wl,-rpath,${abgenConsumersPkg}/lib
         export ABGEN_ROOT=${src}
-        ./smoke ${src}/crate/abgen-wasm/test/fixtures/normal-quad.glb
+        ./sanity ${src}/crate/abgen-wasm/test/fixtures/normal-quad.glb
         touch $out
       '';
   };

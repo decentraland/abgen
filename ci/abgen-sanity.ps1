@@ -1,4 +1,4 @@
-#   pwsh ci/abgen-smoke.ps1 [-Tree <repo root>] [-Profile <cargo profile dir>]
+#   pwsh ci/abgen-sanity.ps1 [-Tree <repo root>] [-Profile <cargo profile dir>]
 
 param(
     [string]$Tree = ".",
@@ -105,7 +105,7 @@ function Read-Frames([byte[]]$buf) {
     return $r
 }
 
-Write-Output "abgen Windows smoke"
+Write-Output "abgen Windows sanity"
 Write-Output ("  version = " + (& $host_exe --version))
 
 $glbBytes = [System.IO.File]::ReadAllBytes($glb)

@@ -437,7 +437,7 @@ jobs:
           path: ci/artifact-hashes/${{ matrix.target }}.sha256
           if-no-files-found: error
 
-      - name: package and smoke test
+      - name: package and sanity test
         env:
           GH_TOKEN: ${{ github.token }}
           ABGEN_RELEASE: ${{ github.ref_name }}
@@ -497,7 +497,7 @@ jobs:
           bash ci/verify-reproducible.sh "$dist" "$dist.tar.gz" "$SOURCE_DATE_EPOCH"
 
           # Cross-compiled legs (windows from linux, x86_64-apple-darwin from
-          # the arm64 macos-15 runner) cannot exec their own output; smoke
+          # the arm64 macos-15 runner) cannot exec their own output; sanity
           # only when the target matches the runner's arch. Rosetta would make
           # the x86_64 darwin binary "work" here, but only incidentally.
           case "${{ matrix.target }}" in
@@ -507,16 +507,16 @@ jobs:
           esac
           run_arch="$(uname -m)"
           [ "$run_arch" = aarch64 ] && run_arch=arm64
-          can_smoke=false
+          can_sanity=false
           if [ "$run_arch" = "$want_arch" ] && ! echo "${{ matrix.target }}" | grep -q windows; then
-            can_smoke=true
+            can_sanity=true
           fi
 
-          if [ "$can_smoke" = true ]; then
-            rm -rf /tmp/smoke && mkdir /tmp/smoke
-            tar -xzf "$dist.tar.gz" -C /tmp/smoke
+          if [ "$can_sanity" = true ]; then
+            rm -rf /tmp/sanity && mkdir /tmp/sanity
+            tar -xzf "$dist.tar.gz" -C /tmp/sanity
             (
-              cd "/tmp/smoke/$dist"
+              cd "/tmp/sanity/$dist"
               ./abgen --version
               HTTP_SERVER_PORT=5199 ./abgen &
               server=$!
@@ -558,7 +558,7 @@ jobs:
           #
           # A nix-built ELF's PT_INTERP is an absolute /nix/store path, so
           # without bundling the loader the helper only runs on the build
-          # machine — and the smoke test below couldn't catch that, since it
+          # machine — and the sanity test below couldn't catch that, since it
           # also runs there. Bundling decouples it from the host's glibc
           # entirely, which libabgen.so can't do since it's dlopen'd into
           # someone else's process.
@@ -607,13 +607,13 @@ jobs:
 
           # Windows legs cross-compile from Linux and are covered by the
           # windows CI job instead; cross-arch legs are skipped by the same
-          # can_smoke computed above.
-          if [ "$can_smoke" = true ]; then
-            rm -rf /tmp/natsmoke && mkdir /tmp/natsmoke
-            tar -xzf "$nat.tar.gz" -C /tmp/natsmoke
-            got=$("/tmp/natsmoke/$nat/abgen-host" --version)
+          # can_sanity computed above.
+          if [ "$can_sanity" = true ]; then
+            rm -rf /tmp/natsanity && mkdir /tmp/natsanity
+            tar -xzf "$nat.tar.gz" -C /tmp/natsanity
+            got=$("/tmp/natsanity/$nat/abgen-host" --version)
             test -n "$got" || { echo "abgen-host printed no version" >&2; exit 1; }
-            echo "native smoke: abgen-host $got"
+            echo "native sanity: abgen-host $got"
 
             # --version returns before apply_memory_limit, so the check above
             # cannot see a broken re-exec. Drive the real path: an empty stdin
@@ -621,7 +621,7 @@ jobs:
             # EXIT_PROTOCOL (64). Anything else — notably ld.so's exit 1 on
             # "unrecognized option" — means the cap never bound.
             set +e
-            "/tmp/natsmoke/$nat/abgen-host" --max-memory-mb 512 </dev/null
+            "/tmp/natsanity/$nat/abgen-host" --max-memory-mb 512 </dev/null
             rc=$?
             set -e
             case "$(uname -s)" in
@@ -641,22 +641,22 @@ jobs:
             esac
             test "$rc" -eq "$want" || {
               echo "abgen-host $what is broken: expected $want, got $rc" >&2; exit 1; }
-            echo "native smoke: --max-memory-mb $what ok"
+            echo "native sanity: --max-memory-mb $what ok"
 
             # And prove the artifacts do not depend on this machine. A nix leg
             # ships its own loader precisely so the archive works off NixOS;
             # if anything still names a build-machine path as its interpreter,
-            # it runs here and nowhere else, and this smoke would not notice.
+            # it runs here and nowhere else, and this sanity check would not notice.
             if [ "${{ matrix.builder }}" = "nix" ]; then
-              bad=$(readelf -lW "/tmp/natsmoke/$nat/bin/abgen-host.bin" \
+              bad=$(readelf -lW "/tmp/natsanity/$nat/bin/abgen-host.bin" \
                     | sed -n 's/.*interpreter: \(.*\)]/\1/p')
               case "$bad" in
                 /nix/store/*) ;;  # expected: the bundled loader handles it
                 *) echo "unexpected interpreter $bad" >&2; exit 1 ;;
               esac
-              test -x "/tmp/natsmoke/$nat/host-lib/ld.so" \
+              test -x "/tmp/natsanity/$nat/host-lib/ld.so" \
                 || { echo "bundled loader missing from the archive" >&2; exit 1; }
-              echo "native smoke: bundled loader present"
+              echo "native sanity: bundled loader present"
             fi
           fi
 
@@ -817,10 +817,10 @@ jobs:
       - name: build the addon
         working-directory: crate/abgen-node
         run: npx napi build --platform --release --target ${{ matrix.target }}
-      - name: smoke the addon
+      - name: sanity-check the addon
         if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin'
         working-directory: crate/abgen-node
-        run: node test/smoke.mjs
+        run: node test/sanity.mjs
       - name: glibc floor
         if: endsWith(matrix.target, '-unknown-linux-gnu')
         working-directory: crate/abgen-node

@@ -83,10 +83,10 @@ mv "$work/$dist.tar.gz" "$work/$dist.tar.gz.sha256" \
    "$work/$nat.tar.gz" "$work/$nat.tar.gz.sha256" "$OUT/"
 
 if [ "$TARGET" = "x86_64-unknown-linux-gnu" ] && [ "$(uname -m)" = "x86_64" ]; then
-  rm -rf "$work/smoke" && mkdir "$work/smoke"
-  tar -xzf "$OUT/$dist.tar.gz" -C "$work/smoke"
-  v="$("$work/smoke/$dist/abgen" --version)"
-  echo "promote smoke: abgen --version -> $v"
+  rm -rf "$work/sanity" && mkdir "$work/sanity"
+  tar -xzf "$OUT/$dist.tar.gz" -C "$work/sanity"
+  v="$("$work/sanity/$dist/abgen" --version)"
+  echo "promote sanity: abgen --version -> $v"
   [ -n "$v" ]
 fi
 

@@ -1,7 +1,7 @@
 /*
  * Proves the C ABI from C: the Rust tests call the same entry points as Rust
  * functions and cannot catch a broken export table or a drifted header.
- * Build + run via crate/abgen-native/tests/run-smoke.sh.
+ * Build + run via crate/abgen-native/tests/run-sanity.sh.
  */
 
 #include <stdio.h>
@@ -141,7 +141,7 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    printf("abgen C ABI smoke test\n");
+    printf("abgen C ABI sanity test\n");
     printf("  abi_version = %u (header says %u)\n", abgen_abi_version(),
            ABGEN_ABI_VERSION);
     printf("  version     = %s\n", abgen_version());

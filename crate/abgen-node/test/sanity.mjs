@@ -9,7 +9,7 @@ const pkg = join(here, '..')
 
 // `napi build --platform` drops a finished addon at the package root; a plain
 // `cargo build` leaves a bare cdylib under target/. Prefer the former: it is the
-// artifact we publish and users load, so the smoke exercises the real thing.
+// artifact we publish and users load, so the sanity exercises the real thing.
 function resolveAddon(explicit) {
   if (explicit) return explicit
   const looked = []

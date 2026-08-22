@@ -27,8 +27,8 @@ re-runs converge on the full asset set.
    rather than creating a new one, so a pre-created release ships with no assets
    attached; only a CI-created release carries the notes from
    `.github/release-notes.md`.
-3. What runs: each leg builds, packages, smoke-tests (`--version` + `/readyz`; windows
-   legs are cross-built and not smoke-run), and uploads its archive with `--clobber`.
+3. What runs: each leg builds, packages, sanity-tests (`--version` + `/readyz`; windows
+   legs are cross-built and not sanity-run), and uploads its archive with `--clobber`.
    The `publish` job re-downloads the published assets, verifies them against the
    build-time hashes, uploads the aggregated `SHA256SUMS.txt`, and publishes seven npm
    packages (six platform binaries, then the `@dcl/abgen` connector); `napi-publish`
@@ -41,7 +41,7 @@ re-runs converge on the full asset set.
    `SHA256SUMS.txt`), and that the release is no longer a draft.
 5. Failed leg: re-run failed jobs from the Actions UI; everything converges.
 
-`workflow_dispatch` on a branch is a build+smoke dry run: no release and no npm publish, but it
+`workflow_dispatch` on a branch is a build+sanity dry run: no release and no npm publish, but it
 verifies the artifact hashes and uploads the archives as workflow artifacts, so a branch can be
 tested on a real machine before a tag exists. `targets` narrows the matrix to one lane for
 iteration; `record_hashes` re-records the manifest and refuses to run with `targets` set.

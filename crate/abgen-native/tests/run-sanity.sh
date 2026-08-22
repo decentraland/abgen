@@ -23,13 +23,13 @@ lib="$root/target/release/$libname"
 out="$(mktemp -d)"
 trap 'rm -rf "$out"' EXIT
 
-echo "compiling smoke.c"
+echo "compiling sanity.c"
 cc -std=c11 -Wall -Wextra -Werror \
     -I "$here/../include" \
-    "$here/smoke.c" \
-    -o "$out/smoke" \
+    "$here/sanity.c" \
+    -o "$out/sanity" \
     "$lib" \
     -Wl,-rpath,"$root/target/release"
 
 echo "running"
-"$out/smoke" "$glb"
+"$out/sanity" "$glb"
