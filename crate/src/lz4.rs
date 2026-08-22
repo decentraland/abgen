@@ -226,8 +226,32 @@ fn hash_ptr(buf: &[u8], i: usize) -> u32 {
 fn lz4_count(buf: &[u8], mut pin: usize, mut pmatch: usize, limit: usize) -> u32 {
     let start = pin;
     const STEP: usize = 8;
+    const WIDE_STEP: usize = 2 * STEP;
 
     debug_assert!(limit <= buf.len());
+
+    // Two words per iteration halves the loop-carried branch/increment
+    // overhead on long matches; each half still resolves the exact
+    // mismatch byte via trailing_zeros, so the count is unchanged.
+    while pin + WIDE_STEP <= limit {
+        let a0 = read64(buf, pin);
+        let b0 = read64(buf, pmatch);
+        let diff0 = a0 ^ b0;
+        if diff0 != 0 {
+            pin += (diff0.trailing_zeros() / 8) as usize;
+            return (pin - start) as u32;
+        }
+        let a1 = read64(buf, pin + STEP);
+        let b1 = read64(buf, pmatch + STEP);
+        let diff1 = a1 ^ b1;
+        if diff1 != 0 {
+            pin += STEP + (diff1.trailing_zeros() / 8) as usize;
+            return (pin - start) as u32;
+        }
+        pin += WIDE_STEP;
+        pmatch += WIDE_STEP;
+    }
+
     while pin + STEP <= limit {
         let a = read64(buf, pin);
         let b = read64(buf, pmatch);
@@ -267,6 +291,23 @@ fn count_back(buf: &[u8], ip: usize, m: usize, imin: usize, mmin: usize) -> i32 
     let mut back: i32 = 0;
 
     let min = std::cmp::max(imin as i64 - ip as i64, mmin as i64 - m as i64) as i32;
+
+    // Word-at-a-time backward extension: read64 at (pos - 8) puts the byte
+    // adjacent to `pos` in the MSB, so leading_zeros/8 counts consecutive
+    // matching bytes in the same near-to-far order the scalar loop below
+    // would visit them one at a time.
+    while back - 8 >= min {
+        let a = read64(buf, (ip as i32 + back - 8) as usize);
+        let b = read64(buf, (m as i32 + back - 8) as usize);
+        let diff = a ^ b;
+        if diff == 0 {
+            back -= 8;
+            continue;
+        }
+        back -= (diff.leading_zeros() / 8) as i32;
+        return back;
+    }
+
     while (back > min)
         && buf[(ip as i32 + back - 1) as usize] == buf[(m as i32 + back - 1) as usize]
     {
