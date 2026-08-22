@@ -1,6 +1,101 @@
 pub const JUMP_OFFSETS: [usize; 5] = [16, 8, 4, 2, 1];
 
 pub fn alpha_bleed_inplace(rgba: &mut [u8], w: u32, h: u32) {
+    debug_assert!(w <= 65535 && h <= 65535);
+    let w = w as usize;
+    let h = h as usize;
+    let n = w * h;
+    debug_assert_eq!(rgba.len(), n * 4);
+
+    let mut has_transparent = false;
+    let mut has_opaque = false;
+    for px in rgba.chunks_exact(4) {
+        if px[3] == 0 {
+            has_transparent = true;
+        } else {
+            has_opaque = true;
+        }
+        if has_transparent && has_opaque {
+            break;
+        }
+    }
+    if !(has_transparent && has_opaque) {
+        return;
+    }
+
+    // Seeds packed as (sy<<16)|sx; -1 = none. -1 is unreachable as a real
+    // coord since x,y <= 65534, and packed values may be negative (sy >= 32768).
+    let mut cur: Vec<i32> = vec![-1; n];
+    let mut next: Vec<i32> = vec![-1; n];
+    for y in 0..h {
+        for x in 0..w {
+            let idx = y * w + x;
+            if rgba[idx * 4 + 3] > 0 {
+                cur[idx] = ((y as i32) << 16) | x as i32;
+            }
+        }
+    }
+
+    let l1 = |x: i32, y: i32, s: i32| -> i32 {
+        let sx = s & 0xffff;
+        let sy = ((s as u32) >> 16) as i32;
+        (x - sx).abs() + (y - sy).abs()
+    };
+
+    for k in JUMP_OFFSETS {
+        for y in 0..h {
+            for x in 0..w {
+                let idx = y * w + x;
+                if rgba[idx * 4 + 3] > 0 {
+                    next[idx] = cur[idx];
+                    continue;
+                }
+                let (xi, yi) = (x as i32, y as i32);
+                let mut best = cur[idx];
+                let mut bestd = if best != -1 {
+                    l1(xi, yi, best)
+                } else {
+                    i32::MAX
+                };
+                let taps = [
+                    (x >= k).then(|| idx - k),
+                    (x + k < w).then(|| idx + k),
+                    (y >= k).then(|| idx - k * w),
+                    (y + k < h).then(|| idx + k * w),
+                ];
+                for tap in taps.into_iter().flatten() {
+                    let s = cur[tap];
+                    if s != -1 {
+                        let d = l1(xi, yi, s);
+                        if d < bestd {
+                            bestd = d;
+                            best = s;
+                        }
+                    }
+                }
+                next[idx] = best;
+            }
+        }
+        std::mem::swap(&mut cur, &mut next);
+    }
+
+    let snap_rgb: Vec<u8> = rgba.to_vec();
+    for i in 0..n {
+        let s = cur[i];
+        if rgba[i * 4 + 3] == 0 && s != -1 {
+            let sx = (s & 0xffff) as usize;
+            let sy = ((s as u32) >> 16) as usize;
+            let sidx = (sy * w + sx) * 4;
+            rgba[i * 4] = snap_rgb[sidx];
+            rgba[i * 4 + 1] = snap_rgb[sidx + 1];
+            rgba[i * 4 + 2] = snap_rgb[sidx + 2];
+        }
+    }
+}
+
+// Pre-packed-seed implementation, kept temporarily as the differential-test oracle.
+#[cfg(test)]
+fn alpha_bleed_inplace_reference(rgba: &mut [u8], w: u32, h: u32) {
     let w = w as usize;
     let h = h as usize;
     let n = w * h;
@@ -182,5 +277,42 @@ mod tests {
         let before = rgba.clone();
         alpha_bleed_inplace(&mut rgba, 2, 1);
         assert_eq!(rgba, before);
+    }
+
+    // Deterministic splitmix64; no rand dependency.
+    fn splitmix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+
+    #[test]
+    fn differential_random_masks_match_reference() {
+        let mut st: u64 = 0xabc1e5;
+        for case in 0..100u32 {
+            let w = 1 + (splitmix(&mut st) % 48) as u32;
+            let h = 1 + (splitmix(&mut st) % 48) as u32;
+            // Vary transparent density from sparse to near-total.
+            let density = splitmix(&mut st) % 101;
+            let n = (w * h) as usize;
+            let mut rgba = vec![0u8; n * 4];
+            for i in 0..n {
+                let r = splitmix(&mut st);
+                rgba[i * 4] = r as u8;
+                rgba[i * 4 + 1] = (r >> 8) as u8;
+                rgba[i * 4 + 2] = (r >> 16) as u8;
+                rgba[i * 4 + 3] = if (r >> 24) % 100 < density {
+                    0
+                } else {
+                    1 + ((r >> 32) % 255) as u8
+                };
+            }
+            let mut expected = rgba.clone();
+            alpha_bleed_inplace_reference(&mut expected, w, h);
+            alpha_bleed_inplace(&mut rgba, w, h);
+            assert_eq!(rgba, expected, "case {case} diverged at {w}x{h}");
+        }
     }
 }
