@@ -11,6 +11,20 @@
 //!   - `ABGEN_DECODE_CACHE_MB` (default 512) bounds the decoded source-image
 //!     (RGBA) cache; set to 0 to disable it outright.
 //!
+//! The encode cache also has an on-disk backing ([`crate::texencode_cache`]'s
+//! `disk` submodule) that survives across process runs, keyed by the same
+//! content hash plus the encoder's crate version + `ABGEN_BUILD_ID` so a
+//! stale build can never serve a hit. It rides the same enable/disable
+//! switch as the in-memory cache and is on by default wherever that is:
+//!   - `ABGEN_DISK_CACHE` (default on, `0`/`false` disables it) is the
+//!     escape hatch.
+//!   - `ABGEN_DISK_CACHE_DIR` overrides the cache directory (default
+//!     `$XDG_CACHE_HOME/abgen/texencode`, else the platform cache dir —
+//!     `~/Library/Caches/abgen/texencode` on macOS, `~/.cache/abgen/texencode`
+//!     elsewhere).
+//!   - `ABGEN_DISK_CACHE_MAX_MB` (default 8192) bounds total bytes on disk,
+//!     LRU-evicted by file mtime.
+//!
 //! Caching never changes output bytes — only which calls skip real work —
 //! so it is safe to leave on everywhere it is enabled.
 //!
