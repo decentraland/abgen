@@ -373,22 +373,28 @@ pub(super) fn mean_color_image(img: &RgbaImage) -> RgbaImage {
 }
 
 impl<'a> Builder<'a> {
-    fn source_image(&self, scene: &Scene, idx: usize) -> texprofile::SourceImage {
-        let img = scene.images[idx].as_ref().unwrap();
-        let (w, h) = img.dimensions();
-        let container = scene
-            .image_bytes
-            .get(idx)
-            .and_then(|o| o.as_ref())
-            .map(|raw| detect_container(raw))
-            .unwrap_or_default();
-        let has_real_alpha = img.as_raw().iter().skip(3).step_by(4).any(|&a| a < 255);
-        texprofile::SourceImage {
-            width: w,
-            height: h,
-            container,
-            has_real_alpha,
-        }
+    fn source_image(&mut self, scene: &Scene, idx: usize) -> texprofile::SourceImage {
+        // Memoized: the alpha scan is O(pixels) and texture() runs per texture-ref.
+        self.src_image_cache
+            .entry(idx)
+            .or_insert_with(|| {
+                let img = scene.images[idx].as_ref().unwrap();
+                let (w, h) = img.dimensions();
+                let container = scene
+                    .image_bytes
+                    .get(idx)
+                    .and_then(|o| o.as_ref())
+                    .map(|raw| detect_container(raw))
+                    .unwrap_or_default();
+                let has_real_alpha = img.as_raw().iter().skip(3).step_by(4).any(|&a| a < 255);
+                texprofile::SourceImage {
+                    width: w,
+                    height: h,
+                    container,
+                    has_real_alpha,
+                }
+            })
+            .clone()
     }
 
     pub(super) fn external_texture(
@@ -553,7 +559,7 @@ impl<'a> Builder<'a> {
 
         let unc_wrap_u = texprofile::sampler_wrap_mode(ws);
         let unc_wrap_v = texprofile::sampler_wrap_mode(wt);
-        let img = scene.images[idx].clone().unwrap();
+        let img = scene.images[idx].as_ref().unwrap();
 
         let n_distinct_samplers = self
             .image_distinct_samplers
@@ -564,7 +570,7 @@ impl<'a> Builder<'a> {
 
         if !self.toggles.v38_compat && self.lod.is_none() {
             let mut inglb_tree = self.texture_tree_with_wrap(
-                &img,
+                img,
                 &name,
                 &unc_p,
                 Some((unc_wrap_u, unc_wrap_v)),
@@ -587,7 +593,7 @@ impl<'a> Builder<'a> {
 
         let real_tex = self.toggles.real_textures;
         let ext_tree = self.texture_tree_with_wrap(
-            &img,
+            img,
             &name,
             &bc7_p,
             None,

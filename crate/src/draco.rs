@@ -85,25 +85,22 @@ pub fn materialize(gltf: &mut J, buffers: &mut [Vec<u8>]) -> Result<()> {
         return Err(anyhow!("draco: no buffers"));
     }
 
-    let mut meshes = gltf
-        .get("meshes")
-        .and_then(|x| x.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut accessors = gltf
-        .get("accessors")
-        .and_then(|x| x.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut buffer_views = gltf
-        .get("bufferViews")
-        .and_then(|x| x.as_array())
-        .cloned()
-        .unwrap_or_default();
+    // Take the arrays instead of cloning; they are re-inserted at the end and the
+    // sole caller drops gltf on error. mem::take leaves Null in place so key
+    // order is preserved (serde_json preserve_order).
+    let take_array = |gltf: &mut J, key: &str| -> Vec<J> {
+        match gltf.get_mut(key).map(std::mem::take) {
+            Some(J::Array(a)) => a,
+            _ => Vec::new(),
+        }
+    };
+    let mut meshes = take_array(gltf, "meshes");
+    let mut accessors = take_array(gltf, "accessors");
+    let mut buffer_views = take_array(gltf, "bufferViews");
 
-    let bv_snapshot = buffer_views.clone();
-
-    let buffers_snapshot: Vec<Vec<u8>> = buffers.to_vec();
+    // New views are appended, never mutated in place, so the original range stays
+    // valid; the length gate keeps ext.bufferView from resolving appended views.
+    let orig_bv_len = buffer_views.len();
 
     let mut new_bytes: Vec<u8> = Vec::new();
     let base_offset = buffers[0].len();
@@ -125,10 +122,12 @@ pub fn materialize(gltf: &mut J, buffers: &mut [Vec<u8>]) -> Result<()> {
                 .and_then(|x| x.as_i64())
                 .ok_or_else(|| anyhow!("draco: ext.bufferView missing"))?
                 as usize;
-            let src_bv = bv_snapshot
+            let src_bv = buffer_views
                 .get(src_bv_idx)
+                .filter(|_| src_bv_idx < orig_bv_len)
                 .ok_or_else(|| anyhow!("draco: ext.bufferView out of range"))?;
-            let src_bytes = slice_from_buffer_view(src_bv, &buffers_snapshot)?;
+            // buffers is only appended to after the loop; borrowing here is safe.
+            let src_bytes = slice_from_buffer_view(src_bv, buffers)?;
 
             let result = decode_mesh_with_config_sync(src_bytes)
                 .ok_or_else(|| anyhow!("draco: decode failed"))?;
