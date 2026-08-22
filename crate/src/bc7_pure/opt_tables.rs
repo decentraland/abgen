@@ -489,11 +489,6 @@ pub(super) fn has_avx512vl() -> bool {
         std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512vl")
     })
 }
-#[cfg(not(target_arch = "x86_64"))]
-#[inline]
-pub(super) fn has_avx512vl() -> bool {
-    false
-}
 
 /// NEON is baseline on aarch64, so this only exists to honor the
 /// `ABGEN_BC7_SCALAR` escape hatch the x86 detectors support; every call site
