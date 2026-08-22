@@ -1,3 +1,18 @@
+//! Small CLI-side helpers shared by every abgen binary.
+//!
+//! In-process texture caches ([`crate::texencode_cache`], [`crate::decode_cache`])
+//! are enabled on every host that drives `export::convert` for more than a
+//! single throwaway texture: the lambda entrypoint, `live::Proxy` (the
+//! JIT/abcdn server path), `abgen-host` (the out-of-process conversion
+//! helper), and `abgen-bench`. Both are content-hash-keyed, bounded by
+//! bytes with LRU eviction, and default on:
+//!   - `ABGEN_TEX_ENCODE_CACHE_MAX_MB` (default 4096) bounds the encoded
+//!     BC7/DXT1/DXT5/BC3 chain cache.
+//!   - `ABGEN_DECODE_CACHE_MB` (default 512) bounds the decoded source-image
+//!     (RGBA) cache; set to 0 to disable it outright.
+//! Caching never changes output bytes — only which calls skip real work —
+//! so it is safe to leave on everywhere it is enabled.
+
 pub fn version_line(bin: &str) -> String {
     format!(
         "{bin} {} ({})",

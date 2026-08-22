@@ -11,8 +11,9 @@ pub enum Kind {
 }
 
 struct Store {
-    map: HashMap<[u8; 32], (Arc<Vec<u8>>, i32)>,
+    map: HashMap<[u8; 32], (Arc<Vec<u8>>, i32, u64)>,
     bytes: usize,
+    stamp: u64,
     hits: u64,
     misses: u64,
 }
@@ -53,6 +54,7 @@ fn store() -> &'static Mutex<Store> {
         Mutex::new(Store {
             map: HashMap::new(),
             bytes: 0,
+            stamp: 0,
             hits: 0,
             misses: 0,
         })
@@ -75,6 +77,21 @@ fn key(kind: Kind, pixels: &[u8], width: u32, height: u32, params: &[i64]) -> [u
     h.finalize()
 }
 
+/// Evict least-recently-used entries until `incoming` fits under `budget`.
+fn make_room(s: &mut Store, incoming: usize, budget: usize) {
+    while s.bytes + incoming > budget && !s.map.is_empty() {
+        let oldest = s
+            .map
+            .iter()
+            .min_by_key(|(_, (_, _, stamp))| *stamp)
+            .map(|(k, _)| *k)
+            .expect("non-empty map has a minimum");
+        if let Some((data, _, _)) = s.map.remove(&oldest) {
+            s.bytes -= data.len();
+        }
+    }
+}
+
 /// Like `get_or_encode`, but hands back the cache's own buffer: hits and
 /// stored misses cost an `Arc` clone instead of copying the encoded chain.
 pub fn get_or_encode_shared(
@@ -91,7 +108,10 @@ pub fn get_or_encode_shared(
     let k = key(kind, pixels, width, height, params);
     {
         let mut s = lock();
-        if let Some((data, mips)) = s.map.get(&k) {
+        s.stamp += 1;
+        let stamp = s.stamp;
+        if let Some((data, mips, at)) = s.map.get_mut(&k) {
+            *at = stamp;
             let out = (Arc::clone(data), *mips);
             s.hits += 1;
             return Some(out);
@@ -101,10 +121,14 @@ pub fn get_or_encode_shared(
     let (data, mips) = f()?;
     let len = data.len();
     let data = Arc::new(data);
-    let mut s = lock();
-    if s.bytes + len <= max_bytes() {
-        if let std::collections::hash_map::Entry::Vacant(e) = s.map.entry(k) {
-            e.insert((Arc::clone(&data), mips));
+    let budget = max_bytes();
+    if len <= budget {
+        let mut s = lock();
+        s.stamp += 1;
+        let stamp = s.stamp;
+        if !s.map.contains_key(&k) {
+            make_room(&mut s, len, budget);
+            s.map.insert(k, (Arc::clone(&data), mips, stamp));
             s.bytes += len;
         }
     }
@@ -210,6 +234,34 @@ mod tests {
 
         let c = get_or_encode(Kind::Bc7, &pixels, 8, 8, &[7], || unreachable!()).unwrap();
         assert_eq!(c, (vec![10, 20, 30], 2), "legacy view sees the same bytes");
+    }
+
+    #[test]
+    fn eviction_is_lru_and_bytes_stay_consistent() {
+        let mut s = Store {
+            map: HashMap::new(),
+            bytes: 0,
+            stamp: 0,
+            hits: 0,
+            misses: 0,
+        };
+        let entry_len = 16usize;
+        let budget = 3 * entry_len;
+        for seed in 0u8..3 {
+            s.stamp += 1;
+            s.bytes += entry_len;
+            s.map
+                .insert([seed; 32], (Arc::new(vec![seed; entry_len]), 1, s.stamp));
+        }
+        s.stamp += 1;
+        let stamp = s.stamp;
+        s.map.get_mut(&[0u8; 32]).unwrap().2 = stamp;
+
+        make_room(&mut s, entry_len, budget);
+        assert!(s.map.contains_key(&[0u8; 32]), "recently touched survives");
+        assert!(!s.map.contains_key(&[1u8; 32]), "LRU entry evicted");
+        assert!(s.map.contains_key(&[2u8; 32]));
+        assert_eq!(s.bytes, 2 * entry_len);
     }
 
     #[test]
