@@ -722,3 +722,140 @@ fn wgpu_bc7_mip_chain_large_texture_golden() {
         sampled.len()
     );
 }
+
+#[test]
+fn wgpu_bc7_mip_chain_batch_matches_sync() {
+    if qualified_gpu_or_skip("wgpu_bc7_mip_chain_batch_matches_sync").is_none() {
+        return;
+    }
+    use super::MipChainJob;
+    use crate::gpu::corelib::bc7::Bc7Profile;
+
+    struct Case {
+        seed: u64,
+        w: u32,
+        h: u32,
+        mc: Option<i32>,
+        flip: bool,
+        srgb: bool,
+        perceptual: bool,
+        profile: Bc7Profile,
+    }
+    let cases = [
+        Case {
+            seed: 3,
+            w: 37,
+            h: 53,
+            mc: None,
+            flip: true,
+            srgb: true,
+            perceptual: true,
+            profile: Bc7Profile::Slow,
+        },
+        Case {
+            seed: 5,
+            w: 64,
+            h: 64,
+            mc: Some(2),
+            flip: false,
+            srgb: false,
+            perceptual: false,
+            profile: Bc7Profile::Basic,
+        },
+        Case {
+            seed: 7,
+            w: 128,
+            h: 32,
+            mc: None,
+            flip: true,
+            srgb: true,
+            perceptual: false,
+            profile: Bc7Profile::Basic,
+        },
+        Case {
+            seed: 11,
+            w: 16,
+            h: 16,
+            mc: Some(1),
+            flip: false,
+            srgb: true,
+            perceptual: true,
+            profile: Bc7Profile::Slow,
+        },
+        Case {
+            seed: 13,
+            w: 96,
+            h: 48,
+            mc: None,
+            flip: false,
+            srgb: false,
+            perceptual: false,
+            profile: Bc7Profile::Basic,
+        },
+    ];
+    let textures: Vec<Vec<u8>> = cases
+        .iter()
+        .map(|c| gen_texture(c.seed, c.w, c.h))
+        .collect();
+
+    let sync_start = std::time::Instant::now();
+    let mut want: Vec<(Vec<u8>, i32)> = Vec::with_capacity(cases.len());
+    for (c, tex) in cases.iter().zip(&textures) {
+        want.push(
+            super::encode_bc7_mip_chain(
+                tex,
+                c.w,
+                c.h,
+                c.mc,
+                c.flip,
+                c.srgb,
+                c.perceptual,
+                c.profile,
+            )
+            .expect("sync mip chain encode"),
+        );
+    }
+    let sync_elapsed = sync_start.elapsed();
+
+    let jobs: Vec<MipChainJob> = cases
+        .iter()
+        .zip(&textures)
+        .map(|(c, tex)| MipChainJob {
+            rgba: tex,
+            width: c.w,
+            height: c.h,
+            mip_count: c.mc,
+            flip: c.flip,
+            srgb: c.srgb,
+            perceptual: c.perceptual,
+            profile: c.profile,
+        })
+        .collect();
+    let batch_start = std::time::Instant::now();
+    let got = super::encode_bc7_mip_chain_batch(&jobs).expect("batch mip chain encode");
+    let batch_elapsed = batch_start.elapsed();
+
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "batch must return one result per job"
+    );
+    for (i, ((got_bytes, got_mips), (want_bytes, want_mips))) in got.iter().zip(&want).enumerate() {
+        assert_eq!(
+            *got_mips, *want_mips,
+            "case {i} ({}x{}): mip count",
+            cases[i].w, cases[i].h
+        );
+        assert_bytes_eq(
+            got_bytes,
+            want_bytes,
+            &format!("case {i} ({}x{})", cases[i].w, cases[i].h),
+        );
+    }
+    eprintln!(
+        "wgpu_bc7_mip_chain_batch_matches_sync: {} textures, byte-identical to sync path; sync={:?} batch={:?}",
+        cases.len(),
+        sync_elapsed,
+        batch_elapsed
+    );
+}
