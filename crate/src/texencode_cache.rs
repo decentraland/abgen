@@ -67,6 +67,13 @@ fn lock() -> std::sync::MutexGuard<'static, Store> {
 
 fn key(kind: Kind, pixels: &[u8], width: u32, height: u32, params: &[i64]) -> [u8; 32] {
     let mut h = crate::hashes::Sha256::new();
+    // Fold in the encoder build id so a stale on-disk entry from a previous
+    // build can never serve: bumping ABGEN_BUILD_ID (a content hash of the
+    // source tree) or the crate version changes every key.
+    h.update(env!("CARGO_PKG_VERSION").as_bytes());
+    h.update(&[0u8]);
+    h.update(env!("ABGEN_BUILD_ID").as_bytes());
+    h.update(&[0u8]);
     h.update(&[kind as u8]);
     h.update(&width.to_le_bytes());
     h.update(&height.to_le_bytes());
@@ -75,6 +82,224 @@ fn key(kind: Kind, pixels: &[u8], width: u32, height: u32, params: &[i64]) -> [u
     }
     h.update(pixels);
     h.finalize()
+}
+
+/// Cross-run, on-disk backing for the in-memory encode cache above.
+///
+/// Same key space (content hash of source pixels + encode params + the
+/// encoder's build id, see [`key`]), same value (the encoded block payload),
+/// so a disk hit is byte-identical to a fresh encode by construction — it
+/// *is* a previous encode's output, not a recomputation. Layout: a shard
+/// dir per key's first two hex chars (keeps directories small), one file
+/// per key, written tmp-then-renamed so a reader never observes a partial
+/// write. Bounded by total bytes with LRU-by-mtime eviction, swept
+/// probabilistically (not on every write — a full directory walk per write
+/// would undercut the point of the cache) after a successful insert.
+///
+/// Default on wherever the in-memory cache is enabled (`ABGEN_DISK_CACHE=0`
+/// is the escape hatch); default off under `cfg(test)` so the unit test
+/// suite never touches a developer's real cache directory — tests that
+/// exercise it opt back in explicitly and point `ABGEN_DISK_CACHE_DIR` at a
+/// throwaway directory.
+#[cfg(not(target_arch = "wasm32"))]
+mod disk {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::SystemTime;
+
+    /// Only run the (directory-walking) eviction sweep once every this many
+    /// writes: bounds the amortized cost of enforcing the byte budget
+    /// without a persistent index, at the price of letting the cache
+    /// overshoot the budget by a few entries between sweeps.
+    const EVICT_EVERY_N_WRITES: u64 = 8;
+
+    static WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    fn enabled() -> bool {
+        // Never touch real disk from the unit test binary by default: a
+        // developer running `cargo test` should not find abgen writing
+        // into their actual OS cache directory.
+        crate::clihelp::env_bool("ABGEN_DISK_CACHE", !cfg!(test))
+    }
+
+    fn max_bytes() -> u64 {
+        std::env::var("ABGEN_DISK_CACHE_MAX_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(8192)
+            .saturating_mul(1024 * 1024)
+    }
+
+    /// `$ABGEN_DISK_CACHE_DIR`, else `$XDG_CACHE_HOME/abgen`, else the
+    /// platform default (`~/Library/Caches/abgen` on macOS, `~/.cache/abgen`
+    /// elsewhere) — no new dependency, just the env vars every platform
+    /// cache-dir crate reads under the hood. `None` if none of that
+    /// resolves (e.g. `$HOME` unset), in which case the disk cache is
+    /// silently skipped and callers fall back to memory-only behavior.
+    fn cache_root() -> Option<PathBuf> {
+        if let Ok(dir) = std::env::var("ABGEN_DISK_CACHE_DIR") {
+            if !dir.trim().is_empty() {
+                return Some(PathBuf::from(dir));
+            }
+        }
+        if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+            if !xdg.trim().is_empty() {
+                return Some(PathBuf::from(xdg).join("abgen").join("texencode"));
+            }
+        }
+        let home = std::env::var("HOME").ok()?;
+        if home.trim().is_empty() {
+            return None;
+        }
+        let base = if cfg!(target_os = "macos") {
+            PathBuf::from(home).join("Library").join("Caches")
+        } else {
+            PathBuf::from(home).join(".cache")
+        };
+        Some(base.join("abgen").join("texencode"))
+    }
+
+    fn hex(key: &[u8; 32]) -> String {
+        let mut s = String::with_capacity(64);
+        for b in key {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
+    fn shard_path(root: &Path, hex: &str) -> PathBuf {
+        root.join(&hex[..2]).join(format!("{hex}.bin"))
+    }
+
+    /// Walk every shard dir and collect `(path, len, mtime)` for real
+    /// entries (skips in-flight `.tmp.` files from a concurrent writer).
+    fn entries(root: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
+        let mut out = Vec::new();
+        let Ok(shards) = fs::read_dir(root) else {
+            return out;
+        };
+        for shard in shards.flatten() {
+            let dir = shard.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Ok(files) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for f in files.flatten() {
+                let path = f.path();
+                let is_tmp = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(".tmp."));
+                if is_tmp {
+                    continue;
+                }
+                if let Ok(meta) = f.metadata() {
+                    if meta.is_file() {
+                        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                        out.push((path, meta.len(), mtime));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Evict oldest-by-mtime entries until the shard tree fits `budget`.
+    fn evict_if_needed(root: &Path, budget: u64) {
+        let mut items = entries(root);
+        let total: u64 = items.iter().map(|(_, len, _)| *len).sum();
+        if total <= budget {
+            return;
+        }
+        items.sort_by_key(|(_, _, mtime)| *mtime);
+        let mut over = total - budget;
+        for (path, len, _) in items {
+            if over == 0 {
+                break;
+            }
+            if fs::remove_file(&path).is_ok() {
+                over = over.saturating_sub(len);
+            }
+        }
+    }
+
+    /// `None` on any miss or error (missing file, disabled, unresolvable
+    /// cache dir, truncated entry) — every case just falls back to a real
+    /// encode, so this never needs to distinguish them for callers.
+    pub(super) fn get(key: &[u8; 32]) -> Option<(Vec<u8>, i32)> {
+        if !enabled() {
+            return None;
+        }
+        let root = cache_root()?;
+        let path = shard_path(&root, &hex(key));
+        let bytes = fs::read(&path).ok()?;
+        if bytes.len() < 4 {
+            return None;
+        }
+        let mips = i32::from_le_bytes(bytes[..4].try_into().ok()?);
+        let data = bytes[4..].to_vec();
+        // Touch mtime on read so hot entries survive LRU eviction; best
+        // effort, a failure here just makes this entry a slightly earlier
+        // eviction candidate, never wrong output.
+        if let Ok(f) = fs::File::open(&path) {
+            let _ = f.set_modified(SystemTime::now());
+        }
+        Some((data, mips))
+    }
+
+    pub(super) fn put(key: &[u8; 32], data: &[u8], mips: i32) {
+        if !enabled() {
+            return;
+        }
+        let budget = max_bytes();
+        let payload_len = data.len() as u64 + 4;
+        if payload_len > budget {
+            return; // a single entry bigger than the whole budget: skip it
+        }
+        let Some(root) = cache_root() else {
+            return;
+        };
+        let path = shard_path(&root, &hex(key));
+        if path.exists() {
+            return; // content-addressed and immutable: nothing to update
+        }
+        let Some(dir) = path.parent() else {
+            return;
+        };
+        if fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        let tmp = crate::tmppath::tmp_sibling(&path);
+        let mut buf = Vec::with_capacity(payload_len as usize);
+        buf.extend_from_slice(&mips.to_le_bytes());
+        buf.extend_from_slice(data);
+        if fs::write(&tmp, &buf).is_err() {
+            let _ = fs::remove_file(&tmp);
+            return;
+        }
+        if fs::rename(&tmp, &path).is_err() {
+            let _ = fs::remove_file(&tmp);
+            return;
+        }
+        if WRITE_COUNT
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(EVICT_EVERY_N_WRITES)
+        {
+            evict_if_needed(&root, budget);
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+mod disk {
+    pub(super) fn get(_key: &[u8; 32]) -> Option<(Vec<u8>, i32)> {
+        None
+    }
+
+    pub(super) fn put(_key: &[u8; 32], _data: &[u8], _mips: i32) {}
 }
 
 /// Evict least-recently-used entries until `incoming` fits under `budget`.
@@ -118,21 +343,35 @@ pub fn get_or_encode_shared(
         }
         s.misses += 1;
     }
-    let (data, mips) = f()?;
-    let len = data.len();
-    let data = Arc::new(data);
-    let budget = max_bytes();
-    if len <= budget {
-        let mut s = lock();
-        s.stamp += 1;
-        let stamp = s.stamp;
-        if !s.map.contains_key(&k) {
-            make_room(&mut s, len, budget);
-            s.map.insert(k, (Arc::clone(&data), mips, stamp));
-            s.bytes += len;
-        }
+    if let Some((data, mips)) = disk::get(&k) {
+        let data = Arc::new(data);
+        remember(k, Arc::clone(&data), mips);
+        return Some((data, mips));
     }
+    let (data, mips) = f()?;
+    disk::put(&k, &data, mips);
+    let data = Arc::new(data);
+    remember(k, Arc::clone(&data), mips);
     Some((data, mips))
+}
+
+/// Insert `data`/`mips` into the in-memory map under `k`, respecting the
+/// byte budget and LRU eviction. No-op if the key already made it in (e.g.
+/// a racing insert) or the entry alone would exceed the whole budget.
+fn remember(k: [u8; 32], data: Arc<Vec<u8>>, mips: i32) {
+    let len = data.len();
+    let budget = max_bytes();
+    if len > budget {
+        return;
+    }
+    let mut s = lock();
+    s.stamp += 1;
+    let stamp = s.stamp;
+    if !s.map.contains_key(&k) {
+        make_room(&mut s, len, budget);
+        s.map.insert(k, (data, mips, stamp));
+        s.bytes += len;
+    }
 }
 
 pub fn get_or_encode(
@@ -276,5 +515,69 @@ mod tests {
         let r = get_or_encode(Kind::Bc3, &pixels, 8, 8, &[99], || Some((vec![1, 2], 3))).unwrap();
         assert_eq!(r, (vec![1, 2], 3), "cache must survive a poisoned lock");
         let _ = stats();
+    }
+
+    /// RAII guard that restores an env var to unset on drop, even on panic
+    /// unwind — keeps the disk-cache opt-in tests from leaking state (or a
+    /// throwaway directory pointer) into whatever test runs next.
+    struct EnvGuard(&'static str);
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+
+    #[test]
+    fn disk_cache_serves_byte_identical_hits_across_simulated_process_restarts() {
+        let dir =
+            std::env::temp_dir().join(format!("abgen_texencode_disk_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("ABGEN_DISK_CACHE_DIR", &dir);
+        std::env::set_var("ABGEN_DISK_CACHE", "1");
+        let _dir_guard = EnvGuard("ABGEN_DISK_CACHE_DIR");
+        let _enable_guard = EnvGuard("ABGEN_DISK_CACHE");
+        enable();
+
+        let pixels: Vec<u8> = (0..8u32 * 8 * 4).map(|i| (i * 11 % 241) as u8).collect();
+        let a = get_or_encode(Kind::Bc7, &pixels, 8, 8, &[123], || {
+            Some((vec![4, 5, 6, 7, 8], 3))
+        })
+        .unwrap();
+        assert_eq!(a, (vec![4, 5, 6, 7, 8], 3));
+
+        // A real second process would start with an empty in-memory map but
+        // the same on-disk cache dir; `clear()` simulates exactly that.
+        clear();
+        let b = get_or_encode(Kind::Bc7, &pixels, 8, 8, &[123], || {
+            unreachable!("disk cache must serve this without recomputing")
+        })
+        .unwrap();
+        assert_eq!(
+            a, b,
+            "disk-cache hit must be byte-identical to the original encode"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_cache_key_changes_with_build_id() {
+        // The key folds in CARGO_PKG_VERSION + ABGEN_BUILD_ID; two encodes
+        // that only differ if the build id differed would need separate
+        // entries. We can't rebuild with a different id in a unit test, but
+        // we can assert the key function actually mixes both in (i.e. it
+        // isn't silently dead code the optimizer could drop).
+        let pixels = vec![1u8, 2, 3, 4];
+        let k1 = key(Kind::Bc7, &pixels, 4, 4, &[1]);
+        // A hand-rolled hash that omits build id/version must differ.
+        let mut h = crate::hashes::Sha256::new();
+        h.update(&[Kind::Bc7 as u8]);
+        h.update(&4u32.to_le_bytes());
+        h.update(&4u32.to_le_bytes());
+        h.update(&1i64.to_le_bytes());
+        h.update(&pixels);
+        let k_without_build_id = h.finalize();
+        assert_ne!(k1, k_without_build_id);
     }
 }

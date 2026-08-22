@@ -324,7 +324,14 @@ fn main() {
     // production's intra-entity texture dedup. time_once() clears both
     // before every rep — otherwise reps 2..N would measure cache hits
     // instead of the conversion, and "minimum across reps" would report a
-    // warm-cache number instead of the true cost.
+    // warm-cache number instead of the true cost. The in-memory clear can't
+    // reach the encode cache's on-disk backing though, so turn that off
+    // here specifically: a rep hitting a *previous rep's* on-disk entry
+    // would silently corrupt the "minimum across reps" measurement the same
+    // way an uncleared in-memory hit would, just persistently.
+    if std::env::var("ABGEN_DISK_CACHE").is_err() {
+        std::env::set_var("ABGEN_DISK_CACHE", "0");
+    }
     abgen::texencode_cache::enable();
     abgen::decode_cache::enable();
 
