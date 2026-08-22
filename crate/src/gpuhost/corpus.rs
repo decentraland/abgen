@@ -565,6 +565,7 @@ fn process_texture(
             mip_count: prof.mip_count,
             srgb: task.srgb,
             bucket: bi,
+            flip: false,
         });
     } else {
         let n = blockify_mip_chain(

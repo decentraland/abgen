@@ -17,17 +17,6 @@ pub fn tex_geometry(width: u32, height: u32, mip_count: i32) -> (u64, u64) {
     (base_bytes + pyr_px * 16 + nb * 64 + nb * 16 + 256, nb)
 }
 
-fn flip_rgba(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let w = width as usize;
-    let h = height as usize;
-    let mut flipped = vec![0u8; w * h * 4];
-    for y in 0..h {
-        let src = &rgba[(h - 1 - y) * w * 4..(h - 1 - y) * w * 4 + w * 4];
-        flipped[y * w * 4..y * w * 4 + w * 4].copy_from_slice(src);
-    }
-    flipped
-}
-
 type MipJob = (
     BlockifyTex,
     std::sync::mpsc::SyncSender<Result<Vec<u8>, String>>,
@@ -282,11 +271,6 @@ pub(crate) fn encode_bc7_mip_chain_gpu(
     );
     let tx = mip_worker().map_err(|e| anyhow!("gpu unavailable: {e}"))?;
     let mips = mip_count.unwrap_or_else(|| compute_default_mip_count(width, height));
-    let data = if flip {
-        flip_rgba(rgba, width, height)
-    } else {
-        rgba.to_vec()
-    };
     let bucket = match (profile, perceptual) {
         (Bc7Profile::Slow, false) => 0,
         (Bc7Profile::Slow, true) => 1,
@@ -297,12 +281,13 @@ pub(crate) fn encode_bc7_mip_chain_gpu(
     let (rtx, rrx) = std::sync::mpsc::sync_channel(1);
     tx.send((
         BlockifyTex {
-            rgba: data,
+            rgba: rgba.to_vec(),
             w: width,
             h: height,
             mip_count: mips,
             srgb,
             bucket,
+            flip,
         },
         rtx,
     ))
