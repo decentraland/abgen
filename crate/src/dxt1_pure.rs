@@ -633,18 +633,27 @@ fn encode_dxt1_mip_chain_uncached(
         let bw = pw / 4;
         let bh = ph / 4;
         let row_bytes = pw * 4;
-        for by in 0..bh {
-            for bx in 0..bw {
-                let mut block = [0u8; PIXELS_PER_BLOCK * 4];
-                let base = by * 4 * row_bytes + bx * 16;
-                for r in 0..4 {
-                    let start = base + r * row_bytes;
-                    block[r * 16..r * 16 + 16].copy_from_slice(&padded[start..start + 16]);
+        // Fixed block-row chunking into a pre-sized slice (the
+        // bc7_pure::encode_blocks pattern): every 8-byte slot is written by
+        // block index, so output bytes are identical at any thread count.
+        use rayon::prelude::*;
+        let off = parts.len();
+        parts.resize(off + bw * bh * BLOCK_SIZE, 0);
+        parts[off..]
+            .par_chunks_mut(bw * BLOCK_SIZE)
+            .enumerate()
+            .for_each(|(by, dst)| {
+                for bx in 0..bw {
+                    let mut block = [0u8; PIXELS_PER_BLOCK * 4];
+                    let base = by * 4 * row_bytes + bx * 16;
+                    for r in 0..4 {
+                        let start = base + r * row_bytes;
+                        block[r * 16..r * 16 + 16].copy_from_slice(&padded[start..start + 16]);
+                    }
+                    dst[bx * BLOCK_SIZE..bx * BLOCK_SIZE + BLOCK_SIZE]
+                        .copy_from_slice(&encode_block(&block));
                 }
-                let enc = encode_block(&block);
-                parts.extend_from_slice(&enc);
-            }
-        }
+            });
         if m < mip_count - 1 {
             let (next, nw, nh) = box_halve_rgba(&cur, cw, ch);
             cur = next;

@@ -90,7 +90,8 @@ sha2 = "0.11"
 hmac = "0.13"
 libm = "=0.2.16"
 draco_decoder = { path = "third_party/draco_decoder" }
-texpresso = "2"
+# rayon feature: deterministic par_chunks_mut block-row split inside compress.
+texpresso = { version = "2", features = ["rayon"] }
 crunch_ffi = { path = "third_party/crunch" }
 libjpeg9c = { path = "third_party/libjpeg9c" }
 texture2ddecoder = "0.1"
