@@ -4,7 +4,7 @@ use crate::builder::{build_bundle, BuildOpts};
 use crate::export::{HostInfo, Input, Kind, Sink};
 use crate::hashes::sha256_hex;
 use crate::naming;
-use crate::validate::{validate_bundle, Severity, ValidateCtx};
+use crate::validate::{validate_bundle_parsed, Severity, ValidateCtx};
 
 fn ext_of(name: &str) -> String {
     match name.rsplit('.').next() {
@@ -172,7 +172,7 @@ fn convert_one(
     match build_bundle(data, &bundle_name, &hash, &opts) {
         Ok(artifact) => {
             let findings =
-                validate_bundle(&artifact.data, &bundle_name, &ValidateCtx::single_file());
+                validate_bundle_parsed(&artifact.bundle, &bundle_name, &ValidateCtx::single_file());
             let fjson: Vec<serde_json::Value> = findings
                 .iter()
                 .map(|f| {

@@ -205,6 +205,27 @@ fn resample_axes(work: &[f64], sw: usize, sh: usize, dw: usize, dh: usize) -> Ve
     out
 }
 
+/// Convert one row of `sw` RGBA pixels from `u8` to `f64`, exactly like the
+/// whole-image conversion `box_downscale_rgba` used to do up front — same
+/// per-channel math, just scoped to a single row so it can be fused into
+/// that row's horizontal resample pass.
+fn row_to_f64(srow: &[u8], srgb: bool) -> Vec<f64> {
+    let mut row = vec![0f64; srow.len()];
+    if srgb {
+        for (px, wp) in srow.chunks_exact(C).zip(row.chunks_exact_mut(C)) {
+            wp[0] = SRGB_LIN_F64[px[0] as usize];
+            wp[1] = SRGB_LIN_F64[px[1] as usize];
+            wp[2] = SRGB_LIN_F64[px[2] as usize];
+            wp[3] = px[3] as f64;
+        }
+    } else {
+        for (d, &v) in row.iter_mut().zip(srow.iter()) {
+            *d = v as f64;
+        }
+    }
+    row
+}
+
 pub fn box_downscale_rgba(
     src: &[u8],
     sw: usize,
@@ -213,38 +234,87 @@ pub fn box_downscale_rgba(
     dh: usize,
     srgb: bool,
 ) -> Vec<u8> {
+    use rayon::prelude::*;
+
     debug_assert_eq!(src.len(), sw * sh * C);
     if (sw, sh) == (dw, dh) {
         return src.to_vec();
     }
 
-    let mut work = vec![0f64; sh * sw * C];
-    if srgb {
-        for (px, wp) in src.chunks_exact(C).zip(work.chunks_exact_mut(C)) {
-            wp[0] = SRGB_LIN_F64[px[0] as usize];
-            wp[1] = SRGB_LIN_F64[px[1] as usize];
-            wp[2] = SRGB_LIN_F64[px[2] as usize];
-            wp[3] = px[3] as f64;
-        }
+    // Horizontal pass, fused with the u8->f64 conversion: each output row
+    // depends only on the matching source row, so both the conversion and
+    // the horizontal resample for that row run together, across rows in
+    // parallel, instead of materializing a whole-image f64 copy up front.
+    let hplan = if dw == sw {
+        None
     } else {
-        for (d, &v) in work.iter_mut().zip(src.iter()) {
-            *d = v as f64;
+        Some(plan_for_axis(sw, dw))
+    };
+    let src_rs = sw * C;
+    let dst_rs = dw * C;
+    let mut inter = vec![0f64; sh * dw * C];
+    inter
+        .par_chunks_mut(dst_rs)
+        .enumerate()
+        .for_each(|(y, orow)| {
+            let srow = &src[y * src_rs..(y + 1) * src_rs];
+            let row_f64 = row_to_f64(srow, srgb);
+            match &hplan {
+                None => orow.copy_from_slice(&row_f64),
+                Some(plan) => {
+                    for (x, taps) in plan.taps.iter().enumerate() {
+                        accum_taps_4(&row_f64, taps, C, 0, orow, x * C);
+                    }
+                }
+            }
+        });
+
+    // Vertical pass: each output row is an independent weighted sum of
+    // source rows, so it also runs row-parallel; the per-row accumulation
+    // order (taps in plan order, channels 0..C) is unchanged.
+    let vplan = if dh == sh {
+        None
+    } else {
+        Some(plan_for_axis(sh, dh))
+    };
+    let fin = match &vplan {
+        None => inter,
+        Some(plan) => {
+            let inter_rs = dw * C;
+            let mut out = vec![0f64; dh * dw * C];
+            out.par_chunks_mut(inter_rs)
+                .zip(plan.taps.par_iter())
+                .for_each(|(orow, taps)| {
+                    let mut wsum = 0f64;
+                    for &(sy, w) in taps {
+                        let srow = &inter[sy * inter_rs..(sy + 1) * inter_rs];
+                        for (a, &s) in orow.iter_mut().zip(srow) {
+                            *a += w * s;
+                        }
+                        wsum += w;
+                    }
+                    for a in orow.iter_mut() {
+                        *a /= wsum;
+                    }
+                });
+            out
         }
-    }
-    let fin = resample_axes(&work, sw, sh, dw, dh);
+    };
 
     let mut out = vec![0u8; dh * dw * C];
     if srgb {
-        for (px, fp) in out.chunks_exact_mut(C).zip(fin.chunks_exact(C)) {
-            px[0] = linear_to_srgb_u8(fp[0] as f32);
-            px[1] = linear_to_srgb_u8(fp[1] as f32);
-            px[2] = linear_to_srgb_u8(fp[2] as f32);
-            px[3] = fp[3].round().clamp(0.0, 255.0) as u8;
-        }
+        out.par_chunks_mut(C)
+            .zip(fin.par_chunks(C))
+            .for_each(|(px, fp)| {
+                px[0] = linear_to_srgb_u8(fp[0] as f32);
+                px[1] = linear_to_srgb_u8(fp[1] as f32);
+                px[2] = linear_to_srgb_u8(fp[2] as f32);
+                px[3] = fp[3].round().clamp(0.0, 255.0) as u8;
+            });
     } else {
-        for (d, &v) in out.iter_mut().zip(fin.iter()) {
+        out.par_iter_mut().zip(fin.par_iter()).for_each(|(d, &v)| {
             *d = v.round().clamp(0.0, 255.0) as u8;
-        }
+        });
     }
     out
 }
@@ -284,8 +354,90 @@ pub fn premul_downscale_rgba(src: &[u8], sw: usize, sh: usize, dw: usize, dh: us
 }
 
 #[cfg(test)]
+fn box_downscale_rgba_reference(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+    srgb: bool,
+) -> Vec<u8> {
+    if (sw, sh) == (dw, dh) {
+        return src.to_vec();
+    }
+    let mut work = vec![0f64; sh * sw * C];
+    if srgb {
+        for (px, wp) in src.chunks_exact(C).zip(work.chunks_exact_mut(C)) {
+            wp[0] = SRGB_LIN_F64[px[0] as usize];
+            wp[1] = SRGB_LIN_F64[px[1] as usize];
+            wp[2] = SRGB_LIN_F64[px[2] as usize];
+            wp[3] = px[3] as f64;
+        }
+    } else {
+        for (d, &v) in work.iter_mut().zip(src.iter()) {
+            *d = v as f64;
+        }
+    }
+    let fin = resample_axes(&work, sw, sh, dw, dh);
+    let mut out = vec![0u8; dh * dw * C];
+    if srgb {
+        for (px, fp) in out.chunks_exact_mut(C).zip(fin.chunks_exact(C)) {
+            px[0] = linear_to_srgb_u8(fp[0] as f32);
+            px[1] = linear_to_srgb_u8(fp[1] as f32);
+            px[2] = linear_to_srgb_u8(fp[2] as f32);
+            px[3] = fp[3].round().clamp(0.0, 255.0) as u8;
+        }
+    } else {
+        for (d, &v) in out.iter_mut().zip(fin.iter()) {
+            *d = v.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn xorshift64(s: &mut u64) -> u64 {
+        let mut x = *s;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *s = x;
+        x
+    }
+
+    /// A/B against the pre-parallelization implementation (kept here as
+    /// `box_downscale_rgba_reference`) over a battery of non-trivial sizes,
+    /// including odd/1-wide/1-tall shapes: the fused, row-parallel version
+    /// must be byte-for-byte identical.
+    #[test]
+    fn box_downscale_matches_reference_impl() {
+        let mut s = 0x1234_5678_9abc_def1u64;
+        let cases: [(usize, usize, usize, usize); 8] = [
+            (37, 53, 17, 23),
+            (64, 64, 32, 32),
+            (128, 32, 40, 40),
+            (200, 1, 50, 1),
+            (1, 200, 1, 50),
+            (300, 200, 300, 200),
+            (5, 5, 5, 5),
+            (9, 7, 3, 11),
+        ];
+        for &(sw, sh, dw, dh) in &cases {
+            let n = sw * sh * C;
+            let src: Vec<u8> = (0..n).map(|_| (xorshift64(&mut s) & 0xff) as u8).collect();
+            for srgb in [false, true] {
+                let got = box_downscale_rgba(&src, sw, sh, dw, dh, srgb);
+                let want = box_downscale_rgba_reference(&src, sw, sh, dw, dh, srgb);
+                assert_eq!(
+                    got, want,
+                    "{sw}x{sh}->{dw}x{dh} srgb={srgb}: fused/parallel path diverged"
+                );
+            }
+        }
+    }
 
     #[test]
     fn linear_domain_average() {

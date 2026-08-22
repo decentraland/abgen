@@ -10,6 +10,7 @@ const COMPRESSION_MASK: u32 = 0x3F;
 const FLAG_BLOCKS_INFO_AT_END: u32 = 0x80;
 const FLAG_BLOCK_INFO_NEED_PADDING: u32 = 0x200;
 
+#[derive(Debug)]
 pub enum FileContent {
     Serialized(SerializedFile),
     Raw(Vec<u8>),
@@ -18,6 +19,7 @@ pub enum FileContent {
 #[derive(Default)]
 pub struct ChunkMemo(std::collections::HashMap<Vec<u8>, Vec<u8>>);
 
+#[derive(Debug)]
 pub struct BundleEntry {
     pub name: String,
     pub content: FileContent,
@@ -25,6 +27,7 @@ pub struct BundleEntry {
     pub flags: u32,
 }
 
+#[derive(Debug)]
 pub struct Bundle {
     pub format_version: u32,
     pub version_player: String,
@@ -127,15 +130,49 @@ impl Bundle {
             r.align_stream(16);
         }
 
-        let mut blocks_data: Vec<u8> = Vec::new();
-        for block in &m_blocks {
-            let comp = r.read_bytes_vec(block.compressed_size as usize);
-            let dec = decompress_block(
-                &comp,
-                block.uncompressed_size as usize,
-                block.flags as u32 & COMPRESSION_MASK,
-            )?;
-            blocks_data.extend_from_slice(&dec);
+        // Prefix-sum the block table into (compressed_offset, uncompressed_size)
+        // pairs so every block's input and output range is known up front;
+        // this lets decompression run in parallel while writing straight
+        // into disjoint slices of a single preallocated output buffer,
+        // mirroring the compress side in `chunk_based_compress`. Blocks are
+        // independent (each is a self-contained LZ4 frame), so this changes
+        // nothing about the decompressed bytes or their order.
+        let blocks_start = r.position();
+        let mut comp_off = Vec::with_capacity(m_blocks.len());
+        let mut unc_sizes = Vec::with_capacity(m_blocks.len());
+        {
+            let mut co = blocks_start;
+            for block in &m_blocks {
+                comp_off.push(co);
+                unc_sizes.push(block.uncompressed_size as usize);
+                co += block.compressed_size as usize;
+            }
+        }
+        let total_uncompressed: usize = unc_sizes.iter().sum();
+        let mut blocks_data: Vec<u8> = vec![0u8; total_uncompressed];
+        {
+            use rayon::prelude::*;
+            let mut rest: &mut [u8] = &mut blocks_data;
+            let mut out_slices: Vec<&mut [u8]> = Vec::with_capacity(m_blocks.len());
+            for &sz in &unc_sizes {
+                let (head, tail) = rest.split_at_mut(sz);
+                out_slices.push(head);
+                rest = tail;
+            }
+            m_blocks
+                .par_iter()
+                .zip(comp_off.par_iter())
+                .zip(out_slices.into_par_iter())
+                .try_for_each(|((block, &co), out)| -> Result<()> {
+                    let comp = &data[co..co + block.compressed_size as usize];
+                    let dec = decompress_block(
+                        comp,
+                        block.uncompressed_size as usize,
+                        block.flags as u32 & COMPRESSION_MASK,
+                    )?;
+                    out.copy_from_slice(&dec);
+                    Ok(())
+                })?;
         }
 
         Ok(DecompressedBundle {

@@ -703,23 +703,23 @@ fn record_encode(
     Ok((staging, out_len, mips))
 }
 
+// Blocking wait + map + copy + release for one texture's staging buffer. Split
+// out of encode_bc7_mip_chain so encode_bc7_mip_chain_batch can submit texture
+// N's dispatch (record_encode, which ends in a non-blocking queue.submit)
+// before waiting on texture N-1's readback: N's command buffer is already
+// queued behind N-1's by the time this call blocks, so the GPU keeps N-1's
+// tail and N's dispatch running back-to-back instead of idling on the CPU's
+// per-texture record/submit gap. wgpu's single-queue timeline still makes
+// this byte-identical to the fully sequential path — command buffers execute,
+// and any resource they touch is synchronized, in submission order.
 #[cfg(not(target_arch = "wasm32"))]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_bc7_mip_chain(
-    rgba: &[u8],
-    width: u32,
-    height: u32,
-    mip_count: Option<i32>,
-    flip: bool,
-    srgb: bool,
-    perceptual: bool,
-    profile: Bc7Profile,
+fn blocking_readback(
+    g: &Gpu,
+    eng: &Engine,
+    staging: ::wgpu::Buffer,
+    out_len: u64,
+    mips: i32,
 ) -> Result<(Vec<u8>, i32)> {
-    let g = gpu().map_err(|e| anyhow!("wgpu unavailable: {e}"))?;
-    let eng = engine(g);
-    let (staging, out_len, mips) = record_encode(
-        g, eng, rgba, width, height, mip_count, flip, srgb, perceptual, profile,
-    )?;
     let slice = staging.slice(0..out_len);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(::wgpu::MapMode::Read, move |r| {
@@ -738,6 +738,84 @@ pub(crate) fn encode_bc7_mip_chain(
     staging.unmap();
     eng.put_readback(staging);
     Ok((out, mips))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_bc7_mip_chain(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    mip_count: Option<i32>,
+    flip: bool,
+    srgb: bool,
+    perceptual: bool,
+    profile: Bc7Profile,
+) -> Result<(Vec<u8>, i32)> {
+    let g = gpu().map_err(|e| anyhow!("wgpu unavailable: {e}"))?;
+    let eng = engine(g);
+    let (staging, out_len, mips) = record_encode(
+        g, eng, rgba, width, height, mip_count, flip, srgb, perceptual, profile,
+    )?;
+    blocking_readback(g, eng, staging, out_len, mips)
+}
+
+/// One texture's inputs for [`encode_bc7_mip_chain_batch`]; same fields as
+/// the positional arguments of [`encode_bc7_mip_chain`].
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct MipChainJob<'a> {
+    pub rgba: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+    pub mip_count: Option<i32>,
+    pub flip: bool,
+    pub srgb: bool,
+    pub perceptual: bool,
+    pub profile: Bc7Profile,
+}
+
+/// Double-buffered pipeline over several textures: each texture's dispatch is
+/// submitted before the previous texture's readback is awaited, so CPU-side
+/// prep/submit for texture N overlaps GPU execution of texture N-1's tail
+/// (two in-flight slots — this texture's just-submitted work, and the prior
+/// texture's pending readback — is enough to close the gap; a third slot
+/// would only help if per-texture CPU prep exceeded GPU time, which it does
+/// not here). Results are returned in the same order as `jobs`, byte-for-byte
+/// identical to calling [`encode_bc7_mip_chain`] once per job — the pooled
+/// buffers reused across jobs are only handed back to the pool once actually
+/// consumed (readback buffers after their map completes; scratch/working
+/// buffers only after their own submit, exactly as the single-texture path
+/// already does), and wgpu's single queue serializes access to any buffer a
+/// later job's write_buffer/dispatch reuses from the pool.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn encode_bc7_mip_chain_batch(jobs: &[MipChainJob]) -> Result<Vec<(Vec<u8>, i32)>> {
+    let g = gpu().map_err(|e| anyhow!("wgpu unavailable: {e}"))?;
+    let eng = engine(g);
+    let mut results = Vec::with_capacity(jobs.len());
+    let mut pending: Option<(::wgpu::Buffer, u64, i32)> = None;
+    for job in jobs {
+        let submitted = record_encode(
+            g,
+            eng,
+            job.rgba,
+            job.width,
+            job.height,
+            job.mip_count,
+            job.flip,
+            job.srgb,
+            job.perceptual,
+            job.profile,
+        )?;
+        if let Some((staging, out_len, mips)) = pending.replace(submitted) {
+            results.push(blocking_readback(g, eng, staging, out_len, mips)?);
+        }
+    }
+    if let Some((staging, out_len, mips)) = pending {
+        results.push(blocking_readback(g, eng, staging, out_len, mips)?);
+    }
+    Ok(results)
 }
 
 #[cfg(target_arch = "wasm32")]

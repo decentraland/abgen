@@ -712,72 +712,73 @@ impl<'a> Builder<'a> {
                 );
                 return t;
             }
-            let stubbed_src;
-            let img: &RgbaImage = if stub_bc7 {
-                stubbed_src = mean_color_image(img);
-                &stubbed_src
-            } else {
-                img
-            };
-            let resized;
-            let src: &RgbaImage = if (prof.target_w, prof.target_h) != (ow, oh) {
-                let buf = crate::resize::box_downscale_rgba(
-                    img.as_raw(),
-                    ow as usize,
-                    oh as usize,
-                    prof.target_w as usize,
-                    prof.target_h as usize,
-                    prof.color_space == 1,
-                );
-                resized = RgbaImage::from_raw(prof.target_w, prof.target_h, buf)
-                    .expect("resize buffer size mismatch");
-                &resized
-            } else {
-                img
-            };
-            if stub_bc7 && prof.texture_format == texprofile::TF_BC7 {
+            if stub_bc7 {
+                // stub_bc7 already implies texture_format == TF_BC7 (see its
+                // definition above), and this stub's bytes depend only on
+                // target dims/mips/lightmap format, never on pixel content.
+                // Computing a mean-color source image and box-resizing it
+                // just to throw both away was dead work ahead of this
+                // return, so skip them entirely.
                 encode_inglb_bc7_stub(
                     prof.target_w,
                     prof.target_h,
                     prof.mip_count,
                     prof.lightmap_format == 3,
                 )
-            } else if prof.texture_format == texprofile::TF_DXT5 {
-                encode_dxt5_mip_chain_real(src, prof.mip_count, prof.color_space == 1)
-            } else if prof.texture_format == texprofile::TF_DXT1 {
-                let (sw, sh) = src.dimensions();
-                crate::dxt1_pure::encode_dxt1_mip_chain(
-                    src.as_raw(),
-                    sw,
-                    sh,
-                    Some(prof.mip_count),
-                    true,
-                    prof.color_space == 1,
-                )
-            } else if prof.texture_format == texprofile::TF_DXT5_CRUNCHED {
-                let (sw, sh) = src.dimensions();
-                crate::bc5_pure::encode_dxt5_crn_dual_use_mip_chain(
-                    src.as_raw(),
-                    sw,
-                    sh,
-                    Some(prof.mip_count),
-                    true,
-                    DXT5_CRUNCH_QUALITY,
-                )
-                .unwrap_or_else(|| {
-                    panic!(
-                        "crunch DXT5 compression failed for texture {name} ({sw}x{sh}, {} mips)",
-                        prof.mip_count
-                    )
-                })
             } else {
-                encode_texture_bc7(
-                    src,
-                    prof.mip_count,
-                    prof.color_space == 1,
-                    Some(prof.lightmap_format == 3),
-                    bc7_pure::Bc7Profile::Slow,
-                )
+                let resized;
+                let src: &RgbaImage = if (prof.target_w, prof.target_h) != (ow, oh) {
+                    let buf = crate::resize::box_downscale_rgba(
+                        img.as_raw(),
+                        ow as usize,
+                        oh as usize,
+                        prof.target_w as usize,
+                        prof.target_h as usize,
+                        prof.color_space == 1,
+                    );
+                    resized = RgbaImage::from_raw(prof.target_w, prof.target_h, buf)
+                        .expect("resize buffer size mismatch");
+                    &resized
+                } else {
+                    img
+                };
+                if prof.texture_format == texprofile::TF_DXT5 {
+                    encode_dxt5_mip_chain_real(src, prof.mip_count, prof.color_space == 1)
+                } else if prof.texture_format == texprofile::TF_DXT1 {
+                    let (sw, sh) = src.dimensions();
+                    crate::dxt1_pure::encode_dxt1_mip_chain(
+                        src.as_raw(),
+                        sw,
+                        sh,
+                        Some(prof.mip_count),
+                        true,
+                        prof.color_space == 1,
+                    )
+                } else if prof.texture_format == texprofile::TF_DXT5_CRUNCHED {
+                    let (sw, sh) = src.dimensions();
+                    crate::bc5_pure::encode_dxt5_crn_dual_use_mip_chain(
+                        src.as_raw(),
+                        sw,
+                        sh,
+                        Some(prof.mip_count),
+                        true,
+                        DXT5_CRUNCH_QUALITY,
+                    )
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "crunch DXT5 compression failed for texture {name} ({sw}x{sh}, {} mips)",
+                            prof.mip_count
+                        )
+                    })
+                } else {
+                    encode_texture_bc7(
+                        src,
+                        prof.mip_count,
+                        prof.color_space == 1,
+                        Some(prof.lightmap_format == 3),
+                        bc7_pure::Bc7Profile::Slow,
+                    )
+                }
             }
         } else if prof.texture_format == texprofile::TF_RGBA32 {
             (dxt_unity::encode_rgba32(img, true), 1)

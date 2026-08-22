@@ -344,7 +344,11 @@ pub(super) struct PartitionPlan {
     pub(super) list7: Vec<Solution>,
 }
 
-pub(super) fn build_partition_plans(lanes: &[&[ColorI; 16]], cp: &Params) -> Vec<PartitionPlan> {
+pub(super) fn build_partition_plans(
+    lanes: &[&[ColorI; 16]],
+    cp: &Params,
+    include7: bool,
+) -> Vec<PartitionPlan> {
     let n = lanes.len();
     let mut plans = vec![PartitionPlan::default(); n];
 
@@ -390,11 +394,87 @@ pub(super) fn build_partition_plans(lanes: &[&[ColorI; 16]], cp: &Params) -> Vec
             }
         }
     }
-    if cp.use_mode7 {
+    if include7 && cp.use_mode7 {
         let r = estimate_partition_list_group(7, lanes, cp, cp.al_max_mode7 as i32);
         for (l, list) in r.into_iter().enumerate() {
             plans[l].list7 = list;
         }
     }
     plans
+}
+
+#[cfg(test)]
+mod mode7_gate_tests {
+    use super::*;
+
+    fn opaque_block(seed: u32) -> [ColorI; 16] {
+        let mut px = [ColorI::default(); 16];
+        for (i, p) in px.iter_mut().enumerate() {
+            let v = seed.wrapping_add((i as u32).wrapping_mul(37));
+            p.c = [
+                (v & 0xff) as i32,
+                ((v >> 3) & 0xff) as i32,
+                ((v >> 5) & 0xff) as i32,
+                255,
+            ];
+        }
+        px
+    }
+
+    /// The opaque path never reads `PartitionPlan::list7`, so gating the
+    /// mode-7 partition-list scan off for opaque lanes must not change any
+    /// other field of the resulting plan, nor the bytes `handle_opaque_block`
+    /// produces from it.
+    #[test]
+    fn include7_false_is_byte_identical_to_true_for_opaque_blocks() {
+        for perceptual in [false, true] {
+            for cp in [Params::basic(perceptual), Params::slow(perceptual)] {
+                assert!(cp.use_mode7, "test assumes use_mode7 is on by default");
+                let blocks: Vec<[ColorI; 16]> = (0..8)
+                    .map(|i| opaque_block(0x1234_5678 + i * 977))
+                    .collect();
+                let lanes: Vec<&[ColorI; 16]> = blocks.iter().collect();
+
+                let with7 = build_partition_plans(&lanes, &cp, true);
+                let without7 = build_partition_plans(&lanes, &cp, false);
+
+                let mut base = CCParams::clear();
+                base.weights = cp.weights;
+
+                for i in 0..lanes.len() {
+                    let a = &with7[i];
+                    let b = &without7[i];
+                    assert_eq!(a.part0, b.part0);
+                    assert_eq!(a.part13, b.part13);
+                    assert_eq!(a.use_list13, b.use_list13);
+                    assert_eq!(a.use_list0, b.use_list0);
+                    assert_eq!(a.use_list2, b.use_list2);
+                    assert_eq!(
+                        a.list13.iter().map(|s| s.err).collect::<Vec<_>>(),
+                        b.list13.iter().map(|s| s.err).collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        a.list0.iter().map(|s| s.err).collect::<Vec<_>>(),
+                        b.list0.iter().map(|s| s.err).collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        a.list2.iter().map(|s| s.err).collect::<Vec<_>>(),
+                        b.list2.iter().map(|s| s.err).collect::<Vec<_>>()
+                    );
+                    assert!(
+                        !a.list7.is_empty() || !cp.use_mode7,
+                        "sanity: scan-on plan should populate list7"
+                    );
+                    assert!(b.list7.is_empty(), "scan-off plan must leave list7 empty");
+
+                    let enc_a = handle_opaque_block(&blocks[i], &cp, &base, a);
+                    let enc_b = handle_opaque_block(&blocks[i], &cp, &base, b);
+                    assert_eq!(
+                        enc_a, enc_b,
+                        "encoded bytes diverged with mode7 scan on vs off"
+                    );
+                }
+            }
+        }
+    }
 }

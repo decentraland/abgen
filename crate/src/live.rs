@@ -68,33 +68,44 @@ fn convertible_entries<'a>(
 fn fetch_jobs() -> usize {
     static JOBS: OnceLock<usize> = OnceLock::new();
     *JOBS.get_or_init(|| {
-        match std::env::var("ABGEN_FETCH_CONCURRENCY")
+        std::env::var("ABGEN_FETCH_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-        {
-            Some(n) if n > 0 => n,
-            _ => 8,
-        }
+            .filter(|&n| n > 0)
+            .unwrap_or_else(crate::clihelp::default_file_concurrency)
+    })
+}
+
+/// Bounded concurrency for the S3 existence (`HEAD`) probes run ahead of
+/// conversion: same runtime-derived default as file conversion and content
+/// download (`clihelp::default_file_concurrency`), since a probe round-trip
+/// is a similarly independent, purely network-bound unit of work — running
+/// them one-at-a-time would serialize N round-trip latencies on the
+/// critical path for no reason. `ABGEN_PROBE_CONCURRENCY` is an escape
+/// hatch, never required to reach the fast default.
+fn probe_jobs() -> usize {
+    static JOBS: OnceLock<usize> = OnceLock::new();
+    *JOBS.get_or_init(|| {
+        std::env::var("ABGEN_PROBE_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(crate::clihelp::default_file_concurrency)
     })
 }
 
 fn corpus_file_jobs() -> usize {
     static JOBS: OnceLock<usize> = OnceLock::new();
     *JOBS.get_or_init(|| {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        // Specific knob wins over the generic one; default stays min(cores, 4)
-        // because peak RSS scales with in-flight files.
-        let from = |k: &str| {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&n| n > 0)
-        };
-        from("ABGEN_JIT_FILE_CONCURRENCY")
-            .or_else(|| from("ABGEN_FILE_CONCURRENCY"))
-            .unwrap_or_else(|| cores.min(4))
+        // Specific knob wins over the generic one; the generic knob and the
+        // memory/core-scaled default live in
+        // clihelp::default_file_concurrency, shared with
+        // export::convert's file-level parallelism.
+        std::env::var("ABGEN_JIT_FILE_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(crate::clihelp::default_file_concurrency)
     })
 }
 
@@ -352,16 +363,23 @@ impl Proxy {
             .resolve_scene(cid)
             .with_context(|| format!("resolve entity {cid}"))?;
 
+        // Only the GLBs' own bytes are needed up front: `scan_entity` and
+        // `compute_deps_digests` below parse each GLB to learn which
+        // content hashes it depends on (parsed metadata only, never the
+        // dependency bytes themselves — `deps_digest_for_glb` hashes
+        // (path, hash) pairs, it doesn't read the referenced textures).
+        // Standalone images and `.bin` dependency payloads are fetched
+        // lazily, per work item, inside `build()`'s `ensure_content` /
+        // `resolve_fn` calls once the parallel conversion loop below picks
+        // them up — so their download overlaps with other files' CPU-bound
+        // conversion instead of sitting as a hard barrier before any
+        // conversion can start (the old code fetched every convertible
+        // extension, including images/.bin, to completion here first).
         let dl_started = std::time::Instant::now();
         let mut to_fetch: Vec<(&str, &str)> = Vec::new();
         let mut seen_hashes = std::collections::HashSet::new();
         for c in &scene.content {
-            if CONVERTIBLE_EXTS
-                .iter()
-                .chain(DEPENDENCY_EXTS.iter())
-                .any(|e| c.file.to_lowercase().ends_with(*e))
-                && seen_hashes.insert(c.hash.as_str())
-            {
+            if is_convertible(&c.file).0 && seen_hashes.insert(c.hash.as_str()) {
                 to_fetch.push((c.hash.as_str(), c.file.as_str()));
             }
         }
@@ -382,7 +400,7 @@ impl Proxy {
             }
         });
         eprintln!(
-            "download: {cid}: {dl_files} file(s) ensured in {:.1}s ({workers} worker(s))",
+            "download: {cid}: {dl_files} glb(s) ensured in {:.1}s ({workers} worker(s))",
             dl_started.elapsed().as_secs_f64()
         );
 
@@ -890,12 +908,25 @@ impl Proxy {
             bare_name: String,
             is_image: bool,
         }
+        struct ProbeCandidate {
+            order: usize,
+            file: String,
+            hash: String,
+            bundle_name: String,
+            bare_name: String,
+            is_image: bool,
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         let mut prebuilt: Vec<(usize, String)> = Vec::new();
         let mut work: Vec<WorkItem> = Vec::new();
-        let mut order: usize = 0;
+        // Naming (deps-digest lookup, dedup) is pure in-memory computation
+        // over data already fetched for `ctx`, so it stays a plain
+        // sequential pass — only the existence probe itself is I/O.
+        let mut candidates: Vec<ProbeCandidate> = Vec::new();
         let mut done_pre: usize = 0;
-        for c in &convertible {
-            order += 1;
+        for (idx, c) in convertible.iter().enumerate() {
+            let order = idx + 1;
             let (is_glb, is_image) = is_convertible(&c.file);
             let case_hash = if platform == "mac" {
                 c.hash.to_lowercase()
@@ -940,16 +971,7 @@ impl Proxy {
                 done_pre += 1;
                 continue;
             }
-            if self.space_probe_asset(&bundle_name) {
-                prebuilt.push((order, bundle_name));
-                done_pre += 1;
-                continue;
-            }
-            let stored_name = naming::fs_safe_component(&bundle_name);
-            if *stored_name != bundle_name {
-                collapsed_names.insert(stored_name.to_string(), c.hash.to_lowercase());
-            }
-            work.push(WorkItem {
+            candidates.push(ProbeCandidate {
                 order,
                 file: c.file.clone(),
                 hash: c.hash.clone(),
@@ -959,7 +981,51 @@ impl Proxy {
             });
         }
 
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Bounded-concurrency existence probe: each candidate's S3 `HEAD`
+        // is an independent network round-trip, so probing them one at a
+        // time (the old behavior) serializes N round-trip latencies ahead
+        // of any conversion. `space_probe_asset` already no-ops without I/O
+        // for bare (non-digest) names, so probing every candidate through
+        // the same worker pool costs nothing extra for those. Verdicts are
+        // collected into `hit_slots`, then merged back in original file
+        // order below — scheduling never reorders `prebuilt`/`work`/`collapsed_names`.
+        let hit_slots: Vec<Mutex<bool>> = candidates.iter().map(|_| Mutex::new(false)).collect();
+        {
+            let probe_workers = probe_jobs().min(candidates.len().max(1));
+            let next_probe = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..probe_workers {
+                    s.spawn(|| loop {
+                        let i = next_probe.fetch_add(1, Ordering::Relaxed);
+                        let Some(cand) = candidates.get(i) else {
+                            break;
+                        };
+                        let hit = self.space_probe_asset(&cand.bundle_name);
+                        *hit_slots[i].lock().unwrap() = hit;
+                    });
+                }
+            });
+        }
+        for (cand, hit_slot) in candidates.into_iter().zip(hit_slots) {
+            let hit = hit_slot.into_inner().unwrap();
+            if hit {
+                prebuilt.push((cand.order, cand.bundle_name));
+                done_pre += 1;
+                continue;
+            }
+            let stored_name = naming::fs_safe_component(&cand.bundle_name);
+            if *stored_name != cand.bundle_name {
+                collapsed_names.insert(stored_name.to_string(), cand.hash.to_lowercase());
+            }
+            work.push(WorkItem {
+                order: cand.order,
+                file: cand.file,
+                hash: cand.hash,
+                bundle_name: cand.bundle_name,
+                bare_name: cand.bare_name,
+                is_image: cand.is_image,
+            });
+        }
         let jobs = corpus_file_jobs().min(work.len().max(1));
         let built_m: Mutex<Vec<(usize, String)>> = Mutex::new(prebuilt);
         let failed_m: Mutex<Vec<String>> = Mutex::new(failed);
@@ -1323,6 +1389,14 @@ impl Proxy {
     }
 
     pub fn new_with_space(cfg: ProxyConfig, injected_space: Option<Arc<Space>>) -> Arc<Self> {
+        // Same bounded, content-hash-keyed texture caches the lambda path
+        // enables: a long-lived live/abcdn server converts many entities
+        // that reuse the same source textures (wearable collections, atlas
+        // reuse across scenes), and both caches cap themselves by bytes
+        // (ABGEN_TEX_ENCODE_CACHE_MAX_MB / ABGEN_DECODE_CACHE_MB) with LRU
+        // eviction, so this is safe to leave on for the process lifetime.
+        crate::texencode_cache::enable();
+        crate::decode_cache::enable();
         let collection_mode = BuildOpts::env_collection_mode();
         let real_textures = !cfg.parity || BuildOpts::env_real_textures();
         let v38_compat = !cfg.parity || BuildOpts::env_v38_compat();

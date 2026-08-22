@@ -72,20 +72,25 @@ struct Bundles<'a> {
 }
 
 pub fn validate_bundle(data: &[u8], label: &str, ctx: &ValidateCtx) -> Vec<Finding> {
-    let mut out = Vec::new();
     let bundle = match Bundle::load_bytes(data) {
         Ok(b) => b,
         Err(e) => {
-            out.push(Finding {
+            return vec![Finding {
                 severity: Severity::Error,
                 code: "E0",
                 bundle: label.to_string(),
                 msg: format!("failed to parse bundle: {e:#}"),
-            });
-            return out;
+            }];
         }
     };
+    validate_bundle_parsed(&bundle, label, ctx)
+}
 
+/// Same checks as [`validate_bundle`], but over a `Bundle` the caller already
+/// has in memory (e.g. one it just built), skipping the LZ4 decompress +
+/// `SerializedFile` reparse that `Bundle::load_bytes` would otherwise redo.
+pub fn validate_bundle_parsed(bundle: &Bundle, label: &str, ctx: &ValidateCtx) -> Vec<Finding> {
+    let mut out = Vec::new();
     let mut sf: Option<&SerializedFile> = None;
     let mut self_cab: Option<String> = None;
     let mut raw_files: HashSet<String> = HashSet::new();

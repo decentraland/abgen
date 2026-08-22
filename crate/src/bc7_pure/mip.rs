@@ -501,24 +501,34 @@ fn encode_bc7_mip_chain_with_profile_uncached(
 /// shuffling produces the identical bytes, minus a full-image copy and the
 /// no-op `to_vec` inside `pad_to_block_size`.
 fn level_to_blocks(cur: &[f32], cw: usize, ch: usize, srgb: bool) -> (Vec<u8>, usize) {
+    use rayon::prelude::*;
+
     if cw.is_multiple_of(4) && ch.is_multiple_of(4) {
         let bw = cw / 4;
         let bh = ch / 4;
         let mut out = vec![0u8; bw * bh * 64];
-        let mut o = 0usize;
-        for by in 0..bh {
-            for bx in 0..bw {
-                for r in 0..4 {
-                    let row = (by * 4 + r) * cw + bx * 4;
-                    for c in 0..4 {
-                        quantize_px(cur, row + c, srgb, &mut out[o..o + 4]);
-                        o += 4;
+        // Each block-row `by` writes exactly `bw * 64` disjoint bytes (block
+        // order is by-major), and every pixel's quantization only reads
+        // `cur` — independent per row, so this runs across block-rows in
+        // parallel with the same per-pixel output as the serial version.
+        out.par_chunks_mut(bw * 64)
+            .enumerate()
+            .for_each(|(by, orow)| {
+                let mut o = 0usize;
+                for bx in 0..bw {
+                    for r in 0..4 {
+                        let row = (by * 4 + r) * cw + bx * 4;
+                        for c in 0..4 {
+                            quantize_px(cur, row + c, srgb, &mut orow[o..o + 4]);
+                            o += 4;
+                        }
                     }
                 }
-            }
-        }
+            });
         return (out, bw * bh);
     }
+    // Deep, non-block-aligned mip tail levels: small (at most a handful of
+    // pixels short of 4x4) and rare, so this stays serial.
     let mut level = vec![0u8; cw * ch * 4];
     for i in 0..(cw * ch) {
         quantize_px(cur, i, srgb, &mut level[i * 4..i * 4 + 4]);
