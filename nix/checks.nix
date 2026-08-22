@@ -10,7 +10,6 @@ let
     CARGO_PROFILE = "checkfast";
   };
   abgenRoot = ''export ABGEN_ROOT="$PWD"'';
-  # in-drv: a green zero-test output must not exist, so no cache can memoize it
   assertRanTests = ''
     junit=target/nextest/default/junit.xml
     [ -f "$junit" ] || { echo "nextest junit report missing - no tests ran" >&2; exit 1; }
@@ -69,7 +68,6 @@ let
       '';
   };
 
-  # aarch64-only like prod; folding into nextest rejected: feature unification differs
   lambdaTests = {
     lambda-deps = lambdaCargoArtifacts;
 

@@ -156,7 +156,6 @@ jobs:
             marker: arm-lambda
             deps: .#checks.aarch64-linux.lambda-deps
             attrs: lambda-tests
-            # one saver per (os,arch,flavor): sharing checkfast dropped this lane's outputs
             flavor: lambda
           - lane: arm lints + smoke
             runner: ubuntu-24.04-arm
@@ -189,7 +188,6 @@ jobs:
       - name: checks (${{ matrix.attrs }})
         if: steps.memo.outputs.hit != 'true'
         run: bash ci/nix-checks.sh ${{ matrix.system }} ${{ matrix.attrs }}
-      # not always(): a cancelled mid-pack save must not own an immutable key
       - uses: ./.github/actions/nix-store-cache/save
         if: success() || failure()
         continue-on-error: true

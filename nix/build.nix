@@ -5,7 +5,6 @@ let
     pname = "abgen";
     version = repoVersion;
     src = buildSource;
-    # explicit: crane's fallback scans src (a drv in the deps closures) at eval time — IFD
     cargoVendorDir = craneLib.vendorCargoDeps { src = buildSource; };
     nativeBuildInputs = with pkgs; [ cmake pkg-config git ];
     doCheck = false;
@@ -54,7 +53,6 @@ let
     cargoCheckExtraArgs = "--all-targets";
   });
 
-  # lto off + cgu 16: 4.9x faster test compiles, identical verdicts
   cargoArtifactsCheckfast = craneLib.buildDepsOnly (commonArgs // {
     inherit dummySrc;
     pname = "abgen-checkfast";
@@ -63,7 +61,6 @@ let
     CARGO_PROFILE = "checkfast";
   });
 
-  # the -p selection resolves narrower features than the workspace closure
   lambdaCargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
     inherit dummySrc;
     pname = "abgen-lambda";

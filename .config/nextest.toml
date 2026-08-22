@@ -5,6 +5,5 @@ default-filter = '''
   + (package(abgen) & kind(lib) & test(/^(abcdn|live|export|jitcache|local_store|texencode_cache|builder|lodgen|clihelp|ffi|worlds)::/))
 '''
 
-# the check derivations assert a nonzero test count from this report
 [profile.default.junit]
 path = "junit.xml"

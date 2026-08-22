@@ -22,6 +22,5 @@ done <<<"$names"
 printf 'building %s check(s):\n' "${#attrs[@]}"
 printf '  %s\n' "${attrs[@]}"
 
-# --max-jobs 2: unbounded drv parallelism OOM-kills the 16 GB runners
 nix build --keep-going --no-link --log-format raw --max-jobs 2 "${attrs[@]}" \
   || nix build --keep-going --no-link --print-build-logs --max-jobs 2 "${attrs[@]}"
