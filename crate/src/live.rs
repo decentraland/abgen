@@ -1395,7 +1395,9 @@ impl Proxy {
         // reuse across scenes), and both caches cap themselves by bytes
         // (ABGEN_TEX_ENCODE_CACHE_MAX_MB / ABGEN_DECODE_CACHE_MB) with LRU
         // eviction, so this is safe to leave on for the process lifetime.
-        crate::texencode_cache::enable();
+        // Client profile: the JIT server runs on client machines
+        // (unity-explorer sidecar, editor).
+        crate::texencode_cache::enable_with_profile(crate::texencode_cache::CacheProfile::Client);
         crate::decode_cache::enable();
         let collection_mode = BuildOpts::env_collection_mode();
         let real_textures = !cfg.parity || BuildOpts::env_real_textures();

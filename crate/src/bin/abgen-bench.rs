@@ -352,7 +352,7 @@ fn main() {
     if std::env::var("ABGEN_DISK_CACHE").is_err() {
         std::env::set_var("ABGEN_DISK_CACHE", "0");
     }
-    abgen::texencode_cache::enable();
+    abgen::texencode_cache::enable_with_profile(abgen::texencode_cache::CacheProfile::Batch);
     abgen::decode_cache::enable();
 
     let mut jobs: Vec<BenchJob> = Vec::new();

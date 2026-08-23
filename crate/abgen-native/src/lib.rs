@@ -13,6 +13,7 @@ use std::os::raw::{c_char, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use abgen_core::export::{self, HostInfo, Kind, Sink};
+use abgen_core::texencode_cache::{self, CacheProfile};
 
 pub const ABI_VERSION: u32 = 1;
 
@@ -100,6 +101,9 @@ pub unsafe extern "C" fn abgen_convert(
     }
 
     let sink = CallbackSink { emit, user_data };
+
+    // Idempotent, so declaring per call is fine.
+    texencode_cache::enable_with_profile(CacheProfile::Client);
 
     // SAFETY: non-null and non-zero, checked above; caller keeps it valid.
     let bytes = unsafe { std::slice::from_raw_parts(request, request_len) };

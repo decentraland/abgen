@@ -18,7 +18,57 @@ struct Store {
     misses: u64,
 }
 
+/// Per-context cache defaults (see `crate/src/clihelp.rs` for the matrix).
+/// The `ABGEN_TEX_ENCODE_CACHE_MAX_MB` / `ABGEN_DISK_CACHE` /
+/// `ABGEN_DISK_CACHE_MAX_MB` env vars always win when set — the profile only
+/// decides the defaults. First profile declared wins for the process.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CacheProfile {
+    /// Lambda: full in-memory default, disk cache off (ephemeral scratch).
+    Lambda,
+    /// Client machines (JIT server sidecar, node addon, UPM native lib and
+    /// `abgen-host`, CLI convert): 256 MiB memory, 2 GiB disk.
+    Client,
+    /// Server/batch hosts (bench, server farm): the historical defaults.
+    Batch,
+}
+
+impl CacheProfile {
+    /// Default `ABGEN_TEX_ENCODE_CACHE_MAX_MB` for this context.
+    pub fn memory_default_mb(self) -> usize {
+        match self {
+            CacheProfile::Client => 256,
+            CacheProfile::Lambda | CacheProfile::Batch => 4096,
+        }
+    }
+
+    /// Default `ABGEN_DISK_CACHE` for this context. Never overrides the
+    /// dev-build stale-encoder guard (see the `disk` module).
+    pub fn disk_default_on(self) -> bool {
+        match self {
+            CacheProfile::Lambda => false,
+            CacheProfile::Client | CacheProfile::Batch => true,
+        }
+    }
+
+    /// Default `ABGEN_DISK_CACHE_MAX_MB` for this context.
+    pub fn disk_default_mb(self) -> u64 {
+        match self {
+            CacheProfile::Client => 2048,
+            CacheProfile::Lambda | CacheProfile::Batch => 8192,
+        }
+    }
+}
+
 static FORCED: AtomicBool = AtomicBool::new(false);
+
+static PROFILE: OnceLock<CacheProfile> = OnceLock::new();
+
+/// Whatever [`enable_with_profile`] set first, else [`CacheProfile::Batch`]
+/// (the historical defaults, so plain [`enable`] callers behave as before).
+fn profile() -> CacheProfile {
+    PROFILE.get().copied().unwrap_or(CacheProfile::Batch)
+}
 
 fn env_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
@@ -30,18 +80,28 @@ fn env_enabled() -> bool {
 }
 
 fn max_bytes() -> usize {
-    static V: OnceLock<usize> = OnceLock::new();
-    *V.get_or_init(|| {
+    static ENV_MB: OnceLock<Option<usize>> = OnceLock::new();
+    let env_mb = *ENV_MB.get_or_init(|| {
         std::env::var("ABGEN_TEX_ENCODE_CACHE_MAX_MB")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4096)
-            .saturating_mul(1024 * 1024)
-    })
+    });
+    env_mb
+        .unwrap_or_else(|| profile().memory_default_mb())
+        .saturating_mul(1024 * 1024)
 }
 
 pub fn enable() {
     FORCED.store(true, Ordering::Relaxed);
+}
+
+/// [`enable`], plus declares which [`CacheProfile`] governs this process's
+/// default cache bounds. First caller wins — a nested declaration (e.g.
+/// `live::Proxy` inside the lambda entrypoint) is a no-op — so call it at
+/// process/host init, before the first encode.
+pub fn enable_with_profile(p: CacheProfile) {
+    let _ = PROFILE.set(p);
+    enable();
 }
 
 fn enabled() -> bool {
@@ -107,8 +167,10 @@ fn key(kind: Kind, pixels: &[u8], width: u32, height: u32, params: &[i64]) -> [u
 /// would undercut the point of the cache) after a successful insert.
 ///
 /// Default on for any build carrying a real content-addressed
-/// `ABGEN_BUILD_ID` — i.e. everything `flake.nix`/`release.yml` produce
-/// (`ABGEN_DISK_CACHE=0` is the escape hatch). Default *off* for dev builds,
+/// `ABGEN_BUILD_ID` — i.e. everything `flake.nix`/`release.yml` produce —
+/// unless the process's [`CacheProfile`] says otherwise (`Lambda` defaults
+/// it off; `ABGEN_DISK_CACHE=0`/`=1` is the escape hatch either way).
+/// Default *off* for dev builds,
 /// whose fixed `devbuild0000` stamp does not pin the encoder, which also
 /// keeps `cargo test` (unit and integration alike) off a developer's real
 /// cache directory. Tests that exercise it opt back in explicitly and point
@@ -154,14 +216,17 @@ mod disk {
         // `crate/tests/*.rs` link this library compiled *without*
         // `cfg(test)`. Keying off the build id covers every case at once.
         // `ABGEN_DISK_CACHE=1` opts back in explicitly.
-        crate::clihelp::env_bool("ABGEN_DISK_CACHE", build_id_pins_encoder())
+        crate::clihelp::env_bool(
+            "ABGEN_DISK_CACHE",
+            build_id_pins_encoder() && super::profile().disk_default_on(),
+        )
     }
 
     fn max_bytes() -> u64 {
         std::env::var("ABGEN_DISK_CACHE_MAX_MB")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(8192)
+            .unwrap_or_else(|| super::profile().disk_default_mb())
             .saturating_mul(1024 * 1024)
     }
 
@@ -610,6 +675,34 @@ mod tests {
             env!("ABGEN_BUILD_ID") != "devbuild0000",
             "the disk cache's default must track whether the build id pins the encoder"
         );
+    }
+
+    /// The per-context default matrix, verbatim from the policy. Asserted
+    /// on the pure profile methods rather than the process-global profile,
+    /// which is set-once per process and races across tests.
+    #[test]
+    fn cache_profile_default_matrix() {
+        use CacheProfile::*;
+        assert_eq!(Lambda.memory_default_mb(), 4096);
+        assert!(!Lambda.disk_default_on(), "lambda must not write to disk");
+
+        assert_eq!(Client.memory_default_mb(), 256);
+        assert!(Client.disk_default_on());
+        assert_eq!(Client.disk_default_mb(), 2048);
+
+        assert_eq!(Batch.memory_default_mb(), 4096);
+        assert!(Batch.disk_default_on());
+        assert_eq!(Batch.disk_default_mb(), 8192);
+    }
+
+    #[test]
+    fn undeclared_profile_falls_back_to_batch() {
+        // PROFILE is shared with every other test in this binary; only
+        // assert the fallback when nothing has declared one yet.
+        if PROFILE.get().is_none() {
+            assert_eq!(profile(), CacheProfile::Batch);
+        }
+        assert_eq!(CacheProfile::Batch.memory_default_mb(), 4096);
     }
 
     #[test]

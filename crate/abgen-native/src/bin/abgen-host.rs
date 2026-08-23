@@ -398,7 +398,9 @@ fn main() {
     // crate/src/clihelp.rs), same as the lambda and live paths: a request
     // that spans several GLBs sharing textures (atlas reuse, wearable
     // collections) gets the dedup within this one process lifetime.
-    abgen_core::texencode_cache::enable();
+    abgen_core::texencode_cache::enable_with_profile(
+        abgen_core::texencode_cache::CacheProfile::Client,
+    );
     abgen_core::decode_cache::enable();
 
     let request = match read_request(&mut std::io::stdin()) {

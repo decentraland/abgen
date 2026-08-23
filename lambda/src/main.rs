@@ -83,7 +83,7 @@ fn init() {
         std::process::exit(1);
     });
     abgen::arm_gpu_default();
-    abgen::texencode_cache::enable();
+    abgen::texencode_cache::enable_with_profile(abgen::texencode_cache::CacheProfile::Lambda);
     abgen::decode_cache::enable();
     if abgen::sns::Sns::global().is_some() {
         eprintln!("init: finished-event publishing enabled (ABGEN_SNS_TOPIC_ARN)");

@@ -144,6 +144,7 @@ pub async fn convert(options: AbgenConvertOptions) -> Result<AbgenConvertResult>
     }
     let request = builder.build();
     default_pool();
+    abgen::texencode_cache::enable_with_profile(abgen::texencode_cache::CacheProfile::Client);
 
     let collected = tokio::task::spawn_blocking(move || {
         let sink = CollectingSink::new();
