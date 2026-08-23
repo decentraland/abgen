@@ -94,10 +94,6 @@ const STORAGE_POOL_USAGES: ::wgpu::BufferUsages = ::wgpu::BufferUsages::STORAGE
     .union(::wgpu::BufferUsages::COPY_DST)
     .union(::wgpu::BufferUsages::COPY_SRC);
 
-// Reuse pools keyed by size class. Cross-submission reuse is safe: all work goes
-// through the one queue, so later write_buffer/dispatches are ordered after
-// earlier reads. Buffers are recycled with stale contents; the only consumer
-// that relied on zero-init is the plan scratch, cleared in record_encode.
 #[derive(Default)]
 struct Pools {
     storage: Mutex<HashMap<u64, Vec<::wgpu::Buffer>>>,
@@ -105,7 +101,6 @@ struct Pools {
     readback: Mutex<HashMap<u64, Vec<::wgpu::Buffer>>>,
 }
 
-// Round up with <=1/16 slack so nearby sizes share a pool entry.
 fn size_class(bytes: u64) -> u64 {
     let n = bytes.max(256);
     let g = (n.next_power_of_two() / 16).max(256);
@@ -318,14 +313,10 @@ fn flip_rgba(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
 struct Stage<'a> {
     pipeline: &'a ::wgpu::ComputePipeline,
     wg: u32,
-    // gid range [first, total): total is the exclusive end, as the shader guard
-    // is `gid >= job.total`.
     first: u64,
     total: u64,
     n_items: u32,
     fone: bool,
-    // (binding, buffer, bound bytes) — pooled buffers are class-sized, so each
-    // binding carries its exact logical size.
     bufs: &'a [(u32, &'a ::wgpu::Buffer, u64)],
 }
 
@@ -347,8 +338,6 @@ fn run_stage(
         for v in [st.n_items, st.total as u32, base as u32, fone] {
             meta.extend_from_slice(&v.to_le_bytes());
         }
-        // One pooled meta buffer per dispatch: everything is recorded into a
-        // single submit, so a shared buffer could not hold per-stage values.
         let meta_buf = eng.take_meta(g);
         g.queue.write_buffer(&meta_buf, 0, &meta);
         let bind = |buf, size| {
@@ -470,12 +459,6 @@ fn record_encode(
         limits.max_storage_buffer_binding_size,
         limits.max_buffer_size
     );
-    // Whole-chain batching: one pooled blocks/scratch/out buffer set covers as
-    // many consecutive levels as the device limits allow (normally all of them);
-    // the greedy split only engages near the limits, and any single level fits
-    // by the ensure above. Level starts are padded to the 4-block plan group so
-    // the plan passes keep bc7_pure's per-level group composition (group results
-    // are not lane-independent; cross-level groups change bytes).
     let pad4 = |nb: u64| nb.next_multiple_of(4);
     let fits = |nb: u64| {
         let need = (nb * 64).max(nb * PLAN_STRIDE as u64 * 4);
@@ -494,7 +477,6 @@ fn record_encode(
         }
     }
     segs.push((start, levels.len()));
-    // Padded per-level block offset within its segment's buffers.
     let mut poffs = vec![0u64; levels.len()];
     for &(s, e) in &segs {
         let mut off = 0u64;
@@ -523,7 +505,6 @@ fn record_encode(
                 src.w as u32,
                 src.h as u32,
             ));
-            // gid space for halve is the dst pixel's pyramid offset.
             prefixes.extend_from_slice(&dst.px_off.to_le_bytes());
         }
         let items_buf = eng.take_storage(g, items.len() as u64);
@@ -542,8 +523,6 @@ fn record_encode(
     let mut pack_items = Vec::with_capacity(levels.len() * 32);
     let mut pack_prefixes = Vec::with_capacity(levels.len() * 8);
     for (l, &poff) in levels.iter().zip(&poffs) {
-        // blk_off is the padded offset into the segment's blocks buffer; the
-        // gid space (and prefixes) stay global and unpadded.
         pack_items.extend_from_slice(&pack_item_bytes(
             l.px_off, poff, l.w as u32, l.h as u32, srgb,
         ));
@@ -609,8 +588,6 @@ fn record_encode(
         let blocks = eng.take_storage(g, blocks_bytes);
         let scratch = eng.take_storage(g, scratch_bytes);
         let out = eng.take_storage(g, seg_out_bytes);
-        // Pooled scratch carries stale plan flags (the plan passes only write
-        // fields for their class); restore the fresh-buffer zero contract.
         cmd.clear_buffer(&scratch, 0, Some(scratch_bytes));
         run_stage(
             g,
@@ -703,15 +680,6 @@ fn record_encode(
     Ok((staging, out_len, mips))
 }
 
-// Blocking wait + map + copy + release for one texture's staging buffer. Split
-// out of encode_bc7_mip_chain so encode_bc7_mip_chain_batch can submit texture
-// N's dispatch (record_encode, which ends in a non-blocking queue.submit)
-// before waiting on texture N-1's readback: N's command buffer is already
-// queued behind N-1's by the time this call blocks, so the GPU keeps N-1's
-// tail and N's dispatch running back-to-back instead of idling on the CPU's
-// per-texture record/submit gap. wgpu's single-queue timeline still makes
-// this byte-identical to the fully sequential path — command buffers execute,
-// and any resource they touch is synchronized, in submission order.
 #[cfg(not(target_arch = "wasm32"))]
 fn blocking_readback(
     g: &Gpu,
@@ -763,7 +731,6 @@ pub(crate) fn encode_bc7_mip_chain(
 /// One texture's inputs for [`encode_bc7_mip_chain_batch`]; same fields as
 /// the positional arguments of [`encode_bc7_mip_chain`].
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct MipChainJob<'a> {
     pub rgba: &'a [u8],
     pub width: u32,
@@ -789,7 +756,6 @@ pub(crate) struct MipChainJob<'a> {
 /// already does), and wgpu's single queue serializes access to any buffer a
 /// later job's write_buffer/dispatch reuses from the pool.
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn encode_bc7_mip_chain_batch(jobs: &[MipChainJob]) -> Result<Vec<(Vec<u8>, i32)>> {
     let g = gpu().map_err(|e| anyhow!("wgpu unavailable: {e}"))?;
     let eng = engine(g);

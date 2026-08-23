@@ -1,10 +1,68 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use crate::builder::{build_bundle, BuildOpts};
 use crate::export::{HostInfo, Input, Kind, Sink};
 use crate::hashes::sha256_hex;
 use crate::naming;
 use crate::validate::{validate_bundle_parsed, Severity, ValidateCtx};
+
+/// One recorded `Sink` call, tagged by which trait method produced it —
+/// not just the raw `(Kind, bytes)` pair `emit` would see. Replaying `Ev`s
+/// through the matching method (`emit_output` for `Output`, `emit` for
+/// everything else) is what makes the replay indistinguishable from a
+/// direct serial call for sinks that override `emit_output`: the default
+/// `emit_output` frames `(name, data)` into a single blob before handing it
+/// to `emit`, so a buffer that only ever recorded/replayed through `emit`
+/// would hand such sinks a framed blob on their raw `emit` arm instead of
+/// the unpacked `(name, data)` their `emit_output` override expects.
+enum Ev {
+    Output(String, Vec<u8>),
+    Raw(Kind, Vec<u8>),
+}
+
+/// Records every event a file's conversion emits, in call order, instead of
+/// forwarding it straight to the real sink. Lets `convert` run several
+/// files' `convert_one` concurrently while still flushing to the real sink
+/// in input order — the on-wire event stream stays identical to the serial
+/// loop's, byte for byte, *and* the same trait method is replayed as was
+/// originally called (see `Ev`). Peak memory at `jobs>1` is the sum of all
+/// buffered bundle bytes for one entity, since every in-flight file's
+/// output sits in a `BufferedSink` until its slot is flushed; for a scene
+/// the size of Genesis Plaza (hundreds of MB) that's acceptable headroom
+/// under `default_file_concurrency`'s per-file RAM budget.
+#[derive(Default)]
+struct BufferedSink {
+    events: Mutex<Vec<Ev>>,
+}
+
+impl BufferedSink {
+    fn into_events(self) -> Vec<Ev> {
+        self.events.into_inner().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Sink for BufferedSink {
+    fn emit(&self, kind: Kind, bytes: &[u8]) {
+        let mut g = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        g.push(Ev::Raw(kind, bytes.to_vec()));
+    }
+
+    fn emit_output(&self, name: &str, data: &[u8]) {
+        let mut g = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        g.push(Ev::Output(name.to_string(), data.to_vec()));
+    }
+}
+
+/// How many files `convert` converts at once. Delegates to
+/// [`crate::clihelp::default_file_concurrency`], the same runtime-scaled
+/// default (and `ABGEN_FILE_CONCURRENCY` override) `live::corpus_file_jobs`
+/// uses for the JIT path, so both hosts agree on how many cores/how much
+/// memory justifies running that many files at once.
+fn file_concurrency() -> usize {
+    crate::clihelp::default_file_concurrency()
+}
 
 fn ext_of(name: &str) -> String {
     match name.rsplit('.').next() {
@@ -209,6 +267,20 @@ fn convert_one(
 }
 
 pub fn convert(input: Input, sink: &dyn Sink, host: HostInfo) -> crate::Result<()> {
+    convert_with_jobs(input, sink, host, file_concurrency())
+}
+
+/// `convert`'s body, with the file-level worker count passed in explicitly
+/// instead of read from [`file_concurrency`] — lets tests exercise the
+/// serial and parallel dispatch paths deterministically in one process,
+/// where `file_concurrency`'s cached, env/runtime-derived value can't be
+/// changed after the first call.
+fn convert_with_jobs(
+    input: Input,
+    sink: &dyn Sink,
+    host: HostInfo,
+    jobs: usize,
+) -> crate::Result<()> {
     let target = target_of(&input.platform, sink);
     let entity_type = entity_type_of(&input);
     let (content_by_file, bytes_by_hash) = content_maps(&input.files);
@@ -240,10 +312,47 @@ pub fn convert(input: Input, sink: &dyn Sink, host: HostInfo) -> crate::Result<(
     let mut built: Vec<String> = Vec::new();
     let mut failures = 0usize;
 
-    for (name, data) in glbs {
-        match convert_one(&ctx, name, data, true, sink) {
-            Some(bundle) => built.push(bundle),
-            None => failures += 1,
+    let jobs = jobs.clamp(1, glbs.len().max(1));
+    if jobs <= 1 {
+        for (name, data) in glbs {
+            match convert_one(&ctx, name, data, true, sink) {
+                Some(bundle) => built.push(bundle),
+                None => failures += 1,
+            }
+        }
+    } else {
+        let next = AtomicUsize::new(0);
+        let slots: Vec<Mutex<Option<(Option<String>, Vec<Ev>)>>> =
+            (0..glbs.len()).map(|_| Mutex::new(None)).collect();
+        std::thread::scope(|s| {
+            for _ in 0..jobs {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((name, data)) = glbs.get(i) else {
+                        break;
+                    };
+                    let buf = BufferedSink::default();
+                    let bundle = convert_one(&ctx, name, data, true, &buf);
+                    *slots[i].lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((bundle, buf.into_events()));
+                });
+            }
+        });
+        for slot in slots {
+            let (bundle, events) = slot
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("every file index is claimed by exactly one worker");
+            for ev in events {
+                match ev {
+                    Ev::Output(name, data) => sink.emit_output(&name, &data),
+                    Ev::Raw(kind, bytes) => sink.emit(kind, &bytes),
+                }
+            }
+            match bundle {
+                Some(b) => built.push(b),
+                None => failures += 1,
+            }
         }
     }
 
@@ -693,7 +802,7 @@ fn bake_lod(job: &LodJob, sink: &dyn Sink) -> crate::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::export::{parse_input, CollectingSink, HostInfo, InputBuilder};
+    use crate::export::{parse_input, Collected, CollectingSink, HostInfo, InputBuilder};
 
     const TEST_HOST: HostInfo = HostInfo::new("v-abgen-test", "test://inline");
 
@@ -762,5 +871,337 @@ mod tests {
             o.iter().map(|(n, d)| (n.clone(), sha256_hex(d))).collect()
         };
         assert_eq!(digest(&a), digest(&b));
+    }
+
+    /// A distinct-content tiny glTF per tag, so a multi-file scene produces
+    /// distinct bundle names instead of deduping to one.
+    fn tiny_gltf_tagged(tag: &str) -> Vec<u8> {
+        let base = String::from_utf8(tiny_gltf()).expect("tiny_gltf is utf8");
+        base.replace("\"tri\"", &format!("\"tri_{tag}\""))
+            .into_bytes()
+    }
+
+    fn convert_multi_glb(jobs: usize) -> (Collected, usize) {
+        let n = 5;
+        let mut b = InputBuilder::new();
+        for i in 0..n {
+            b = b.file(
+                format!("models/m{i}.gltf"),
+                tiny_gltf_tagged(&format!("{i}")),
+            );
+        }
+        let blob = b
+            .file(
+                "scene.json",
+                br#"{"scene":{"base":"0,0","parcels":["0,0"]}}"#.to_vec(),
+            )
+            .platform("windows")
+            .build();
+        let input = parse_input(&blob).expect("request parses");
+        let sink = CollectingSink::new();
+        convert_with_jobs(input, &sink, TEST_HOST, jobs).expect("convert");
+        (sink.take(), n)
+    }
+
+    /// The whole point of file-level parallelism is that it must be
+    /// invisible from the outside: same bundles, same bytes, same manifest,
+    /// and — because `convert` buffers each file's events and flushes them
+    /// in input order — the exact same JSON event sequence, whether the
+    /// files run one at a time or `jobs` at a time.
+    #[test]
+    fn concurrency_does_not_change_output_or_event_order() {
+        let (serial, n) = convert_multi_glb(1);
+        let (parallel, _) = convert_multi_glb(8);
+
+        assert!(serial.errors.is_empty(), "{:?}", serial.errors);
+        assert!(parallel.errors.is_empty(), "{:?}", parallel.errors);
+        assert_eq!(serial.outputs.len(), n, "expected one bundle per model");
+
+        assert_eq!(
+            serial.events, parallel.events,
+            "event stream diverged between jobs=1 and jobs=8"
+        );
+        let digest = |o: &[(String, Vec<u8>)]| -> Vec<(String, String)> {
+            o.iter().map(|(n, d)| (n.clone(), sha256_hex(d))).collect()
+        };
+        assert_eq!(
+            digest(&serial.outputs),
+            digest(&parallel.outputs),
+            "output bundle names/bytes diverged between jobs=1 and jobs=8"
+        );
+        assert_eq!(serial.manifest, parallel.manifest);
+    }
+
+    /// A sink that records `("!raw", sha256(bytes))` when a `Kind::Output`
+    /// event reaches it through the default, framed `emit` path, and
+    /// `(name, sha256(data))` when it reaches it through `emit_output`
+    /// directly — exactly like `abgen-bench`'s `HashSink` and prod's
+    /// `DirSink`, both of which override `emit_output` and never see raw
+    /// `Kind::Output` bytes in normal (serial) operation. This is the
+    /// distinguishing sink that caught round 2's bug: a buffer that only
+    /// ever records/replays through `emit` hands such sinks a framed blob
+    /// on the raw arm instead of the unpacked `(name, data)` pair their
+    /// `emit_output` override expects.
+    #[derive(Default)]
+    struct DistSink {
+        calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl Sink for DistSink {
+        fn emit(&self, kind: Kind, bytes: &[u8]) {
+            if kind == Kind::Output {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(("!raw".to_string(), sha256_hex(bytes)));
+            }
+        }
+
+        fn emit_output(&self, name: &str, data: &[u8]) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.to_string(), sha256_hex(data)));
+        }
+    }
+
+    /// The exact regression that killed perf/round-2: the buffered replay
+    /// must call the same trait method (`emit_output`, not the default
+    /// `emit`-with-framing) that `convert_one` originally called, so a sink
+    /// overriding `emit_output` sees an identical call sequence whether
+    /// files converted serially or concurrently.
+    #[test]
+    fn sink_replay_is_trait_method_faithful() {
+        let mut b = InputBuilder::new();
+        for i in 0..2 {
+            b = b.file(
+                format!("models/m{i}.gltf"),
+                tiny_gltf_tagged(&format!("{i}")),
+            );
+        }
+        let blob = b
+            .file(
+                "scene.json",
+                br#"{"scene":{"base":"0,0","parcels":["0,0"]}}"#.to_vec(),
+            )
+            .platform("windows")
+            .build();
+
+        let serial_sink = DistSink::default();
+        let input = parse_input(&blob).expect("request parses");
+        convert_with_jobs(input, &serial_sink, TEST_HOST, 1).expect("convert jobs=1");
+        let serial_calls = serial_sink.calls.into_inner().unwrap();
+
+        let parallel_sink = DistSink::default();
+        let input = parse_input(&blob).expect("request parses");
+        convert_with_jobs(input, &parallel_sink, TEST_HOST, 8).expect("convert jobs=8");
+        let parallel_calls = parallel_sink.calls.into_inner().unwrap();
+
+        assert!(
+            !serial_calls.is_empty(),
+            "expected at least one emit_output call"
+        );
+        assert!(
+            serial_calls.iter().all(|(name, _)| name != "!raw"),
+            "serial run saw a raw Kind::Output emit: {serial_calls:?}"
+        );
+        assert!(
+            parallel_calls.iter().all(|(name, _)| name != "!raw"),
+            "parallel run saw a raw Kind::Output emit — the buffered replay \
+             is calling emit() instead of emit_output(): {parallel_calls:?}"
+        );
+        assert_eq!(
+            serial_calls, parallel_calls,
+            "emit_output call sequence diverged between jobs=1 and jobs=8"
+        );
+    }
+
+    /// A tiny 128x128 pseudo-random RGBA PNG, distinct per seed, so each
+    /// model's texture decodes/encodes to different bytes.
+    fn noisy_png(seed: u32) -> Vec<u8> {
+        let mut img = image::RgbaImage::new(128, 128);
+        let mut s = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        for p in img.pixels_mut() {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let b = s.to_le_bytes();
+            *p = image::Rgba([b[0], b[1], b[2], 255]);
+        }
+        let mut out = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .expect("png encodes");
+        out
+    }
+
+    /// A one-triangle glTF with a UV'd, textured material, split into a
+    /// JSON file plus external `.bin` (positions/indices/UVs) and `.png`
+    /// (baseColorTexture) siblings in the same directory — exercises image
+    /// decode and BC7/DXT texture encode in `build_bundle`, not just the
+    /// geometry path `tiny_gltf` covers.
+    fn textured_model(dir: &str, tag: &str, seed: u32) -> Vec<(String, Vec<u8>)> {
+        let positions: [[f32; 3]; 3] = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let uvs: [[f32; 2]; 3] = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+
+        let mut bin = Vec::new();
+        for v in positions {
+            for c in v {
+                bin.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        for i in [0u16, 1, 2] {
+            bin.extend_from_slice(&i.to_le_bytes());
+        }
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
+        let uv_offset = bin.len();
+        for uv in uvs {
+            for c in uv {
+                bin.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+
+        let bin_name = format!("model_{tag}.bin");
+        let png_name = format!("tex_{tag}.png");
+        let gltf = serde_json::json!({
+            "asset": {"version": "2.0"},
+            "scene": 0,
+            "scenes": [{"nodes": [0]}],
+            "nodes": [{"mesh": 0, "name": format!("tex_tri_{tag}")}],
+            "meshes": [{"primitives": [{
+                "attributes": {"POSITION": 0, "TEXCOORD_0": 2},
+                "indices": 1,
+                "material": 0,
+            }]}],
+            "materials": [{
+                "name": format!("mat_{tag}"),
+                "pbrMetallicRoughness": {"baseColorTexture": {"index": 0}},
+            }],
+            "textures": [{"source": 0}],
+            "images": [{"uri": png_name}],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+                 "min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 0.0]},
+                {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"},
+                {"bufferView": 2, "componentType": 5126, "count": 3, "type": "VEC2"},
+            ],
+            "bufferViews": [
+                {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+                {"buffer": 0, "byteOffset": 36, "byteLength": 6},
+                {"buffer": 0, "byteOffset": uv_offset, "byteLength": 24},
+            ],
+            "buffers": [{"byteLength": bin.len(), "uri": bin_name}],
+        });
+
+        vec![
+            (
+                format!("{dir}/model_{tag}.gltf"),
+                serde_json::to_vec(&gltf).unwrap(),
+            ),
+            (format!("{dir}/{bin_name}"), bin),
+            (format!("{dir}/{png_name}"), noisy_png(seed)),
+        ]
+    }
+
+    fn convert_textured_scene(jobs: usize) -> Collected {
+        let n = 6;
+        let mut b = InputBuilder::new();
+        for i in 0..n {
+            for (name, data) in textured_model("models", &format!("{i}"), 1000 + i as u32) {
+                b = b.file(name, data);
+            }
+        }
+        let blob = b
+            .file(
+                "scene.json",
+                br#"{"scene":{"base":"0,0","parcels":["0,0"]}}"#.to_vec(),
+            )
+            .platform("windows")
+            .build();
+        let input = parse_input(&blob).expect("request parses");
+        let sink = CollectingSink::new();
+        convert_with_jobs(input, &sink, TEST_HOST, jobs).expect("convert");
+        sink.take()
+    }
+
+    /// Same guarantee as `concurrency_does_not_change_output_or_event_order`,
+    /// but over textured models so the decode + BC7/DXT encode + resS
+    /// layout paths run concurrently, not just plain geometry.
+    #[test]
+    fn textured_concurrency_matches_serial() {
+        let serial = convert_textured_scene(1);
+        let parallel = convert_textured_scene(8);
+
+        assert!(serial.errors.is_empty(), "{:?}", serial.errors);
+        assert!(parallel.errors.is_empty(), "{:?}", parallel.errors);
+        assert_eq!(serial.outputs.len(), 6, "expected one bundle per model");
+
+        let digest = |o: &[(String, Vec<u8>)]| -> Vec<(String, String)> {
+            let mut v: Vec<(String, String)> =
+                o.iter().map(|(n, d)| (n.clone(), sha256_hex(d))).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            digest(&serial.outputs),
+            digest(&parallel.outputs),
+            "textured bundle bytes diverged between jobs=1 and jobs=8"
+        );
+    }
+
+    /// Real-scene reproduction, gated behind `ABGEN_REPRO_SCENE_DIR` so it's
+    /// a no-op (not a failure) when no corpus fixture is provided. Point it
+    /// at a directory containing `_manifest.json` = `[[file, sha256], ...]`
+    /// plus one file per hash (named by hash, content-addressed like a real
+    /// content server), and it converts the resulting scene at jobs=1 vs
+    /// jobs=8 with the texencode/decode caches enabled and cleared between
+    /// runs, then asserts the sorted `(name, sha256)` output lists match.
+    #[test]
+    fn real_scene_concurrency_repro() {
+        let Ok(dir) = std::env::var("ABGEN_REPRO_SCENE_DIR") else {
+            eprintln!("ABGEN_REPRO_SCENE_DIR unset; skipping real_scene_concurrency_repro");
+            return;
+        };
+        let dir = std::path::Path::new(&dir);
+        let manifest_bytes =
+            std::fs::read(dir.join("_manifest.json")).expect("read _manifest.json");
+        let manifest: Vec<(String, String)> =
+            serde_json::from_slice(&manifest_bytes).expect("_manifest.json parses");
+
+        let mut b = InputBuilder::new();
+        for (name, hash) in &manifest {
+            let data = std::fs::read(dir.join(hash))
+                .unwrap_or_else(|e| panic!("read content file {hash} for {name}: {e}"));
+            b = b.file(name.clone(), data);
+        }
+        let blob = b.platform("windows").build();
+
+        let digest = |c: &Collected| -> Vec<(String, String)> {
+            let mut v: Vec<(String, String)> = c
+                .outputs
+                .iter()
+                .map(|(n, d)| (n.clone(), sha256_hex(d)))
+                .collect();
+            v.sort();
+            v
+        };
+
+        crate::texencode_cache::clear();
+        crate::decode_cache::clear();
+        let input = parse_input(&blob).expect("scene manifest parses as an Input");
+        let serial_sink = CollectingSink::new();
+        convert_with_jobs(input, &serial_sink, TEST_HOST, 1).expect("convert jobs=1");
+        let serial = digest(&serial_sink.take());
+
+        crate::texencode_cache::clear();
+        crate::decode_cache::clear();
+        let input = parse_input(&blob).expect("scene manifest parses as an Input");
+        let parallel_sink = CollectingSink::new();
+        convert_with_jobs(input, &parallel_sink, TEST_HOST, 8).expect("convert jobs=8");
+        let parallel = digest(&parallel_sink.take());
+
+        assert_eq!(
+            serial, parallel,
+            "real-scene output digests diverged between jobs=1 and jobs=8"
+        );
     }
 }

@@ -1,4 +1,6 @@
 use super::*;
+use rayon::prelude::*;
+use std::collections::HashMap;
 
 pub fn compute_default_mip_count(width: u32, height: u32) -> i32 {
     let m = width.max(height).max(1);
@@ -29,11 +31,14 @@ pub fn encode_rgba32_mip_chain(
     let h = height as usize;
     assert_eq!(rgba.len(), w * h * 4);
     let flipped: Vec<u8> = if flip {
+        let row_len = w * 4;
         let mut out = vec![0u8; w * h * 4];
-        for y in 0..h {
-            let src = &rgba[(h - 1 - y) * w * 4..(h - 1 - y) * w * 4 + w * 4];
-            out[y * w * 4..y * w * 4 + w * 4].copy_from_slice(src);
-        }
+        out.par_chunks_mut(row_len)
+            .enumerate()
+            .for_each(|(y, dst)| {
+                let src = &rgba[(h - 1 - y) * row_len..(h - 1 - y) * row_len + row_len];
+                dst.copy_from_slice(src);
+            });
         out
     } else {
         rgba.to_vec()
@@ -42,41 +47,54 @@ pub fn encode_rgba32_mip_chain(
     let mip_count = mip_count.unwrap_or_else(|| compute_default_mip_count(width, height));
 
     let mut cur: Vec<f32> = vec![0f32; w * h * 4];
-    for i in 0..(w * h) {
+    cur.par_chunks_mut(4).enumerate().for_each(|(i, dst)| {
         let r = flipped[i * 4];
         let g = flipped[i * 4 + 1];
         let b = flipped[i * 4 + 2];
         let a = flipped[i * 4 + 3] as f32;
         if srgb {
-            cur[i * 4] = srgb_to_linear_u8(r);
-            cur[i * 4 + 1] = srgb_to_linear_u8(g);
-            cur[i * 4 + 2] = srgb_to_linear_u8(b);
-            cur[i * 4 + 3] = a;
+            dst[0] = srgb_to_linear_u8(r);
+            dst[1] = srgb_to_linear_u8(g);
+            dst[2] = srgb_to_linear_u8(b);
+            dst[3] = a;
         } else {
-            cur[i * 4] = r as f32;
-            cur[i * 4 + 1] = g as f32;
-            cur[i * 4 + 2] = b as f32;
-            cur[i * 4 + 3] = a;
+            dst[0] = r as f32;
+            dst[1] = g as f32;
+            dst[2] = b as f32;
+            dst[3] = a;
         }
-    }
+    });
     let mut cw = w;
     let mut ch = h;
 
-    let mut parts: Vec<u8> = Vec::new();
+    let cap = {
+        let mut pw = w;
+        let mut ph = h;
+        let mut total = 0usize;
+        for m in 0..mip_count {
+            total += pw * ph * 4;
+            if m < mip_count - 1 {
+                pw = (pw / 2).max(1);
+                ph = (ph / 2).max(1);
+            }
+        }
+        total
+    };
+    let mut parts: Vec<u8> = Vec::with_capacity(cap);
     for m in 0..mip_count {
         let mut level = vec![0u8; cw * ch * 4];
-        for i in 0..(cw * ch) {
+        level.par_chunks_mut(4).enumerate().for_each(|(i, dst)| {
             if srgb {
-                level[i * 4] = linear_to_srgb_u8(cur[i * 4]);
-                level[i * 4 + 1] = linear_to_srgb_u8(cur[i * 4 + 1]);
-                level[i * 4 + 2] = linear_to_srgb_u8(cur[i * 4 + 2]);
+                dst[0] = linear_to_srgb_u8(cur[i * 4]);
+                dst[1] = linear_to_srgb_u8(cur[i * 4 + 1]);
+                dst[2] = linear_to_srgb_u8(cur[i * 4 + 2]);
             } else {
-                level[i * 4] = round_half_up_u8(cur[i * 4]);
-                level[i * 4 + 1] = round_half_up_u8(cur[i * 4 + 1]);
-                level[i * 4 + 2] = round_half_up_u8(cur[i * 4 + 2]);
+                dst[0] = round_half_up_u8(cur[i * 4]);
+                dst[1] = round_half_up_u8(cur[i * 4 + 1]);
+                dst[2] = round_half_up_u8(cur[i * 4 + 2]);
             }
-            level[i * 4 + 3] = round_half_up_u8(cur[i * 4 + 3]);
-        }
+            dst[3] = round_half_up_u8(cur[i * 4 + 3]);
+        });
         parts.extend_from_slice(&level);
         if m < mip_count - 1 {
             let (next, nw, nh) = box_halve(&cur, cw, ch);
@@ -254,23 +272,25 @@ fn box_halve_neon(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
     let nw = w / 2;
     let mut out = vec![0f32; nh * nw * c];
     let row_stride = w * c;
-    // SAFETY: NEON is baseline on aarch64. For ny<nh, nx<nw the reads touch
-    unsafe {
-        let quarter = vdupq_n_f32(0.25);
-        for ny in 0..nh {
-            let r0 = arr.as_ptr().add(2 * ny * row_stride);
-            let r1 = arr.as_ptr().add((2 * ny + 1) * row_stride);
-            let dst = out.as_mut_ptr().add(ny * nw * c);
-            for nx in 0..nw {
-                let p00 = vld1q_f32(r0.add(nx * 8));
-                let p01 = vld1q_f32(r0.add(nx * 8 + 4));
-                let p10 = vld1q_f32(r1.add(nx * 8));
-                let p11 = vld1q_f32(r1.add(nx * 8 + 4));
-                let acc = vaddq_f32(vaddq_f32(vaddq_f32(p00, p01), p10), p11);
-                vst1q_f32(dst.add(nx * 4), vmulq_f32(acc, quarter));
+    out.par_chunks_mut(nw * c)
+        .enumerate()
+        .for_each(|(ny, dst)| {
+            // SAFETY: NEON is baseline on aarch64. For nx<nw the reads touch
+            unsafe {
+                let quarter = vdupq_n_f32(0.25);
+                let r0 = arr.as_ptr().add(2 * ny * row_stride);
+                let r1 = arr.as_ptr().add((2 * ny + 1) * row_stride);
+                let dst_ptr = dst.as_mut_ptr();
+                for nx in 0..nw {
+                    let p00 = vld1q_f32(r0.add(nx * 8));
+                    let p01 = vld1q_f32(r0.add(nx * 8 + 4));
+                    let p10 = vld1q_f32(r1.add(nx * 8));
+                    let p11 = vld1q_f32(r1.add(nx * 8 + 4));
+                    let acc = vaddq_f32(vaddq_f32(vaddq_f32(p00, p01), p10), p11);
+                    vst1q_f32(dst_ptr.add(nx * 4), vmulq_f32(acc, quarter));
+                }
             }
-        }
-    }
+        });
     (out, nw, nh)
 }
 
@@ -283,22 +303,44 @@ fn box_halve_scalar(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize)
     let denom = (fh * fw) as f32;
     let mut out = vec![0f32; nh * nw * c];
     let row_stride = w * c;
-    for ny in 0..nh {
-        for nx in 0..nw {
-            for ch in 0..c {
-                let mut acc = 0f32;
-                for dy in 0..fh {
-                    for dx in 0..fw {
-                        let y = ny * fh + dy;
-                        let x = nx * fw + dx;
-                        acc += arr[y * row_stride + x * c + ch];
+    out.par_chunks_mut(nw * c)
+        .enumerate()
+        .for_each(|(ny, orow)| {
+            for nx in 0..nw {
+                for ch in 0..c {
+                    let mut acc = 0f32;
+                    for dy in 0..fh {
+                        for dx in 0..fw {
+                            let y = ny * fh + dy;
+                            let x = nx * fw + dx;
+                            acc += arr[y * row_stride + x * c + ch];
+                        }
                     }
+                    orow[nx * c + ch] = acc / denom;
                 }
-                out[(ny * nw + nx) * c + ch] = acc / denom;
             }
-        }
-    }
+        });
     (out, nw, nh)
+}
+
+fn bc7_cache_params(
+    mip_count: Option<i32>,
+    flip: bool,
+    srgb: bool,
+    perceptual: bool,
+    profile: Bc7Profile,
+) -> [i64; 6] {
+    [
+        mip_count.map(i64::from).unwrap_or(-1),
+        flip as i64,
+        srgb as i64,
+        perceptual as i64,
+        match profile {
+            Bc7Profile::Slow => 0,
+            Bc7Profile::Basic => 1,
+        },
+        encode_backend_tag(),
+    ]
 }
 
 pub fn encode_bc7_mip_chain_with_profile(
@@ -311,17 +353,7 @@ pub fn encode_bc7_mip_chain_with_profile(
     perceptual: bool,
     profile: Bc7Profile,
 ) -> (Vec<u8>, i32) {
-    let params = [
-        mip_count.map(i64::from).unwrap_or(-1),
-        flip as i64,
-        srgb as i64,
-        perceptual as i64,
-        match profile {
-            Bc7Profile::Slow => 0,
-            Bc7Profile::Basic => 1,
-        },
-        encode_backend_tag(),
-    ];
+    let params = bc7_cache_params(mip_count, flip, srgb, perceptual, profile);
     crate::texencode_cache::get_or_encode(
         crate::texencode_cache::Kind::Bc7,
         rgba,
@@ -335,6 +367,126 @@ pub fn encode_bc7_mip_chain_with_profile(
         },
     )
     .expect("bc7 encode closure always returns Some")
+}
+
+/// One texture's inputs for [`encode_bc7_mip_chain_with_profile_batch`]; same
+/// fields as the positional arguments of [`encode_bc7_mip_chain_with_profile`].
+pub struct Bc7ChainRequest<'a> {
+    pub rgba: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+    pub mip_count: Option<i32>,
+    pub flip: bool,
+    pub srgb: bool,
+    pub perceptual: bool,
+    pub profile: Bc7Profile,
+}
+
+/// Batched entry point: cache-probes every request first, then routes the
+/// deduplicated set of cache misses through one GPU submission stream (when
+/// gpu_dispatch is enabled), falling back to the plain scalar path for
+/// anything the GPU batch didn't resolve. Byte-identical to calling
+/// [`encode_bc7_mip_chain_with_profile`] once per request, in order — see the
+/// determinism proof in the round-3 bc7-batch-plumbing spec.
+pub fn encode_bc7_mip_chain_with_profile_batch(reqs: &[Bc7ChainRequest]) -> Vec<(Vec<u8>, i32)> {
+    let mut results: Vec<Option<(Vec<u8>, i32)>> = vec![None; reqs.len()];
+    let params: Vec<[i64; 6]> = reqs
+        .iter()
+        .map(|r| bc7_cache_params(r.mip_count, r.flip, r.srgb, r.perceptual, r.profile))
+        .collect();
+
+    for (i, req) in reqs.iter().enumerate() {
+        if let Some(v) = crate::texencode_cache::get_or_encode(
+            crate::texencode_cache::Kind::Bc7,
+            req.rgba,
+            req.width,
+            req.height,
+            &params[i],
+            || None,
+        ) {
+            results[i] = Some(v);
+        }
+    }
+
+    let mut slot_key: Vec<Option<[u8; 32]>> = vec![None; reqs.len()];
+    let mut seen_keys: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    let mut unique_misses: Vec<usize> = Vec::new();
+    for (i, req) in reqs.iter().enumerate() {
+        if results[i].is_some() {
+            continue;
+        }
+        let k = crate::texencode_cache::content_key(
+            crate::texencode_cache::Kind::Bc7,
+            req.rgba,
+            req.width,
+            req.height,
+            &params[i],
+        );
+        slot_key[i] = Some(k);
+        if seen_keys.insert(k) {
+            unique_misses.push(i);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::gpu_dispatch::enabled() && !unique_misses.is_empty() {
+        let jobs: Vec<crate::gpu_dispatch::Bc7Job> = unique_misses
+            .iter()
+            .map(|&i| {
+                let req = &reqs[i];
+                crate::gpu_dispatch::Bc7Job {
+                    rgba: req.rgba,
+                    width: req.width,
+                    height: req.height,
+                    mip_count: req.mip_count,
+                    flip: req.flip,
+                    srgb: req.srgb,
+                    perceptual: req.perceptual,
+                    profile: req.profile,
+                }
+            })
+            .collect();
+        if let Some(batch_results) = crate::gpu_dispatch::encode_bc7_mip_chain_batch(&jobs) {
+            for (u, &i) in unique_misses.iter().enumerate() {
+                let req = &reqs[i];
+                let stored = crate::texencode_cache::get_or_encode(
+                    crate::texencode_cache::Kind::Bc7,
+                    req.rgba,
+                    req.width,
+                    req.height,
+                    &params[i],
+                    || Some(batch_results[u].clone()),
+                )
+                .expect("bc7 encode closure always returns Some");
+                let k = slot_key[i].expect("miss slot always has a content key");
+                for (j, key) in slot_key.iter().enumerate() {
+                    if results[j].is_none() && *key == Some(k) {
+                        results[j] = Some(stored.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    for (i, req) in reqs.iter().enumerate() {
+        if results[i].is_none() {
+            results[i] = Some(encode_bc7_mip_chain_with_profile(
+                req.rgba,
+                req.width,
+                req.height,
+                req.mip_count,
+                req.flip,
+                req.srgb,
+                req.perceptual,
+                req.profile,
+            ));
+        }
+    }
+
+    results
+        .into_iter()
+        .map(|r| r.expect("bc7 batch: every slot is filled by the probe, GPU, or scalar pass"))
+        .collect()
 }
 
 fn encode_backend_tag() -> i64 {
@@ -384,10 +536,9 @@ fn encode_bc7_mip_chain_with_profile_uncached(
     };
 
     let mut cur: Vec<f32> = vec![0f32; w * h * 4];
-    for y in 0..h {
+    cur.par_chunks_mut(w * 4).enumerate().for_each(|(y, dst)| {
         let sy = if flip { h - 1 - y } else { y };
         let src = &rgba[sy * w * 4..sy * w * 4 + w * 4];
-        let dst = &mut cur[y * w * 4..y * w * 4 + w * 4];
         for x in 0..w {
             let r = src[x * 4];
             let g = src[x * 4 + 1];
@@ -405,7 +556,7 @@ fn encode_bc7_mip_chain_with_profile_uncached(
                 dst[x * 4 + 3] = a;
             }
         }
-    }
+    });
     let mut cw = w;
     let mut ch = h;
 
@@ -425,50 +576,93 @@ fn encode_bc7_mip_chain_with_profile_uncached(
     debug_assert_eq!(total, compute_mip_chain_size(width, height, mip_count));
     let mut parts = vec![0u8; total];
 
-    const TASK_BLOCKS: usize = 64;
-    let mut tasks: Vec<(usize, usize, usize)> = Vec::new();
+    let mut units: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut out_off = 0usize;
     for (li, (_, n)) in levels.iter().enumerate() {
         let mut b = 0usize;
         while b < *n {
-            let cnt = TASK_BLOCKS.min(n - b);
-            tasks.push((li, b, cnt));
-            b += cnt;
+            let nb = SIMD_W.min(*n - b);
+            units.push((li, b, nb, out_off));
+            out_off += nb * 16;
+            b += nb;
         }
     }
-    let mut slices: Vec<&mut [u8]> = Vec::with_capacity(tasks.len());
+    debug_assert_eq!(out_off, total);
+
+    use rayon::prelude::*;
+
+    let hashes: Vec<u64> = units
+        .par_iter()
+        .map(|&(li, bs, nb, _)| {
+            let key = &levels[li].0[bs * 64..(bs + nb) * 64];
+            let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+            for w in key.chunks_exact(8) {
+                let word = u64::from_le_bytes(w.try_into().unwrap());
+                h = (h ^ word).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                h ^= h >> 29;
+            }
+            h
+        })
+        .collect();
+
+    let mut buckets: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut rep: Vec<u32> = Vec::with_capacity(units.len());
+    for (u, &(li, bs, nb, _)) in units.iter().enumerate() {
+        let key = &levels[li].0[bs * 64..(bs + nb) * 64];
+        let bucket = buckets.entry(hashes[u]).or_default();
+        let mut found = None;
+        for &cand in bucket.iter() {
+            let (cli, cbs, cnb, _) = units[cand as usize];
+            if cnb == nb && &levels[cli].0[cbs * 64..(cbs + cnb) * 64] == key {
+                found = Some(cand);
+                break;
+            }
+        }
+        match found {
+            Some(r) => rep.push(r),
+            None => {
+                bucket.push(u as u32);
+                rep.push(u as u32);
+            }
+        }
+    }
+
+    let mut slices: Vec<&mut [u8]> = Vec::with_capacity(units.len());
     {
         let mut rest: &mut [u8] = &mut parts;
-        for &(_, _, cnt) in &tasks {
-            let (a, b) = rest.split_at_mut(cnt * 16);
+        for &(_, _, nb, _) in &units {
+            let (a, b) = rest.split_at_mut(nb * 16);
             slices.push(a);
             rest = b;
         }
         debug_assert!(rest.is_empty());
     }
 
-    use rayon::prelude::*;
     slices
         .into_par_iter()
-        .zip(tasks.par_iter())
-        .for_each(|(dst, &(li, start, cnt))| {
-            let src = &levels[li].0;
-            let mut group: Vec<[ColorI; 16]> = Vec::with_capacity(SIMD_W);
-            let mut o = 0usize;
-            let mut b = 0usize;
-            while b < cnt {
-                let g = SIMD_W.min(cnt - b);
-                group.clear();
-                for k in 0..g {
-                    let bi = start + b + k;
-                    group.push(block_from_bytes(&src[bi * 64..bi * 64 + 64]));
-                }
-                for blk in compress_group(&group, &params) {
-                    dst[o..o + 16].copy_from_slice(&blk);
-                    o += 16;
-                }
-                b += g;
+        .zip(units.par_iter())
+        .with_min_len(16)
+        .enumerate()
+        .for_each(|(u, (dst, &(li, bs, nb, _)))| {
+            if rep[u] as usize != u {
+                return;
             }
+            let mut group: [[ColorI; 16]; SIMD_W] = [[ColorI::default(); 16]; SIMD_W];
+            for (k, slot) in group.iter_mut().enumerate().take(nb) {
+                let bi = bs + k;
+                *slot = block_from_bytes(&levels[li].0[bi * 64..bi * 64 + 64]);
+            }
+            compress_group_into(&group[..nb], &params, dst);
         });
+
+    for (u, &r) in rep.iter().enumerate() {
+        let r = r as usize;
+        if r != u {
+            let (_, _, nb, u_off) = units[u];
+            let (_, _, _, rep_off) = units[r];
+            parts.copy_within(rep_off..rep_off + nb * 16, u_off);
+        }
+    }
 
     if let Some(path) = bc7_capture_path() {
         use std::io::Write;
@@ -501,16 +695,10 @@ fn encode_bc7_mip_chain_with_profile_uncached(
 /// shuffling produces the identical bytes, minus a full-image copy and the
 /// no-op `to_vec` inside `pad_to_block_size`.
 fn level_to_blocks(cur: &[f32], cw: usize, ch: usize, srgb: bool) -> (Vec<u8>, usize) {
-    use rayon::prelude::*;
-
     if cw.is_multiple_of(4) && ch.is_multiple_of(4) {
         let bw = cw / 4;
         let bh = ch / 4;
         let mut out = vec![0u8; bw * bh * 64];
-        // Each block-row `by` writes exactly `bw * 64` disjoint bytes (block
-        // order is by-major), and every pixel's quantization only reads
-        // `cur` — independent per row, so this runs across block-rows in
-        // parallel with the same per-pixel output as the serial version.
         out.par_chunks_mut(bw * 64)
             .enumerate()
             .for_each(|(by, orow)| {
@@ -527,8 +715,6 @@ fn level_to_blocks(cur: &[f32], cw: usize, ch: usize, srgb: bool) -> (Vec<u8>, u
             });
         return (out, bw * bh);
     }
-    // Deep, non-block-aligned mip tail levels: small (at most a handful of
-    // pixels short of 4x4) and rare, so this stays serial.
     let mut level = vec![0u8; cw * ch * 4];
     for i in 0..(cw * ch) {
         quantize_px(cur, i, srgb, &mut level[i * 4..i * 4 + 4]);
@@ -551,7 +737,491 @@ fn quantize_px(cur: &[f32], i: usize, srgb: bool, dst: &mut [u8]) {
     dst[3] = round_half_up_u8(cur[i * 4 + 3]);
 }
 
+#[cfg(test)]
+mod group_dedup_tests {
+    use super::*;
+
+    /// Serial reference that replicates the pre-dedup driver byte-for-byte:
+    /// build the same working image, chunk each level into SIMD_W=4 groups
+    /// (tail last) in order, and call `compress_group` directly instead of
+    /// going through the hash/dedup/copy machinery.
+    #[allow(clippy::too_many_arguments)]
+    fn reference_encode(
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        flip: bool,
+        srgb: bool,
+        perceptual: bool,
+        profile: Bc7Profile,
+    ) -> (Vec<u8>, i32) {
+        let w = width as usize;
+        let h = height as usize;
+        let mip_count = compute_default_mip_count(width, height);
+        let params = match profile {
+            Bc7Profile::Slow => Params::slow(perceptual),
+            Bc7Profile::Basic => Params::basic(perceptual),
+        };
+
+        let mut cur: Vec<f32> = vec![0f32; w * h * 4];
+        for y in 0..h {
+            let sy = if flip { h - 1 - y } else { y };
+            let src = &rgba[sy * w * 4..sy * w * 4 + w * 4];
+            let dst = &mut cur[y * w * 4..y * w * 4 + w * 4];
+            for x in 0..w {
+                let r = src[x * 4];
+                let g = src[x * 4 + 1];
+                let b = src[x * 4 + 2];
+                let a = src[x * 4 + 3] as f32;
+                if srgb {
+                    dst[x * 4] = srgb_to_linear_u8(r);
+                    dst[x * 4 + 1] = srgb_to_linear_u8(g);
+                    dst[x * 4 + 2] = srgb_to_linear_u8(b);
+                    dst[x * 4 + 3] = a;
+                } else {
+                    dst[x * 4] = r as f32;
+                    dst[x * 4 + 1] = g as f32;
+                    dst[x * 4 + 2] = b as f32;
+                    dst[x * 4 + 3] = a;
+                }
+            }
+        }
+        let mut cw = w;
+        let mut ch = h;
+
+        let mut out: Vec<u8> = Vec::new();
+        for m in 0..mip_count {
+            let (blocks, n) = level_to_blocks(&cur, cw, ch, srgb);
+            let mut b = 0usize;
+            while b < n {
+                let g = SIMD_W.min(n - b);
+                let mut group: Vec<[ColorI; 16]> = Vec::with_capacity(g);
+                for k in 0..g {
+                    let bi = b + k;
+                    group.push(block_from_bytes(&blocks[bi * 64..bi * 64 + 64]));
+                }
+                for blk in compress_group(&group, &params) {
+                    out.extend_from_slice(&blk);
+                }
+                b += g;
+            }
+            if m < mip_count - 1 {
+                let (next, nw, nh) = box_halve(&cur, cw, ch);
+                cur = next;
+                cw = nw;
+                ch = nh;
+            }
+        }
+        (out, mip_count)
+    }
+
+    /// 128x128 image tiled from a 16x16 pattern containing a solid region, a
+    /// gradient, and an alpha<255 region — its deep mips converge to
+    /// near-flat, and the tiling repeats identical group content at many
+    /// different group indices across the mip chain.
+    fn tiled_image() -> (Vec<u8>, u32, u32) {
+        let tw = 16usize;
+        let th = 16usize;
+        let mut tile = vec![0u8; tw * th * 4];
+        for y in 0..th {
+            for x in 0..tw {
+                let i = (y * tw + x) * 4;
+                if x < 6 {
+                    tile[i] = 200;
+                    tile[i + 1] = 40;
+                    tile[i + 2] = 40;
+                    tile[i + 3] = 255;
+                } else if x < 12 {
+                    tile[i] = (x * 16) as u8;
+                    tile[i + 1] = (y * 16) as u8;
+                    tile[i + 2] = ((x + y) * 8) as u8;
+                    tile[i + 3] = 255;
+                } else {
+                    tile[i] = 30;
+                    tile[i + 1] = 180;
+                    tile[i + 2] = 90;
+                    tile[i + 3] = 40 + (((x + y * 3) * 7) % 200) as u8;
+                }
+            }
+        }
+        let w = 128usize;
+        let h = 128usize;
+        let mut img = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let sx = x % tw;
+                let sy = y % th;
+                let si = (sy * tw + sx) * 4;
+                let di = (y * w + x) * 4;
+                img[di..di + 4].copy_from_slice(&tile[si..si + 4]);
+            }
+        }
+        (img, w as u32, h as u32)
+    }
+
+    #[test]
+    fn group_dedup_matches_serial_reference() {
+        let (rgba, w, h) = tiled_image();
+        for profile in [Bc7Profile::Slow, Bc7Profile::Basic] {
+            for perceptual in [false, true] {
+                for srgb in [false, true] {
+                    let (got, got_count) = encode_bc7_mip_chain_with_profile_uncached(
+                        &rgba, w, h, None, false, srgb, perceptual, profile,
+                    );
+                    let (want, want_count) =
+                        reference_encode(&rgba, w, h, false, srgb, perceptual, profile);
+                    assert_eq!(got_count, want_count);
+                    assert_eq!(
+                        got, want,
+                        "profile={profile:?} perceptual={perceptual} srgb={srgb}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Same tile content appears at many different SIMD_W group indices
+    /// across the mip chain (and within each level) — this guards that
+    /// rep-selection and the copy-after-join use the correct offsets rather
+    /// than aliasing on index instead of content.
+    #[test]
+    fn group_dedup_repeated_content_at_different_group_indices() {
+        let (rgba, w, h) = tiled_image();
+        let (got, got_count) = encode_bc7_mip_chain_with_profile_uncached(
+            &rgba,
+            w,
+            h,
+            None,
+            false,
+            false,
+            false,
+            Bc7Profile::Basic,
+        );
+        let (want, want_count) =
+            reference_encode(&rgba, w, h, false, false, false, Bc7Profile::Basic);
+        assert_eq!(got_count, want_count);
+        assert_eq!(got, want);
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    fn noise_rgba(seed: u64, w: u32, h: u32) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut out = vec![0u8; (w * h * 4) as usize];
+        for b in out.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x >> 24) as u8;
+        }
+        out
+    }
+
+    #[test]
+    fn batch_matches_scalar_for_probe_hit_and_miss_paths() {
+        crate::texencode_cache::enable();
+
+        let tex0 = noise_rgba(1, 8, 8);
+        let tex1 = noise_rgba(2, 8, 8);
+        let tex2 = noise_rgba(3, 8, 8);
+        let tex3 = tex1.clone();
+        let textures = [tex0, tex1, tex2, tex3];
+
+        let reqs: Vec<Bc7ChainRequest> = textures
+            .iter()
+            .map(|t| Bc7ChainRequest {
+                rgba: t,
+                width: 8,
+                height: 8,
+                mip_count: Some(1),
+                flip: false,
+                srgb: false,
+                perceptual: false,
+                profile: Bc7Profile::Basic,
+            })
+            .collect();
+
+        let expected: Vec<(Vec<u8>, i32)> = reqs
+            .iter()
+            .map(|r| {
+                encode_bc7_mip_chain_with_profile(
+                    r.rgba,
+                    r.width,
+                    r.height,
+                    r.mip_count,
+                    r.flip,
+                    r.srgb,
+                    r.perceptual,
+                    r.profile,
+                )
+            })
+            .collect();
+        assert_eq!(textures[1], textures[3]);
+
+        let batch_hit = encode_bc7_mip_chain_with_profile_batch(&reqs);
+        assert_eq!(batch_hit, expected);
+
+        crate::texencode_cache::clear();
+        let batch_miss = encode_bc7_mip_chain_with_profile_batch(&reqs);
+        assert_eq!(batch_miss, expected);
+    }
+}
+
+#[cfg(test)]
+fn box_halve_scalar_serial(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
+    let c = 4usize;
+    let nh = (h / 2).max(1);
+    let nw = (w / 2).max(1);
+    let fh = if h > 1 { 2 } else { 1 };
+    let fw = if w > 1 { 2 } else { 1 };
+    let denom = (fh * fw) as f32;
+    let mut out = vec![0f32; nh * nw * c];
+    let row_stride = w * c;
+    for ny in 0..nh {
+        for nx in 0..nw {
+            for ch in 0..c {
+                let mut acc = 0f32;
+                for dy in 0..fh {
+                    for dx in 0..fw {
+                        let y = ny * fh + dy;
+                        let x = nx * fw + dx;
+                        acc += arr[y * row_stride + x * c + ch];
+                    }
+                }
+                out[(ny * nw + nx) * c + ch] = acc / denom;
+            }
+        }
+    }
+    (out, nw, nh)
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
+fn box_halve_neon_serial(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
+    use std::arch::aarch64::*;
+    let c = 4usize;
+    let nh = h / 2;
+    let nw = w / 2;
+    let mut out = vec![0f32; nh * nw * c];
+    let row_stride = w * c;
+    unsafe {
+        let quarter = vdupq_n_f32(0.25);
+        for ny in 0..nh {
+            let r0 = arr.as_ptr().add(2 * ny * row_stride);
+            let r1 = arr.as_ptr().add((2 * ny + 1) * row_stride);
+            let dst = out.as_mut_ptr().add(ny * nw * c);
+            for nx in 0..nw {
+                let p00 = vld1q_f32(r0.add(nx * 8));
+                let p01 = vld1q_f32(r0.add(nx * 8 + 4));
+                let p10 = vld1q_f32(r1.add(nx * 8));
+                let p11 = vld1q_f32(r1.add(nx * 8 + 4));
+                let acc = vaddq_f32(vaddq_f32(vaddq_f32(p00, p01), p10), p11);
+                vst1q_f32(dst.add(nx * 4), vmulq_f32(acc, quarter));
+            }
+        }
+    }
+    (out, nw, nh)
+}
+
+#[cfg(test)]
+fn box_halve_serial(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
+    #[cfg(target_arch = "aarch64")]
+    if w > 1 && h > 1 {
+        return box_halve_neon_serial(arr, w, h);
+    }
+    box_halve_scalar_serial(arr, w, h)
+}
+
+/// Serial reference for [`encode_bc7_mip_chain_with_profile_uncached`]: identical
+/// except the f32 ingest loop and the box_halve calls use the pre-parallelization
+/// bodies. `level_to_blocks` and the block-compress stage are untouched by the
+/// row-parallel change, so they are called as-is (shared with the real function).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn encode_bc7_mip_chain_with_profile_uncached_serial(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    mip_count: Option<i32>,
+    flip: bool,
+    srgb: bool,
+    perceptual: bool,
+    profile: Bc7Profile,
+) -> (Vec<u8>, i32) {
+    let w = width as usize;
+    let h = height as usize;
+    assert_eq!(rgba.len(), w * h * 4);
+
+    let mip_count = mip_count.unwrap_or_else(|| compute_default_mip_count(width, height));
+    let params = match profile {
+        Bc7Profile::Slow => Params::slow(perceptual),
+        Bc7Profile::Basic => Params::basic(perceptual),
+    };
+
+    let mut cur: Vec<f32> = vec![0f32; w * h * 4];
+    for y in 0..h {
+        let sy = if flip { h - 1 - y } else { y };
+        let src = &rgba[sy * w * 4..sy * w * 4 + w * 4];
+        let dst = &mut cur[y * w * 4..y * w * 4 + w * 4];
+        for x in 0..w {
+            let r = src[x * 4];
+            let g = src[x * 4 + 1];
+            let b = src[x * 4 + 2];
+            let a = src[x * 4 + 3] as f32;
+            if srgb {
+                dst[x * 4] = srgb_to_linear_u8(r);
+                dst[x * 4 + 1] = srgb_to_linear_u8(g);
+                dst[x * 4 + 2] = srgb_to_linear_u8(b);
+                dst[x * 4 + 3] = a;
+            } else {
+                dst[x * 4] = r as f32;
+                dst[x * 4 + 1] = g as f32;
+                dst[x * 4 + 2] = b as f32;
+                dst[x * 4 + 3] = a;
+            }
+        }
+    }
+    let mut cw = w;
+    let mut ch = h;
+
+    let mut levels: Vec<(Vec<u8>, usize)> = Vec::with_capacity(mip_count.max(0) as usize);
+    for m in 0..mip_count {
+        levels.push(level_to_blocks(&cur, cw, ch, srgb));
+        if m < mip_count - 1 {
+            let (next, nw, nh) = box_halve_serial(&cur, cw, ch);
+            cur = next;
+            cw = nw;
+            ch = nh;
+        }
+    }
+    drop(cur);
+
+    let total = levels.iter().map(|(_, n)| n * 16).sum::<usize>();
+    let mut parts = vec![0u8; total];
+
+    const TASK_BLOCKS: usize = 64;
+    let mut tasks: Vec<(usize, usize, usize)> = Vec::new();
+    for (li, (_, n)) in levels.iter().enumerate() {
+        let mut b = 0usize;
+        while b < *n {
+            let cnt = TASK_BLOCKS.min(n - b);
+            tasks.push((li, b, cnt));
+            b += cnt;
+        }
+    }
+    let mut slices: Vec<&mut [u8]> = Vec::with_capacity(tasks.len());
+    {
+        let mut rest: &mut [u8] = &mut parts;
+        for &(_, _, cnt) in &tasks {
+            let (a, b) = rest.split_at_mut(cnt * 16);
+            slices.push(a);
+            rest = b;
+        }
+        debug_assert!(rest.is_empty());
+    }
+
+    slices
+        .into_par_iter()
+        .zip(tasks.par_iter())
+        .for_each(|(dst, &(li, start, cnt))| {
+            let src = &levels[li].0;
+            let mut group: Vec<[ColorI; 16]> = Vec::with_capacity(SIMD_W);
+            let mut o = 0usize;
+            let mut b = 0usize;
+            while b < cnt {
+                let g = SIMD_W.min(cnt - b);
+                group.clear();
+                for k in 0..g {
+                    let bi = start + b + k;
+                    group.push(block_from_bytes(&src[bi * 64..bi * 64 + 64]));
+                }
+                for blk in compress_group(&group, &params) {
+                    dst[o..o + 16].copy_from_slice(&blk);
+                    o += 16;
+                }
+                b += g;
+            }
+        });
+
+    (parts, mip_count)
+}
+
+/// Serial reference for [`encode_rgba32_mip_chain`]'s ingest/quantize loops.
+#[cfg(test)]
+fn encode_rgba32_mip_chain_serial(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    mip_count: Option<i32>,
+    flip: bool,
+    srgb: bool,
+) -> (Vec<u8>, i32) {
+    let w = width as usize;
+    let h = height as usize;
+    assert_eq!(rgba.len(), w * h * 4);
+    let flipped: Vec<u8> = if flip {
+        let mut out = vec![0u8; w * h * 4];
+        for y in 0..h {
+            let src = &rgba[(h - 1 - y) * w * 4..(h - 1 - y) * w * 4 + w * 4];
+            out[y * w * 4..y * w * 4 + w * 4].copy_from_slice(src);
+        }
+        out
+    } else {
+        rgba.to_vec()
+    };
+
+    let mip_count = mip_count.unwrap_or_else(|| compute_default_mip_count(width, height));
+
+    let mut cur: Vec<f32> = vec![0f32; w * h * 4];
+    for i in 0..(w * h) {
+        let r = flipped[i * 4];
+        let g = flipped[i * 4 + 1];
+        let b = flipped[i * 4 + 2];
+        let a = flipped[i * 4 + 3] as f32;
+        if srgb {
+            cur[i * 4] = srgb_to_linear_u8(r);
+            cur[i * 4 + 1] = srgb_to_linear_u8(g);
+            cur[i * 4 + 2] = srgb_to_linear_u8(b);
+            cur[i * 4 + 3] = a;
+        } else {
+            cur[i * 4] = r as f32;
+            cur[i * 4 + 1] = g as f32;
+            cur[i * 4 + 2] = b as f32;
+            cur[i * 4 + 3] = a;
+        }
+    }
+    let mut cw = w;
+    let mut ch = h;
+
+    let mut parts: Vec<u8> = Vec::new();
+    for m in 0..mip_count {
+        let mut level = vec![0u8; cw * ch * 4];
+        for i in 0..(cw * ch) {
+            if srgb {
+                level[i * 4] = linear_to_srgb_u8(cur[i * 4]);
+                level[i * 4 + 1] = linear_to_srgb_u8(cur[i * 4 + 1]);
+                level[i * 4 + 2] = linear_to_srgb_u8(cur[i * 4 + 2]);
+            } else {
+                level[i * 4] = round_half_up_u8(cur[i * 4]);
+                level[i * 4 + 1] = round_half_up_u8(cur[i * 4 + 1]);
+                level[i * 4 + 2] = round_half_up_u8(cur[i * 4 + 2]);
+            }
+            level[i * 4 + 3] = round_half_up_u8(cur[i * 4 + 3]);
+        }
+        parts.extend_from_slice(&level);
+        if m < mip_count - 1 {
+            let (next, nw, nh) = box_halve(&cur, cw, ch);
+            cur = next;
+            cw = nw;
+            ch = nh;
+        }
+    }
+    (parts, mip_count)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -567,6 +1237,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn neon_box_halve_matches_scalar() {
         let mut rng = Rng(0xdead_beef_cafe_f00d);
@@ -598,6 +1269,134 @@ mod tests {
                     a[i].to_bits(),
                     b[i].to_bits(),
                     "lane {i} differs for {w}x{h}"
+                );
+            }
+        }
+    }
+
+    fn lcg_f32_buf(n: usize, seed: u64) -> Vec<f32> {
+        let mut rng = Rng(seed | 1);
+        (0..n)
+            .map(|_| match rng.next_u32() % 4 {
+                0 => (rng.next_u32() % 256) as f32,
+                1 => f32::from_bits(0x3f80_0000 | (rng.next_u32() & 0x007f_ffff)) - 1.0,
+                2 => 255.0,
+                _ => 0.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn box_halve_matches_serial_various_sizes() {
+        for &(w, h) in &[(4usize, 4usize), (5, 3), (1, 8), (8, 1), (256, 256)] {
+            let arr = lcg_f32_buf(w * h * 4, 0x1357_9bdf ^ ((w * 991 + h) as u64));
+            let (a, aw, ah) = box_halve(&arr, w, h);
+            let (b, bw, bh) = box_halve_serial(&arr, w, h);
+            assert_eq!((aw, ah), (bw, bh), "dims differ for {w}x{h}");
+            assert_eq!(a.len(), b.len());
+            for i in 0..a.len() {
+                assert_eq!(
+                    a[i].to_bits(),
+                    b[i].to_bits(),
+                    "lane {i} differs for {w}x{h}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn box_halve_scalar_matches_serial_various_sizes() {
+        for &(w, h) in &[(4usize, 4usize), (5, 3), (1, 8), (8, 1), (256, 256)] {
+            let arr = lcg_f32_buf(w * h * 4, 0x2468_ace1 ^ ((w * 733 + h) as u64));
+            let (a, aw, ah) = box_halve_scalar(&arr, w, h);
+            let (b, bw, bh) = box_halve_scalar_serial(&arr, w, h);
+            assert_eq!((aw, ah), (bw, bh), "dims differ for {w}x{h}");
+            for i in 0..a.len() {
+                assert_eq!(
+                    a[i].to_bits(),
+                    b[i].to_bits(),
+                    "scalar lane {i} differs for {w}x{h}"
+                );
+            }
+        }
+    }
+
+    fn lcg_rgba(w: usize, h: usize, mut seed: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; w * h * 4];
+        for b in buf.iter_mut() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (seed >> 24) as u8;
+        }
+        buf
+    }
+
+    #[test]
+    fn bc7_mip_chain_matches_serial() {
+        let (w, h) = (64u32, 48u32);
+        let rgba = lcg_rgba(w as usize, h as usize, 0xc0ff_ee11);
+        for &srgb in &[false, true] {
+            for &profile in &[Bc7Profile::Slow, Bc7Profile::Basic] {
+                let par = encode_bc7_mip_chain_with_profile_uncached(
+                    &rgba, w, h, None, true, srgb, false, profile,
+                );
+                let serial = encode_bc7_mip_chain_with_profile_uncached_serial(
+                    &rgba, w, h, None, true, srgb, false, profile,
+                );
+                assert_eq!(
+                    par, serial,
+                    "bc7 mip chain mismatch srgb={srgb} profile={profile:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bc7_mip_chain_thread_count_invariant() {
+        let (w, h) = (64u32, 48u32);
+        let rgba = lcg_rgba(w as usize, h as usize, 0x1122_3344);
+        let global = encode_bc7_mip_chain_with_profile_uncached(
+            &rgba,
+            w,
+            h,
+            None,
+            true,
+            true,
+            false,
+            Bc7Profile::Basic,
+        );
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let single = pool.install(|| {
+            encode_bc7_mip_chain_with_profile_uncached(
+                &rgba,
+                w,
+                h,
+                None,
+                true,
+                true,
+                false,
+                Bc7Profile::Basic,
+            )
+        });
+        assert_eq!(
+            global, single,
+            "bc7 mip chain must be invariant to thread count"
+        );
+    }
+
+    #[test]
+    fn rgba32_mip_chain_matches_serial() {
+        let (w, h) = (64u32, 48u32);
+        let rgba = lcg_rgba(w as usize, h as usize, 0x0bad_f00d);
+        for &srgb in &[false, true] {
+            for &flip in &[false, true] {
+                let par = encode_rgba32_mip_chain(&rgba, w, h, None, flip, srgb);
+                let serial = encode_rgba32_mip_chain_serial(&rgba, w, h, None, flip, srgb);
+                assert_eq!(
+                    par, serial,
+                    "rgba32 mip chain mismatch srgb={srgb} flip={flip}"
                 );
             }
         }

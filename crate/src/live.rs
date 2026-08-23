@@ -97,10 +97,6 @@ fn probe_jobs() -> usize {
 fn corpus_file_jobs() -> usize {
     static JOBS: OnceLock<usize> = OnceLock::new();
     *JOBS.get_or_init(|| {
-        // Specific knob wins over the generic one; the generic knob and the
-        // memory/core-scaled default live in
-        // clihelp::default_file_concurrency, shared with
-        // export::convert's file-level parallelism.
         std::env::var("ABGEN_JIT_FILE_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -363,18 +359,6 @@ impl Proxy {
             .resolve_scene(cid)
             .with_context(|| format!("resolve entity {cid}"))?;
 
-        // Only the GLBs' own bytes are needed up front: `scan_entity` and
-        // `compute_deps_digests` below parse each GLB to learn which
-        // content hashes it depends on (parsed metadata only, never the
-        // dependency bytes themselves — `deps_digest_for_glb` hashes
-        // (path, hash) pairs, it doesn't read the referenced textures).
-        // Standalone images and `.bin` dependency payloads are fetched
-        // lazily, per work item, inside `build()`'s `ensure_content` /
-        // `resolve_fn` calls once the parallel conversion loop below picks
-        // them up — so their download overlaps with other files' CPU-bound
-        // conversion instead of sitting as a hard barrier before any
-        // conversion can start (the old code fetched every convertible
-        // extension, including images/.bin, to completion here first).
         let dl_started = std::time::Instant::now();
         let mut to_fetch: Vec<(&str, &str)> = Vec::new();
         let mut seen_hashes = std::collections::HashSet::new();
@@ -454,9 +438,6 @@ impl Proxy {
         }
         self.ensure_content(hash).ok();
         let Ok(raw) = self.content.fetch_mmap(hash) else {
-            // Unreadable content is not a decode failure (the old inline
-            // check skipped it too); left un-memoized so a later successful
-            // fetch still gets a real verdict.
             return true;
         };
         let v = crate::builder::source_image_decodes(&raw);
@@ -753,7 +734,6 @@ impl Proxy {
             versions.push(self.fallback_version.as_str());
         }
         for ver in versions {
-            // Entity kind is unknown at read time — shared prefix first, then entity-scoped.
             let keys = [
                 Self::asset_bundle_key(ver, file),
                 Self::bundle_key(ver, cid, file),
@@ -772,7 +752,6 @@ impl Proxy {
     }
 
     fn space_probe_asset(&self, file: &str) -> bool {
-        // Digest-carrying names are self-describing; bare names are never probed.
         if !naming::bundle_name_has_digest(file) {
             return false;
         }
@@ -920,9 +899,6 @@ impl Proxy {
 
         let mut prebuilt: Vec<(usize, String)> = Vec::new();
         let mut work: Vec<WorkItem> = Vec::new();
-        // Naming (deps-digest lookup, dedup) is pure in-memory computation
-        // over data already fetched for `ctx`, so it stays a plain
-        // sequential pass — only the existence probe itself is I/O.
         let mut candidates: Vec<ProbeCandidate> = Vec::new();
         let mut done_pre: usize = 0;
         for (idx, c) in convertible.iter().enumerate() {
@@ -939,10 +915,6 @@ impl Proxy {
                 match ctx.deps_digests.get(&c.hash) {
                     Some(d) => format!("{case_hash}_{d}_{platform}"),
                     None if ctx.undeployed_dep_glbs.contains(&c.hash) => {
-                        // Broken deployment, not a conversion error: prod
-                        // skips these GLBs entirely (no manifest entry,
-                        // exit 0) — counting them as failed broke exit-code
-                        // parity on every scene carrying one (#59).
                         tracing::warn!(
                             entity = %cid,
                             file = %c.file,
@@ -981,14 +953,6 @@ impl Proxy {
             });
         }
 
-        // Bounded-concurrency existence probe: each candidate's S3 `HEAD`
-        // is an independent network round-trip, so probing them one at a
-        // time (the old behavior) serializes N round-trip latencies ahead
-        // of any conversion. `space_probe_asset` already no-ops without I/O
-        // for bare (non-digest) names, so probing every candidate through
-        // the same worker pool costs nothing extra for those. Verdicts are
-        // collected into `hit_slots`, then merged back in original file
-        // order below — scheduling never reorders `prebuilt`/`work`/`collapsed_names`.
         let hit_slots: Vec<Mutex<bool>> = candidates.iter().map(|_| Mutex::new(false)).collect();
         {
             let probe_workers = probe_jobs().min(candidates.len().max(1));
@@ -1389,13 +1353,7 @@ impl Proxy {
     }
 
     pub fn new_with_space(cfg: ProxyConfig, injected_space: Option<Arc<Space>>) -> Arc<Self> {
-        // Same bounded, content-hash-keyed texture caches the lambda path
-        // enables: a long-lived live/abcdn server converts many entities
-        // that reuse the same source textures (wearable collections, atlas
-        // reuse across scenes), and both caches cap themselves by bytes
-        // (ABGEN_TEX_ENCODE_CACHE_MAX_MB / ABGEN_DECODE_CACHE_MB) with LRU
-        // eviction, so this is safe to leave on for the process lifetime.
-        crate::texencode_cache::enable();
+        crate::texencode_cache::enable_with_profile(crate::texencode_cache::CacheProfile::Client);
         crate::decode_cache::enable();
         let collection_mode = BuildOpts::env_collection_mode();
         let real_textures = !cfg.parity || BuildOpts::env_real_textures();
@@ -1889,7 +1847,6 @@ mod tests {
             ]
         );
 
-        // The name decides probing, not the proxy's naming flag.
         let (host2, seen2) = super::stub::serve(vec![]);
         let digests_off = stub_proxy(&host2, false, "digests-off-probe");
         assert!(!digests_off.space_probe_asset("Qmhit_0123456789abcdef0123456789abcdef_windows"));

@@ -67,10 +67,20 @@ impl Sink for TimingSink {
         }
     }
 
+    /// The digest/byte counts must be identical whether an output arrives
+    /// via `emit_output` or via a default-framed `emit(Kind::Output)`:
+    /// `split_output` is the exact inverse of `Sink::emit_output`'s default
+    /// framing (pinned by `export::tests::output_payload_roundtrips`).
     fn emit(&self, kind: Kind, bytes: &[u8]) {
         if kind == Kind::Output {
+            let len = export::split_output(bytes)
+                .map(|(_, data)| data.len())
+                .unwrap_or(bytes.len());
             if let Ok(mut n) = self.bytes_out.lock() {
-                *n += bytes.len() as u64;
+                *n += len as u64;
+            }
+            if let Ok(mut n) = self.bundles.lock() {
+                *n += 1;
             }
             return;
         }
@@ -115,8 +125,18 @@ impl Sink for HashSink {
         }
     }
 
+    /// The digest/byte counts must be identical whether an output arrives
+    /// via `emit_output` or via a default-framed `emit(Kind::Output)`:
+    /// `split_output` is the exact inverse of `Sink::emit_output`'s default
+    /// framing (pinned by `export::tests::output_payload_roundtrips`).
     fn emit(&self, kind: Kind, bytes: &[u8]) {
         if kind != Kind::Output {
+            return;
+        }
+        if let Some((name, data)) = export::split_output(bytes) {
+            if let Ok(mut p) = self.pairs.lock() {
+                p.push((name, hashes::sha256_hex(&data)));
+            }
             return;
         }
         let n = match self.anon.lock() {
@@ -153,10 +173,6 @@ fn build_request(files: &[(String, Vec<u8>)], platform: &str) -> Vec<u8> {
 }
 
 fn time_once(files: &[(String, Vec<u8>)], platform: &str) -> Run {
-    // Clear per rep: caching is enabled (see main()) so intra-entity
-    // duplicate textures get deduped like production, but a rep must not
-    // see hits from the *previous* rep's identical input, or "minimum
-    // across reps" degenerates into a warm-cache measurement.
     abgen::texencode_cache::clear();
     abgen::decode_cache::clear();
 
@@ -320,19 +336,10 @@ fn main() {
         std::process::exit(2);
     }
 
-    // Same bounded caches the lambda/live paths use, so a bench run reflects
-    // production's intra-entity texture dedup. time_once() clears both
-    // before every rep — otherwise reps 2..N would measure cache hits
-    // instead of the conversion, and "minimum across reps" would report a
-    // warm-cache number instead of the true cost. The in-memory clear can't
-    // reach the encode cache's on-disk backing though, so turn that off
-    // here specifically: a rep hitting a *previous rep's* on-disk entry
-    // would silently corrupt the "minimum across reps" measurement the same
-    // way an uncleared in-memory hit would, just persistently.
     if std::env::var("ABGEN_DISK_CACHE").is_err() {
         std::env::set_var("ABGEN_DISK_CACHE", "0");
     }
-    abgen::texencode_cache::enable();
+    abgen::texencode_cache::enable_with_profile(abgen::texencode_cache::CacheProfile::Batch);
     abgen::decode_cache::enable();
 
     let mut jobs: Vec<BenchJob> = Vec::new();
@@ -466,5 +473,74 @@ fn main() {
         for (name, d) in files.iter().take(8) {
             println!("    {:>7.0}ms  {}", ms(**d), name);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hand-builds the frame `Sink::emit_output`'s default impl produces:
+    /// name_len LE u32 + name + data_len LE u32 + data (export/mod.rs:22-29).
+    fn frame(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut blob = Vec::with_capacity(8 + name.len() + data.len());
+        blob.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        blob.extend_from_slice(name.as_bytes());
+        blob.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        blob.extend_from_slice(data);
+        blob
+    }
+
+    #[test]
+    fn hash_sink_decodes_framed_outputs() {
+        let name = "abc_windows";
+        let data = [7u8, 8, 9];
+
+        let framed = HashSink::default();
+        framed.emit(Kind::Output, &frame(name, &data));
+        let framed_pairs = framed.pairs.into_inner().unwrap_or_default();
+
+        let direct = HashSink::default();
+        direct.emit_output(name, &data);
+        let direct_pairs = direct.pairs.into_inner().unwrap_or_default();
+
+        assert_eq!(
+            framed_pairs,
+            vec![(name.to_string(), hashes::sha256_hex(&data))]
+        );
+        assert_eq!(framed_pairs, direct_pairs);
+    }
+
+    #[test]
+    fn hash_sink_falls_back_on_malformed_blob() {
+        let sink = HashSink::default();
+        sink.emit(Kind::Output, b"junk");
+        let pairs = sink.pairs.into_inner().unwrap_or_default();
+        assert_eq!(
+            pairs,
+            vec![("!raw-output-1".to_string(), hashes::sha256_hex(b"junk"))]
+        );
+    }
+
+    #[test]
+    fn timing_sink_counts_bundle_bytes_not_framing() {
+        let name = "abc_windows";
+        let data = [1u8, 2, 3, 4, 5];
+
+        let framed = TimingSink::new();
+        framed.emit(Kind::Output, &frame(name, &data));
+
+        let direct = TimingSink::new();
+        direct.emit_output(name, &data);
+
+        assert_eq!(
+            *framed.bytes_out.lock().unwrap(),
+            *direct.bytes_out.lock().unwrap()
+        );
+        assert_eq!(*framed.bytes_out.lock().unwrap(), data.len() as u64);
+        assert_eq!(
+            *framed.bundles.lock().unwrap(),
+            *direct.bundles.lock().unwrap()
+        );
     }
 }

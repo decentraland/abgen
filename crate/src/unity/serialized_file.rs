@@ -277,7 +277,6 @@ impl SerializedFile {
     pub fn save(&self) -> Vec<u8> {
         let version = self.version;
         let mut meta = Writer::new(self.big_endian);
-        let mut data_w = Writer::new(self.big_endian);
 
         if version >= 7 {
             meta.write_cstr(&self.unity_version);
@@ -302,11 +301,12 @@ impl SerializedFile {
         objs.sort_by_key(|o| o.path_id);
         meta.write_i32(objs.len() as i32);
         let last_idx = objs.len().saturating_sub(1);
+        let mut cur: i64 = 0;
         for (i, obj) in objs.iter().enumerate() {
             meta.align_stream(4);
             meta.write_i64(obj.path_id);
 
-            let byte_start = data_w.position() as i64;
+            let byte_start = cur;
             if version >= 22 {
                 meta.write_i64(byte_start);
             } else {
@@ -315,12 +315,13 @@ impl SerializedFile {
             meta.write_u32(obj.data.len() as u32);
             meta.write_i32(obj.type_id);
 
-            data_w.write_bytes(&obj.data);
+            cur += obj.data.len() as i64;
 
             if i != last_idx {
-                data_w.align_stream(16);
+                cur = (cur + 15) & !15;
             }
         }
+        let data_len = cur as usize;
 
         if version >= 11 {
             meta.write_i32(self.script_types.len() as i32);
@@ -359,9 +360,6 @@ impl SerializedFile {
         }
 
         let meta_bytes = meta.into_bytes();
-        let data_bytes = data_w.into_bytes();
-
-        let mut w = Writer::new(true);
 
         let metadata_size = meta_bytes.len();
         let mut header_size = 16usize;
@@ -369,7 +367,9 @@ impl SerializedFile {
         header_size += if version < 22 { 4 } else { 4 + 28 };
         let mut data_offset = header_size + metadata_size;
         data_offset += (16 - data_offset % 16) % 16;
-        let file_size = data_offset + data_bytes.len();
+        let file_size = data_offset + data_len;
+
+        let mut w = Writer::with_capacity(true, file_size);
 
         if version < 22 {
             w.write_u32(metadata_size as u32);
@@ -393,7 +393,12 @@ impl SerializedFile {
 
         w.write_bytes(&meta_bytes);
         w.align_stream(16);
-        w.write_bytes(&data_bytes);
+        for (i, obj) in objs.iter().enumerate() {
+            w.write_bytes(&obj.data);
+            if i != last_idx {
+                w.align_stream(16);
+            }
+        }
 
         w.into_bytes()
     }
@@ -451,6 +456,136 @@ fn read_object(
         type_name: class_name(class_id).to_string(),
         data: obj_data,
     })
+}
+
+/// Reference implementation of `SerializedFile::save` as it existed before
+/// the copy-elimination refactor (round 4, bundle-serialize-copy-chain):
+/// writes objects into a separate `data_w` buffer, then copies that buffer
+/// into the final writer. Used by `unity::bundle_file::tests` to assert the
+/// refactored `save` produces byte-identical output.
+#[cfg(test)]
+pub(crate) fn naive_save(sf: &SerializedFile) -> Vec<u8> {
+    let version = sf.version;
+    let mut meta = Writer::new(sf.big_endian);
+    let mut data_w = Writer::new(sf.big_endian);
+
+    if version >= 7 {
+        meta.write_cstr(&sf.unity_version);
+    }
+    if version >= 8 {
+        meta.write_i32(sf.target_platform);
+    }
+    if version >= 13 {
+        meta.write_bool(sf.enable_type_tree);
+    }
+
+    meta.write_i32(sf.types.len() as i32);
+    for st in &sf.types {
+        write_serialized_type(st, &mut meta, version, sf.enable_type_tree, false);
+    }
+
+    if (7..14).contains(&version) {
+        meta.write_i32(sf.big_id_enabled);
+    }
+
+    let mut objs: Vec<&Object> = sf.objects.iter().collect();
+    objs.sort_by_key(|o| o.path_id);
+    meta.write_i32(objs.len() as i32);
+    let last_idx = objs.len().saturating_sub(1);
+    for (i, obj) in objs.iter().enumerate() {
+        meta.align_stream(4);
+        meta.write_i64(obj.path_id);
+
+        let byte_start = data_w.position() as i64;
+        if version >= 22 {
+            meta.write_i64(byte_start);
+        } else {
+            meta.write_u32(byte_start as u32);
+        }
+        meta.write_u32(obj.data.len() as u32);
+        meta.write_i32(obj.type_id);
+
+        data_w.write_bytes(&obj.data);
+
+        if i != last_idx {
+            data_w.align_stream(16);
+        }
+    }
+
+    if version >= 11 {
+        meta.write_i32(sf.script_types.len() as i32);
+        for (local_idx, local_id) in &sf.script_types {
+            meta.write_i32(*local_idx);
+            if version < 14 {
+                meta.write_i32(*local_id as i32);
+            } else {
+                meta.align_stream(4);
+                meta.write_i64(*local_id);
+            }
+        }
+    }
+
+    meta.write_i32(sf.externals.len() as i32);
+    for fi in &sf.externals {
+        if version >= 6 {
+            meta.write_cstr(&fi.temp_empty);
+        }
+        if version >= 5 {
+            meta.write_bytes(&fi.guid);
+            meta.write_i32(fi.r#type);
+        }
+        meta.write_cstr(&fi.path);
+    }
+
+    if version >= 20 {
+        meta.write_i32(sf.ref_types.len() as i32);
+        for st in &sf.ref_types {
+            write_serialized_type(st, &mut meta, version, sf.enable_type_tree, true);
+        }
+    }
+
+    if version >= 5 {
+        meta.write_cstr(&sf.user_information);
+    }
+
+    let meta_bytes = meta.into_bytes();
+    let data_bytes = data_w.into_bytes();
+
+    let mut w = Writer::new(true);
+
+    let metadata_size = meta_bytes.len();
+    let mut header_size = 16usize;
+
+    header_size += if version < 22 { 4 } else { 4 + 28 };
+    let mut data_offset = header_size + metadata_size;
+    data_offset += (16 - data_offset % 16) % 16;
+    let file_size = data_offset + data_bytes.len();
+
+    if version < 22 {
+        w.write_u32(metadata_size as u32);
+        w.write_u32(file_size as u32);
+        w.write_u32(version);
+        w.write_u32(data_offset as u32);
+        w.write_bool(sf.big_endian);
+        w.write_bytes(&sf.reserved);
+    } else {
+        w.write_u32(0);
+        w.write_u32(0);
+        w.write_u32(version);
+        w.write_u32(0);
+        w.write_bool(sf.big_endian);
+        w.write_bytes(&sf.reserved);
+        w.write_u32(metadata_size as u32);
+        w.write_i64(file_size as i64);
+        w.write_i64(data_offset as i64);
+        w.write_i64(sf.unknown);
+    }
+
+    w.write_bytes(&meta_bytes);
+    w.align_stream(16);
+    w.write_bytes(&data_bytes);
+
+    w.into_bytes()
 }
 
 pub const fn class_name(class_id: i32) -> &'static str {

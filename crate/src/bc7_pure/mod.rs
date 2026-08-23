@@ -271,6 +271,7 @@ fn compress_group_into(group: &[[ColorI; 16]], cp: &Params, out: &mut [u8]) {
     }
 }
 
+#[cfg(test)]
 fn compress_group(group: &[[ColorI; 16]], cp: &Params) -> Vec<[u8; 16]> {
     let mut bytes = vec![0u8; group.len() * 16];
     compress_group_into(group, cp, &mut bytes);

@@ -365,6 +365,8 @@ impl<'a> Builder<'a> {
             }
         }
 
+        self.resolve_pending_bc7_textures();
+
         if emits_metadata_textasset(&self.root_hash, self.toggles.v38_compat) {
             let mut meta = self.base_clone("TextAsset");
             meta.insert("m_Name", "metadata");

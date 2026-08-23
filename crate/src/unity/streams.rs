@@ -118,6 +118,14 @@ impl Writer {
             big_endian,
         }
     }
+
+    pub fn with_capacity(big_endian: bool, cap: usize) -> Self {
+        Writer {
+            buf: Vec::with_capacity(cap),
+            big_endian,
+        }
+    }
+
     pub fn into_bytes(self) -> Vec<u8> {
         self.buf
     }

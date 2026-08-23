@@ -198,6 +198,7 @@ fn run() -> Result<()> {
         abgen::clihelp::usage_error(usage_text());
     }
     template_preflight();
+    abgen::texencode_cache::enable_with_profile(abgen::texencode_cache::CacheProfile::Client);
     let glb_path = &positional[0];
     let bundle_name = &positional[1];
     let root_hash = &positional[2];

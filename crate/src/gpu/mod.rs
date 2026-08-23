@@ -309,6 +309,34 @@ pub fn encode_bc7_mip_chain_gpu(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use wgpu_bc7::MipChainJob;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn encode_bc7_mip_chain_gpu_batch(
+    jobs: &[wgpu_bc7::MipChainJob],
+) -> Result<Vec<(Vec<u8>, i32)>> {
+    match &resolution().active {
+        Ok(Backend::Wgpu) => wgpu_bc7::encode_bc7_mip_chain_batch(jobs),
+        Ok(Backend::Cuda) => jobs
+            .iter()
+            .map(|j| {
+                cuda::encode_bc7_mip_chain_gpu(
+                    j.rgba,
+                    j.width,
+                    j.height,
+                    j.mip_count,
+                    j.flip,
+                    j.srgb,
+                    j.perceptual,
+                    j.profile,
+                )
+            })
+            .collect(),
+        Err(e) => Err(anyhow!("{e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
