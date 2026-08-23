@@ -508,6 +508,145 @@ impl Space {
     }
 }
 
+/// Read-only S3 source for content-addressed catalyst/worlds bytes, spliced
+/// into [`crate::catalyst::CatalystClient::fetch_content`] ahead of the HTTP
+/// primary. Bucket layout is unverified (see space.rs module docs on
+/// `ABGEN_CONTENT_S3_*`); the prefix is configurable so operators can point
+/// it at whatever the real mirror turns out to be.
+pub struct S3ContentSource {
+    space: Space,
+    prefix: String,
+}
+
+fn normalize_prefix(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}/")
+    }
+}
+
+/// Pure endpoint resolution, split out of [`S3ContentSource::from_env`] so it
+/// can be unit tested without touching process env vars: with no explicit
+/// endpoint, default to the regional AWS host with path-style forced on
+/// (matches prod's `ABGEN_S3_*` pattern); an explicit endpoint keeps whatever
+/// path-style the caller asks for (minio/mirror stacks).
+fn resolve_endpoint(
+    explicit_endpoint: Option<&str>,
+    region: &str,
+    path_style_if_explicit: bool,
+) -> (String, String, bool) {
+    match explicit_endpoint {
+        Some(endpoint) => {
+            let (scheme, host) = match endpoint.split_once("://") {
+                Some((s, h)) => (s.to_string(), h.trim_end_matches('/').to_string()),
+                None => (
+                    "https".to_string(),
+                    endpoint.trim_end_matches('/').to_string(),
+                ),
+            };
+            (scheme, host, path_style_if_explicit)
+        }
+        None => (
+            "https".to_string(),
+            format!("s3.{region}.amazonaws.com"),
+            true,
+        ),
+    }
+}
+
+impl S3ContentSource {
+    /// `None` unless `ABGEN_CONTENT_S3_BUCKET` is set — the feature is off by
+    /// default. The inner [`Space`] is always constructed `read_only: true`
+    /// regardless of `ABGEN_S3_READ_ONLY`: this source must never PUT.
+    pub fn from_env() -> Option<S3ContentSource> {
+        let first = |vars: &[&str]| {
+            vars.iter()
+                .find_map(|v| std::env::var(v).ok().filter(|s| !s.is_empty()))
+        };
+        let bucket = std::env::var("ABGEN_CONTENT_S3_BUCKET")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        let creds = CredsSource::from_env()?;
+        let region = first(&["ABGEN_CONTENT_S3_REGION", "ABGEN_S3_REGION", "AWS_REGION"])
+            .unwrap_or_else(|| "us-east-1".to_string());
+        let path_style_if_explicit = crate::clihelp::env_bool("ABGEN_S3_PATH_STYLE", false);
+        let (scheme, host, path_style) = resolve_endpoint(
+            first(&["ABGEN_CONTENT_S3_ENDPOINT"]).as_deref(),
+            &region,
+            path_style_if_explicit,
+        );
+        let prefix = normalize_prefix(
+            std::env::var("ABGEN_CONTENT_S3_PREFIX")
+                .ok()
+                .as_deref()
+                .unwrap_or(""),
+        );
+        Some(S3ContentSource {
+            space: Space {
+                scheme,
+                host,
+                region,
+                bucket: Some(bucket),
+                path_style,
+                read_only: true,
+                creds,
+            },
+            prefix,
+        })
+    }
+
+    /// Test/tooling injection point, mirroring [`Space::with_static_creds`].
+    /// `read_only` is always forced `true` on the inner [`Space`], matching
+    /// [`S3ContentSource::from_env`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_static_creds(
+        scheme: &str,
+        host: &str,
+        region: &str,
+        bucket: Option<&str>,
+        path_style: bool,
+        prefix: &str,
+        access_key: &str,
+        secret_key: &str,
+    ) -> S3ContentSource {
+        S3ContentSource {
+            space: Space::with_static_creds(
+                scheme, host, region, bucket, path_style, true, access_key, secret_key,
+            ),
+            prefix: normalize_prefix(prefix),
+        }
+    }
+
+    fn key(&self, hash: &str) -> String {
+        format!("{}{hash}", self.prefix)
+    }
+
+    /// `Ok(None)` on a clean miss (404/403, folded by [`Space::get`]) so the
+    /// caller falls through to HTTP; `Ok(Some(bytes))` with an empty payload
+    /// is treated the same as a miss.
+    pub fn fetch(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        let key = self.key(hash);
+        let t = std::time::Instant::now();
+        let r = self.space.get(&key);
+        let result = match &r {
+            Ok(Some(b)) if !b.is_empty() => "hit",
+            Ok(_) => "miss",
+            Err(_) => "error",
+        };
+        metrics::histogram!("abgen_content_s3_request_duration_seconds", "result" => result)
+            .record(t.elapsed().as_secs_f64());
+        metrics::counter!("abgen_content_s3_requests_total", "result" => result).increment(1);
+        if let Ok(Some(b)) = &r {
+            if !b.is_empty() {
+                metrics::counter!("abgen_content_s3_bytes_total").increment(b.len() as u64);
+            }
+        }
+        r
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,5 +993,144 @@ mod tests {
         assert_eq!(e % 86_400, 3600 + 2 * 60 + 3);
         let (y, m, d) = civil_from_days((e / 86_400) as i64);
         assert_eq!((y, m, d), (2026, 7, 10));
+    }
+
+    #[test]
+    fn content_source_prefix_normalization() {
+        for (raw, want) in [
+            ("", ""),
+            ("   ", ""),
+            ("contents", "contents/"),
+            ("contents/", "contents/"),
+            ("/contents", "contents/"),
+            ("/contents/", "contents/"),
+            ("a/b", "a/b/"),
+        ] {
+            assert_eq!(normalize_prefix(raw), want, "prefix {raw:?}");
+        }
+    }
+
+    #[test]
+    fn content_source_resolve_endpoint_defaults_and_overrides() {
+        assert_eq!(
+            resolve_endpoint(None, "us-east-1", false),
+            (
+                "https".to_string(),
+                "s3.us-east-1.amazonaws.com".to_string(),
+                true
+            ),
+            "no explicit endpoint: regional AWS host, path-style forced on"
+        );
+        assert_eq!(
+            resolve_endpoint(None, "eu-west-1", true),
+            (
+                "https".to_string(),
+                "s3.eu-west-1.amazonaws.com".to_string(),
+                true
+            ),
+            "path_style_if_explicit is irrelevant without an explicit endpoint"
+        );
+        assert_eq!(
+            resolve_endpoint(Some("http://minio:9000"), "us-east-1", true),
+            ("http".to_string(), "minio:9000".to_string(), true)
+        );
+        assert_eq!(
+            resolve_endpoint(Some("minio:9000/"), "us-east-1", false),
+            ("https".to_string(), "minio:9000".to_string(), false),
+            "no scheme in explicit endpoint defaults to https; trailing slash trimmed"
+        );
+    }
+
+    /// Every sub-case below keeps `ABGEN_CONTENT_S3_ENDPOINT` pinned at a
+    /// loopback address whenever `ABGEN_CONTENT_S3_BUCKET` is set: this test
+    /// mutates real, process-wide env var names that `CatalystClient::new`'s
+    /// process-wide `OnceLock` also reads (via `S3ContentSource::from_env`)
+    /// on whatever thread first constructs a client anywhere in this test
+    /// binary. If that race ever lands mid-test, the worst case must be an
+    /// instant loopback connection-refused (safe, harmless) rather than a
+    /// real outbound call to `s3.<region>.amazonaws.com` with test creds,
+    /// which could hang other, unrelated tests.
+    #[test]
+    fn content_source_from_env_bucket_and_creds_gate_and_wire_fields() {
+        let vars = [
+            "ABGEN_CONTENT_S3_BUCKET",
+            "ABGEN_CONTENT_S3_PREFIX",
+            "ABGEN_CONTENT_S3_REGION",
+            "ABGEN_CONTENT_S3_ENDPOINT",
+            "ABGEN_S3_REGION",
+            "ABGEN_S3_PATH_STYLE",
+            "ABGEN_S3_ACCESS_KEY",
+            "ABGEN_S3_SECRET_KEY",
+            "AWS_REGION",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|v| (*v, std::env::var(v).ok())).collect();
+        for v in vars {
+            std::env::remove_var(v);
+        }
+
+        assert!(
+            S3ContentSource::from_env().is_none(),
+            "no bucket -> feature disabled"
+        );
+
+        std::env::set_var("ABGEN_CONTENT_S3_ENDPOINT", "http://127.0.0.1:1");
+        std::env::set_var("ABGEN_CONTENT_S3_BUCKET", "test-bucket");
+        assert!(
+            S3ContentSource::from_env().is_none(),
+            "bucket without creds -> feature disabled"
+        );
+
+        std::env::set_var("ABGEN_S3_ACCESS_KEY", "AKIATEST");
+        std::env::set_var("ABGEN_S3_SECRET_KEY", "secret");
+        let s = S3ContentSource::from_env().expect("bucket + creds -> enabled");
+        assert_eq!(s.space.bucket.as_deref(), Some("test-bucket"));
+        assert_eq!(s.space.scheme, "http");
+        assert_eq!(s.space.host, "127.0.0.1:1");
+        assert!(
+            s.space.read_only,
+            "content source must never be able to PUT"
+        );
+        assert_eq!(s.space.region, "us-east-1", "default region");
+        assert_eq!(s.prefix, "", "default prefix is the bare-hash layout");
+        assert!(
+            !s.space.path_style,
+            "explicit endpoint + unset ABGEN_S3_PATH_STYLE stays virtual-hosted"
+        );
+
+        std::env::set_var("ABGEN_S3_PATH_STYLE", "true");
+        assert!(S3ContentSource::from_env().unwrap().space.path_style);
+        std::env::remove_var("ABGEN_S3_PATH_STYLE");
+
+        std::env::set_var("ABGEN_CONTENT_S3_PREFIX", "contents/");
+        assert_eq!(S3ContentSource::from_env().unwrap().prefix, "contents/");
+        std::env::set_var("ABGEN_CONTENT_S3_PREFIX", "/contents");
+        assert_eq!(S3ContentSource::from_env().unwrap().prefix, "contents/");
+        std::env::remove_var("ABGEN_CONTENT_S3_PREFIX");
+
+        std::env::set_var("AWS_REGION", "sa-east-1");
+        assert_eq!(
+            S3ContentSource::from_env().unwrap().space.region,
+            "sa-east-1"
+        );
+        std::env::set_var("ABGEN_S3_REGION", "eu-west-1");
+        assert_eq!(
+            S3ContentSource::from_env().unwrap().space.region,
+            "eu-west-1",
+            "ABGEN_S3_REGION beats AWS_REGION"
+        );
+        std::env::set_var("ABGEN_CONTENT_S3_REGION", "ap-south-1");
+        assert_eq!(
+            S3ContentSource::from_env().unwrap().space.region,
+            "ap-south-1",
+            "ABGEN_CONTENT_S3_REGION beats ABGEN_S3_REGION"
+        );
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 }

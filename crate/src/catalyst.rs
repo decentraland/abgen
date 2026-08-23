@@ -1,5 +1,7 @@
+use crate::space::S3ContentSource;
 use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 pub const DEFAULT_CATALYST: &str = "http://localhost:5141/content";
@@ -123,12 +125,24 @@ pub(crate) fn ensure_entity_id(v: &mut serde_json::Value, id: &str) {
     }
 }
 
+/// Process-wide, env-derived S3 content source, built once and shared by
+/// every [`CatalystClient`] (Proxy, abgen-corpus, lods, wearables) so the
+/// feature activates from `ABGEN_CONTENT_S3_BUCKET` alone, with no config to
+/// thread through each binary.
+fn content_source_from_env() -> Option<Arc<S3ContentSource>> {
+    static SOURCE: OnceLock<Option<Arc<S3ContentSource>>> = OnceLock::new();
+    SOURCE
+        .get_or_init(|| S3ContentSource::from_env().map(Arc::new))
+        .clone()
+}
+
 #[derive(Clone)]
 pub struct CatalystClient {
     base: String,
     agent: ureq::Agent,
     local: Option<crate::local_store::LocalContentStore>,
     fallback_bases: Vec<String>,
+    content_source: Option<Arc<S3ContentSource>>,
 }
 
 impl CatalystClient {
@@ -143,12 +157,21 @@ impl CatalystClient {
             agent,
             local: None,
             fallback_bases: Vec::new(),
+            content_source: content_source_from_env(),
         }
     }
 
     pub fn with_fallback_base(mut self, base: String) -> Self {
         self.fallback_bases
             .push(base.trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Test/tooling injection point — overrides the env-derived default
+    /// (which is cached process-wide and so can't vary per test). Pass
+    /// `None` to force HTTP-only even if `ABGEN_CONTENT_S3_BUCKET` is set.
+    pub fn with_content_source(mut self, source: Option<Arc<S3ContentSource>>) -> Self {
+        self.content_source = source;
         self
     }
 
@@ -234,6 +257,19 @@ impl CatalystClient {
             store
                 .fetch(content_hash)
                 .map_err(|e| anyhow!("local content store has no CID {content_hash}: {e}"))
+        } else if let Some(source) = &self.content_source {
+            match source.fetch(content_hash) {
+                Ok(Some(b)) if !b.is_empty() => Ok(b),
+                Ok(_) => self.get(&format!("/contents/{content_hash}")),
+                Err(e) => {
+                    tracing::warn!(
+                        hash = %content_hash,
+                        error = %format!("{e:#}"),
+                        "content s3 fetch failed; falling back to HTTP"
+                    );
+                    self.get(&format!("/contents/{content_hash}"))
+                }
+            }
         } else {
             self.get(&format!("/contents/{content_hash}"))
         };
@@ -430,6 +466,150 @@ use std::io::Read;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn s3_source_at(host: &str, prefix: &str) -> Arc<S3ContentSource> {
+        Arc::new(S3ContentSource::with_static_creds(
+            "http",
+            host,
+            "us-east-1",
+            None,
+            false,
+            prefix,
+            "AKIATEST",
+            "secret",
+        ))
+    }
+
+    #[test]
+    fn fetch_content_hits_s3_and_never_touches_http() {
+        let (host, seen) =
+            crate::live::stub::serve(vec![("/HASH1".to_string(), 200, b"S3BODY".to_vec())]);
+        let client = CatalystClient::new(&format!("http://{host}"))
+            .with_content_source(Some(s3_source_at(&host, "")));
+        let got = client.fetch_content("HASH1").unwrap();
+        assert_eq!(got, b"S3BODY");
+        assert_eq!(seen.lock().unwrap().clone(), vec!["GET /HASH1".to_string()]);
+    }
+
+    #[test]
+    fn fetch_content_falls_back_to_http_on_s3_miss() {
+        let (host, seen) = crate::live::stub::serve(vec![(
+            "/contents/HASH1".to_string(),
+            200,
+            b"HTTPBODY".to_vec(),
+        )]);
+        let client = CatalystClient::new(&format!("http://{host}"))
+            .with_content_source(Some(s3_source_at(&host, "")));
+        let got = client.fetch_content("HASH1").unwrap();
+        assert_eq!(got, b"HTTPBODY");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec!["GET /HASH1".to_string(), "GET /contents/HASH1".to_string()],
+            "S3 miss (404) must be tried before the HTTP primary"
+        );
+    }
+
+    #[test]
+    fn fetch_content_falls_back_to_http_on_s3_error() {
+        let (host, seen) = crate::live::stub::serve(vec![
+            ("/HASH1".to_string(), 500, Vec::new()),
+            ("/contents/HASH1".to_string(), 200, b"HTTPBODY".to_vec()),
+        ]);
+        let client = CatalystClient::new(&format!("http://{host}"))
+            .with_content_source(Some(s3_source_at(&host, "")));
+        let got = client.fetch_content("HASH1").unwrap();
+        assert_eq!(got, b"HTTPBODY");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec!["GET /HASH1".to_string(), "GET /contents/HASH1".to_string()],
+            "S3 transport error (500) must warn and fall through to HTTP"
+        );
+    }
+
+    #[test]
+    fn fetch_content_respects_prefix() {
+        let (host, seen) = crate::live::stub::serve(vec![(
+            "/contents/prefix/HASH1".to_string(),
+            200,
+            b"PREFIXED".to_vec(),
+        )]);
+        let client = CatalystClient::new(&format!("http://{host}"))
+            .with_content_source(Some(s3_source_at(&host, "contents/prefix")));
+        let got = client.fetch_content("HASH1").unwrap();
+        assert_eq!(got, b"PREFIXED");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec!["GET /contents/prefix/HASH1".to_string()]
+        );
+    }
+
+    #[test]
+    fn fetch_content_local_store_override_skips_s3_entirely() {
+        let dir = tempfile_dir("catalyst-local-skips-s3");
+        let local = crate::local_store::LocalContentStore::new(&dir);
+        local.write("HASH1", b"LOCALBODY").unwrap();
+        let (host, seen) =
+            crate::live::stub::serve(vec![("/HASH1".to_string(), 200, b"S3BODY".to_vec())]);
+        let client = CatalystClient::from_args("http://127.0.0.1:9", Some(dir.to_str().unwrap()))
+            .with_content_source(Some(s3_source_at(&host, "")));
+        let got = client.fetch_content("HASH1").unwrap();
+        assert_eq!(got, b"LOCALBODY");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "S3 must not be consulted under --local"
+        );
+    }
+
+    #[test]
+    fn resolve_scene_content_hash_target_is_served_from_s3() {
+        let entity = serde_json::json!({
+            "id": "HASH1",
+            "type": "scene",
+            "pointers": ["0,0"],
+            "content": []
+        });
+        let (host, seen) = crate::live::stub::serve(vec![(
+            "/HASH1".to_string(),
+            200,
+            serde_json::to_vec(&entity).unwrap(),
+        )]);
+        let client = CatalystClient::new(&format!("http://{host}"))
+            .with_content_source(Some(s3_source_at(&host, "")));
+        let scene = client.resolve_scene("HASH1").unwrap();
+        assert_eq!(scene.entity_id, "HASH1");
+        assert_eq!(seen.lock().unwrap().clone(), vec!["GET /HASH1".to_string()]);
+    }
+
+    #[test]
+    fn resolve_scene_pointer_target_never_consults_s3() {
+        let entity = serde_json::json!([{
+            "id": "E1",
+            "type": "scene",
+            "pointers": ["0,0"],
+            "content": []
+        }]);
+        let (host, seen) = crate::live::stub::serve(vec![(
+            "/entities/active".to_string(),
+            200,
+            serde_json::to_vec(&entity).unwrap(),
+        )]);
+        let client = CatalystClient::new(&format!("http://{host}"))
+            .with_content_source(Some(s3_source_at(&host, "")));
+        let scene = client.resolve_scene("0,0").unwrap();
+        assert_eq!(scene.entity_id, "E1");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec!["POST /entities/active".to_string()],
+            "pointer resolution is DB-backed; it must never go through the content source"
+        );
+    }
+
+    fn tempfile_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("abgen-catalyst-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
 
     #[test]
     fn pointer_detection() {
