@@ -67,6 +67,8 @@ pub mod texprofile;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod tmppath;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod upload;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod worlds;
 
 pub mod bc5_pure;

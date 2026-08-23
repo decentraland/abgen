@@ -72,17 +72,17 @@ fn fetch_jobs() -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or_else(crate::clihelp::default_file_concurrency)
+            .unwrap_or_else(crate::clihelp::default_network_concurrency)
     })
 }
 
 /// Bounded concurrency for the S3 existence (`HEAD`) probes run ahead of
-/// conversion: same runtime-derived default as file conversion and content
-/// download (`clihelp::default_file_concurrency`), since a probe round-trip
-/// is a similarly independent, purely network-bound unit of work — running
-/// them one-at-a-time would serialize N round-trip latencies on the
-/// critical path for no reason. `ABGEN_PROBE_CONCURRENCY` is an escape
-/// hatch, never required to reach the fast default.
+/// conversion: same runtime-derived default as content download
+/// (`clihelp::default_network_concurrency`), since a probe round-trip is a
+/// similarly independent, purely network-bound unit of work — running them
+/// one-at-a-time would serialize N round-trip latencies on the critical
+/// path for no reason. `ABGEN_PROBE_CONCURRENCY` is an escape hatch, never
+/// required to reach the fast default.
 fn probe_jobs() -> usize {
     static JOBS: OnceLock<usize> = OnceLock::new();
     *JOBS.get_or_init(|| {
@@ -90,7 +90,7 @@ fn probe_jobs() -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or_else(crate::clihelp::default_file_concurrency)
+            .unwrap_or_else(crate::clihelp::default_network_concurrency)
     })
 }
 
@@ -98,6 +98,22 @@ fn corpus_file_jobs() -> usize {
     static JOBS: OnceLock<usize> = OnceLock::new();
     *JOBS.get_or_init(|| {
         std::env::var("ABGEN_JIT_FILE_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(crate::clihelp::default_file_concurrency)
+    })
+}
+
+/// Bounded concurrency for the dedicated bundle-upload pool: a network-bound
+/// worker count, kept separate from `corpus_file_jobs` (CPU-bound conversion)
+/// so uploads no longer steal convert-worker slots for network wait.
+/// `ABGEN_UPLOAD_CONCURRENCY` is an escape hatch, never required to reach
+/// the default.
+fn upload_jobs() -> usize {
+    static JOBS: OnceLock<usize> = OnceLock::new();
+    *JOBS.get_or_init(|| {
+        std::env::var("ABGEN_UPLOAD_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
@@ -189,6 +205,14 @@ impl KeyedLocks {
         let mut g = self.map.lock().unwrap();
         g.entry(key.to_string()).or_default().clone()
     }
+
+    fn get_bounded(&self, key: &str, cap: usize) -> Arc<Mutex<()>> {
+        let mut g = self.map.lock().unwrap();
+        if !g.contains_key(key) {
+            bounded_reserve(&mut g, cap, key);
+        }
+        g.entry(key.to_string()).or_default().clone()
+    }
 }
 
 pub(crate) struct EntityCtx {
@@ -201,6 +225,23 @@ pub(crate) struct EntityCtx {
     /// skips these (no manifest entry, exit 0), so they must not count as
     /// conversion failures (#59).
     undeployed_dep_glbs: std::collections::HashSet<String>,
+    /// Background image-prefetch workers spawned by [`Proxy::entity_ctx`].
+    /// Nothing on the correctness path ever joins these — every later
+    /// texture consumer goes through `ensure_content`'s keyed lock and
+    /// picks up whatever a worker already fetched or fetches it itself —
+    /// this is purely so tests (and `--once` callers) can wait for a
+    /// deterministic point.
+    #[cfg_attr(not(test), allow(dead_code))]
+    prefetch_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+impl EntityCtx {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn join_prefetch(&self) {
+        for h in self.prefetch_handles.lock().unwrap().drain(..) {
+            let _ = h.join();
+        }
+    }
 }
 
 pub struct Proxy {
@@ -222,6 +263,12 @@ pub struct Proxy {
     hash_index_cap: usize,
     entity_locks: KeyedLocks,
     bundle_locks: KeyedLocks,
+    /// Per-content-hash locks around the miss path of `ensure_content`:
+    /// dedupes concurrent fetches of the same hash (background image
+    /// prefetch racing a convert worker that needs the same texture) and
+    /// gives the loser a wait point instead of a second network round-trip.
+    content_locks: KeyedLocks,
+    self_weak: std::sync::Weak<Proxy>,
     collection_mode: bool,
     real_textures: bool,
     v38_compat: bool,
@@ -310,6 +357,14 @@ impl Proxy {
             }
             return Ok(());
         }
+        let lock = self.content_locks.get_bounded(hash, self.hash_index_cap);
+        let _g = lock.lock().unwrap();
+        if self.content.exists(hash) {
+            if let Some(c) = self.jit() {
+                c.touch(&format!("c:{hash}"));
+            }
+            return Ok(());
+        }
         if let Some(local) = &self.local {
             if let Ok(b) = local.fetch(hash) {
                 if !b.is_empty() {
@@ -329,6 +384,56 @@ impl Proxy {
         self.content.write(hash, &bytes)?;
         self.record_content(hash, bytes.len());
         Ok(())
+    }
+
+    fn self_arc(&self) -> Option<Arc<Proxy>> {
+        self.self_weak.upgrade()
+    }
+
+    /// Kicks off background prefetch of `items` (standalone/referenced
+    /// image content) and returns immediately; nothing on the correctness
+    /// path waits on the returned handles — every later texture consumer
+    /// (`resolve_fn`, `image_decode_ok`, the top-level `build` item) goes
+    /// through `ensure_content`'s keyed lock, so it either finds the bytes
+    /// a worker already landed or fetches them itself. Handles exist only
+    /// so tests / `--once` callers can join for a deterministic point.
+    fn spawn_image_prefetch(
+        &self,
+        cid: &str,
+        items: Vec<(String, String)>,
+    ) -> Vec<std::thread::JoinHandle<()>> {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        let Some(proxy) = self.self_arc() else {
+            for (hash, file) in &items {
+                if let Err(e) = self.ensure_content(hash) {
+                    eprintln!("warn: {cid}: content {hash} ({file}): {e}");
+                }
+            }
+            return Vec::new();
+        };
+        let workers = fetch_jobs().min(items.len());
+        let items = Arc::new(items);
+        let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cid = cid.to_string();
+        (0..workers)
+            .map(|_| {
+                let proxy = proxy.clone();
+                let items = items.clone();
+                let next = next.clone();
+                let cid = cid.clone();
+                std::thread::spawn(move || loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((hash, file)) = items.get(i) else {
+                        break;
+                    };
+                    if let Err(e) = proxy.ensure_content(hash) {
+                        eprintln!("warn: {cid}: content {hash} ({file}): {e}");
+                    }
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn content_bytes_allow_empty(&self, hash: &str) -> Result<Vec<u8>> {
@@ -361,10 +466,17 @@ impl Proxy {
 
         let dl_started = std::time::Instant::now();
         let mut to_fetch: Vec<(&str, &str)> = Vec::new();
+        let mut image_items: Vec<(String, String)> = Vec::new();
         let mut seen_hashes = std::collections::HashSet::new();
         for c in &scene.content {
-            if is_convertible(&c.file).0 && seen_hashes.insert(c.hash.as_str()) {
+            let (is_glb, is_image) = is_convertible(&c.file);
+            if !seen_hashes.insert(c.hash.as_str()) {
+                continue;
+            }
+            if is_glb {
                 to_fetch.push((c.hash.as_str(), c.file.as_str()));
+            } else if is_image {
+                image_items.push((c.hash.clone(), c.file.clone()));
             }
         }
         let dl_files = to_fetch.len();
@@ -383,8 +495,12 @@ impl Proxy {
                 });
             }
         });
+
+        let img_files = image_items.len();
+        let prefetch_handles = self.spawn_image_prefetch(cid, image_items);
         eprintln!(
-            "download: {cid}: {dl_files} glb(s) ensured in {:.1}s ({workers} worker(s))",
+            "download: {cid}: {dl_files} glb(s) in {:.1}s ({workers} worker(s)); \
+             {img_files} image(s) prefetching in background",
             dl_started.elapsed().as_secs_f64()
         );
 
@@ -422,6 +538,7 @@ impl Proxy {
             scan,
             deps_digests,
             undeployed_dep_glbs,
+            prefetch_handles: Mutex::new(prefetch_handles),
         });
         let mut g = self.entities.lock().unwrap();
         bounded_reserve(&mut g, self.entity_cap, cid);
@@ -711,22 +828,6 @@ impl Proxy {
         r
     }
 
-    fn space_put_timed(space: &crate::space::Space, key: &str, bytes: &[u8]) -> crate::Result<()> {
-        let t = std::time::Instant::now();
-        let r = space.put(key, bytes);
-        let result = if r.is_ok() { "ok" } else { "error" };
-        metrics::histogram!("abgen_space_request_duration_seconds", "op" => "put", "result" => result)
-            .record(t.elapsed().as_secs_f64());
-        if r.is_ok() {
-            metrics::counter!("abgen_space_transfer_bytes_total", "direction" => "upload")
-                .increment(bytes.len() as u64);
-            metrics::histogram!("abgen_space_object_bytes").record(bytes.len() as f64);
-        } else {
-            metrics::counter!("abgen_space_errors_total", "op" => "put").increment(1);
-        }
-        r
-    }
-
     pub fn space_get_bundle(&self, cid: &str, file: &str) -> Option<Vec<u8>> {
         let space = self.space.as_ref()?;
         let mut versions = vec![self.version.as_str()];
@@ -810,7 +911,7 @@ impl Proxy {
         if space.read_only {
             return;
         }
-        match Self::space_put_timed(space, key, bytes) {
+        match space.put_timed(key, bytes) {
             Ok(()) => tracing::info!(key = %key, bytes = bytes.len(), "space put"),
             Err(e) => tracing::warn!(key = %key, error = %format!("{e:#}"), "space put failed"),
         }
@@ -846,6 +947,19 @@ impl Proxy {
 
     pub fn date(&self) -> &str {
         &self.date
+    }
+
+    /// A dedicated bundle-upload worker pool, sized by `upload_jobs()`, or
+    /// `None` when there is nowhere to upload to (no space configured) or
+    /// uploads are disabled (`ABGEN_S3_READ_ONLY`) — same gate `space_put_key`
+    /// already applies per-call, hoisted so the pool is never spun up for a
+    /// build that will never PUT anything.
+    fn upload_pool(&self) -> Option<crate::upload::UploadPool> {
+        let space = self.space.as_ref()?;
+        if space.read_only {
+            return None;
+        }
+        Some(crate::upload::UploadPool::new(space.clone(), upload_jobs()))
     }
 
     pub fn build_entity_into_corpus(
@@ -999,6 +1113,8 @@ impl Proxy {
         let next = AtomicUsize::new(0);
         let hard_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
 
+        let upload_pool = self.upload_pool();
+
         let shared_placement = ctx.scene.entity_type == "scene";
         let run_item = |it: &WorkItem| -> Result<()> {
             self.progress_update(cid, done.load(Ordering::Relaxed), total, &it.file);
@@ -1025,7 +1141,24 @@ impl Proxy {
                         }
                     }
                     if !existed {
-                        self.space_put_bundle(cid, &it.bundle_name, shared_placement, &bytes);
+                        match &upload_pool {
+                            Some(pool) => {
+                                let key = if shared_placement {
+                                    Self::asset_bundle_key(&self.version, &it.bundle_name)
+                                } else {
+                                    Self::bundle_key(&self.version, cid, &it.bundle_name)
+                                };
+                                pool.enqueue(key, dst.clone());
+                            }
+                            None => {
+                                self.space_put_bundle(
+                                    cid,
+                                    &it.bundle_name,
+                                    shared_placement,
+                                    &bytes,
+                                );
+                            }
+                        }
                     }
                     built_m
                         .lock()
@@ -1084,6 +1217,26 @@ impl Proxy {
             });
             if let Some(e) = hard_err.into_inner().unwrap() {
                 return Err(e);
+            }
+        }
+
+        if let Some(report) = upload_pool.map(crate::upload::UploadPool::drain) {
+            if report.failed.is_empty() {
+                tracing::info!(
+                    entity = %cid,
+                    platform = %platform,
+                    ok = report.ok,
+                    "upload pool drained"
+                );
+            } else {
+                tracing::warn!(
+                    entity = %cid,
+                    platform = %platform,
+                    ok = report.ok,
+                    failed = report.failed.len(),
+                    keys = ?report.failed,
+                    "upload pool drained with failures; manifest publishing anyway"
+                );
             }
         }
 
@@ -1394,7 +1547,8 @@ impl Proxy {
             }
             None => None,
         };
-        Arc::new(Proxy {
+        Arc::new_cyclic(|self_weak| Proxy {
+            self_weak: self_weak.clone(),
             catalyst: {
                 let mut c = CatalystClient::from_args(&cfg.catalyst_url, cfg.local_root.as_deref());
                 if let Some(wurl) = crate::worlds::content_fallback_from_env() {
@@ -1426,6 +1580,7 @@ impl Proxy {
                 .unwrap_or(65536),
             entity_locks: KeyedLocks::default(),
             bundle_locks: KeyedLocks::default(),
+            content_locks: KeyedLocks::default(),
             collection_mode,
             real_textures,
             v38_compat,
@@ -1489,6 +1644,13 @@ pub mod stub {
     }
 
     pub fn serve(routes: Routes) -> (String, Arc<Mutex<Vec<String>>>) {
+        serve_with_delay(routes, None)
+    }
+
+    pub fn serve_with_delay(
+        routes: Routes,
+        delay: Option<(String, std::time::Duration)>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1526,6 +1688,11 @@ pub mod stub {
                     let _ = reader.read_exact(&mut body);
                 }
                 seen2.lock().unwrap().push(format!("{method} {path}"));
+                if let Some((dp, d)) = &delay {
+                    if *dp == path {
+                        std::thread::sleep(*d);
+                    }
+                }
                 let (code, body) = routes
                     .iter()
                     .find(|(p, _, _)| path == *p)
@@ -1938,6 +2105,24 @@ mod tests {
     }
 
     #[test]
+    fn upload_pool_spawns_only_when_space_present_and_writable() {
+        let (host, _seen) = super::stub::serve(vec![]);
+
+        let writable = stub_proxy(&host, false, "pool-rw");
+        assert!(writable.upload_pool().is_some());
+
+        let read_only = stub_proxy(&host, true, "pool-ro");
+        assert!(read_only.upload_pool().is_none());
+
+        let no_space = Proxy::new(ProxyConfig {
+            catalyst_url: "http://127.0.0.1:9".to_string(),
+            cache_dir: temp_cache("pool-no-space").to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+        assert!(no_space.upload_pool().is_none());
+    }
+
+    #[test]
     fn bare_names_read_shared_then_entity_scoped_and_never_probe() {
         let (host, seen) = super::stub::serve(vec![]);
         let proxy = stub_proxy_reuse(&host, "digestless-read");
@@ -1967,6 +2152,119 @@ mod tests {
         bounded_reserve(&mut m, 2, "c");
         assert_eq!(m.len(), 2);
         assert!(m.contains_key("c"));
+    }
+
+    #[test]
+    fn concurrent_ensure_content_dedupes_to_one_fetch() {
+        let cache_dir = temp_cache("ensure-content-dedup");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let (host, seen) = super::stub::serve_with_delay(
+            vec![("/contents/dupehash".to_string(), 200, b"BYTES".to_vec())],
+            Some((
+                "/contents/dupehash".to_string(),
+                std::time::Duration::from_millis(150),
+            )),
+        );
+
+        let proxy = Proxy::new(ProxyConfig {
+            catalyst_url: format!("http://{host}"),
+            cache_dir: cache_dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let proxy = proxy.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    proxy.ensure_content("dupehash").unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let gets = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.as_str() == "GET /contents/dupehash")
+            .count();
+        assert_eq!(
+            gets, 1,
+            "concurrent ensure_content must dedupe to one fetch"
+        );
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn background_prefetch_texture_blocks_late_consumer_until_ready() {
+        let cache_dir = temp_cache("prefetch-wait");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let entity = serde_json::json!({
+            "id": "bafkprefetch",
+            "type": "scene",
+            "content": [
+                {"file": "tex.png", "hash": "qmtexslow"},
+            ]
+        });
+        let ent_bytes = serde_json::to_vec(&entity).unwrap();
+
+        let (host, seen) = super::stub::serve_with_delay(
+            vec![
+                ("/contents/bafkprefetch".to_string(), 200, ent_bytes),
+                ("/contents/qmtexslow".to_string(), 200, b"TEXBYTES".to_vec()),
+            ],
+            Some((
+                "/contents/qmtexslow".to_string(),
+                std::time::Duration::from_millis(200),
+            )),
+        );
+
+        let proxy = Proxy::new(ProxyConfig {
+            catalyst_url: format!("http://{host}"),
+            cache_dir: cache_dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+
+        let ctx = proxy.entity_ctx("bafkprefetch").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        let started = std::time::Instant::now();
+        proxy.ensure_content("qmtexslow").unwrap();
+        let waited = started.elapsed();
+
+        ctx.join_prefetch();
+
+        assert!(
+            waited >= std::time::Duration::from_millis(100),
+            "late consumer should have blocked on the in-flight background \
+             fetch instead of racing a second one, waited {waited:?}"
+        );
+        let gets = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.as_str() == "GET /contents/qmtexslow")
+            .count();
+        assert_eq!(
+            gets, 1,
+            "background prefetch + late consumer must dedupe to one fetch"
+        );
+        assert_eq!(
+            proxy.content_bytes_allow_empty("qmtexslow").unwrap(),
+            b"TEXBYTES"
+        );
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
     #[test]
