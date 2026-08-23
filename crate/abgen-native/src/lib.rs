@@ -102,7 +102,6 @@ pub unsafe extern "C" fn abgen_convert(
 
     let sink = CallbackSink { emit, user_data };
 
-    // Idempotent, so declaring per call is fine.
     texencode_cache::enable_with_profile(CacheProfile::Client);
 
     // SAFETY: non-null and non-zero, checked above; caller keeps it valid.

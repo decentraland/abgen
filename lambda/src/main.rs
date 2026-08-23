@@ -105,7 +105,6 @@ fn init_tracing() {
             .with_env_filter(filter)
             .init();
     } else {
-        // CloudWatch renders ANSI escapes literally.
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(false)
@@ -144,10 +143,6 @@ fn handle_http(cfg: &config::Config, req: &http::Request) -> serde_json::Value {
     };
     match run_jobs(cfg, parsed) {
         Ok(v) => {
-            // A Records-shaped body reports per-record failures instead of
-            // erroring, and no queue exists on this path to redeliver them:
-            // surface any failure as a 500 so callers keying on the status
-            // code cannot mistake a lost job for success.
             let failed = v
                 .get("batchItemFailures")
                 .and_then(serde_json::Value::as_array)
@@ -224,8 +219,6 @@ fn run_batch(
             Ok(summary) => eprintln!("ok {label}: {summary}"),
             Err(err) => {
                 eprintln!("failed {label}: {err:#}");
-                // Without a message id the failure cannot be reported, and
-                // succeeding here would delete the record: fail the invocation.
                 let Some(id) = record.message_id else {
                     return Err(err.context(format!(
                         "SQS record {i} has no messageId — cannot report a partial-batch failure"
@@ -262,9 +255,6 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
         .content_server_url
         .as_deref()
         .unwrap_or(&cfg.default_content_server);
-    // Scheme/shape validation is unconditional — an event-supplied URL must
-    // never make the handler fetch plaintext/internal targets even on a
-    // deployment that (fail-open) never set ALLOWED_CONTENT_SERVER_HOSTS.
     event::validate_content_server(content_server, cfg.allowed_content_server_hosts.as_deref())?;
     let proxy = convert::make_proxy(cfg, content_server);
 
@@ -301,8 +291,6 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
             }));
         }
     } else {
-        // A force reconversion can downgrade a previously-ok manifest, so a
-        // stale converted-ok marker must not outlive it.
         for platform in &cfg.platforms {
             if let Some(key) = output::converted_marker_key(&proxy, cfg, &job.entity_id, platform) {
                 abgen::rediscache::forget(&key);
@@ -328,13 +316,6 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
         || output::publish(cfg, &agent, &proxy, &entity_doc, &outcome),
         || {
             if job.force {
-                // A concurrent non-force redelivery may have re-marked from
-                // the old manifest while this force job ran; drop the markers
-                // again the moment the (possibly downgraded) result is
-                // published — before notify, whose SNS retries would widen the
-                // stale-marker window and whose failure must not skip the
-                // forget. A re-mark landing after this point is the residual
-                // race documented in the README.
                 for platform in &cfg.platforms {
                     if let Some(key) =
                         output::converted_marker_key(&proxy, cfg, &job.entity_id, platform)
@@ -681,8 +662,6 @@ mod tests {
         );
         assert_eq!(job_outcome(&Ok(json!({"exitCode": 1}))), "failed");
         assert_eq!(job_outcome(&Ok(json!({"exitCode": 0}))), "converted");
-        // Success summaries must carry a top-level exitCode — without one the
-        // job counts as failed (this miscounted every successful LOD job once).
         assert_eq!(job_outcome(&Ok(json!({"entityId": "e"}))), "failed");
     }
 

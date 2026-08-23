@@ -77,8 +77,6 @@ fn available_memory_gib() -> Option<u64> {
     let mut mem: u64 = 0;
     let mut size: libc::size_t = std::mem::size_of::<u64>();
     // SAFETY: `hw.memsize` is a well-known macOS sysctl returning a u64;
-    // `mem`/`size` are correctly sized and initialized for it, and the
-    // newp/newlen args are null/0 (read-only query).
     let rc = unsafe {
         libc::sysctlbyname(
             c"hw.memsize".as_ptr(),

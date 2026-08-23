@@ -321,12 +321,6 @@ fn convert_with_jobs(
             }
         }
     } else {
-        // Bounded file-level parallelism: each of `jobs` worker threads
-        // pulls the next unclaimed file index and converts it into its own
-        // BufferedSink, so files run concurrently. Results are collected
-        // into per-index slots and flushed to `sink` in original input
-        // order afterward, so the event stream and `built`/`failures`
-        // bookkeeping match the serial loop exactly.
         let next = AtomicUsize::new(0);
         let slots: Vec<Mutex<Option<(Option<String>, Vec<Ev>)>>> =
             (0..glbs.len()).map(|_| Mutex::new(None)).collect();

@@ -130,13 +130,6 @@ impl Bundle {
             r.align_stream(16);
         }
 
-        // Prefix-sum the block table into (compressed_offset, uncompressed_size)
-        // pairs so every block's input and output range is known up front;
-        // this lets decompression run in parallel while writing straight
-        // into disjoint slices of a single preallocated output buffer,
-        // mirroring the compress side in `chunk_based_compress`. Blocks are
-        // independent (each is a self-contained LZ4 frame), so this changes
-        // nothing about the decompressed bytes or their order.
         let blocks_start = r.position();
         let mut comp_off = Vec::with_capacity(m_blocks.len());
         let mut unc_sizes = Vec::with_capacity(m_blocks.len());
@@ -682,7 +675,6 @@ mod tests {
             return;
         }
 
-        // (a) plain template roundtrip.
         let bundle = Bundle::load(&path).expect("load template");
         let refactored = bundle.save_lz4().expect("save_lz4");
         let naive = naive_save_lz4(&bundle, None).expect("naive save_lz4");
@@ -691,8 +683,6 @@ mod tests {
             "refactored save_lz4 must match naive reference byte-for-byte"
         );
 
-        // (b) synthesize a bundle with an extra Raw entry big enough to
-        // exercise the stored-raw compression branch.
         let mut synth = Bundle::load(&path).expect("load template for synth");
         synth.files.push(BundleEntry {
             name: "synthetic.raw".to_string(),
@@ -706,8 +696,6 @@ mod tests {
             "refactored save_lz4 must match naive reference on synthesized bundle"
         );
 
-        // (c) memoized save must be deterministic across repeated calls and
-        // still match the naive reference.
         let mut memo = ChunkMemo::default();
         let first = synth
             .save_lz4_memo(Some(&mut memo))

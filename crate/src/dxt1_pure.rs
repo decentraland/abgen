@@ -56,7 +56,6 @@ fn encode_block_solid(r: u8, g: u8, b: u8) -> [u8; BLOCK_SIZE] {
     } else {
         c0 += 1;
     }
-    // c0 > c1 always holds here, so the swap in the general path never fires.
 
     let ep0 = unpack_565(c0);
     let ep1 = unpack_565(c1);
@@ -713,9 +712,6 @@ fn encode_dxt1_mip_chain_uncached(
         let bw = pw / 4;
         let bh = ph / 4;
         let row_bytes = pw * 4;
-        // Fixed block-row chunking into a pre-sized slice (the
-        // bc7_pure::encode_blocks pattern): every 8-byte slot is written by
-        // block index, so output bytes are identical at any thread count.
         use rayon::prelude::*;
         let off = parts.len();
         parts.resize(off + bw * bh * BLOCK_SIZE, 0);
@@ -1117,8 +1113,6 @@ mod tests {
             }
         }
 
-        // Solid RGB with per-pixel varying alpha must still hit the fast path
-        // (alpha is never read by either encoder) and match the scalar output.
         let blk = solid_block(0xAA, 0x55, 0x33, true);
         let fast = encode_block(&blk);
         let sc = encode_block_scalar(&blk);

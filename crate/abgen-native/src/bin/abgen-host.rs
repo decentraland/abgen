@@ -394,10 +394,6 @@ fn main() {
             .build_global();
     }
 
-    // Bounded by ABGEN_TEX_ENCODE_CACHE_MAX_MB / ABGEN_DECODE_CACHE_MB (see
-    // crate/src/clihelp.rs), same as the lambda and live paths: a request
-    // that spans several GLBs sharing textures (atlas reuse, wearable
-    // collections) gets the dedup within this one process lifetime.
     abgen_core::texencode_cache::enable_with_profile(
         abgen_core::texencode_cache::CacheProfile::Client,
     );

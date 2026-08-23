@@ -198,8 +198,6 @@ fn run() -> Result<()> {
         abgen::clihelp::usage_error(usage_text());
     }
     template_preflight();
-    // The win for a one-shot build is the on-disk encode cache carrying
-    // across invocations of the same content.
     abgen::texencode_cache::enable_with_profile(abgen::texencode_cache::CacheProfile::Client);
     let glb_path = &positional[0];
     let bundle_name = &positional[1];

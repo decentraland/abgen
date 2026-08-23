@@ -276,7 +276,6 @@ fn box_halve_neon(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
         .enumerate()
         .for_each(|(ny, dst)| {
             // SAFETY: NEON is baseline on aarch64. For nx<nw the reads touch
-            // r0/r1 within [0, w*c) and dst is this row's disjoint &mut slice.
             unsafe {
                 let quarter = vdupq_n_f32(0.25);
                 let r0 = arr.as_ptr().add(2 * ny * row_stride);
@@ -396,7 +395,6 @@ pub fn encode_bc7_mip_chain_with_profile_batch(reqs: &[Bc7ChainRequest]) -> Vec<
         .map(|r| bc7_cache_params(r.mip_count, r.flip, r.srgb, r.perceptual, r.profile))
         .collect();
 
-    // Probe pass: a pure cache lookup, the `|| None` closure never inserts.
     for (i, req) in reqs.iter().enumerate() {
         if let Some(v) = crate::texencode_cache::get_or_encode(
             crate::texencode_cache::Kind::Bc7,
@@ -410,7 +408,6 @@ pub fn encode_bc7_mip_chain_with_profile_batch(reqs: &[Bc7ChainRequest]) -> Vec<
         }
     }
 
-    // Dedup remaining slots into a unique-miss list, first-occurrence order.
     let mut slot_key: Vec<Option<[u8; 32]>> = vec![None; reqs.len()];
     let mut seen_keys: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     let mut unique_misses: Vec<usize> = Vec::new();
@@ -471,8 +468,6 @@ pub fn encode_bc7_mip_chain_with_profile_batch(reqs: &[Bc7ChainRequest]) -> Vec<
         }
     }
 
-    // Anything still unfilled (GPU disabled, wasm, or a None from the GPU
-    // batch): fill it with the literal scalar sequence, input order.
     for (i, req) in reqs.iter().enumerate() {
         if results[i].is_none() {
             results[i] = Some(encode_bc7_mip_chain_with_profile(
@@ -581,10 +576,6 @@ fn encode_bc7_mip_chain_with_profile_uncached(
     debug_assert_eq!(total, compute_mip_chain_size(width, height, mip_count));
     let mut parts = vec![0u8; total];
 
-    // Units are the SIMD_W=4-block groups the encoder has always chunked
-    // levels into (one short tail group per level) — this is the smallest
-    // pure encode unit (see partition.rs group coupling), and it is exactly
-    // the group partition the pre-dedup driver produced.
     let mut units: Vec<(usize, usize, usize, usize)> = Vec::new();
     let mut out_off = 0usize;
     for (li, (_, n)) in levels.iter().enumerate() {
@@ -600,9 +591,6 @@ fn encode_bc7_mip_chain_with_profile_uncached(
 
     use rayon::prelude::*;
 
-    // Hash pass: a pure per-unit map of the group's raw pixel bytes, so it
-    // is safe to compute in parallel. Hash quality only affects which
-    // bucket a candidate probes, never the bytes written below.
     let hashes: Vec<u64> = units
         .par_iter()
         .map(|&(li, bs, nb, _)| {
@@ -617,9 +605,6 @@ fn encode_bc7_mip_chain_with_profile_uncached(
         })
         .collect();
 
-    // Rep pass: sequential, ascending unit index. Representative selection
-    // is a full byte comparison of the group slice, independent of hash
-    // function and thread scheduling.
     let mut buckets: HashMap<u64, Vec<u32>> = HashMap::new();
     let mut rep: Vec<u32> = Vec::with_capacity(units.len());
     for (u, &(li, bs, nb, _)) in units.iter().enumerate() {
@@ -653,8 +638,6 @@ fn encode_bc7_mip_chain_with_profile_uncached(
         debug_assert!(rest.is_empty());
     }
 
-    // Encode pass: skip units whose bytes are already produced by an
-    // earlier representative; those slots are filled by the copy pass below.
     slices
         .into_par_iter()
         .zip(units.par_iter())
@@ -672,8 +655,6 @@ fn encode_bc7_mip_chain_with_profile_uncached(
             compress_group_into(&group[..nb], &params, dst);
         });
 
-    // Copy pass: sequential, after the parallel encode's mutable slice
-    // borrows have ended, so a plain copy_within on `parts` is sound.
     for (u, &r) in rep.iter().enumerate() {
         let r = r as usize;
         if r != u {
@@ -718,10 +699,6 @@ fn level_to_blocks(cur: &[f32], cw: usize, ch: usize, srgb: bool) -> (Vec<u8>, u
         let bw = cw / 4;
         let bh = ch / 4;
         let mut out = vec![0u8; bw * bh * 64];
-        // Each block-row `by` writes exactly `bw * 64` disjoint bytes (block
-        // order is by-major), and every pixel's quantization only reads
-        // `cur` — independent per row, so this runs across block-rows in
-        // parallel with the same per-pixel output as the serial version.
         out.par_chunks_mut(bw * 64)
             .enumerate()
             .for_each(|(by, orow)| {
@@ -738,8 +715,6 @@ fn level_to_blocks(cur: &[f32], cw: usize, ch: usize, srgb: bool) -> (Vec<u8>, u
             });
         return (out, bw * bh);
     }
-    // Deep, non-block-aligned mip tail levels: small (at most a handful of
-    // pixels short of 4x4) and rare, so this stays serial.
     let mut level = vec![0u8; cw * ch * 4];
     for i in 0..(cw * ch) {
         quantize_px(cur, i, srgb, &mut level[i * 4..i * 4 + 4]);
@@ -969,8 +944,6 @@ mod batch_tests {
             })
             .collect();
 
-        // Computing the reference via the scalar path also warms the cache
-        // under the exact same params/content keys the batch path will use.
         let expected: Vec<(Vec<u8>, i32)> = reqs
             .iter()
             .map(|r| {
@@ -988,11 +961,9 @@ mod batch_tests {
             .collect();
         assert_eq!(textures[1], textures[3]);
 
-        // Probe-hit path: cache is already warm from `expected` above.
         let batch_hit = encode_bc7_mip_chain_with_profile_batch(&reqs);
         assert_eq!(batch_hit, expected);
 
-        // Miss path: force every slot through the batch's fallback/GPU route.
         crate::texencode_cache::clear();
         let batch_miss = encode_bc7_mip_chain_with_profile_batch(&reqs);
         assert_eq!(batch_miss, expected);

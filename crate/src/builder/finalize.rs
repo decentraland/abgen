@@ -191,10 +191,6 @@ pub(super) fn commit_objects(
         }
     }
 
-    // Pass 1 (serial): register types in first-encounter order — this order
-    // is byte-load-bearing for the emitted SerializedFile — and collect the
-    // per-object work for pass 2. Any missing-node error is surfaced here so
-    // pass 2 can be infallible.
     struct PendingObj<'a> {
         path_id: i64,
         type_id: i32,
@@ -228,10 +224,6 @@ pub(super) fn commit_objects(
         });
     }
 
-    // Pass 2 (parallel): write_typetree is a pure function of its arguments,
-    // so mapping it over an indexed parallel iterator and collecting yields
-    // the identical bytes in the identical (objects-iteration) order as the
-    // old serial loop.
     let out_objects: Vec<unity::Object> = {
         use rayon::prelude::*;
         pending

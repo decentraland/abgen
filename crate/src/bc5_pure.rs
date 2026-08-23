@@ -270,9 +270,6 @@ pub(crate) fn compress_bc5_blocks(padded: &[u8], pw: usize, ph: usize, out: &mut
     let bh = ph / 4;
     debug_assert_eq!(out.len(), bw * bh * BC5_BLOCK_SIZE);
     debug_assert_eq!(padded.len(), pw * ph * 4);
-    // Fixed block-row chunking into a pre-sized slice (the
-    // bc7_pure::encode_blocks pattern): every 16-byte slot is written by
-    // block index, so output bytes are identical at any thread count.
     use rayon::prelude::*;
     out.par_chunks_mut(bw * BC5_BLOCK_SIZE)
         .enumerate()

@@ -137,9 +137,6 @@ pub(crate) fn content_key(
 
 fn key(kind: Kind, pixels: &[u8], width: u32, height: u32, params: &[i64]) -> [u8; 32] {
     let mut h = crate::hashes::Sha256::new();
-    // Fold in the encoder build id so a stale on-disk entry from a previous
-    // build can never serve: bumping ABGEN_BUILD_ID (a content hash of the
-    // source tree) or the crate version changes every key.
     h.update(env!("CARGO_PKG_VERSION").as_bytes());
     h.update(&[0u8]);
     h.update(env!("ABGEN_BUILD_ID").as_bytes());
@@ -205,17 +202,6 @@ mod disk {
     }
 
     fn enabled() -> bool {
-        // Default on only where the build id actually pins the encoder.
-        // `build.rs` stamps every un-stamped build `devbuild0000`, so all
-        // locally built binaries — `abgen-host`, the `live` server, the
-        // bench — share one key space no matter what the source tree says.
-        // A developer who edits the encoder and rebuilds would then get the
-        // *previous* build's bytes served straight off disk, which is the
-        // exact "stale build can never serve a hit" invariant this key is
-        // supposed to provide. `cfg!(test)` cannot express this either:
-        // `crate/tests/*.rs` link this library compiled *without*
-        // `cfg(test)`. Keying off the build id covers every case at once.
-        // `ABGEN_DISK_CACHE=1` opts back in explicitly.
         crate::clihelp::env_bool(
             "ABGEN_DISK_CACHE",
             build_id_pins_encoder() && super::profile().disk_default_on(),
@@ -340,9 +326,6 @@ mod disk {
         }
         let mips = i32::from_le_bytes(bytes[..4].try_into().ok()?);
         let data = bytes[4..].to_vec();
-        // Touch mtime on read so hot entries survive LRU eviction; best
-        // effort, a failure here just makes this entry a slightly earlier
-        // eviction candidate, never wrong output.
         if let Ok(f) = fs::File::open(&path) {
             let _ = f.set_modified(SystemTime::now());
         }
@@ -356,14 +339,14 @@ mod disk {
         let budget = max_bytes();
         let payload_len = data.len() as u64 + 4;
         if payload_len > budget {
-            return; // a single entry bigger than the whole budget: skip it
+            return;
         }
         let Some(root) = cache_root() else {
             return;
         };
         let path = shard_path(&root, &hex(key));
         if path.exists() {
-            return; // content-addressed and immutable: nothing to update
+            return;
         }
         let Some(dir) = path.parent() else {
             return;
@@ -645,8 +628,6 @@ mod tests {
         .unwrap();
         assert_eq!(a, (vec![4, 5, 6, 7, 8], 3));
 
-        // A real second process would start with an empty in-memory map but
-        // the same on-disk cache dir; `clear()` simulates exactly that.
         clear();
         let b = get_or_encode(Kind::Bc7, &pixels, 8, 8, &[123], || {
             unreachable!("disk cache must serve this without recomputing")
@@ -697,8 +678,6 @@ mod tests {
 
     #[test]
     fn undeclared_profile_falls_back_to_batch() {
-        // PROFILE is shared with every other test in this binary; only
-        // assert the fallback when nothing has declared one yet.
         if PROFILE.get().is_none() {
             assert_eq!(profile(), CacheProfile::Batch);
         }
@@ -707,14 +686,8 @@ mod tests {
 
     #[test]
     fn disk_cache_key_changes_with_build_id() {
-        // The key folds in CARGO_PKG_VERSION + ABGEN_BUILD_ID; two encodes
-        // that only differ if the build id differed would need separate
-        // entries. We can't rebuild with a different id in a unit test, but
-        // we can assert the key function actually mixes both in (i.e. it
-        // isn't silently dead code the optimizer could drop).
         let pixels = vec![1u8, 2, 3, 4];
         let k1 = key(Kind::Bc7, &pixels, 4, 4, &[1]);
-        // A hand-rolled hash that omits build id/version must differ.
         let mut h = crate::hashes::Sha256::new();
         h.update(&[Kind::Bc7 as u8]);
         h.update(&4u32.to_le_bytes());

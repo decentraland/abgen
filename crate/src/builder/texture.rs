@@ -526,7 +526,6 @@ impl<'a> Builder<'a> {
     }
 
     fn source_image(&mut self, scene: &Scene, idx: usize) -> texprofile::SourceImage {
-        // Memoized: the alpha scan is O(pixels) and texture() runs per texture-ref.
         self.src_image_cache
             .entry(idx)
             .or_insert_with(|| {
@@ -866,12 +865,6 @@ impl<'a> Builder<'a> {
                 return TexTree::Done(t);
             }
             if stub_bc7 {
-                // stub_bc7 already implies texture_format == TF_BC7 (see its
-                // definition above), and this stub's bytes depend only on
-                // target dims/mips/lightmap format, never on pixel content.
-                // Computing a mean-color source image and box-resizing it
-                // just to throw both away was dead work ahead of this
-                // return, so skip them entirely.
                 let (data, mips) = encode_inglb_bc7_stub(
                     prof.target_w,
                     prof.target_h,
@@ -1001,9 +994,6 @@ impl<'a> Builder<'a> {
                 t.insert("image data", Value::Bytes(data));
                 TexTree::Done(t)
             }
-            // m_MipCount, m_CompleteImageSize, and "image data" are filled
-            // in later by resolve_pending_bc7_textures, once the batch BC7
-            // encode this job was queued into has resolved.
             DataMips::Deferred(job) => TexTree::Pending(t, job),
         }
     }

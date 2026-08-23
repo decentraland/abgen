@@ -173,10 +173,6 @@ fn build_request(files: &[(String, Vec<u8>)], platform: &str) -> Vec<u8> {
 }
 
 fn time_once(files: &[(String, Vec<u8>)], platform: &str) -> Run {
-    // Clear per rep: caching is enabled (see main()) so intra-entity
-    // duplicate textures get deduped like production, but a rep must not
-    // see hits from the *previous* rep's identical input, or "minimum
-    // across reps" degenerates into a warm-cache measurement.
     abgen::texencode_cache::clear();
     abgen::decode_cache::clear();
 
@@ -340,15 +336,6 @@ fn main() {
         std::process::exit(2);
     }
 
-    // Same bounded caches the lambda/live paths use, so a bench run reflects
-    // production's intra-entity texture dedup. time_once() clears both
-    // before every rep — otherwise reps 2..N would measure cache hits
-    // instead of the conversion, and "minimum across reps" would report a
-    // warm-cache number instead of the true cost. The in-memory clear can't
-    // reach the encode cache's on-disk backing though, so turn that off
-    // here specifically: a rep hitting a *previous rep's* on-disk entry
-    // would silently corrupt the "minimum across reps" measurement the same
-    // way an uncleared in-memory hit would, just persistently.
     if std::env::var("ABGEN_DISK_CACHE").is_err() {
         std::env::set_var("ABGEN_DISK_CACHE", "0");
     }

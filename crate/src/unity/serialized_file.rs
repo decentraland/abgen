@@ -301,11 +301,6 @@ impl SerializedFile {
         objs.sort_by_key(|o| o.path_id);
         meta.write_i32(objs.len() as i32);
         let last_idx = objs.len().saturating_sub(1);
-        // Running counter replicating the position a separate `data_w`
-        // buffer would have reached; this lets byte_start be computed
-        // without materializing (and later copying) a whole extra data
-        // buffer — the object bytes are written straight into the final
-        // writer below, in this same order.
         let mut cur: i64 = 0;
         for (i, obj) in objs.iter().enumerate() {
             meta.align_stream(4);
