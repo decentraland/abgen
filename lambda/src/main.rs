@@ -709,6 +709,9 @@ mod tests {
     /// space configured the final attempt must still fail into the DLQ.
     #[test]
     fn tombstone_engages_only_on_the_final_receive() {
+        let _env = crate::convert::TEST_SPACE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let cfg = test_cfg();
         let job = |receive_count| event::Job {
             entity_id: "bafktomb01".to_string(),

@@ -302,6 +302,22 @@ mod tests {
             ("/manifest/bafkpart_windows.json".to_string(), 200, good),
             ("/manifest/bafkpart_mac.json".to_string(), 200, Vec::new()),
         ]);
+        let _env = crate::convert::TEST_SPACE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for k in [
+                    "ABGEN_S3_ENDPOINT",
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_SECRET_ACCESS_KEY",
+                ] {
+                    std::env::remove_var(k);
+                }
+            }
+        }
+        let _guard = EnvGuard;
         std::env::set_var("ABGEN_S3_ENDPOINT", format!("http://{host}"));
         std::env::set_var("AWS_ACCESS_KEY_ID", "AKIATEST");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
