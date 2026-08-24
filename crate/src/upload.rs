@@ -25,6 +25,23 @@ pub struct UploadReport {
     pub failed: Vec<String>,
 }
 
+impl UploadReport {
+    /// Hard gate for callers that must not proceed past `drain` — publishing
+    /// a corpus manifest that advertises a bundle which never landed is worse
+    /// than failing the build, and a success here deletes the SQS message
+    /// that would otherwise drive the retry.
+    pub fn ensure_ok(&self) -> Result<()> {
+        if self.failed.is_empty() {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "{} bundle upload(s) failed after {UPLOAD_RETRIES} attempts each: {:?}",
+            self.failed.len(),
+            self.failed
+        ))
+    }
+}
+
 /// Bounded background PUT queue: `enqueue` hands off a finalized on-disk
 /// bundle's key/path to a fixed worker pool, freeing the caller (a
 /// conversion worker) immediately instead of blocking it on the network.
@@ -173,6 +190,7 @@ mod tests {
 
         assert_eq!(report.ok, 2);
         assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert!(report.ensure_ok().is_ok());
         let mut log = seen.lock().unwrap().clone();
         log.sort();
         assert_eq!(
@@ -201,6 +219,12 @@ mod tests {
         let log = seen.lock().unwrap().clone();
         let bad_attempts = log.iter().filter(|l| *l == "PUT /v1/missing.bin").count();
         assert_eq!(bad_attempts, UPLOAD_RETRIES as usize);
+
+        let err = report.ensure_ok().unwrap_err().to_string();
+        assert!(
+            err.contains("v1/missing.bin") && err.contains("1 bundle upload(s) failed"),
+            "gate must name the failed key: {err}"
+        );
     }
 
     #[test]

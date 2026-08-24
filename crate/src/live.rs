@@ -1221,23 +1221,15 @@ impl Proxy {
         }
 
         if let Some(report) = upload_pool.map(crate::upload::UploadPool::drain) {
-            if report.failed.is_empty() {
-                tracing::info!(
-                    entity = %cid,
-                    platform = %platform,
-                    ok = report.ok,
-                    "upload pool drained"
-                );
-            } else {
-                tracing::warn!(
-                    entity = %cid,
-                    platform = %platform,
-                    ok = report.ok,
-                    failed = report.failed.len(),
-                    keys = ?report.failed,
-                    "upload pool drained with failures; manifest publishing anyway"
-                );
-            }
+            report
+                .ensure_ok()
+                .with_context(|| format!("{cid} {platform}: manifest not published"))?;
+            tracing::info!(
+                entity = %cid,
+                platform = %platform,
+                ok = report.ok,
+                "upload pool drained"
+            );
         }
 
         let mut built_pairs = built_m.into_inner().unwrap();
