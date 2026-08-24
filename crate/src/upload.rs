@@ -26,10 +26,8 @@ pub struct UploadReport {
 }
 
 impl UploadReport {
-    /// Hard gate for callers that must not proceed past `drain` — publishing
-    /// a corpus manifest that advertises a bundle which never landed is worse
-    /// than failing the build, and a success here deletes the SQS message
-    /// that would otherwise drive the retry.
+    /// Hard gate before the corpus manifest: a manifest must never advertise
+    /// a bundle that did not land, and a false success acks the SQS message.
     pub fn ensure_ok(&self) -> Result<()> {
         if self.failed.is_empty() {
             return Ok(());
