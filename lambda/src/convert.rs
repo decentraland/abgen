@@ -113,3 +113,8 @@ fn read_exit_code(manifest_path: &std::path::Path) -> Option<i32> {
         .and_then(serde_json::Value::as_i64)
         .map(|v| v as i32)
 }
+
+/// Serializes tests that mutate process-global space env (ABGEN_S3_*, AWS_*)
+/// against tests whose assertions depend on the space being unconfigured.
+#[cfg(test)]
+pub(crate) static TEST_SPACE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
