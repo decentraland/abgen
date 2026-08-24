@@ -105,11 +105,14 @@ fn corpus_file_jobs() -> usize {
     })
 }
 
-/// Bounded concurrency for the dedicated bundle-upload pool: a network-bound
-/// worker count, kept separate from `corpus_file_jobs` (CPU-bound conversion)
-/// so uploads no longer steal convert-worker slots for network wait.
-/// `ABGEN_UPLOAD_CONCURRENCY` is an escape hatch, never required to reach
-/// the default.
+/// Bounded concurrency for the dedicated bundle-upload pool, kept separate
+/// from `corpus_file_jobs` (CPU-bound conversion) so uploads no longer steal
+/// convert-worker slots for network wait. The RAM-derived
+/// `default_file_concurrency` fallback is deliberate, not a missed rename:
+/// each worker re-reads a full bundle into memory (`upload_with_retries`),
+/// so the network-scaled default (8–32) could hold that many bundles in RAM
+/// at once. `ABGEN_UPLOAD_CONCURRENCY` is an escape hatch, never required
+/// to reach the default.
 fn upload_jobs() -> usize {
     static JOBS: OnceLock<usize> = OnceLock::new();
     *JOBS.get_or_init(|| {
