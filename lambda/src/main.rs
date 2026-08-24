@@ -55,6 +55,9 @@ fn main() {
                  \x20    ABGEN_EMF_NAMESPACE (CloudWatch EMF metrics on stdout),\n\
                  \x20    ABGEN_LOG_FORMAT (json for JSON logs), RUST_LOG (filter,\n\
                  \x20    default abgen=info,abgen_lambda=info),\n\
+                 \x20    ABGEN_MAX_RECEIVE_COUNT (default 3 — on the final SQS\n\
+                 \x20    receive a failed conversion publishes an exitCode-5\n\
+                 \x20    tombstone manifest and acks instead of going to the DLQ),\n\
                  \x20    ENABLE_LODS (off: LOD jobs are acked and skipped; on: levels 0+1\n\
                  \x20    are regenerated from the scene and written to LOD/<level>/ and\n\
                  \x20    lods-unity/manifests/ — the deployment's FBX sources are unused)"
@@ -174,7 +177,15 @@ fn run_jobs(cfg: &config::Config, event: event::Event) -> Result<serde_json::Val
 /// until the DLQ must show up as `outcome="error"`, not only in stderr).
 fn instrumented_job(cfg: &config::Config, job: Result<event::Job>) -> Result<serde_json::Value> {
     let started = std::time::Instant::now();
-    let summary = job.and_then(|job| catch_job_panic(|| handle_job(cfg, &job)));
+    let summary = job.and_then(|job| {
+        let summary = catch_job_panic(|| handle_job(cfg, &job));
+        match summary {
+            Err(err) if !job.is_lods && job.receive_count >= cfg.max_receive_count => {
+                tombstone_final_failure(cfg, &job, err)
+            }
+            other => other,
+        }
+    });
     let outcome = job_outcome(&summary);
     metrics::histogram!("abgen_lambda_job_duration_seconds", "outcome" => outcome)
         .record(started.elapsed().as_secs_f64());
@@ -375,6 +386,70 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
     }))
 }
 
+/// Last SQS delivery before the DLQ (prod parity: consumer-server publishes
+/// the manifest with its real exitCode and a finished event on *every*
+/// terminal outcome, success or not): publish an `exitCode: 5` tombstone
+/// manifest for each platform still missing a good one, notify the registry,
+/// and ack the message — a visible, reconvertible failure instead of an
+/// unmonitored DLQ entry. Platforms that already converted keep their
+/// manifests. Any error in here returns the *original* failure, so a
+/// tombstone that cannot land still reaches the DLQ.
+fn tombstone_final_failure(
+    cfg: &config::Config,
+    job: &event::Job,
+    err: anyhow::Error,
+) -> Result<serde_json::Value> {
+    eprintln!(
+        "final attempt ({}/{}) failed for {}: {err:#} — publishing failure tombstone",
+        job.receive_count, cfg.max_receive_count, job.entity_id
+    );
+    // The job's content server may be exactly what failed validation; a
+    // tombstone must never embed an unvalidated event-supplied URL.
+    let content_server = job
+        .content_server_url
+        .as_deref()
+        .filter(|cs| {
+            event::validate_content_server(cs, cfg.allowed_content_server_hosts.as_deref()).is_ok()
+        })
+        .unwrap_or(&cfg.default_content_server);
+    let proxy = convert::make_proxy(cfg, content_server);
+    if !proxy.space_configured() {
+        return Err(err.context("no space configured — cannot publish a failure tombstone"));
+    }
+    let tombstoned =
+        match output::publish_failure_tombstones(cfg, &proxy, &job.entity_id, content_server) {
+            Ok(t) => t,
+            Err(e) => return Err(err.context(format!("{e:#}"))),
+        };
+    // Platforms with a good manifest get their event too (status 13): when
+    // the repeated failure was the notify step itself, the tombstone pass is
+    // the registry's last chance to hear about the successful conversion.
+    let finished: Vec<notify::Finished> = cfg
+        .platforms
+        .iter()
+        .map(|p| notify::Finished {
+            platform: p,
+            status_code: if tombstoned.contains(p) {
+                notify::STATUS_UNEXPECTED_ERROR
+            } else {
+                notify::STATUS_ALREADY_CONVERTED
+            },
+        })
+        .collect();
+    let notified =
+        match notify::send_finished(cfg, &job.entity_id, content_server, false, &finished) {
+            Ok(n) => n,
+            Err(e) => return Err(err.context(format!("{e:#}"))),
+        };
+    Ok(serde_json::json!({
+        "entityId": job.entity_id,
+        "exitCode": notify::STATUS_UNEXPECTED_ERROR,
+        "tombstoned": tombstoned,
+        "error": format!("{err:#}"),
+        "notified": notified,
+    }))
+}
+
 /// Sequences the terminal steps of a conversion: `forget` runs immediately
 /// after a successful publish and before `notify`, and runs even when notify
 /// then fails — a stale converted-ok marker must never outlive a publish
@@ -407,6 +482,7 @@ mod tests {
             allowed_content_server_hosts: None,
             http_secret: None,
             lods_enabled: false,
+            max_receive_count: 3,
         }
     }
 
@@ -428,6 +504,7 @@ mod tests {
                 content_server_url: None,
                 is_lods: false,
                 force: false,
+                receive_count: 1,
             }),
         }
     }
@@ -620,6 +697,35 @@ mod tests {
         let e = json!({"entityId": "bafkabc123", "contentServerUrl": "http://10.0.3.7:8500"});
         let err = handle(&cfg, &e).unwrap_err();
         assert!(format!("{err:#}").contains("https required"), "{err:#}");
+    }
+
+    /// Both jobs fail fast on content-server validation (no network): below
+    /// the receive threshold the error passes through untouched; at the
+    /// threshold the tombstone path engages — and with no space configured
+    /// it must still fail (into the DLQ), naming the tombstone step.
+    #[test]
+    fn tombstone_engages_only_on_the_final_receive() {
+        let cfg = test_cfg();
+        let job = |receive_count| event::Job {
+            entity_id: "bafktomb01".to_string(),
+            content_server_url: Some("http://10.0.3.7:8500".to_string()),
+            is_lods: false,
+            force: false,
+            receive_count,
+        };
+
+        let err = instrumented_job(&cfg, Ok(job(2))).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("https required"), "{text}");
+        assert!(!text.contains("tombstone"), "{text}");
+
+        let err = instrumented_job(&cfg, Ok(job(3))).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("cannot publish a failure tombstone"),
+            "{text}"
+        );
+        assert!(text.contains("https required"), "{text}");
     }
 
     #[test]

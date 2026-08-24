@@ -10,6 +10,10 @@ pub struct Config {
     pub allowed_content_server_hosts: Option<Vec<String>>,
     pub http_secret: Option<String>,
     pub lods_enabled: bool,
+    /// Must match the SQS queue's redrive `maxReceiveCount` (ops-lambdas): a
+    /// job failing on this receive is on its last delivery before the DLQ,
+    /// so a failure tombstone manifest is published instead of erroring.
+    pub max_receive_count: u32,
 }
 
 impl Config {
@@ -50,6 +54,11 @@ impl Config {
                 .ok()
                 .filter(|v| !v.is_empty()),
             lods_enabled: abgen::clihelp::env_bool("ENABLE_LODS", false),
+            max_receive_count: std::env::var("ABGEN_MAX_RECEIVE_COUNT")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(3),
         }
     }
 }

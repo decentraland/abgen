@@ -4,6 +4,10 @@ use anyhow::{Context, Result};
 /// Prod's triage-fast-path status for already-converted entities.
 pub const STATUS_ALREADY_CONVERTED: i32 = 13;
 
+/// Prod's UNEXPECTED_ERROR exit code — the status a failure tombstone
+/// manifest carries.
+pub const STATUS_UNEXPECTED_ERROR: i32 = 5;
+
 pub struct Finished<'a> {
     pub platform: &'a str,
     pub status_code: i32,

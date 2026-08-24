@@ -948,6 +948,21 @@ impl Proxy {
         self.space_put_key(&format!("manifest/{stem}.json"), bytes);
     }
 
+    /// Hard-failing variant of [`space_put_manifest`](Self::space_put_manifest)
+    /// for callers whose correctness depends on the write landing (the
+    /// lambda's final-attempt failure tombstone): the error propagates
+    /// instead of being logged away.
+    pub fn space_put_manifest_strict(&self, stem: &str, bytes: &[u8]) -> Result<()> {
+        let Some(space) = self.space.as_ref() else {
+            bail!("no space configured");
+        };
+        if space.read_only {
+            bail!("space is read-only (ABGEN_S3_READ_ONLY)");
+        }
+        let key = format!("manifest/{stem}.json");
+        space.put_timed(&key, bytes)
+    }
+
     pub fn date(&self) -> &str {
         &self.date
     }
@@ -2115,6 +2130,45 @@ mod tests {
             ..Default::default()
         });
         assert!(no_space.upload_pool().is_none());
+    }
+
+    #[test]
+    fn space_put_manifest_strict_lands_or_errors() {
+        let (host, seen) = super::stub::serve(vec![(
+            "/manifest/bafktomb_windows.json".to_string(),
+            200,
+            Vec::new(),
+        )]);
+
+        let proxy = stub_proxy(&host, false, "manifest-strict-rw");
+        proxy
+            .space_put_manifest_strict("bafktomb_windows", b"{}")
+            .unwrap();
+        assert!(seen
+            .lock()
+            .unwrap()
+            .contains(&"PUT /manifest/bafktomb_windows.json".to_string()));
+
+        // Unrouted key: the stub answers non-2xx and the error must surface.
+        assert!(proxy
+            .space_put_manifest_strict("bafkmissing_windows", b"{}")
+            .is_err());
+
+        let read_only = stub_proxy(&host, true, "manifest-strict-ro");
+        assert!(read_only
+            .space_put_manifest_strict("bafktomb_windows", b"{}")
+            .is_err());
+
+        let no_space = Proxy::new(ProxyConfig {
+            catalyst_url: "http://127.0.0.1:9".to_string(),
+            cache_dir: temp_cache("manifest-strict-no-space")
+                .to_string_lossy()
+                .into_owned(),
+            ..Default::default()
+        });
+        assert!(no_space
+            .space_put_manifest_strict("bafktomb_windows", b"{}")
+            .is_err());
     }
 
     #[test]

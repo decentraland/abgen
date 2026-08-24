@@ -2,7 +2,7 @@ use crate::catalyst;
 use crate::config::Config;
 use crate::convert::EntityOutcome;
 use abgen::live::Proxy;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 
 /// Bucket+version-scoped so an `AB_VERSION` bump can't suppress reconversion;
@@ -94,6 +94,47 @@ pub fn publish(
     }))
 }
 
+/// The failure tombstone: prod's manifest shape with no files and
+/// UNEXPECTED_ERROR — visible to the registry and consumers, and never
+/// mistaken for a conversion (`platform_converted` requires `exitCode == 0`,
+/// so any later deploy or force job reconverts right over it).
+fn failure_manifest(cfg: &Config, content_server: &str, date: &str) -> Vec<u8> {
+    serde_json::json!({
+        "version": cfg.version,
+        "files": [],
+        "exitCode": crate::notify::STATUS_UNEXPECTED_ERROR,
+        "contentServerUrl": content_server,
+        "date": date,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Publishes a failure tombstone manifest for every platform that has no
+/// good manifest yet, on the job's final SQS delivery — the alternative is
+/// the unmonitored DLQ. Returns the tombstoned platforms; errors propagate
+/// (a tombstone we cannot land must still go to the DLQ).
+pub fn publish_failure_tombstones(
+    cfg: &Config,
+    proxy: &Arc<Proxy>,
+    entity_id: &str,
+    content_server: &str,
+) -> Result<Vec<String>> {
+    let mut tombstoned = Vec::new();
+    for platform in &cfg.platforms {
+        if platform_converted(proxy, cfg, entity_id, platform) {
+            continue;
+        }
+        let bytes = failure_manifest(cfg, content_server, proxy.date());
+        proxy
+            .space_put_manifest_strict(&format!("{entity_id}_{platform}"), &bytes)
+            .with_context(|| format!("tombstone manifest for {entity_id} {platform}"))?;
+        tombstoned.push(platform.clone());
+    }
+    metrics::counter!("abgen_lambda_tombstones_total").increment(tombstoned.len() as u64);
+    Ok(tombstoned)
+}
+
 /// Entity-supplied file names end up in S3 object keys, and `uri_encode_key`
 /// preserves '/' and '.', so a hostile name could escape the
 /// `{version}/{entityId}/` prefix.
@@ -172,6 +213,30 @@ fn upload_scene_sources(
 #[cfg(test)]
 mod tests {
     use super::valid_key_component;
+
+    #[test]
+    fn failure_manifest_json_is_pinned() {
+        let cfg = crate::config::Config {
+            platforms: vec!["windows".to_string()],
+            version: "v49".to_string(),
+            cache_dir: String::new(),
+            default_content_server: String::new(),
+            out_root: std::path::PathBuf::new(),
+            keep_output: false,
+            allowed_content_server_hosts: None,
+            http_secret: None,
+            lods_enabled: false,
+            max_receive_count: 3,
+        };
+        let bytes =
+            super::failure_manifest(&cfg, "https://peer.decentraland.org/content", "2026-08-24");
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "{\"version\":\"v49\",\"files\":[],\"exitCode\":5,\
+             \"contentServerUrl\":\"https://peer.decentraland.org/content\",\
+             \"date\":\"2026-08-24\"}"
+        );
+    }
 
     #[test]
     fn accepts_ordinary_names() {

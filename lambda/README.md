@@ -68,6 +68,7 @@ all hits.
 | `ALLOWED_CONTENT_SERVER_HOSTS` | — (**fail-open**) | comma-separated allowlist of hosts an event's `contentServerUrl` may name; **unset means any https host is accepted**, so every deployment should set it. Scheme/shape validation (https only, no userinfo) applies regardless — allowlist or not, a plaintext or internal-IP URL is rejected. The `lambdaImage` bakes in `peer.decentraland.org`; a function env var overrides it. |
 | `ABGEN_EMF_NAMESPACE` | — (off) | CloudWatch namespace for EMF metrics (e.g. `abgen/lambda`); unset means no recorder is installed and every `metrics::` call stays a no-op |
 | `ABGEN_LOG_FORMAT` | plain text | `json` for JSON log lines |
+| `ABGEN_MAX_RECEIVE_COUNT` | `3` | must match the SQS redrive `maxReceiveCount`: a conversion failing on this receive publishes an `exitCode: 5` tombstone manifest per unconverted platform (+ a `statusCode: 5` finished event) and acks, instead of erroring into the DLQ. A tombstone never blocks reconversion — the already-converted check requires `exitCode: 0` — and if the tombstone itself cannot be published the original error propagates, so the message still reaches the DLQ. |
 | `RUST_LOG` | `abgen=info,abgen_lambda=info` | tracing filter override |
 
 S3 is abgen's built-in "space" client (SigV4, ureq). Credentials come from
@@ -197,6 +198,7 @@ beyond `serde_json`. `AWS_LAMBDA_FUNCTION_NAME` (set by Lambda) becomes a
 | `abgen_lambda_convert_duration_seconds` | `platform` | per-platform build |
 | `abgen_lambda_bundles_total` | `platform` | manifest entries written |
 | `abgen_lambda_texencode_cache_total` | `outcome` (`hit`/`miss`) | dual-emit texture cache |
+| `abgen_lambda_tombstones_total` | — | failure tombstone manifests published on the final SQS receive |
 | `abgen_space_request_duration_seconds`, `abgen_space_transfer_bytes_total`, `abgen_space_object_bytes`, `abgen_space_errors_total` | `op`, `result`, `direction` | `abgen::live` S3 client |
 
 Naming: the upstream consumer-server's registry
