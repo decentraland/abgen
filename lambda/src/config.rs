@@ -10,9 +10,8 @@ pub struct Config {
     pub allowed_content_server_hosts: Option<Vec<String>>,
     pub http_secret: Option<String>,
     pub lods_enabled: bool,
-    /// Must match the SQS queue's redrive `maxReceiveCount` (ops-lambdas): a
-    /// job failing on this receive is on its last delivery before the DLQ,
-    /// so a failure tombstone manifest is published instead of erroring.
+    /// Must match the SQS redrive `maxReceiveCount`: a job failing on this
+    /// receive publishes a failure tombstone instead of erroring into the DLQ.
     pub max_receive_count: u32,
 }
 

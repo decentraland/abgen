@@ -386,14 +386,10 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
     }))
 }
 
-/// Last SQS delivery before the DLQ (prod parity: consumer-server publishes
-/// the manifest with its real exitCode and a finished event on *every*
-/// terminal outcome, success or not): publish an `exitCode: 5` tombstone
-/// manifest for each platform still missing a good one, notify the registry,
-/// and ack the message — a visible, reconvertible failure instead of an
-/// unmonitored DLQ entry. Platforms that already converted keep their
-/// manifests. Any error in here returns the *original* failure, so a
-/// tombstone that cannot land still reaches the DLQ.
+/// Last SQS delivery before the DLQ: publish an `exitCode: 5` tombstone per
+/// unconverted platform, notify, ack — prod publishes manifest+event on every
+/// terminal outcome. Errors return the *original* failure, so a tombstone
+/// that cannot land still dead-letters.
 fn tombstone_final_failure(
     cfg: &config::Config,
     job: &event::Job,
@@ -403,8 +399,7 @@ fn tombstone_final_failure(
         "final attempt ({}/{}) failed for {}: {err:#} — publishing failure tombstone",
         job.receive_count, cfg.max_receive_count, job.entity_id
     );
-    // The job's content server may be exactly what failed validation; a
-    // tombstone must never embed an unvalidated event-supplied URL.
+    // Never embed an event-supplied URL that failed validation.
     let content_server = job
         .content_server_url
         .as_deref()
@@ -421,9 +416,8 @@ fn tombstone_final_failure(
             Ok(t) => t,
             Err(e) => return Err(err.context(format!("{e:#}"))),
         };
-    // Platforms with a good manifest get their event too (status 13): when
-    // the repeated failure was the notify step itself, the tombstone pass is
-    // the registry's last chance to hear about the successful conversion.
+    // Converted platforms re-notify 13: if notify itself was the repeated
+    // failure, this pass is the registry's last chance to hear about them.
     let finished: Vec<notify::Finished> = cfg
         .platforms
         .iter()
@@ -699,10 +693,8 @@ mod tests {
         assert!(format!("{err:#}").contains("https required"), "{err:#}");
     }
 
-    /// Both jobs fail fast on content-server validation (no network): below
-    /// the receive threshold the error passes through untouched; at the
-    /// threshold the tombstone path engages — and with no space configured
-    /// it must still fail (into the DLQ), naming the tombstone step.
+    /// Validation-failure jobs, so both paths stay network-free; with no
+    /// space configured the final attempt must still fail into the DLQ.
     #[test]
     fn tombstone_engages_only_on_the_final_receive() {
         let cfg = test_cfg();

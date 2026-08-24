@@ -6,11 +6,8 @@ pub struct Job {
     pub content_server_url: Option<String>,
     pub is_lods: bool,
     pub force: bool,
-    /// SQS `ApproximateReceiveCount` — 1 for direct/HTTP invokes and when the
-    /// attribute is absent or unparseable. Approximate means it can overcount
-    /// (a delivery that never reached the handler still increments it), never
-    /// undercount, so `>=` comparisons against the queue's maxReceiveCount are
-    /// safe for last-attempt detection.
+    /// SQS `ApproximateReceiveCount`; 1 for direct/HTTP invokes. Approximate
+    /// overcounts but never undercounts, so `>=` last-attempt checks are safe.
     pub receive_count: u32,
 }
 

@@ -948,10 +948,8 @@ impl Proxy {
         self.space_put_key(&format!("manifest/{stem}.json"), bytes);
     }
 
-    /// Hard-failing variant of [`space_put_manifest`](Self::space_put_manifest)
-    /// for callers whose correctness depends on the write landing (the
-    /// lambda's final-attempt failure tombstone): the error propagates
-    /// instead of being logged away.
+    /// Hard-failing `space_put_manifest` for writes correctness depends on
+    /// (the lambda's failure tombstone): errors propagate, not logged away.
     pub fn space_put_manifest_strict(&self, stem: &str, bytes: &[u8]) -> Result<()> {
         let Some(space) = self.space.as_ref() else {
             bail!("no space configured");

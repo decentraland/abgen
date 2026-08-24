@@ -94,10 +94,8 @@ pub fn publish(
     }))
 }
 
-/// The failure tombstone: prod's manifest shape with no files and
-/// UNEXPECTED_ERROR — visible to the registry and consumers, and never
-/// mistaken for a conversion (`platform_converted` requires `exitCode == 0`,
-/// so any later deploy or force job reconverts right over it).
+/// Prod's manifest shape with no files and UNEXPECTED_ERROR; never mistaken
+/// for a conversion — `platform_converted` requires `exitCode == 0`.
 fn failure_manifest(cfg: &Config, content_server: &str, date: &str) -> Vec<u8> {
     serde_json::json!({
         "version": cfg.version,
@@ -110,10 +108,8 @@ fn failure_manifest(cfg: &Config, content_server: &str, date: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// Publishes a failure tombstone manifest for every platform that has no
-/// good manifest yet, on the job's final SQS delivery — the alternative is
-/// the unmonitored DLQ. Returns the tombstoned platforms; errors propagate
-/// (a tombstone we cannot land must still go to the DLQ).
+/// One tombstone per platform without a good manifest; errors propagate —
+/// a tombstone we cannot land must still reach the DLQ.
 pub fn publish_failure_tombstones(
     cfg: &Config,
     proxy: &Arc<Proxy>,
