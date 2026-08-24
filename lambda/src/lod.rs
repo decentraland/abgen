@@ -222,6 +222,7 @@ mod tests {
             allowed_content_server_hosts: None,
             http_secret: None,
             lods_enabled: true,
+            max_receive_count: 3,
         }
     }
 

@@ -6,6 +6,9 @@ pub struct Job {
     pub content_server_url: Option<String>,
     pub is_lods: bool,
     pub force: bool,
+    /// SQS `ApproximateReceiveCount`; 1 for direct/HTTP invokes. Approximate
+    /// overcounts but never undercounts, so `>=` last-attempt checks are safe.
+    pub receive_count: u32,
 }
 
 pub struct Record {
@@ -46,7 +49,13 @@ fn job_from_record(record: &Value) -> Result<Job> {
         .and_then(Value::as_str)
         .context("no string body")?;
     let parsed: Value = serde_json::from_str(body).context("body is not JSON")?;
-    job_from_value(&parsed)
+    let mut job = job_from_value(&parsed)?;
+    job.receive_count = record
+        .pointer("/attributes/ApproximateReceiveCount")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1);
+    Ok(job)
 }
 
 fn job_from_value(v: &Value) -> Result<Job> {
@@ -61,6 +70,7 @@ fn job_from_value(v: &Value) -> Result<Job> {
                 .map(normalize_content_server),
             is_lods: false,
             force,
+            receive_count: 1,
         });
     }
     if let Some(id) = v.pointer("/entity/entityId").and_then(Value::as_str) {
@@ -79,6 +89,7 @@ fn job_from_value(v: &Value) -> Result<Job> {
             content_server_url,
             is_lods,
             force,
+            receive_count: 1,
         });
     }
     bail!("unrecognized event shape: expected entityId or entity.entityId")
@@ -189,6 +200,23 @@ mod tests {
         assert!(records[1].job.is_err());
         assert!(records[2].message_id.is_none());
         assert!(records[3].message_id.is_none());
+    }
+
+    #[test]
+    fn parses_receive_count_from_sqs_attributes() {
+        let body = serde_json::json!({"entityId": "bafkrc0001"}).to_string();
+        let e = serde_json::json!({"Records": [
+            {"body": body.clone(), "attributes": {"ApproximateReceiveCount": "3"}},
+            {"body": body.clone(), "attributes": {"ApproximateReceiveCount": "junk"}},
+            {"body": body},
+        ]});
+        let jobs = jobs_from_event(&e).unwrap();
+        assert_eq!(jobs[0].receive_count, 3);
+        assert_eq!(jobs[1].receive_count, 1);
+        assert_eq!(jobs[2].receive_count, 1);
+
+        let direct = serde_json::json!({"entityId": "bafkrc0002"});
+        assert_eq!(jobs_from_event(&direct).unwrap()[0].receive_count, 1);
     }
 
     #[test]
