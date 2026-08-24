@@ -209,13 +209,18 @@ fn upload_scene_sources(
 #[cfg(test)]
 mod tests {
     use super::valid_key_component;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
 
-    #[test]
-    fn failure_manifest_json_is_pinned() {
-        let cfg = crate::config::Config {
-            platforms: vec!["windows".to_string()],
+    fn cfg(tag: &str) -> crate::config::Config {
+        crate::config::Config {
+            platforms: vec!["windows".to_string(), "mac".to_string()],
             version: "v49".to_string(),
-            cache_dir: String::new(),
+            cache_dir: std::env::temp_dir()
+                .join(format!("abgen-output-test-{tag}-{}", std::process::id()))
+                .to_string_lossy()
+                .into_owned(),
             default_content_server: String::new(),
             out_root: std::path::PathBuf::new(),
             keep_output: false,
@@ -223,7 +228,110 @@ mod tests {
             http_secret: None,
             lods_enabled: false,
             max_receive_count: 3,
-        };
+        }
+    }
+
+    /// Trimmed copy of `abgen::live::stub::serve` (that one is `cfg(test)`
+    /// and invisible to this crate).
+    fn serve(routes: Vec<(String, u16, Vec<u8>)>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut stream) = conn else { break };
+                let Ok(clone) = stream.try_clone() else {
+                    continue;
+                };
+                let mut reader = BufReader::new(clone);
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let mut parts = line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+                let mut content_len = 0usize;
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).is_err() {
+                        break;
+                    }
+                    let ht = h.trim();
+                    if ht.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = ht.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                if content_len > 0 {
+                    let mut body = vec![0u8; content_len];
+                    let _ = reader.read_exact(&mut body);
+                }
+                seen2.lock().unwrap().push(format!("{method} {path}"));
+                let (code, body) = routes
+                    .iter()
+                    .find(|(p, _, _)| path == *p)
+                    .map(|(_, c, b)| (*c, b.clone()))
+                    .unwrap_or((404, Vec::new()));
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {code} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        (format!("127.0.0.1:{}", addr.port()), seen)
+    }
+
+    #[test]
+    fn tombstones_only_unconverted_platforms() {
+        let good = serde_json::json!({
+            "version": "v49", "files": ["x", "dcl"], "exitCode": 0,
+            "contentServerUrl": "cs", "date": "d"
+        })
+        .to_string()
+        .into_bytes();
+        // The mac route serves an unparseable (empty) manifest on GET, so the
+        // platform reads as unconverted; the same route accepts the PUT.
+        let (host, seen) = serve(vec![
+            ("/manifest/bafkpart_windows.json".to_string(), 200, good),
+            ("/manifest/bafkpart_mac.json".to_string(), 200, Vec::new()),
+        ]);
+        std::env::set_var("ABGEN_S3_ENDPOINT", format!("http://{host}"));
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIATEST");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+
+        let cfg = cfg("tombstone-partial");
+        let proxy = crate::convert::make_proxy(&cfg, "http://127.0.0.1:9");
+        let tombstoned = super::publish_failure_tombstones(
+            &cfg,
+            &proxy,
+            "bafkpart",
+            "https://peer.decentraland.org/content",
+        )
+        .unwrap();
+        assert_eq!(tombstoned, vec!["mac".to_string()]);
+
+        let log = seen.lock().unwrap().clone();
+        assert!(
+            log.contains(&"PUT /manifest/bafkpart_mac.json".to_string()),
+            "{log:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|l| l == "PUT /manifest/bafkpart_windows.json"),
+            "{log:?}"
+        );
+    }
+
+    #[test]
+    fn failure_manifest_json_is_pinned() {
+        let cfg = cfg("pinned");
         let bytes =
             super::failure_manifest(&cfg, "https://peer.decentraland.org/content", "2026-08-24");
         assert_eq!(

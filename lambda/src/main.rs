@@ -246,6 +246,7 @@ pub(crate) fn job_outcome(summary: &Result<serde_json::Value>) -> &'static str {
     match summary {
         Err(_) => "error",
         Ok(v) if v.get("skipped").is_some() => "skipped",
+        Ok(v) if v.get("tombstoned").is_some() => "tombstoned",
         Ok(v) if v.get("exitCode").and_then(serde_json::Value::as_i64) != Some(0) => "failed",
         Ok(_) => "converted",
     }
@@ -386,6 +387,36 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
     }))
 }
 
+/// Converted platforms re-notify 13: if notify itself was the repeated
+/// failure, this pass is the registry's last chance to hear about them.
+fn tombstone_statuses<'a>(
+    platforms: &'a [String],
+    tombstoned: &'a [String],
+) -> Vec<notify::Finished<'a>> {
+    platforms
+        .iter()
+        .map(|p| notify::Finished {
+            platform: p,
+            status_code: if tombstoned.contains(p) {
+                notify::STATUS_UNEXPECTED_ERROR
+            } else {
+                notify::STATUS_ALREADY_CONVERTED
+            },
+        })
+        .collect()
+}
+
+/// Never embed an event-supplied URL that failed validation — it may be
+/// exactly what the job failed on.
+fn tombstone_content_server<'a>(cfg: &'a config::Config, job: &'a event::Job) -> &'a str {
+    job.content_server_url
+        .as_deref()
+        .filter(|cs| {
+            event::validate_content_server(cs, cfg.allowed_content_server_hosts.as_deref()).is_ok()
+        })
+        .unwrap_or(&cfg.default_content_server)
+}
+
 /// Last SQS delivery before the DLQ: publish an `exitCode: 5` tombstone per
 /// unconverted platform, notify, ack — prod publishes manifest+event on every
 /// terminal outcome. Errors return the *original* failure, so a tombstone
@@ -399,14 +430,8 @@ fn tombstone_final_failure(
         "final attempt ({}/{}) failed for {}: {err:#} — publishing failure tombstone",
         job.receive_count, cfg.max_receive_count, job.entity_id
     );
-    // Never embed an event-supplied URL that failed validation.
-    let content_server = job
-        .content_server_url
-        .as_deref()
-        .filter(|cs| {
-            event::validate_content_server(cs, cfg.allowed_content_server_hosts.as_deref()).is_ok()
-        })
-        .unwrap_or(&cfg.default_content_server);
+    let content_server = tombstone_content_server(cfg, job);
+    // catalyst_url goes unused here — this path only writes to space.
     let proxy = convert::make_proxy(cfg, content_server);
     if !proxy.space_configured() {
         return Err(err.context("no space configured — cannot publish a failure tombstone"));
@@ -416,20 +441,7 @@ fn tombstone_final_failure(
             Ok(t) => t,
             Err(e) => return Err(err.context(format!("{e:#}"))),
         };
-    // Converted platforms re-notify 13: if notify itself was the repeated
-    // failure, this pass is the registry's last chance to hear about them.
-    let finished: Vec<notify::Finished> = cfg
-        .platforms
-        .iter()
-        .map(|p| notify::Finished {
-            platform: p,
-            status_code: if tombstoned.contains(p) {
-                notify::STATUS_UNEXPECTED_ERROR
-            } else {
-                notify::STATUS_ALREADY_CONVERTED
-            },
-        })
-        .collect();
+    let finished = tombstone_statuses(&cfg.platforms, &tombstoned);
     let notified =
         match notify::send_finished(cfg, &job.entity_id, content_server, false, &finished) {
             Ok(n) => n,
@@ -761,6 +773,47 @@ mod tests {
         assert_eq!(job_outcome(&Ok(json!({"exitCode": 1}))), "failed");
         assert_eq!(job_outcome(&Ok(json!({"exitCode": 0}))), "converted");
         assert_eq!(job_outcome(&Ok(json!({"entityId": "e"}))), "failed");
+        assert_eq!(
+            job_outcome(&Ok(json!({"exitCode": 5, "tombstoned": ["mac"]}))),
+            "tombstoned"
+        );
+    }
+
+    #[test]
+    fn tombstone_statuses_map_5_for_failed_and_13_for_converted() {
+        let platforms = vec!["windows".to_string(), "mac".to_string()];
+        let tombstoned = vec!["mac".to_string()];
+        let finished = tombstone_statuses(&platforms, &tombstoned);
+        assert_eq!(finished.len(), 2);
+        assert_eq!(finished[0].platform, "windows");
+        assert_eq!(finished[0].status_code, notify::STATUS_ALREADY_CONVERTED);
+        assert_eq!(finished[1].platform, "mac");
+        assert_eq!(finished[1].status_code, notify::STATUS_UNEXPECTED_ERROR);
+    }
+
+    #[test]
+    fn tombstone_never_embeds_an_invalid_content_server() {
+        let mut cfg = test_cfg();
+        cfg.allowed_content_server_hosts = Some(vec!["peer.decentraland.org".to_string()]);
+        let job = |url: Option<&str>| event::Job {
+            entity_id: "bafkurl001".to_string(),
+            content_server_url: url.map(str::to_string),
+            is_lods: false,
+            force: false,
+            receive_count: 3,
+        };
+        let ok = "https://peer.decentraland.org/content";
+        assert_eq!(tombstone_content_server(&cfg, &job(Some(ok))), ok);
+        for bad in ["http://10.0.3.7:8500", "https://evil.example.com"] {
+            assert_eq!(
+                tombstone_content_server(&cfg, &job(Some(bad))),
+                cfg.default_content_server
+            );
+        }
+        assert_eq!(
+            tombstone_content_server(&cfg, &job(None)),
+            cfg.default_content_server
+        );
     }
 
     /// A record whose body fails to parse must still hit the per-job metrics

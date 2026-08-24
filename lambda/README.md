@@ -194,7 +194,7 @@ beyond `serde_json`. `AWS_LAMBDA_FUNCTION_NAME` (set by Lambda) becomes a
 | metric | dimensions | from |
 |--------|------------|------|
 | `abgen_lambda_invocations_total`, `abgen_lambda_invocation_duration_seconds` | `result` | runtime loop |
-| `abgen_lambda_jobs_total`, `abgen_lambda_job_duration_seconds` | `outcome` (`converted`/`skipped`/`failed`/`error`) | handler |
+| `abgen_lambda_jobs_total`, `abgen_lambda_job_duration_seconds` | `outcome` (`converted`/`skipped`/`failed`/`tombstoned`/`error`) | handler |
 | `abgen_lambda_convert_duration_seconds` | `platform` | per-platform build |
 | `abgen_lambda_bundles_total` | `platform` | manifest entries written |
 | `abgen_lambda_texencode_cache_total` | `outcome` (`hit`/`miss`) | dual-emit texture cache |

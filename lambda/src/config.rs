@@ -53,11 +53,22 @@ impl Config {
                 .ok()
                 .filter(|v| !v.is_empty()),
             lods_enabled: abgen::clihelp::env_bool("ENABLE_LODS", false),
-            max_receive_count: std::env::var("ABGEN_MAX_RECEIVE_COUNT")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .filter(|&n| n > 0)
-                .unwrap_or(3),
+            max_receive_count: max_receive_count_from_env(),
         }
     }
+}
+
+fn max_receive_count_from_env() -> u32 {
+    let n = std::env::var("ABGEN_MAX_RECEIVE_COUNT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(3);
+    if n == 1 {
+        eprintln!(
+            "config: ABGEN_MAX_RECEIVE_COUNT=1 — every first failure tombstones \
+             immediately, no SQS retries (misconfiguration?)"
+        );
+    }
+    n
 }
