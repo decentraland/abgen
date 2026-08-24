@@ -306,6 +306,13 @@ pub const GLB_DEP_EXTENSIONS: [&str; 11] = [
     ".bin", ".jpg", ".png", ".jpeg", ".tga", ".gif", ".bmp", ".psd", ".tiff", ".iff", ".ktx",
 ];
 
+fn short_digest(payload: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
+}
+
 pub fn compute_deps_digest(deps: &[(String, String)]) -> String {
     let mut ordered: Vec<&(String, String)> = deps
         .iter()
@@ -318,14 +325,42 @@ pub fn compute_deps_digest(deps: &[(String, String)]) -> String {
         .collect();
 
     let json = serde_json::to_string(&payload).expect("serialize deps");
-    let mut hasher = Sha256::new();
-    hasher.update(json.as_bytes());
-    let digest = hasher.finalize();
-    let hex = digest
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    hex[..32].to_string()
+    short_digest(json.as_bytes())
+}
+
+/// Extension a standalone image bundle bakes into its asset key: the
+/// source file's extension, case preserved, when it names a deployable
+/// image type — mirrors the builder's key derivation without needing the
+/// image bytes.
+pub fn image_key_extension(file: &str) -> String {
+    let last_seg = file.rsplit(['/', '\\']).next().unwrap_or(file);
+    if let Some(dot) = last_seg.rfind('.') {
+        let ext = &last_seg[dot..];
+        if matches!(
+            ext.to_ascii_lowercase().as_str(),
+            ".png" | ".jpg" | ".jpeg" | ".psd"
+        ) {
+            return ext.to_string();
+        }
+    }
+    String::new()
+}
+
+/// Digest over every build-affecting input of a standalone image bundle
+/// beyond its content hash and the platform suffix: `model_referenced`,
+/// the `linear` color-space classification, the `normal`-map
+/// classification, and the asset-key extension
+/// ([`image_key_extension`]). Process-wide toggles are excluded — they
+/// are fixed per bundle version, which already prefixes every space key.
+pub fn image_class_digest(
+    model_referenced: bool,
+    linear: bool,
+    normal: bool,
+    key_ext: &str,
+) -> String {
+    let json = serde_json::to_string(&(model_referenced, linear, normal, key_ext))
+        .expect("serialize image class");
+    short_digest(json.as_bytes())
 }
 
 /// Marker for a GLB dependency that is absent from the entity's deployed
@@ -495,6 +530,39 @@ mod tests {
             compute_deps_digest(&[("only.ktx2".to_string(), "hashY".to_string())]),
             compute_deps_digest(&[])
         );
+    }
+
+    #[test]
+    fn image_class_digest_folds_each_input() {
+        let base = image_class_digest(false, false, false, ".png");
+        assert_eq!(base, "f698278562d3edf9245f7b57f39575b0");
+        assert_eq!(base, image_class_digest(false, false, false, ".png"));
+        let variants = [
+            base.clone(),
+            image_class_digest(true, false, false, ".png"),
+            image_class_digest(false, true, false, ".png"),
+            image_class_digest(false, false, true, ".png"),
+            image_class_digest(false, false, false, ".jpg"),
+            image_class_digest(false, false, false, ".PNG"),
+        ];
+        for (i, a) in variants.iter().enumerate() {
+            assert_eq!(a.len(), 32);
+            assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
+            for b in variants.iter().skip(i + 1) {
+                assert_ne!(a, b);
+            }
+        }
+        assert!(bundle_name_has_digest(&format!("Qmhash_{base}_windows")));
+    }
+
+    #[test]
+    fn image_key_extension_matches_builder_key_derivation() {
+        assert_eq!(image_key_extension("tex/a.png"), ".png");
+        assert_eq!(image_key_extension("A.PNG"), ".PNG");
+        assert_eq!(image_key_extension("dir\\b.Jpeg"), ".Jpeg");
+        assert_eq!(image_key_extension("a.b.jpg"), ".jpg");
+        assert_eq!(image_key_extension("noext"), "");
+        assert_eq!(image_key_extension("a.tga"), "");
     }
 
     #[test]

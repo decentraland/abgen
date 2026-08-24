@@ -228,13 +228,12 @@ pub(crate) struct EntityCtx {
     /// skips these (no manifest entry, exit 0), so they must not count as
     /// conversion failures (#59).
     undeployed_dep_glbs: std::collections::HashSet<String>,
-    /// Background image-prefetch workers spawned by [`Proxy::entity_ctx`].
-    /// Nothing on the correctness path ever joins these — every later
-    /// texture consumer goes through `ensure_content`'s keyed lock and
-    /// picks up whatever a worker already fetched or fetches it itself —
-    /// this is purely so tests (and `--once` callers) can wait for a
-    /// deterministic point.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Background image-prefetch workers, spawned once probe results say
+    /// which images will actually be built. Nothing on the correctness
+    /// path ever joins these — every later texture consumer goes through
+    /// `ensure_content`'s keyed lock and picks up whatever a worker
+    /// already fetched or fetches it itself — this is purely so tests
+    /// (and `--once` callers) can wait for a deterministic point.
     prefetch_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
@@ -244,6 +243,15 @@ impl EntityCtx {
         for h in self.prefetch_handles.lock().unwrap().drain(..) {
             let _ = h.join();
         }
+    }
+
+    fn image_digest(&self, hash: &str, file: &str) -> String {
+        naming::image_class_digest(
+            self.scan.model_refs.contains(hash),
+            self.scan.linear_refs.contains(hash),
+            self.scan.normal_refs.contains(hash),
+            &naming::image_key_extension(file),
+        )
     }
 }
 
@@ -393,13 +401,14 @@ impl Proxy {
         self.self_weak.upgrade()
     }
 
-    /// Kicks off background prefetch of `items` (standalone/referenced
-    /// image content) and returns immediately; nothing on the correctness
-    /// path waits on the returned handles — every later texture consumer
-    /// (`resolve_fn`, `image_decode_ok`, the top-level `build` item) goes
-    /// through `ensure_content`'s keyed lock, so it either finds the bytes
-    /// a worker already landed or fetches them itself. Handles exist only
-    /// so tests / `--once` callers can join for a deterministic point.
+    /// Kicks off background prefetch of `items` (image content that probe
+    /// results say will be built) and returns immediately; nothing on the
+    /// correctness path waits on the returned handles — every later
+    /// texture consumer (`resolve_fn`, `image_decode_ok`, the top-level
+    /// `build` item) goes through `ensure_content`'s keyed lock, so it
+    /// either finds the bytes a worker already landed or fetches them
+    /// itself. Handles exist only so tests / `--once` callers can join
+    /// for a deterministic point.
     fn spawn_image_prefetch(
         &self,
         cid: &str,
@@ -469,7 +478,7 @@ impl Proxy {
 
         let dl_started = std::time::Instant::now();
         let mut to_fetch: Vec<(&str, &str)> = Vec::new();
-        let mut image_items: Vec<(String, String)> = Vec::new();
+        let mut img_files = 0usize;
         let mut seen_hashes = std::collections::HashSet::new();
         for c in &scene.content {
             let (is_glb, is_image) = is_convertible(&c.file);
@@ -479,7 +488,7 @@ impl Proxy {
             if is_glb {
                 to_fetch.push((c.hash.as_str(), c.file.as_str()));
             } else if is_image {
-                image_items.push((c.hash.clone(), c.file.clone()));
+                img_files += 1;
             }
         }
         let dl_files = to_fetch.len();
@@ -499,11 +508,9 @@ impl Proxy {
             }
         });
 
-        let img_files = image_items.len();
-        let prefetch_handles = self.spawn_image_prefetch(cid, image_items);
         eprintln!(
             "download: {cid}: {dl_files} glb(s) in {:.1}s ({workers} worker(s)); \
-             {img_files} image(s) prefetching in background",
+             {img_files} image(s) deferred until probe results",
             dl_started.elapsed().as_secs_f64()
         );
 
@@ -541,7 +548,7 @@ impl Proxy {
             scan,
             deps_digests,
             undeployed_dep_glbs,
-            prefetch_handles: Mutex::new(prefetch_handles),
+            prefetch_handles: Mutex::new(Vec::new()),
         });
         let mut g = self.entities.lock().unwrap();
         bounded_reserve(&mut g, self.entity_cap, cid);
@@ -646,19 +653,23 @@ impl Proxy {
             bail!("content {file} (hash {hash}) is not a convertible glb/image");
         }
         if let Some(req_digest) = req_digest {
-            if !is_glb {
-                bail!(
-                    "bundle name {bundle_name:?} carries a deps digest but {file} is not glb/gltf"
-                );
-            }
-            match ctx.deps_digests.get(hash) {
-                Some(d) if d == req_digest => {}
-                Some(d) => bail!(
-                    "deps digest mismatch for {file} (hash {hash}): requested {req_digest}, computed {d}"
-                ),
-                None => bail!(
-                    "deps digest unavailable for {file} (hash {hash}): dependency resolution failed at entity scan"
-                ),
+            if is_glb {
+                match ctx.deps_digests.get(hash) {
+                    Some(d) if d == req_digest => {}
+                    Some(d) => bail!(
+                        "deps digest mismatch for {file} (hash {hash}): requested {req_digest}, computed {d}"
+                    ),
+                    None => bail!(
+                        "deps digest unavailable for {file} (hash {hash}): dependency resolution failed at entity scan"
+                    ),
+                }
+            } else {
+                let d = ctx.image_digest(hash, &file);
+                if d != req_digest {
+                    bail!(
+                        "image class digest mismatch for {file} (hash {hash}): requested {req_digest}, computed {d}"
+                    );
+                }
             }
         }
 
@@ -1040,8 +1051,13 @@ impl Proxy {
                 c.hash.clone()
             };
             let bare_name = format!("{case_hash}_{platform}");
-            let digest_naming = self.deps_digest && is_glb && ctx.scene.entity_type == "scene";
-            let bundle_name = if digest_naming {
+            let digest_naming = self.deps_digest && ctx.scene.entity_type == "scene";
+            let bundle_name = if digest_naming && is_image {
+                format!(
+                    "{case_hash}_{}_{platform}",
+                    ctx.image_digest(&c.hash, &c.file)
+                )
+            } else if digest_naming && is_glb {
                 match ctx.deps_digests.get(&c.hash) {
                     Some(d) => format!("{case_hash}_{d}_{platform}"),
                     None if ctx.undeployed_dep_glbs.contains(&c.hash) => {
@@ -1120,6 +1136,15 @@ impl Proxy {
                 is_image: cand.is_image,
             });
         }
+        let miss_images: Vec<(String, String)> = work
+            .iter()
+            .filter(|it| it.is_image)
+            .map(|it| (it.hash.clone(), it.file.clone()))
+            .collect();
+        ctx.prefetch_handles
+            .lock()
+            .unwrap()
+            .extend(self.spawn_image_prefetch(cid, miss_images));
         let jobs = corpus_file_jobs().min(work.len().max(1));
         let built_m: Mutex<Vec<(usize, String)>> = Mutex::new(prebuilt);
         let failed_m: Mutex<Vec<String>> = Mutex::new(failed);
@@ -1134,16 +1159,28 @@ impl Proxy {
         let shared_placement = ctx.scene.entity_type == "scene";
         let run_item = |it: &WorkItem| -> Result<()> {
             self.progress_update(cid, done.load(Ordering::Relaxed), total, &it.file);
-            let stored_name = naming::fs_safe_component(&it.bundle_name);
+            let decode_ok = !it.is_image || self.image_decode_ok(&it.hash);
+            let name = if decode_ok {
+                &it.bundle_name
+            } else {
+                &it.bare_name
+            };
+            let stored_name = naming::fs_safe_component(name);
+            if *stored_name != *name {
+                collapsed_m
+                    .lock()
+                    .unwrap()
+                    .insert(stored_name.to_string(), it.hash.to_lowercase());
+            }
             let dst = pdir.join(&*stored_name);
             let existed = dst.is_file();
-            match self.bundle(cid, &it.bundle_name) {
+            match self.bundle(cid, name) {
                 Ok(bytes) => {
                     let tmp = crate::tmppath::tmp_sibling(&dst);
                     std::fs::write(&tmp, &bytes)
                         .with_context(|| format!("write {}", tmp.display()))?;
                     std::fs::rename(&tmp, &dst).ok();
-                    if it.bundle_name != it.bare_name {
+                    if *name != it.bare_name {
                         let stored_alias = naming::fs_safe_component(&it.bare_name);
                         if *stored_alias != it.bare_name {
                             collapsed_m
@@ -1160,27 +1197,19 @@ impl Proxy {
                         match &upload_pool {
                             Some(pool) => {
                                 let key = if shared_placement {
-                                    Self::asset_bundle_key(&self.version, &it.bundle_name)
+                                    Self::asset_bundle_key(&self.version, name)
                                 } else {
-                                    Self::bundle_key(&self.version, cid, &it.bundle_name)
+                                    Self::bundle_key(&self.version, cid, name)
                                 };
                                 pool.enqueue(key, dst.clone());
                             }
                             None => {
-                                self.space_put_bundle(
-                                    cid,
-                                    &it.bundle_name,
-                                    shared_placement,
-                                    &bytes,
-                                );
+                                self.space_put_bundle(cid, name, shared_placement, &bytes);
                             }
                         }
                     }
-                    built_m
-                        .lock()
-                        .unwrap()
-                        .push((it.order, it.bundle_name.clone()));
-                    if it.is_image && !self.image_decode_ok(&it.hash) {
+                    built_m.lock().unwrap().push((it.order, name.clone()));
+                    if !decode_ok {
                         tracing::warn!(
                             entity = %cid,
                             file = %it.file,
@@ -1193,12 +1222,12 @@ impl Proxy {
                 Err(e) => {
                     tracing::error!(
                         entity = %cid,
-                        bundle = %it.bundle_name,
+                        bundle = %name,
                         file = %it.file,
                         error = %format!("{e:#}"),
                         "jit build failed — omitted from manifest, exitCode will be non-zero"
                     );
-                    failed_m.lock().unwrap().push(it.bundle_name.clone());
+                    failed_m.lock().unwrap().push(name.clone());
                 }
             }
             let d = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1484,7 +1513,8 @@ pub struct ProxyConfig {
     pub fallback_version: String,
     pub use_space: bool,
 
-    /// Digest names for scene glbs + pre-build reuse probe; naming only, never placement.
+    /// Digest names for scene glbs and standalone images + pre-build reuse
+    /// probe; naming only, never placement.
     pub deps_digest: bool,
 
     pub template_root: Option<String>,
@@ -1651,6 +1681,8 @@ pub mod stub {
         super::Proxy::new_with_space(cfg, Some(Arc::new(space)))
     }
 
+    pub type Store = Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>;
+
     pub fn serve(routes: Routes) -> (String, Arc<Mutex<Vec<String>>>) {
         serve_with_delay(routes, None)
     }
@@ -1659,10 +1691,29 @@ pub mod stub {
         routes: Routes,
         delay: Option<(String, std::time::Duration)>,
     ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let (host, seen, _) = serve_inner(routes, delay, None);
+        (host, seen)
+    }
+
+    /// Stateful space stub: `PUT` stores the body under its path; `HEAD`/`GET`
+    /// answer 200 for stored paths (falling back to `routes`), so redeploy
+    /// probe/reuse round-trips can be simulated against one shared space.
+    pub fn serve_store(routes: Routes) -> (String, Arc<Mutex<Vec<String>>>, Store) {
+        let store: Store = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (host, seen, _) = serve_inner(routes, None, Some(store.clone()));
+        (host, seen, store)
+    }
+
+    fn serve_inner(
+        routes: Routes,
+        delay: Option<(String, std::time::Duration)>,
+        store: Option<Store>,
+    ) -> (String, Arc<Mutex<Vec<String>>>, Option<Store>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let seen2 = seen.clone();
+        let store2 = store.clone();
         std::thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(mut stream) = conn else { break };
@@ -1691,9 +1742,10 @@ pub mod stub {
                         content_len = v.trim().parse().unwrap_or(0);
                     }
                 }
+                let mut req_body = Vec::new();
                 if content_len > 0 {
-                    let mut body = vec![0u8; content_len];
-                    let _ = reader.read_exact(&mut body);
+                    req_body = vec![0u8; content_len];
+                    let _ = reader.read_exact(&mut req_body);
                 }
                 seen2.lock().unwrap().push(format!("{method} {path}"));
                 if let Some((dp, d)) = &delay {
@@ -1701,11 +1753,30 @@ pub mod stub {
                         std::thread::sleep(*d);
                     }
                 }
-                let (code, body) = routes
-                    .iter()
-                    .find(|(p, _, _)| path == *p)
-                    .map(|(_, c, b)| (*c, b.clone()))
-                    .unwrap_or((404, Vec::new()));
+                let stored = store2.as_ref().and_then(|s| {
+                    if method == "PUT" {
+                        s.lock().unwrap().insert(path.clone(), req_body.clone());
+                        Some((200u16, Vec::new()))
+                    } else {
+                        s.lock().unwrap().get(&path).map(|b| {
+                            (
+                                200u16,
+                                if method == "HEAD" {
+                                    Vec::new()
+                                } else {
+                                    b.clone()
+                                },
+                            )
+                        })
+                    }
+                });
+                let (code, body) = stored.unwrap_or_else(|| {
+                    routes
+                        .iter()
+                        .find(|(p, _, _)| path == *p)
+                        .map(|(_, c, b)| (*c, b.clone()))
+                        .unwrap_or((404, Vec::new()))
+                });
                 let reason = match code {
                     200 => "OK",
                     404 => "Not Found",
@@ -1720,7 +1791,7 @@ pub mod stub {
                 let _ = stream.flush();
             }
         });
-        (format!("127.0.0.1:{}", addr.port()), seen)
+        (format!("127.0.0.1:{}", addr.port()), seen, store)
     }
 }
 
@@ -2283,6 +2354,13 @@ mod tests {
         });
 
         let ctx = proxy.entity_ctx("bafkprefetch").unwrap();
+        ctx.prefetch_handles
+            .lock()
+            .unwrap()
+            .extend(proxy.spawn_image_prefetch(
+                "bafkprefetch",
+                vec![("qmtexslow".to_string(), "tex.png".to_string())],
+            ));
         std::thread::sleep(std::time::Duration::from_millis(30));
 
         let started = std::time::Instant::now();
@@ -2503,6 +2581,215 @@ mod tests {
         assert!(!seen3.lock().unwrap().iter().any(|p| p.contains("b64-")));
 
         let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        let mut png = Vec::new();
+        image::RgbaImage::new(1, 1)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        png
+    }
+
+    fn fresh_cache(tag: &str) -> PathBuf {
+        let dir = temp_cache(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn redeploy_probe_skips_standalone_images_with_manifest_parity() {
+        let entity = |id: &str| {
+            serde_json::json!({
+                "id": id,
+                "type": "scene",
+                "content": [
+                    {"file": "tex/good.png", "hash": "qmgoodimg"},
+                    {"file": "tex/bad.png", "hash": "qmbadimg"},
+                ]
+            })
+        };
+        let (cat_host, cat_seen) = super::stub::serve(vec![
+            (
+                "/contents/bafkredeploya".to_string(),
+                200,
+                serde_json::to_vec(&entity("bafkredeploya")).unwrap(),
+            ),
+            (
+                "/contents/bafkredeployb".to_string(),
+                200,
+                serde_json::to_vec(&entity("bafkredeployb")).unwrap(),
+            ),
+            ("/contents/qmgoodimg".to_string(), 200, tiny_png()),
+            (
+                "/contents/qmbadimg".to_string(),
+                200,
+                b"not an image".to_vec(),
+            ),
+        ]);
+        let (space_host, space_seen, store) = super::stub::serve_store(vec![]);
+
+        let digest = naming::image_class_digest(false, false, false, ".png");
+        let good_name = format!("qmgoodimg_{digest}_windows");
+
+        let dir_a = fresh_cache("redeploy-a");
+        let out_a = dir_a.join("corpus");
+        let proxy_a = super::stub::stub_proxy_at_reuse(
+            &space_host,
+            &format!("http://{cat_host}"),
+            false,
+            &dir_a,
+            true,
+        );
+        let built_a = proxy_a
+            .build_entity_into_corpus(&out_a, "bafkredeploya", "windows", "http://cs")
+            .unwrap();
+        assert_eq!(
+            built_a,
+            vec![good_name.clone(), "qmbadimg_windows".to_string()]
+        );
+        {
+            let s = store.lock().unwrap();
+            assert!(s.contains_key(&format!("/v41/assets/{good_name}")));
+            assert!(s.contains_key("/v41/assets/qmbadimg_windows"));
+        }
+        let manifest_a =
+            std::fs::read(out_a.join("bafkredeploya").join("windows.manifest.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&manifest_a).unwrap();
+        assert_eq!(parsed["exitCode"], 12);
+
+        let dir_b = fresh_cache("redeploy-b");
+        let out_b = dir_b.join("corpus");
+        let proxy_b = super::stub::stub_proxy_at_reuse(
+            &space_host,
+            &format!("http://{cat_host}"),
+            false,
+            &dir_b,
+            true,
+        );
+        let built_b = proxy_b
+            .build_entity_into_corpus(&out_b, "bafkredeployb", "windows", "http://cs")
+            .unwrap();
+        assert_eq!(built_b, built_a);
+        let manifest_b =
+            std::fs::read(out_b.join("bafkredeployb").join("windows.manifest.json")).unwrap();
+        assert_eq!(manifest_a, manifest_b);
+
+        let count = |log: &Arc<Mutex<Vec<String>>>, line: &str| {
+            log.lock().unwrap().iter().filter(|l| *l == line).count()
+        };
+        assert_eq!(
+            count(&cat_seen, "GET /contents/qmgoodimg"),
+            1,
+            "probe-hit image must not re-download on redeploy"
+        );
+        assert_eq!(
+            count(&cat_seen, "GET /contents/qmbadimg"),
+            2,
+            "non-decodable image keeps its bare name and rebuilds every pass"
+        );
+        assert_eq!(
+            count(&space_seen, &format!("PUT /v41/assets/{good_name}")),
+            1,
+            "probe-hit image must not re-upload"
+        );
+        assert_eq!(
+            count(&space_seen, &format!("HEAD /v41/assets/{good_name}")),
+            2
+        );
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn cross_entity_image_classifications_get_distinct_space_names() {
+        let gltf = b"{\"asset\":{\"version\":\"2.0\"},\"images\":[{\"uri\":\"tex.png\"}]}".to_vec();
+        let entity_c = serde_json::json!({
+            "id": "bafkclassc",
+            "type": "scene",
+            "content": [
+                {"file": "m.gltf", "hash": "qmgltfc"},
+                {"file": "tex.png", "hash": "qmsharedimg"},
+            ]
+        });
+        let entity_d = serde_json::json!({
+            "id": "bafkclassd",
+            "type": "scene",
+            "content": [
+                {"file": "tex.png", "hash": "qmsharedimg"},
+            ]
+        });
+        let (cat_host, cat_seen) = super::stub::serve(vec![
+            (
+                "/contents/bafkclassc".to_string(),
+                200,
+                serde_json::to_vec(&entity_c).unwrap(),
+            ),
+            (
+                "/contents/bafkclassd".to_string(),
+                200,
+                serde_json::to_vec(&entity_d).unwrap(),
+            ),
+            ("/contents/qmgltfc".to_string(), 200, gltf),
+            ("/contents/qmsharedimg".to_string(), 200, tiny_png()),
+        ]);
+        let (space_host, _space_seen, store) = super::stub::serve_store(vec![]);
+
+        let d_c = naming::image_class_digest(true, false, false, ".png");
+        let d_d = naming::image_class_digest(false, false, false, ".png");
+        assert_ne!(d_c, d_d);
+        let key_c = format!("/v41/assets/qmsharedimg_{d_c}_windows");
+        let key_d = format!("/v41/assets/qmsharedimg_{d_d}_windows");
+
+        let dir_c = fresh_cache("class-c");
+        let proxy_c = super::stub::stub_proxy_at_reuse(
+            &space_host,
+            &format!("http://{cat_host}"),
+            false,
+            &dir_c,
+            true,
+        );
+        let built_c = proxy_c
+            .build_entity_into_corpus(&dir_c.join("corpus"), "bafkclassc", "windows", "http://cs")
+            .unwrap();
+        assert!(built_c.contains(&format!("qmsharedimg_{d_c}_windows")));
+        assert!(store.lock().unwrap().contains_key(&key_c));
+
+        let dir_d = fresh_cache("class-d");
+        let proxy_d = super::stub::stub_proxy_at_reuse(
+            &space_host,
+            &format!("http://{cat_host}"),
+            false,
+            &dir_d,
+            true,
+        );
+        let built_d = proxy_d
+            .build_entity_into_corpus(&dir_d.join("corpus"), "bafkclassd", "windows", "http://cs")
+            .unwrap();
+        assert_eq!(built_d, vec![format!("qmsharedimg_{d_d}_windows")]);
+
+        let s = store.lock().unwrap();
+        assert!(s.contains_key(&key_d));
+        assert_ne!(
+            s[&key_c], s[&key_d],
+            "each classification variant carries its own bytes"
+        );
+        drop(s);
+        let downloads = cat_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| *l == "GET /contents/qmsharedimg")
+            .count();
+        assert_eq!(
+            downloads, 2,
+            "no cross-contamination: each entity converts its own variant"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_d);
     }
 
     #[test]
