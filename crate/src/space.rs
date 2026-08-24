@@ -46,8 +46,12 @@ pub struct Space {
 pub(crate) fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
+        let per_host = crate::clihelp::default_network_concurrency();
         ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(60)))
+            .max_idle_connections_per_host(per_host)
+            .max_idle_connections(2 * per_host)
+            .max_idle_age(std::time::Duration::from_secs(60))
             .build()
             .into()
     })
@@ -505,6 +509,22 @@ impl Space {
         req.send(body)
             .map_err(|e| crate::anyhow!("space PUT {key}: {e}"))?;
         Ok(())
+    }
+
+    pub(crate) fn put_timed(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        let t = std::time::Instant::now();
+        let r = self.put(key, bytes);
+        let result = if r.is_ok() { "ok" } else { "error" };
+        metrics::histogram!("abgen_space_request_duration_seconds", "op" => "put", "result" => result)
+            .record(t.elapsed().as_secs_f64());
+        if r.is_ok() {
+            metrics::counter!("abgen_space_transfer_bytes_total", "direction" => "upload")
+                .increment(bytes.len() as u64);
+            metrics::histogram!("abgen_space_object_bytes").record(bytes.len() as f64);
+        } else {
+            metrics::counter!("abgen_space_errors_total", "op" => "put").increment(1);
+        }
+        r
     }
 }
 

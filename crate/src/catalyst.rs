@@ -133,9 +133,13 @@ pub struct CatalystClient {
 
 impl CatalystClient {
     pub fn new(base_url: &str) -> Self {
+        let per_host = crate::clihelp::default_network_concurrency();
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(HTTP_TIMEOUT_SECS)))
             .max_redirects(0)
+            .max_idle_connections_per_host(per_host)
+            .max_idle_connections(2 * per_host)
+            .max_idle_age(Duration::from_secs(60))
             .build()
             .into();
         CatalystClient {

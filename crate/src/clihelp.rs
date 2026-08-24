@@ -117,6 +117,20 @@ pub fn default_file_concurrency() -> usize {
     })
 }
 
+/// Default bounded concurrency for network-bound work (content fetch, S3
+/// probes): `(4 * cores).clamp(8, 32)`, uncoupled from the ~4 GiB/file RAM
+/// budget behind [`default_file_concurrency`]. `ABGEN_FETCH_CONCURRENCY` /
+/// `ABGEN_PROBE_CONCURRENCY` remain the per-call escape hatches.
+pub fn default_network_concurrency() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        (cores * 4).clamp(8, 32)
+    })
+}
+
 pub fn version_line(bin: &str) -> String {
     format!(
         "{bin} {} ({})",
@@ -191,6 +205,12 @@ mod tests {
     #[test]
     fn default_file_concurrency_is_at_least_one() {
         assert!(default_file_concurrency() >= 1);
+    }
+
+    #[test]
+    fn default_network_concurrency_is_clamped() {
+        let n = default_network_concurrency();
+        assert!((8..=32).contains(&n), "expected 8..=32, got {n}");
     }
 
     #[test]
