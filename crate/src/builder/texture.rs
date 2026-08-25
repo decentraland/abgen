@@ -569,8 +569,27 @@ impl<'a> Builder<'a> {
         if ext_hash.is_empty() {
             return None;
         }
-        let bundle_file =
-            crate::naming::canonical_filename(&ext_hash, ".png", self.target, None).ok()?;
+        // The external reference must be the exact name the image bundle is
+        // uploaded under. metadata_dependencies carries those names (digest
+        // or bare per the caller's rules); bare is only a fallback for refs
+        // outside the dependency list.
+        let target_suffix = format!("_{}", self.target);
+        let bundle_file = self
+            .metadata_dependencies
+            .iter()
+            .find(|d| {
+                d.strip_suffix(target_suffix.as_str())
+                    .map(|stem| {
+                        crate::naming::split_bundle_stem(stem)
+                            .0
+                            .eq_ignore_ascii_case(&ext_hash)
+                    })
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .or_else(|| {
+                crate::naming::canonical_filename(&ext_hash, ".png", self.target, None).ok()
+            })?;
         let file_id = match self.ext_bundle_fileid.get(&bundle_file) {
             Some(&f) => f,
             None => {
