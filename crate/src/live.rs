@@ -598,9 +598,11 @@ impl Proxy {
                     h.clone()
                 };
                 if digest_naming {
-                    let dep_entry = ctx.scene.content.iter().find(|c| {
-                        c.hash.eq_ignore_ascii_case(&h) && is_convertible(&c.file).1
-                    });
+                    let dep_entry = ctx
+                        .scene
+                        .content
+                        .iter()
+                        .find(|c| c.hash.eq_ignore_ascii_case(&h) && is_convertible(&c.file).1);
                     if let Some(c) = dep_entry {
                         let decodes = self
                             .decode_ok
@@ -2139,7 +2141,10 @@ mod tests {
         let deps = proxy.metadata_dep_names(&wctx, "models/a.gltf", "GHASH", "windows");
         assert_eq!(
             deps,
-            vec!["ThashONE_windows".to_string(), "ThashTWO_windows".to_string()]
+            vec![
+                "ThashONE_windows".to_string(),
+                "ThashTWO_windows".to_string()
+            ]
         );
 
         let _ = std::fs::remove_dir_all(&cache_dir);
