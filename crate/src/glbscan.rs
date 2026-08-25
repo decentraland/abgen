@@ -191,13 +191,14 @@ fn scan_one(
 }
 
 impl EntityScan {
-    pub fn metadata_deps(
+    /// Hashes only — bundle naming happens at the caller, which owns the
+    /// digest-naming rules the referenced bundles are uploaded under.
+    pub fn metadata_dep_hashes(
         &self,
         store: &LocalContentStore,
         glb_file: &str,
         glb_hash: &str,
         content_by_file: &HashMap<String, String>,
-        platform: &str,
     ) -> Vec<String> {
         let ext = file_ext_lower(glb_file);
         let uris: Arc<Vec<String>> = match self.uris.get(&(glb_hash.to_string(), ext.clone())) {
@@ -220,15 +221,33 @@ impl EntityScan {
                 Some(h) => h,
                 None => continue,
             };
-            let name = if platform == "mac" {
-                format!("{}_{platform}", h.to_lowercase())
-            } else {
-                format!("{h}_{platform}")
-            };
-            if seen.insert(name.clone()) {
-                out.push(name);
+            if seen.insert(h.clone()) {
+                out.push(h.clone());
             }
         }
         out
+    }
+
+    /// Bare `{hash}_{platform}` dependency names — only valid where the
+    /// referenced image bundles are also uploaded bare (the corpus tool's
+    /// naming; the live pipeline names deps through its digest rules).
+    pub fn metadata_dep_names_bare(
+        &self,
+        store: &LocalContentStore,
+        glb_file: &str,
+        glb_hash: &str,
+        content_by_file: &HashMap<String, String>,
+        platform: &str,
+    ) -> Vec<String> {
+        self.metadata_dep_hashes(store, glb_file, glb_hash, content_by_file)
+            .into_iter()
+            .map(|h| {
+                if platform == "mac" {
+                    format!("{}_{platform}", h.to_lowercase())
+                } else {
+                    format!("{h}_{platform}")
+                }
+            })
+            .collect()
     }
 }

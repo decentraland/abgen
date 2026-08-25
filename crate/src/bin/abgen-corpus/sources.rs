@@ -814,8 +814,13 @@ pub(crate) fn from_reference(
                     })
                     .or_else(|| inv.get(&cid).cloned())
                     .unwrap_or_else(|| format!("{cid}.glb"));
-                let m_deps =
-                    scan.metadata_deps(&store, &glb_file, &cid, &content_by_file, platform);
+                let m_deps = scan.metadata_dep_names_bare(
+                    &store,
+                    &glb_file,
+                    &cid,
+                    &content_by_file,
+                    platform,
+                );
                 let glb_file_l = glb_file.to_lowercase();
                 let is_image = IMAGE_EXTS.iter().any(|e| glb_file_l.ends_with(e));
                 let model_ref = is_image && model_refs.contains(&cid);
