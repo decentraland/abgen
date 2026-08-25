@@ -381,7 +381,7 @@ pub(crate) fn derive_one_entity(
             continue;
         }
         let m_deps = if is_glb {
-            scan.metadata_deps(store, &c.file, &c.hash, &content_by_file, platform)
+            scan.metadata_dep_names_bare(store, &c.file, &c.hash, &content_by_file, platform)
         } else {
             Vec::new()
         };

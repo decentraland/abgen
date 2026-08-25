@@ -572,6 +572,56 @@ impl Proxy {
         v
     }
 
+    /// Dependency names embedded in a GLB bundle's metadata.json. Each must be
+    /// the exact name the referenced image bundle is uploaded under (clients
+    /// download dependencies by these names verbatim), so this mirrors the
+    /// corpus naming rule: class-digest names for scene images under digest
+    /// naming, bare otherwise. A known-undecodable image falls back to its
+    /// bare name like the build path does; an image whose decode verdict is
+    /// not in yet is named optimistically — if it later fails to decode the
+    /// entity is already exit-12 territory.
+    fn metadata_dep_names(
+        &self,
+        ctx: &EntityCtx,
+        glb_file: &str,
+        glb_hash: &str,
+        platform: &str,
+    ) -> Vec<String> {
+        let digest_naming = self.deps_digest && ctx.scene.entity_type == "scene";
+        ctx.scan
+            .metadata_dep_hashes(&self.content, glb_file, glb_hash, &ctx.content_by_file)
+            .into_iter()
+            .map(|h| {
+                let case_hash = if platform == "mac" {
+                    h.to_lowercase()
+                } else {
+                    h.clone()
+                };
+                if digest_naming {
+                    let dep_entry = ctx.scene.content.iter().find(|c| {
+                        c.hash.eq_ignore_ascii_case(&h) && is_convertible(&c.file).1
+                    });
+                    if let Some(c) = dep_entry {
+                        let decodes = self
+                            .decode_ok
+                            .lock()
+                            .unwrap()
+                            .get(&h)
+                            .copied()
+                            .unwrap_or(true);
+                        if decodes {
+                            return format!(
+                                "{case_hash}_{}_{platform}",
+                                ctx.image_digest(&h, &c.file)
+                            );
+                        }
+                    }
+                }
+                format!("{case_hash}_{platform}")
+            })
+            .collect()
+    }
+
     fn bundle(&self, cid: &str, bundle_name: &str) -> Result<Vec<u8>> {
         let safe_cid = naming::fs_safe_component(cid);
         let entity_dir = self.bundle_dir.join(&*safe_cid);
@@ -683,8 +733,7 @@ impl Proxy {
         };
 
         let m_deps = if is_glb {
-            ctx.scan
-                .metadata_deps(&self.content, &file, hash, &ctx.content_by_file, platform)
+            self.metadata_dep_names(ctx, &file, hash, platform)
         } else {
             Vec::new()
         };
@@ -1985,6 +2034,115 @@ mod tests {
         let local = LocalContentStore::new(&local_dir);
         local.write("lateimg", b"still not an image").unwrap();
         assert!(!proxy.image_decode_ok("lateimg"));
+    }
+
+    #[test]
+    fn metadata_dep_names_match_uploaded_image_bundle_names() {
+        let cache_dir = temp_cache("metadata-dep-names");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let local_dir = cache_dir.join("src-local");
+        let local = LocalContentStore::new(&local_dir);
+
+        let gltf =
+            r#"{"asset":{"version":"2.0"},"images":[{"uri":"tex1.png"},{"uri":"Tex2.png"}]}"#;
+        local.write("GHASH", gltf.as_bytes()).unwrap();
+        let mut png = Vec::new();
+        image::RgbaImage::new(1, 1)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        local.write("ThashONE", &png).unwrap();
+        local.write("ThashTWO", &png).unwrap();
+
+        let content = vec![
+            crate::catalyst::ContentEntry {
+                file: "models/a.gltf".into(),
+                hash: "GHASH".into(),
+            },
+            crate::catalyst::ContentEntry {
+                file: "models/tex1.png".into(),
+                hash: "ThashONE".into(),
+            },
+            crate::catalyst::ContentEntry {
+                file: "models/Tex2.png".into(),
+                hash: "ThashTWO".into(),
+            },
+        ];
+        let content_by_file: HashMap<String, String> = content
+            .iter()
+            .map(|c| (c.file.to_lowercase(), c.hash.clone()))
+            .collect();
+
+        let make_ctx = |entity_type: &str| EntityCtx {
+            scene: Scene {
+                entity_id: "bafkentity".into(),
+                entity_type: entity_type.into(),
+                pointers: vec![],
+                content: content.clone(),
+                metadata: serde_json::Value::Null,
+            },
+            content_by_file: content_by_file.clone(),
+            scan: scan_entity(&local, &content_by_file, &UriCache::new()),
+            deps_digests: HashMap::new(),
+            undeployed_dep_glbs: std::collections::HashSet::new(),
+            prefetch_handles: Mutex::new(Vec::new()),
+        };
+
+        let proxy = Proxy::new(ProxyConfig {
+            catalyst_url: "http://127.0.0.1:9".to_string(),
+            local_root: Some(local_dir.to_string_lossy().into_owned()),
+            cache_dir: cache_dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+
+        // Scene + digest naming: deps carry the image class digest — the exact
+        // names the corpus loop uploads those images under.
+        let ctx = make_ctx("scene");
+        let deps = proxy.metadata_dep_names(&ctx, "models/a.gltf", "GHASH", "windows");
+        assert_eq!(
+            deps,
+            vec![
+                format!(
+                    "ThashONE_{}_windows",
+                    ctx.image_digest("ThashONE", "models/tex1.png")
+                ),
+                format!(
+                    "ThashTWO_{}_windows",
+                    ctx.image_digest("ThashTWO", "models/Tex2.png")
+                ),
+            ]
+        );
+        assert!(deps.iter().all(|d| naming::bundle_name_has_digest(d)));
+
+        // Mac lowercases the hash, digest unchanged.
+        let deps_mac = proxy.metadata_dep_names(&ctx, "models/a.gltf", "GHASH", "mac");
+        assert_eq!(
+            deps_mac[0],
+            format!(
+                "thashone_{}_mac",
+                ctx.image_digest("ThashONE", "models/tex1.png")
+            )
+        );
+
+        // A known-undecodable image falls back to its bare name, matching the
+        // build path's bare-named upload.
+        proxy
+            .decode_ok
+            .lock()
+            .unwrap()
+            .insert("ThashTWO".to_string(), false);
+        let deps = proxy.metadata_dep_names(&ctx, "models/a.gltf", "GHASH", "windows");
+        assert_eq!(deps[1], "ThashTWO_windows");
+
+        // Non-scene entities keep bare names — their images are uploaded bare.
+        let wctx = make_ctx("wearable");
+        let deps = proxy.metadata_dep_names(&wctx, "models/a.gltf", "GHASH", "windows");
+        assert_eq!(
+            deps,
+            vec!["ThashONE_windows".to_string(), "ThashTWO_windows".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
     #[test]
