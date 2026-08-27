@@ -13,19 +13,19 @@ pub const REQUIRED_TEMPLATES: [&str; 4] = [
 const EMBEDDED: [(&str, &[u8]); 4] = [
     (
         ALL_TYPES_TEMPLATE,
-        include_bytes!("../../../template/all-types.windows.bundle"),
+        include_bytes!("../../template/all-types.windows.bundle"),
     ),
     (
         "animated-types.windows.bundle",
-        include_bytes!("../../../template/animated-types.windows.bundle"),
+        include_bytes!("../../template/animated-types.windows.bundle"),
     ),
     (
         "emote-types.windows.bundle",
-        include_bytes!("../../../template/emote-types.windows.bundle"),
+        include_bytes!("../../template/emote-types.windows.bundle"),
     ),
     (
         "skinned-types.windows.bundle",
-        include_bytes!("../../../template/skinned-types.windows.bundle"),
+        include_bytes!("../../template/skinned-types.windows.bundle"),
     ),
 ];
 

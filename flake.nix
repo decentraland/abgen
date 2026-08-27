@@ -24,7 +24,6 @@
           ./rust-toolchain.toml
           ./.config/nextest.toml
           ./crate
-          ./template
           ./lambda/Cargo.toml
           ./lambda/src
         ])
@@ -103,7 +102,7 @@
 
           runtimeData = pkgs.runCommand "abgen-runtime" { } ''
             mkdir -p $out/opt/abgen
-            cp -r ${buildSource}/template $out/opt/abgen/template
+            cp -r ${buildSource}/crate/template $out/opt/abgen/template
             cp -r ${buildSource}/crate/shader $out/opt/abgen/shader
           '';
         in

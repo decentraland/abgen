@@ -9,7 +9,7 @@ let
     cargoArtifacts = cargoArtifactsCheckfast;
     CARGO_PROFILE = "checkfast";
   };
-  abgenRoot = ''export ABGEN_ROOT="$PWD"'';
+  abgenRoot = ''export ABGEN_ROOT="$PWD/crate"'';
   assertRanTests = ''
     junit=target/nextest/default/junit.xml
     [ -f "$junit" ] || { echo "nextest junit report missing - no tests ran" >&2; exit 1; }
@@ -62,7 +62,7 @@ let
           -o sanity \
           ${abgenConsumersPkg}/lib/${libName} \
           -Wl,-rpath,${abgenConsumersPkg}/lib
-        export ABGEN_ROOT=${src}
+        export ABGEN_ROOT=${src}/crate
         ./sanity ${src}/crate/abgen-wasm/test/fixtures/normal-quad.glb
         touch $out
       '';

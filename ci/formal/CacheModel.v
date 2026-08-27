@@ -33,7 +33,7 @@
 (* ------------------------------------------------------------------------- *)
 
 (* Abstract carrier types. The filtered part of the source tree is what the
-   nix fileset filter keeps (crate/, Cargo.*, flake.*, lambda/, template/);
+   nix fileset filter keeps (crate/, Cargo.*, flake.*, lambda/);
    the excluded part is .github/, ci/, *.md — CI and docs. *)
 Parameter FilteredSrc ExcludedSrc DepsLock FlakeLock Toolchain Env Arch : Type.
 
