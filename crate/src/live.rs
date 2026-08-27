@@ -287,7 +287,6 @@ pub struct Proxy {
     magenta_missing: bool,
     jit_cache: OnceLock<Arc<crate::jitcache::JitDiskCache>>,
     deps_digest: bool,
-    content_ephemeral: bool,
     build_progress: Mutex<HashMap<String, BuildProgress>>,
     /// Content is immutable per hash, so a standalone image's decode verdict
     /// holds for every platform and repeat conversion in this process.
@@ -1372,24 +1371,7 @@ impl Proxy {
                 ),
             }
         }
-        self.drop_ephemeral_content(&ctx);
         Ok(built)
-    }
-
-    /// Under `content_ephemeral`, drops the entity's stored source payloads now that its
-    /// corpus build is done — later reads re-fetch on demand, and the digest ledger stays
-    /// so revalidation keeps detecting edits. Entries in active use are skipped: the
-    /// ledger refuses pinned keys, and unix keeps unlinked mmaps alive regardless.
-    fn drop_ephemeral_content(&self, ctx: &EntityCtx) {
-        if !self.content_ephemeral {
-            return;
-        }
-        for c in &ctx.scene.content {
-            let hash = &c.hash;
-            if self.jit().is_none_or(|j| j.forget(&format!("c:{hash}"))) {
-                let _ = std::fs::remove_file(self.content.path_of(hash));
-            }
-        }
     }
 
     const VERSIONED_ID_DIGEST: &'static str = "id-versioned";
@@ -1601,12 +1583,6 @@ pub struct ProxyConfig {
     /// probe; naming only, never placement.
     pub deps_digest: bool,
 
-    /// Drop an entity's stored content payloads once its corpus build completes,
-    /// keeping only the digest ledger. For servers whose content source is ~free
-    /// to re-fetch (the embedded sidecar against a loopback preview server) —
-    /// later rebuilds re-download on demand.
-    pub content_ephemeral: bool,
-
     pub template_root: Option<String>,
 }
 
@@ -1623,7 +1599,6 @@ impl Default for ProxyConfig {
             fallback_version: "v41".to_string(),
             use_space: false,
             deps_digest: true,
-            content_ephemeral: false,
             template_root: None,
         }
     }
@@ -1643,8 +1618,6 @@ impl Proxy {
         let v38_timestamp = BuildOpts::env_v38_timestamp();
         let magenta_missing = cfg.magenta_missing || BuildOpts::env_magenta_missing();
         let deps_digest = crate::clihelp::env_bool("ABGEN_DEPS_DIGEST", cfg.deps_digest);
-        let content_ephemeral =
-            crate::clihelp::env_bool("ABGEN_CONTENT_EPHEMERAL", cfg.content_ephemeral);
         if let Some(root) = cfg.template_root.as_deref().filter(|s| !s.is_empty()) {
             let env_root = std::env::var("ABGEN_ROOT").unwrap_or_default();
             if env_root.trim() != root {
@@ -1719,7 +1692,6 @@ impl Proxy {
             magenta_missing,
             jit_cache: OnceLock::new(),
             deps_digest,
-            content_ephemeral,
             build_progress: Mutex::new(HashMap::new()),
             decode_ok: Mutex::new(HashMap::new()),
         })
@@ -1770,35 +1742,6 @@ pub mod stub {
             version: "v41".to_string(),
             fallback_version: "v40".to_string(),
             deps_digest,
-            ..Default::default()
-        };
-        super::Proxy::new_with_space(cfg, Some(Arc::new(space)))
-    }
-
-    /// Like `stub_proxy_at` but with `content_ephemeral` on (and digest naming off, so
-    /// repeat builds are never satisfied by the space reuse probe).
-    pub fn stub_proxy_at_ephemeral(
-        host: &str,
-        catalyst_url: &str,
-        cache_dir: &std::path::Path,
-    ) -> Arc<super::Proxy> {
-        let space = crate::space::Space::with_static_creds(
-            "http",
-            host,
-            "us-east-1",
-            None,
-            false,
-            false,
-            "AKIATEST",
-            "secret",
-        );
-        let cfg = super::ProxyConfig {
-            catalyst_url: catalyst_url.to_string(),
-            cache_dir: cache_dir.to_string_lossy().into_owned(),
-            version: "v41".to_string(),
-            fallback_version: "v40".to_string(),
-            deps_digest: false,
-            content_ephemeral: true,
             ..Default::default()
         };
         super::Proxy::new_with_space(cfg, Some(Arc::new(space)))
@@ -2985,67 +2928,6 @@ mod tests {
             (corpus_meta.dev(), corpus_meta.ino()),
             (cache_meta.dev(), cache_meta.ino()),
             "corpus entry must hard-link the bundle-cache file, not duplicate its bytes"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn ephemeral_content_is_dropped_after_the_entity_build_and_rebuilds_self_heal() {
-        let entity = serde_json::json!({
-            "id": "bafkephemeral",
-            "type": "scene",
-            "content": [
-                {"file": "tex.png", "hash": "qmephimg"},
-            ]
-        });
-        let (cat_host, cat_seen) = super::stub::serve(vec![
-            (
-                "/contents/bafkephemeral".to_string(),
-                200,
-                serde_json::to_vec(&entity).unwrap(),
-            ),
-            ("/contents/qmephimg".to_string(), 200, tiny_png()),
-        ]);
-        let (space_host, _space_seen, _store) = super::stub::serve_store(vec![]);
-
-        let dir = fresh_cache("ephemeral");
-        let proxy =
-            super::stub::stub_proxy_at_ephemeral(&space_host, &format!("http://{cat_host}"), &dir);
-        let built = proxy
-            .build_entity_into_corpus(&dir.join("corpus"), "bafkephemeral", "windows", "http://cs")
-            .unwrap();
-        assert_eq!(built, vec!["qmephimg_windows".to_string()]);
-
-        // The source payload is gone; the built corpus entry remains.
-        assert!(
-            !proxy.content_store().exists("qmephimg"),
-            "source payload must be dropped after the build"
-        );
-        assert!(dir
-            .join("corpus")
-            .join("bafkephemeral")
-            .join("windows")
-            .join(&built[0])
-            .is_file());
-
-        // A rebuild self-heals by re-fetching the dropped source on demand.
-        let _ = std::fs::remove_dir_all(dir.join("corpus"));
-        let (_content_root, bundle_dir) = proxy.cache_roots();
-        let _ = std::fs::remove_dir_all(bundle_dir.join("bafkephemeral"));
-        let rebuilt = proxy
-            .build_entity_into_corpus(&dir.join("corpus"), "bafkephemeral", "windows", "http://cs")
-            .unwrap();
-        assert_eq!(rebuilt, built);
-        let fetches = cat_seen
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|l| *l == "GET /contents/qmephimg")
-            .count();
-        assert_eq!(
-            fetches, 2,
-            "the rebuild must re-download the dropped source"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

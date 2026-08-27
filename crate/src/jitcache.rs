@@ -147,28 +147,6 @@ impl JitDiskCache {
         delete(victims);
     }
 
-    /// Drops an entry from the ledger without touching its file. Refuses pinned entries
-    /// (something is actively using them); returns whether the key is now absent, so the
-    /// caller can gate deleting the underlying file on it.
-    pub fn forget(&self, key: &str) -> bool {
-        if !self.enabled() {
-            return true;
-        }
-        let mut inner = self.lock();
-        let Some(e) = inner.entries.get(key) else {
-            return true;
-        };
-        if e.refs > 0 {
-            return false;
-        }
-        let tick = e.tick;
-        if let Some(e) = inner.entries.remove(key) {
-            inner.total = inner.total.saturating_sub(e.bytes);
-        }
-        inner.order.remove(&tick);
-        true
-    }
-
     pub fn touch(&self, key: &str) {
         if !self.enabled() {
             return;
