@@ -25,7 +25,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="${WORK:-$ROOT/target/verify-dep-casing}"
 
 echo "== building abgen-corpus + metadump"
-cargo build --release --manifest-path "$ROOT/Cargo.toml" \
+cargo build --release --manifest-path "$ROOT/Cargo.toml" -p abgen \
   --bin abgen-corpus --example metadump
 
 rm -rf "$WORK/out"
