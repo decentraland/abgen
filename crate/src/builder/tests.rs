@@ -886,10 +886,7 @@ fn metadata_deps_follow_cdn_casing_per_platform() {
         deps.contains(&"qmdepabcdef_mac".to_string()),
         "mac deps must be fully lowercased even when passed case-preserved: {deps:?}"
     );
-    assert!(
-        !deps.contains(&"QmDepAbCdEf_mac".to_string()),
-        "{deps:?}"
-    );
+    assert!(!deps.contains(&"QmDepAbCdEf_mac".to_string()), "{deps:?}");
 }
 
 #[test]
@@ -931,9 +928,12 @@ fn build_bundle_multi_recases_metadata_deps_per_platform() {
 
             // The encode-once sibling must stay byte-identical to a fresh
             // single-platform build fed that platform's dep names.
-            let single_deps =
-                vec![if name.ends_with("_mac") { "QmDepAbCdEf_mac" } else { "QmDepAbCdEf_windows" }
-                    .to_string()];
+            let single_deps = vec![if name.ends_with("_mac") {
+                "QmDepAbCdEf_mac"
+            } else {
+                "QmDepAbCdEf_windows"
+            }
+            .to_string()];
             let single_opts = BuildOpts {
                 source_file: Some("test.gltf"),
                 metadata_dependencies: &single_deps,
@@ -941,8 +941,7 @@ fn build_bundle_multi_recases_metadata_deps_per_platform() {
                 v38_timestamp: 638_000_000_000_000_000,
                 ..BuildOpts::default()
             };
-            let single =
-                build_bundle(&gltf, name, "QmMetaMulti", &single_opts).expect("single");
+            let single = build_bundle(&gltf, name, "QmMetaMulti", &single_opts).expect("single");
             assert_eq!(
                 art.data, single.data,
                 "{name}: fused serialize must match a fresh build"
