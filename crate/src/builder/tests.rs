@@ -825,6 +825,132 @@ fn build_bundle_multi_pair_standalone_texture_matches_singles() {
     }
 }
 
+/// Dependencies list from the metadata TextAsset embedded in a built bundle.
+fn metadata_deps_of(data: &[u8]) -> Vec<String> {
+    let b = ReadBundle::load_bytes(data).expect("bundle parses");
+    for f in &b.files {
+        let FileContent::Serialized(sf) = &f.content else {
+            continue;
+        };
+        for o in &sf.objects {
+            if o.class_id != 49 {
+                continue;
+            }
+            let v = sf.read_typetree(o).expect("TextAsset typetree");
+            if v.get("m_Name").and_then(|x| x.as_str()) != Some("metadata") {
+                continue;
+            }
+            let script = v
+                .get("m_Script")
+                .and_then(|x| x.as_str())
+                .expect("metadata m_Script");
+            let json: serde_json::Value = serde_json::from_str(script).expect("metadata json");
+            return json["dependencies"]
+                .as_array()
+                .expect("dependencies array")
+                .iter()
+                .map(|d| d.as_str().expect("string dep").to_string())
+                .collect();
+        }
+    }
+    panic!("no metadata TextAsset in bundle");
+}
+
+#[test]
+fn metadata_deps_follow_cdn_casing_per_platform() {
+    let gltf = tiny_gltf(1);
+    let deps_windows = vec!["QmDepAbCdEf_windows".to_string()];
+    let opts = BuildOpts {
+        source_file: Some("test.gltf"),
+        metadata_dependencies: &deps_windows,
+        v38_compat: true,
+        v38_timestamp: 638_000_000_000_000_000,
+        ..BuildOpts::default()
+    };
+    let win = build_bundle(&gltf, "QmMetaCase_windows", "QmMetaCase", &opts).expect("windows");
+    let deps = metadata_deps_of(&win.data);
+    assert!(
+        deps.contains(&"QmDepAbCdEf_windows".to_string()),
+        "windows deps must keep the content hash's original casing \
+         (the CDN key is case-sensitive): {deps:?}"
+    );
+
+    let deps_mac = vec!["QmDepAbCdEf_mac".to_string()];
+    let opts = BuildOpts {
+        metadata_dependencies: &deps_mac,
+        ..opts
+    };
+    let mac = build_bundle(&gltf, "qmmetacase_mac", "QmMetaCase", &opts).expect("mac");
+    let deps = metadata_deps_of(&mac.data);
+    assert!(
+        deps.contains(&"qmdepabcdef_mac".to_string()),
+        "mac deps must be fully lowercased even when passed case-preserved: {deps:?}"
+    );
+    assert!(
+        !deps.contains(&"QmDepAbCdEf_mac".to_string()),
+        "{deps:?}"
+    );
+}
+
+#[test]
+fn build_bundle_multi_recases_metadata_deps_per_platform() {
+    let gltf = tiny_gltf(1);
+    for (names, primary_dep) in [
+        (
+            ["QmMetaMulti_windows", "qmmetamulti_mac"],
+            "QmDepAbCdEf_windows",
+        ),
+        (
+            ["qmmetamulti_mac", "QmMetaMulti_windows"],
+            "QmDepAbCdEf_mac",
+        ),
+    ] {
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        let deps = vec![primary_dep.to_string()];
+        let opts = BuildOpts {
+            source_file: Some("test.gltf"),
+            metadata_dependencies: &deps,
+            v38_compat: true,
+            v38_timestamp: 638_000_000_000_000_000,
+            ..BuildOpts::default()
+        };
+        let multi = build_bundle_multi(&gltf, &names, "QmMetaMulti", &opts).expect("multi");
+        assert_eq!(multi.len(), 2);
+        for (art, name) in multi.iter().zip(names.iter()) {
+            let got = metadata_deps_of(&art.data);
+            let want = if name.ends_with("_mac") {
+                "qmdepabcdef_mac"
+            } else {
+                "QmDepAbCdEf_windows"
+            };
+            assert!(
+                got.contains(&want.to_string()),
+                "{name}: retargeted sibling must re-case deps for its own \
+                 platform, got {got:?}"
+            );
+
+            // The encode-once sibling must stay byte-identical to a fresh
+            // single-platform build fed that platform's dep names.
+            let single_deps =
+                vec![if name.ends_with("_mac") { "QmDepAbCdEf_mac" } else { "QmDepAbCdEf_windows" }
+                    .to_string()];
+            let single_opts = BuildOpts {
+                source_file: Some("test.gltf"),
+                metadata_dependencies: &single_deps,
+                v38_compat: true,
+                v38_timestamp: 638_000_000_000_000_000,
+                ..BuildOpts::default()
+            };
+            let single =
+                build_bundle(&gltf, name, "QmMetaMulti", &single_opts).expect("single");
+            assert_eq!(
+                art.data, single.data,
+                "{name}: fused serialize must match a fresh build"
+            );
+        }
+    }
+}
+
 fn lod_test_material(name: &str) -> crate::scene::Material {
     crate::scene::Material {
         name: name.to_string(),
