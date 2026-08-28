@@ -470,6 +470,31 @@ fn bc7_job_inputs(
     }
 }
 
+/// External-reference file name for an image dependency: the exact name from
+/// the caller-supplied dependency list when present (digest or bare per the
+/// caller's rules — it must match the name the bundle is uploaded under),
+/// bare `{hash}_{target}` only for refs outside the list.
+pub(super) fn external_dep_bundle_file(
+    metadata_dependencies: &[String],
+    ext_hash: &str,
+    target: &str,
+) -> Option<String> {
+    let target_suffix = format!("_{target}");
+    metadata_dependencies
+        .iter()
+        .find(|d| {
+            d.strip_suffix(target_suffix.as_str())
+                .map(|stem| {
+                    crate::naming::split_bundle_stem(stem)
+                        .0
+                        .eq_ignore_ascii_case(ext_hash)
+                })
+                .unwrap_or(false)
+        })
+        .cloned()
+        .or_else(|| crate::naming::canonical_filename(ext_hash, ".png", target, None).ok())
+}
+
 impl<'a> Builder<'a> {
     /// Adds a Texture2D tree, queuing its BC7 job (if any) for the batched
     /// resolve pass instead of encoding it inline.
@@ -569,27 +594,8 @@ impl<'a> Builder<'a> {
         if ext_hash.is_empty() {
             return None;
         }
-        // The external reference must be the exact name the image bundle is
-        // uploaded under. metadata_dependencies carries those names (digest
-        // or bare per the caller's rules); bare is only a fallback for refs
-        // outside the dependency list.
-        let target_suffix = format!("_{}", self.target);
-        let bundle_file = self
-            .metadata_dependencies
-            .iter()
-            .find(|d| {
-                d.strip_suffix(target_suffix.as_str())
-                    .map(|stem| {
-                        crate::naming::split_bundle_stem(stem)
-                            .0
-                            .eq_ignore_ascii_case(&ext_hash)
-                    })
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .or_else(|| {
-                crate::naming::canonical_filename(&ext_hash, ".png", self.target, None).ok()
-            })?;
+        let bundle_file =
+            external_dep_bundle_file(&self.metadata_dependencies, &ext_hash, self.target)?;
         let file_id = match self.ext_bundle_fileid.get(&bundle_file) {
             Some(&f) => f,
             None => {
@@ -1125,6 +1131,80 @@ mod row_parallel_tests {
         assert_eq!(
             global, single,
             "dxt5 mip chain must be invariant to thread count"
+        );
+    }
+}
+
+#[cfg(test)]
+mod external_dep_bundle_file_tests {
+    use super::external_dep_bundle_file;
+
+    fn deps(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn picks_the_digest_name_from_the_dependency_list() {
+        let d = deps(&[
+            "Qmother_1111aaaa1111aaaa1111aaaa1111aaaa_windows",
+            "Qmtex_00ff00ff00ff00ff00ff00ff00ff00ff_windows",
+        ]);
+        assert_eq!(
+            external_dep_bundle_file(&d, "Qmtex", "windows").unwrap(),
+            "Qmtex_00ff00ff00ff00ff00ff00ff00ff00ff_windows"
+        );
+    }
+
+    #[test]
+    fn picks_a_bare_name_from_the_dependency_list_verbatim() {
+        // Known-undecodable images and non-scene entities carry bare names in
+        // the list — the ref must match that upload name, not re-derive it.
+        let d = deps(&["Qmtex_windows"]);
+        assert_eq!(
+            external_dep_bundle_file(&d, "Qmtex", "windows").unwrap(),
+            "Qmtex_windows"
+        );
+    }
+
+    #[test]
+    fn matches_hash_case_insensitively() {
+        // mac dependency lists carry lowercased hashes; the resolver returns
+        // the deployed original case.
+        let d = deps(&["qmtex_00ff00ff00ff00ff00ff00ff00ff00ff_mac"]);
+        assert_eq!(
+            external_dep_bundle_file(&d, "QmTex", "mac").unwrap(),
+            "qmtex_00ff00ff00ff00ff00ff00ff00ff00ff_mac"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_bare_for_refs_outside_the_list() {
+        let d = deps(&["Qmother_1111aaaa1111aaaa1111aaaa1111aaaa_windows"]);
+        assert_eq!(
+            external_dep_bundle_file(&d, "Qmtex", "windows").unwrap(),
+            "Qmtex_windows"
+        );
+        assert_eq!(
+            external_dep_bundle_file(&[], "Qmtex", "windows").unwrap(),
+            "Qmtex_windows"
+        );
+    }
+
+    #[test]
+    fn ignores_entries_of_another_platform() {
+        let d = deps(&["Qmtex_00ff00ff00ff00ff00ff00ff00ff00ff_windows"]);
+        assert_eq!(
+            external_dep_bundle_file(&d, "Qmtex", "mac").unwrap(),
+            "Qmtex_mac"
+        );
+    }
+
+    #[test]
+    fn does_not_prefix_match_a_longer_hash() {
+        let d = deps(&["Qmtexture_00ff00ff00ff00ff00ff00ff00ff00ff_windows"]);
+        assert_eq!(
+            external_dep_bundle_file(&d, "Qmtex", "windows").unwrap(),
+            "Qmtex_windows"
         );
     }
 }
