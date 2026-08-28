@@ -33,7 +33,9 @@ fn main() {
                 if obj.class_id != 49 {
                     continue;
                 }
-                let Ok(v) = sf.read_typetree(obj) else { continue };
+                let Ok(v) = sf.read_typetree(obj) else {
+                    continue;
+                };
                 if v.get("m_Name").and_then(|x| x.as_str()) != Some("metadata") {
                     continue;
                 }
