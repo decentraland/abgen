@@ -1,7 +1,7 @@
 //! Print the embedded metadata TextAsset JSON of each bundle, one line per
 //! file: `<path>\t<m_Script JSON>` (or `<path>\t-` when the bundle carries no
-//! metadata TextAsset). Handy for eyeballing the per-platform CDN casing of
-//! `dependencies` entries against the file names a corpus actually ships.
+//! metadata TextAsset). Used by scripts/verify-dep-casing.sh to assert the
+//! per-platform CDN casing of `dependencies` entries.
 
 use abgen::unity::bundle_file::{Bundle, FileContent};
 
