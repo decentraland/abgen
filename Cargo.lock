@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "abgen"
-version = "0.17.8"
+version = "0.17.10"
 dependencies = [
  "anyhow",
  "axum",
@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "abgen-lambda"
-version = "0.17.8"
+version = "0.17.10"
 dependencies = [
  "abgen",
  "anyhow",
@@ -69,7 +69,7 @@ dependencies = [
 
 [[package]]
 name = "abgen-native"
-version = "0.17.8"
+version = "0.17.10"
 dependencies = [
  "abgen",
  "libc",
@@ -1004,7 +1004,7 @@ dependencies = [
 
 [[package]]
 name = "dcl-contents"
-version = "0.17.8"
+version = "0.17.10"
 dependencies = [
  "async-trait",
  "axum",
