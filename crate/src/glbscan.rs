@@ -231,6 +231,10 @@ impl EntityScan {
     /// Bare `{hash}_{platform}` dependency names — only valid where the
     /// referenced image bundles are also uploaded bare (the corpus tool's
     /// naming; the live pipeline names deps through its digest rules).
+    /// Hash casing is preserved on every platform: the builder applies the
+    /// per-platform CDN casing (mac ⇒ lowercase) when it serializes
+    /// metadata.json. Pre-lowercasing here would lose the original casing a
+    /// `retarget` sibling pass (mac primary → windows sibling) needs.
     pub fn metadata_dep_names_bare(
         &self,
         store: &LocalContentStore,
@@ -241,13 +245,7 @@ impl EntityScan {
     ) -> Vec<String> {
         self.metadata_dep_hashes(store, glb_file, glb_hash, content_by_file)
             .into_iter()
-            .map(|h| {
-                if platform == "mac" {
-                    format!("{}_{platform}", h.to_lowercase())
-                } else {
-                    format!("{h}_{platform}")
-                }
-            })
+            .map(|h| format!("{h}_{platform}"))
             .collect()
     }
 }

@@ -286,20 +286,41 @@ pub(crate) fn build_bundle_multi_at(
 
 fn sibling_spec(spec: &BundleSpec, primary: &str, platform: &str) -> BundleSpec {
     let old_suffix = format!("_{primary}");
-    let swap = |s: &str| -> String {
-        let swapped = s
-            .strip_suffix(old_suffix.as_str())
+    let swap_suffix = |s: &str| -> String {
+        s.strip_suffix(old_suffix.as_str())
             .map(|stem| format!("{stem}_{platform}"))
-            .unwrap_or_else(|| s.to_string());
-        if platform == "mac" {
-            swapped.to_lowercase()
-        } else {
-            swapped
-        }
+            .unwrap_or_else(|| s.to_string())
     };
+    // Upload names follow the CDN casing contract: fully lowercase for mac,
+    // the content hash's original casing everywhere else. The hash segment
+    // can't be re-cased textually from a mac primary (already lowercased),
+    // so it is rebuilt from the spec's cid. Metadata deps are only
+    // suffix-swapped: they stay case-preserved in the spec, and the builder
+    // re-cases them per target when it serializes metadata.json.
+    let case_hash = if platform == "mac" {
+        spec.cid.to_lowercase()
+    } else {
+        spec.cid.clone()
+    };
+    let bundle_name = spec
+        .bundle_name
+        .strip_suffix(old_suffix.as_str())
+        .filter(|stem| {
+            stem.get(..spec.cid.len())
+                .is_some_and(|h| h.eq_ignore_ascii_case(&spec.cid))
+        })
+        .map(|stem| format!("{case_hash}{}_{platform}", &stem[spec.cid.len()..]))
+        .unwrap_or_else(|| {
+            let swapped = swap_suffix(&spec.bundle_name);
+            if platform == "mac" {
+                swapped.to_lowercase()
+            } else {
+                swapped
+            }
+        });
     BundleSpec {
-        bundle_name: swap(&spec.bundle_name),
-        metadata_deps: spec.metadata_deps.iter().map(|d| swap(d)).collect(),
+        bundle_name,
+        metadata_deps: spec.metadata_deps.iter().map(|d| swap_suffix(d)).collect(),
         ..spec.clone()
     }
 }
@@ -724,5 +745,48 @@ mod tests {
             glb_names(&tolerant),
             vec![format!("Qmglb_{digest}_windows")]
         );
+    }
+
+    fn spec_with(bundle_name: &str, deps: &[&str]) -> BundleSpec {
+        BundleSpec {
+            cid: "QmAbCdE".to_string(),
+            bundle_name: bundle_name.to_string(),
+            source_file: Some("m.gltf".to_string()),
+            entity_type: Some("scene".to_string()),
+            metadata_deps: deps.iter().map(|s| s.to_string()).collect(),
+            model_referenced: false,
+            expect_hash: None,
+            standalone_color_space: None,
+            standalone_normal: false,
+            force_default_material: false,
+        }
+    }
+
+    #[test]
+    fn sibling_spec_recases_upload_name_and_preserves_dep_casing() {
+        // windows primary → mac sibling: the upload name is fully lowercased,
+        // metadata deps only swap suffix (the builder lowercases them for mac
+        // at serialization).
+        let mac = sibling_spec(
+            &spec_with("QmAbCdE_1234abcd_windows", &["QmDepXyZ_windows"]),
+            "windows",
+            "mac",
+        );
+        assert_eq!(mac.bundle_name, "qmabcde_1234abcd_mac");
+        assert_eq!(mac.metadata_deps, vec!["QmDepXyZ_mac".to_string()]);
+
+        // mac primary → windows sibling: the hash segment is re-cased from
+        // the cid — it can't be recovered from the lowercased mac name.
+        let win = sibling_spec(
+            &spec_with("qmabcde_1234abcd_mac", &["QmDepXyZ_mac"]),
+            "mac",
+            "windows",
+        );
+        assert_eq!(win.bundle_name, "QmAbCdE_1234abcd_windows");
+        assert_eq!(win.metadata_deps, vec!["QmDepXyZ_windows".to_string()]);
+
+        // Bare (non-digest) names re-case the same way.
+        let win_bare = sibling_spec(&spec_with("qmabcde_mac", &[]), "mac", "windows");
+        assert_eq!(win_bare.bundle_name, "QmAbCdE_windows");
     }
 }

@@ -455,13 +455,20 @@ impl<'a> Builder<'a> {
                     deps.push(f.clone());
                 }
             }
-            if self.toggles.v38_compat {
+            // CDN casing contract (the prod converter's GetCdnFileName): mac
+            // bundles ship under fully lowercased file names, every other
+            // platform keeps the content hash's original casing. Clients fetch
+            // these dependency entries verbatim from a case-sensitive CDN, so
+            // each entry must match the name its bundle is uploaded under.
+            // Applied at serialization time — not by callers — so a
+            // `retarget` sibling pass re-cases each dep for its own platform.
+            if self.target == "mac" {
                 for d in &mut deps {
                     *d = d.to_ascii_lowercase();
                 }
-                if !self.material_entries.is_empty() {
-                    deps.push(format!("dcl/scene_ignore_{}", self.target));
-                }
+            }
+            if self.toggles.v38_compat && !self.material_entries.is_empty() {
+                deps.push(format!("dcl/scene_ignore_{}", self.target));
             }
         }
         deps.sort_unstable_by(|x, y| natural_bundle_cmp(x, y));

@@ -547,6 +547,11 @@ pub struct BuildOpts<'a> {
     pub resolve: gltf::Resolve<'a>,
     pub model_referenced: bool,
     pub resolve_hash: Option<&'a dyn Fn(&str) -> Option<String>>,
+    /// Dependency bundle names embedded in metadata.json, matching the
+    /// bundle name's platform suffix. Pass them case-preserved: the builder
+    /// applies the per-platform CDN casing (mac ⇒ lowercase) at
+    /// serialization. Pre-lowercased mac names serialize identically, but
+    /// lose the original casing a `retarget` sibling pass needs.
     pub metadata_dependencies: &'a [String],
     pub expect_hash: Option<&'a str>,
     pub standalone_color_space: Option<i64>,
