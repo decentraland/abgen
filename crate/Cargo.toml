@@ -73,6 +73,10 @@ path = "examples/texpng.rs"
 name = "atlasprobe"
 path = "examples/atlasprobe.rs"
 
+[[example]]
+name = "metadump"
+path = "examples/metadump.rs"
+
 [build-dependencies]
 cc = "1"
 
