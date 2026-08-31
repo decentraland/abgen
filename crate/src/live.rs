@@ -624,10 +624,18 @@ impl Proxy {
             .collect()
     }
 
+    /// Where `bundle` caches its output on disk; shared with the corpus writer so it can
+    /// hard-link the cached file instead of storing a second physical copy.
+    fn bundle_cache_path(&self, cid: &str, bundle_name: &str) -> PathBuf {
+        self.bundle_dir
+            .join(&*naming::fs_safe_component(cid))
+            .join(&*naming::fs_safe_component(bundle_name))
+    }
+
     fn bundle(&self, cid: &str, bundle_name: &str) -> Result<Vec<u8>> {
         let safe_cid = naming::fs_safe_component(cid);
         let entity_dir = self.bundle_dir.join(&*safe_cid);
-        let cache_path = entity_dir.join(&*naming::fs_safe_component(bundle_name));
+        let cache_path = self.bundle_cache_path(cid, bundle_name);
         if let Ok(b) = std::fs::read(&cache_path) {
             if let Some(c) = self.jit() {
                 c.touch(&format!("b:{safe_cid}"));
@@ -1227,9 +1235,16 @@ impl Proxy {
             let existed = dst.is_file();
             match self.bundle(cid, name) {
                 Ok(bytes) => {
+                    // `bundle` just cached these bytes under bundle_dir — hard-link that file into
+                    // the corpus instead of writing a second physical copy. Both writers replace
+                    // via tmp+rename (fresh inode), so a later rebuild of either side never mutates
+                    // the other through the shared link. Falls back to a plain write when the link
+                    // cannot be made (cache write failed, evicted, or cross-device roots).
                     let tmp = crate::tmppath::tmp_sibling(&dst);
-                    std::fs::write(&tmp, &bytes)
-                        .with_context(|| format!("write {}", tmp.display()))?;
+                    if std::fs::hard_link(self.bundle_cache_path(cid, name), &tmp).is_err() {
+                        std::fs::write(&tmp, &bytes)
+                            .with_context(|| format!("write {}", tmp.display()))?;
+                    }
                     std::fs::rename(&tmp, &dst).ok();
                     if *name != it.bare_name {
                         let stored_alias = naming::fs_safe_component(&it.bare_name);
@@ -2864,6 +2879,58 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn corpus_entries_hard_link_to_the_bundle_cache() {
+        use std::os::unix::fs::MetadataExt;
+        let entity = serde_json::json!({
+            "id": "bafklinked",
+            "type": "scene",
+            "content": [
+                {"file": "tex.png", "hash": "qmlinkimg"},
+            ]
+        });
+        let (cat_host, _cat_seen) = super::stub::serve(vec![
+            (
+                "/contents/bafklinked".to_string(),
+                200,
+                serde_json::to_vec(&entity).unwrap(),
+            ),
+            ("/contents/qmlinkimg".to_string(), 200, tiny_png()),
+        ]);
+        let (space_host, _space_seen, _store) = super::stub::serve_store(vec![]);
+
+        let dir = fresh_cache("hardlink");
+        let proxy = super::stub::stub_proxy_at_reuse(
+            &space_host,
+            &format!("http://{cat_host}"),
+            false,
+            &dir,
+            true,
+        );
+        let built = proxy
+            .build_entity_into_corpus(&dir.join("corpus"), "bafklinked", "windows", "http://cs")
+            .unwrap();
+        assert_eq!(built.len(), 1);
+        let name = &built[0];
+        let corpus_file = dir
+            .join("corpus")
+            .join("bafklinked")
+            .join("windows")
+            .join(name);
+        let (_content_root, bundle_dir) = proxy.cache_roots();
+        let cache_file = bundle_dir.join("bafklinked").join(name);
+        let corpus_meta = std::fs::metadata(&corpus_file).unwrap();
+        let cache_meta = std::fs::metadata(&cache_file).unwrap();
+        assert_eq!(
+            (corpus_meta.dev(), corpus_meta.ino()),
+            (cache_meta.dev(), cache_meta.ino()),
+            "corpus entry must hard-link the bundle-cache file, not duplicate its bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
