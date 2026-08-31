@@ -38,13 +38,13 @@ for name in "${!SHADER_SHAS[@]}"; do
 done
 
 for name in "${!TEMPLATE_SHAS[@]}"; do
-  p="$ROOT/template/$name"
+  p="$ROOT/crate/template/$name"
   if [ -f "$p" ] && check_sha "$p" "${TEMPLATE_SHAS[$name]}"; then
     echo "ok  template $name"
   else
     echo "ERR template $name missing or sha mismatch" >&2
     echo "    Templates are typetree-donor bundles that cannot be fetched;" >&2
-    echo "    restore them from git history (git checkout -- template/) or" >&2
+    echo "    restore them from git history (git checkout -- crate/template/) or" >&2
     echo "    (maintainer regeneration path: see scripts/ + shader.rs pins)" >&2
     fail=1
   fi

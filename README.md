@@ -65,11 +65,9 @@ a hand-rolled C ABI; the JS runtime in `crate/abgen-wasm/js/` (worker pool + Web
 host page embeds. It is a plain cargo package with its own committed `Cargo.lock`, excluded from the
 workspace: nothing in CI or the release matrix ever needs a wasm toolchain (the pinned one lives in
 `crate/abgen-wasm/toolchain/flake.nix`). `crate/abgen-wasm/README.md` documents the build, the headless
-driver, the native-vs-wasm byte-parity gate and its decoder contract. Layout caveat: this repo places
-`template/` at the repo root, while the wasm lane's helper scripts and the wasm32-only `include_bytes!`
-template paths in `crate/src/builder/templates.rs` assume the source layout where it is a sibling of
-the crate — an in-repo wasm32 build needs those relative paths bumped one level (`../../template/` ->
-`../../../template/`). No workspace target compiles for wasm32, so the divergence never touches CI.
+driver, the native-vs-wasm byte-parity gate and its decoder contract. `template/` lives inside the crate (`crate/template/`, beside `crate/shader/`), which is also the
+layout the wasm lane's `include_bytes!` template paths assume — an in-repo wasm32 build needs no
+path adjustments. No workspace target compiles for wasm32, so that lane never touches CI.
 ## Features
 One compile-time feature flag: `server` (on by default) gates the abcdn HTTP server + registry stack
 (axum/tokio/sqlx and the `dcl-contents` crate); the `abgen` bin has `required-features = ["server"]`.
@@ -126,7 +124,7 @@ restore it - it never fetches or re-downloads:
 | `ABGEN_CACHE_DIR` | `./abgen-serve-cache` | JIT conversion cache |
 | `ABGEN_VERSION` | `v49` | advertised AB version |
 | `ABGEN_MANIFEST_CONTENT_SERVER_URL` | `https://peer.decentraland.org/content` | `contentServerUrl` stamped into manifests |
-| `ABGEN_ROOT` | repo root | root containing `template/` |
+| `ABGEN_ROOT` | unset (embedded copies) | override root containing `template/` |
 | `ABGEN_METRICS_BEARER_TOKEN` | unset | if set, `/metrics` requires this bearer token |
 | `ABGEN_JIT_FAIL_TTL_S` | `60` | failure negative-cache TTL for entity JIT builds; concurrent identical requests single-flight per `{entity}:{platform}` |
 | `ABGEN_JIT_CONTENT_DIGEST` | `0` | freshness for content servers whose declared hashes are not content-addressed (the `@dcl/sdk-commands` preview server keys them by file path). Defaults to ON when `ABGEN_CATALYST_URL` points at a loopback host (a dev preview server), OFF otherwise; explicit values always win. When on, manifest requests re-download the entity's convertible content, sha256 it, and prune stale conversions when bytes changed under an unchanged hash. Changed non-glb files (textures/`.bin`) also invalidate every glb bundle of the entity. Debounced per entity via `ABGEN_REVALIDATE_DEBOUNCE_S` (default `2`) |

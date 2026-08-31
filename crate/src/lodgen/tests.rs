@@ -373,12 +373,7 @@ fn post_order_reingest_and_atlas_on_emitted_raw_glb() {
 
 #[test]
 fn empty_scene_bundle_passes_empty_gate_and_fails_content_gate() {
-    std::env::set_var(
-        "ABGEN_ROOT",
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap(),
-    );
+    std::env::set_var("ABGEN_ROOT", env!("CARGO_MANIFEST_DIR"));
     let dir = std::env::temp_dir().join(format!("abgen-lod-emptygate-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -461,12 +456,7 @@ fn first_target_platform(data: &[u8]) -> i32 {
 
 #[test]
 fn multi_platform_bundles_union_manifest_and_target_platform_gate() {
-    std::env::set_var(
-        "ABGEN_ROOT",
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap(),
-    );
+    std::env::set_var("ABGEN_ROOT", env!("CARGO_MANIFEST_DIR"));
     let dir = std::env::temp_dir().join(format!("abgen-lod-multiplat-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -598,12 +588,7 @@ fn multi_platform_bundles_union_manifest_and_target_platform_gate() {
 
 #[test]
 fn multi_level_sources_build_both_levels_from_one_bake() {
-    std::env::set_var(
-        "ABGEN_ROOT",
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap(),
-    );
+    std::env::set_var("ABGEN_ROOT", env!("CARGO_MANIFEST_DIR"));
     let dir =
         std::env::temp_dir().join(format!("abgen-lod-multilevel-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -676,12 +661,7 @@ fn multi_level_sources_build_both_levels_from_one_bake() {
 
 #[test]
 fn self_gate_passes_on_synthetic_lod_bundle_and_catches_mismatches() {
-    std::env::set_var(
-        "ABGEN_ROOT",
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap(),
-    );
+    std::env::set_var("ABGEN_ROOT", env!("CARGO_MANIFEST_DIR"));
     let dir = std::env::temp_dir().join(format!("abgen-lod-selfgate-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -768,12 +748,7 @@ fn self_gate_passes_on_synthetic_lod_bundle_and_catches_mismatches() {
 
 #[test]
 fn orphan_material_is_dropped_from_lod_bundle() {
-    std::env::set_var(
-        "ABGEN_ROOT",
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap(),
-    );
+    std::env::set_var("ABGEN_ROOT", env!("CARGO_MANIFEST_DIR"));
     let dir = std::env::temp_dir().join(format!("abgen-lod-orphanmat-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
