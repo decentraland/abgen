@@ -96,10 +96,8 @@ impl Config {
     }
 }
 
-/// The registry that describes an ab-cdn's content sits beside it on the same domain
-/// (`https://ab-cdn.<domain>` -> `https://asset-bundle-registry.<domain>`), so any CDN of that
-/// shape gets its registry derived. A gateway path, a loopback sidecar or a bucket host has none
-/// to infer and needs ABGEN_UPSTREAM_AB_REGISTRY set explicitly.
+/// Default for ABGEN_UPSTREAM_AB_REGISTRY: `asset-bundle-registry.<domain>` when the CDN is
+/// `ab-cdn.<domain>`; no default otherwise.
 fn registry_for_ab_cdn(cdn: &str) -> Option<String> {
     let (scheme, authority) = cdn.split_once("://")?;
     if authority.contains('/') {
