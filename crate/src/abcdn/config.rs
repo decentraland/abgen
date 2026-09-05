@@ -96,16 +96,21 @@ impl Config {
     }
 }
 
+/// The registry that describes an ab-cdn's content sits beside it on the same domain
+/// (`https://ab-cdn.<domain>` -> `https://asset-bundle-registry.<domain>`), so any CDN of that
+/// shape gets its registry derived. A gateway path, a loopback sidecar or a bucket host has none
+/// to infer and needs ABGEN_UPSTREAM_AB_REGISTRY set explicitly.
 fn registry_for_ab_cdn(cdn: &str) -> Option<String> {
-    match cdn {
-        "https://ab-cdn.decentraland.org" => {
-            Some("https://asset-bundle-registry.decentraland.org".to_string())
-        }
-        "https://ab-cdn.decentraland.zone" => {
-            Some("https://asset-bundle-registry.decentraland.zone".to_string())
-        }
-        _ => None,
+    let (scheme, authority) = cdn.split_once("://")?;
+    if authority.contains('/') {
+        return None;
     }
+    let domain = authority.to_ascii_lowercase();
+    let domain = domain.strip_prefix("ab-cdn.")?;
+    if domain.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://asset-bundle-registry.{domain}"))
 }
 fn content_connection_string() -> Option<String> {
     if let Ok(url) = env::var("CONTENT_PG_CONNECTION_STRING") {
@@ -169,7 +174,46 @@ fn is_loopback_url(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_loopback_url;
+    use super::{is_loopback_url, registry_for_ab_cdn};
+
+    #[test]
+    fn registry_is_derived_beside_any_ab_cdn() {
+        assert_eq!(
+            registry_for_ab_cdn("https://ab-cdn.decentraland.org").as_deref(),
+            Some("https://asset-bundle-registry.decentraland.org")
+        );
+        assert_eq!(
+            registry_for_ab_cdn("https://ab-cdn.decentraland.zone").as_deref(),
+            Some("https://asset-bundle-registry.decentraland.zone")
+        );
+        assert_eq!(
+            registry_for_ab_cdn("https://ab-cdn.example.org").as_deref(),
+            Some("https://asset-bundle-registry.example.org")
+        );
+        assert_eq!(
+            registry_for_ab_cdn("https://AB-CDN.Example.org").as_deref(),
+            Some("https://asset-bundle-registry.example.org")
+        );
+        assert_eq!(
+            registry_for_ab_cdn("http://ab-cdn.localhost:5133").as_deref(),
+            Some("http://asset-bundle-registry.localhost:5133")
+        );
+    }
+
+    #[test]
+    fn no_registry_is_inferred_for_other_cdn_shapes() {
+        assert_eq!(
+            registry_for_ab_cdn("https://gateway.decentraland.org/ab-cdn"),
+            None
+        );
+        assert_eq!(registry_for_ab_cdn("http://127.0.0.1:5147"), None);
+        assert_eq!(
+            registry_for_ab_cdn("https://ab-cdn.decentraland.org/v49"),
+            None
+        );
+        assert_eq!(registry_for_ab_cdn("ab-cdn.decentraland.org"), None);
+        assert_eq!(registry_for_ab_cdn("https://ab-cdn."), None);
+    }
 
     #[test]
     fn loopback_detection_for_revalidation_default() {
