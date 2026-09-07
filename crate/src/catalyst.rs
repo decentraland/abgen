@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const DEFAULT_CATALYST: &str = "http://localhost:5141/content";
@@ -150,7 +150,10 @@ pub struct CatalystClient {
     fallback_bases: Vec<String>,
     content_cache: Option<PathBuf>,
     stats: Arc<ClientStats>,
+    content_flights: Arc<crate::singleflight::Group<String, ContentFlightResult>>,
 }
+
+type ContentFlightResult = Option<Arc<std::result::Result<Arc<Vec<u8>>, String>>>;
 
 impl CatalystClient {
     pub fn new(base_url: &str) -> Self {
@@ -170,6 +173,7 @@ impl CatalystClient {
             fallback_bases: Vec::new(),
             content_cache: None,
             stats: Arc::new(ClientStats::default()),
+            content_flights: Arc::new(crate::singleflight::Group::new()),
         }
     }
 
@@ -279,13 +283,6 @@ impl CatalystClient {
             .map(|root| root.join(&*crate::naming::fs_safe_component(content_hash)))
     }
 
-    fn content_lock(content_hash: &str) -> MutexGuard<'static, ()> {
-        static LOCKS: OnceLock<[Mutex<()>; 256]> = OnceLock::new();
-        let locks = LOCKS.get_or_init(|| std::array::from_fn(|_| Mutex::new(())));
-        let slot = crate::hashes::crc32(content_hash.as_bytes()) as usize % locks.len();
-        locks[slot].lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     fn fetch_content_uncached(&self, content_hash: &str) -> Result<Vec<u8>> {
         let primary = if let Some(store) = &self.local {
             store
@@ -320,24 +317,40 @@ impl CatalystClient {
                 return Ok(bytes);
             }
         }
-        let _lock = Self::content_lock(content_hash);
-        if let Some(path) = &cache_path {
-            if let Ok(bytes) = std::fs::read(path) {
-                self.record_cache_hit(bytes.len());
-                return Ok(bytes);
+        let (outcome, leader) =
+            self.content_flights
+                .run_with_leader(content_hash.to_string(), || {
+                    if let Some(path) = &cache_path {
+                        if let Ok(bytes) = std::fs::read(path) {
+                            self.record_cache_hit(bytes.len());
+                            return Some(Arc::new(Ok(Arc::new(bytes))));
+                        }
+                    }
+                    let result = self
+                        .fetch_content_uncached(content_hash)
+                        .map(Arc::new)
+                        .map_err(|error| format!("{error:#}"));
+                    if let (Some(path), Ok(bytes)) = (&cache_path, &result) {
+                        if let Some(parent) = path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let tmp = crate::tmppath::tmp_sibling(path);
+                        if std::fs::write(&tmp, bytes.as_slice()).is_ok() {
+                            let _ = std::fs::rename(&tmp, path);
+                        }
+                    }
+                    Some(Arc::new(result))
+                });
+        let outcome = outcome.ok_or_else(|| anyhow!("content fetch aborted for {content_hash}"))?;
+        match outcome.as_ref() {
+            Ok(bytes) => {
+                if !leader {
+                    self.record_cache_hit(bytes.len());
+                }
+                Ok(bytes.as_ref().clone())
             }
+            Err(error) => Err(anyhow!(error.clone())),
         }
-        let bytes = self.fetch_content_uncached(content_hash)?;
-        if let Some(path) = &cache_path {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let tmp = crate::tmppath::tmp_sibling(path);
-            if std::fs::write(&tmp, &bytes).is_ok() {
-                let _ = std::fs::rename(&tmp, path);
-            }
-        }
-        Ok(bytes)
     }
 
     pub fn fetch_entity(&self, entity_id: &str) -> Result<Scene> {
@@ -681,8 +694,18 @@ mod tests {
     fn read_through_cache_coalesces_concurrent_content_downloads() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let response = Arc::new(Barrier::new(2));
+        let server_response = Arc::clone(&response);
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let mut request_len = 0;
+            while !request[..request_len].windows(4).any(|v| v == b"\r\n\r\n") {
+                let read = stream.read(&mut request[request_len..]).unwrap();
+                assert!(read > 0 && request_len + read < request.len());
+                request_len += read;
+            }
+            server_response.wait();
             let body = b"shared-payload";
             write!(
                 stream,
@@ -712,6 +735,11 @@ mod tests {
             }));
         }
         barrier.wait();
+        let key = "payload".to_string();
+        while client.content_flights.waiter_count(&key) != 1 {
+            std::thread::yield_now();
+        }
+        response.wait();
         for thread in threads {
             assert_eq!(thread.join().unwrap(), b"shared-payload");
         }

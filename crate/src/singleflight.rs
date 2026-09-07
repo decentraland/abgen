@@ -26,6 +26,10 @@ where
     }
 
     pub(crate) fn run(&self, key: K, work: impl FnOnce() -> V) -> V {
+        self.run_with_leader(key, work).0
+    }
+
+    pub(crate) fn run_with_leader(&self, key: K, work: impl FnOnce() -> V) -> (V, bool) {
         let (call, leader) = {
             let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(call) = calls.get(&key) {
@@ -57,7 +61,7 @@ where
             #[cfg(test)]
             call.waiters
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            return result;
+            return (result, false);
         }
 
         let outcome = catch_unwind(AssertUnwindSafe(work));
@@ -78,7 +82,7 @@ where
         }
 
         match outcome {
-            Ok(result) => result,
+            Ok(result) => (result, true),
             Err(payload) => resume_unwind(payload),
         }
     }

@@ -113,12 +113,33 @@ const timeout = new Promise((resolveTimeout) => setTimeout(() => resolveTimeout(
 }), Number(process.env.ABGEN_WASM_GPU_TIMEOUT_MS || 180000)));
 const report = await Promise.race([result, timeout]);
 if (!report.ok && stderr) report.browserStderr = stderr;
-if (child.exitCode === null) {
-  const exited = new Promise((resolveExit) => child.once('exit', resolveExit));
+const waitForExit = (milliseconds) => new Promise((resolveExit) => {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    resolveExit(true);
+    return;
+  }
+  const timer = setTimeout(() => {
+    child.removeListener('exit', exited);
+    resolveExit(false);
+  }, milliseconds);
+  const exited = () => {
+    clearTimeout(timer);
+    resolveExit(true);
+  };
+  child.once('exit', exited);
+});
+if (!(await waitForExit(0))) {
   child.kill('SIGTERM');
-  await Promise.race([exited, new Promise((resolveWait) => setTimeout(resolveWait, 5000))]);
+  if (!(await waitForExit(5000))) {
+    child.kill('SIGKILL');
+    await waitForExit(5000);
+  }
 }
 await new Promise((resolveClose) => server.close(resolveClose));
-rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+try {
+  rmSync(profile, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+} catch (error) {
+  console.error(`wasm-gpu: profile cleanup failed: ${error}`);
+}
 console.log(JSON.stringify(report));
 if (!report.ok) process.exit(1);
