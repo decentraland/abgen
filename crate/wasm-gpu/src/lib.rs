@@ -27,31 +27,54 @@ fn gen_texture(seed: u64, w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-async fn qualify(g: &Gpu, eng: &Engine) -> Result<(), String> {
-    const W: u32 = 37;
-    const H: u32 = 53;
-    let tex = gen_texture(1, W, H);
+async fn qualify_case(
+    g: &Gpu,
+    eng: &Engine,
+    w: u32,
+    h: u32,
+    srgb: bool,
+    perceptual: bool,
+    profile: Bc7Profile,
+) -> Result<(), String> {
+    let tex = gen_texture(1, w, h);
     let tables = gpu::corelib::bc7::build_opt_tables();
+    let (want, want_mips) = gpu::corelib::mips::encode_bc7_mip_chain_with_profile(
+        &tex, w, h, None, true, srgb, perceptual, profile, &tables,
+    );
+    let (got, got_mips) =
+        encode_bc7_mip_chain_on(g, eng, &tex, w, h, None, true, srgb, perceptual, profile)
+            .await
+            .map_err(|e| format!("qualification encode failed: {e:#}"))?;
+    if got == want && got_mips == want_mips {
+        return Ok(());
+    }
+    let diff = got
+        .iter()
+        .zip(&want)
+        .position(|(a, b)| a != b)
+        .unwrap_or(got.len().min(want.len()));
+    Err(format!(
+        "{w}x{h} srgb={srgb} perceptual={perceptual} {profile:?}:          not bit-exact vs CPU oracle at byte {diff}, lengths {}/{},          mips {got_mips}/{want_mips}",
+        got.len(),
+        want.len(),
+    ))
+}
+
+async fn qualify(g: &Gpu, eng: &Engine) -> Result<(), String> {
     for profile in [Bc7Profile::Slow, Bc7Profile::Basic] {
-        let (want, want_mips) = gpu::corelib::mips::encode_bc7_mip_chain_with_profile(
-            &tex, W, H, None, true, true, true, profile, &tables,
-        );
-        let (got, got_mips) = encode_bc7_mip_chain_on(
-            g, eng, &tex, W, H, None, true, true, true, profile,
-        )
-        .await
-        .map_err(|e| format!("qualification encode failed: {e:#}"))?;
-        if got != want || got_mips != want_mips {
-            let diff = got
-                .iter()
-                .zip(&want)
-                .position(|(a, b)| a != b)
-                .unwrap_or(got.len().min(want.len()));
-            return Err(format!(
-                "not bit-exact vs CPU oracle for {profile:?}: byte {diff}, \
-                 lengths {}/{}, mips {got_mips}/{want_mips}",
-                got.len(), want.len(),
-            ));
+        qualify_case(g, eng, 37, 53, true, true, profile).await?;
+    }
+    Ok(())
+}
+
+async fn qualify_full(g: &Gpu, eng: &Engine) -> Result<(), String> {
+    for (w, h) in [(64, 64), (128, 32), (37, 53)] {
+        for srgb in [false, true] {
+            for perceptual in [false, true] {
+                for profile in [Bc7Profile::Slow, Bc7Profile::Basic] {
+                    qualify_case(g, eng, w, h, srgb, perceptual, profile).await?;
+                }
+            }
         }
     }
     Ok(())
@@ -67,6 +90,17 @@ pub async fn gpu_init() -> Result<String, JsValue> {
     let summary = g.adapter_summary();
     STATE.with(|s| *s.borrow_mut() = Some(Rc::new((g, eng))));
     Ok(summary)
+}
+
+#[wasm_bindgen]
+pub async fn gpu_qualify_full() -> Result<(), JsValue> {
+    let state = STATE.with(|s| s.borrow().clone());
+    let Some(state) = state else {
+        return Err(JsValue::from_str("gpu_init has not succeeded"));
+    };
+    qualify_full(&state.0, &state.1)
+        .await
+        .map_err(|e| JsValue::from_str(&format!("{}: {e}", state.0.adapter_summary())))
 }
 
 #[wasm_bindgen]

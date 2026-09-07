@@ -1,5 +1,7 @@
 use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const DEFAULT_CATALYST: &str = "http://localhost:5141/content";
@@ -123,12 +125,29 @@ pub(crate) fn ensure_entity_id(v: &mut serde_json::Value, id: &str) {
     }
 }
 
+#[derive(Default)]
+struct ClientStats {
+    network_requests: AtomicU64,
+    network_bytes: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_bytes: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IoStats {
+    pub network_requests: u64,
+    pub network_bytes: u64,
+    pub cache_hits: u64,
+    pub cache_bytes: u64,
+}
+
 #[derive(Clone)]
 pub struct CatalystClient {
     base: String,
     agent: ureq::Agent,
     local: Option<crate::local_store::LocalContentStore>,
     fallback_bases: Vec<String>,
+    stats: Arc<ClientStats>,
 }
 
 impl CatalystClient {
@@ -147,6 +166,7 @@ impl CatalystClient {
             agent,
             local: None,
             fallback_bases: Vec::new(),
+            stats: Arc::new(ClientStats::default()),
         }
     }
 
@@ -188,6 +208,10 @@ impl CatalystClient {
                 Ok(resp) => {
                     let mut buf: Vec<u8> = Vec::new();
                     resp.into_body().into_reader().read_to_end(&mut buf)?;
+                    self.stats.network_requests.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .network_bytes
+                        .fetch_add(buf.len() as u64, Ordering::Relaxed);
                     return Ok(buf);
                 }
                 Err(ureq::Error::StatusCode(code)) => {
@@ -219,6 +243,10 @@ impl CatalystClient {
                 Ok(resp) => {
                     let mut buf: Vec<u8> = Vec::new();
                     resp.into_body().into_reader().read_to_end(&mut buf)?;
+                    self.stats.network_requests.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .network_bytes
+                        .fetch_add(buf.len() as u64, Ordering::Relaxed);
                     return Ok(buf);
                 }
                 Err(ureq::Error::StatusCode(code)) => {
@@ -242,7 +270,12 @@ impl CatalystClient {
             self.get(&format!("/contents/{content_hash}"))
         };
         match primary {
-            Ok(b) => Ok(b),
+            Ok(b) => {
+                if self.local.is_some() {
+                    self.record_cache_hit(b.len());
+                }
+                Ok(b)
+            }
             Err(primary_err) => {
                 for base in &self.fallback_bases {
                     if let Ok(b) = self.get_abs(&format!("{base}/contents/{content_hash}")) {
@@ -264,6 +297,21 @@ impl CatalystClient {
 
     pub fn base_url(&self) -> &str {
         &self.base
+    }
+    pub(crate) fn record_cache_hit(&self, bytes: usize) {
+        self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .cache_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn io_stats(&self) -> IoStats {
+        IoStats {
+            network_requests: self.stats.network_requests.load(Ordering::Relaxed),
+            network_bytes: self.stats.network_bytes.load(Ordering::Relaxed),
+            cache_hits: self.stats.cache_hits.load(Ordering::Relaxed),
+            cache_bytes: self.stats.cache_bytes.load(Ordering::Relaxed),
+        }
     }
 
     pub fn active_entities_by_hash(&self, hash: &str) -> Result<Vec<String>> {

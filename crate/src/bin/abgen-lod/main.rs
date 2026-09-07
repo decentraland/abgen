@@ -9,6 +9,8 @@ use abgen::lods;
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::PathBuf;
 
+mod qualify;
+
 const BIN_NAME: &str = "abgen-lod";
 const CATALYST: &str = "https://peer.decentraland.org/content";
 
@@ -96,6 +98,17 @@ USAGE:
             [--gltfpack PATH]
             [--allow-unsimplified] [--keep-glb] [--no-uv-reclamp] [--emissive]
             [--fidelity] [--gpu]
+  abgen-lod qualify-corpus --out DIR [--report FILE] [--cache DIR] [-j JOBS]
+            [--catalyst URL] [--worlds-url URL] [--platform windows,mac]
+            [--city-min -150] [--city-max 150] [--no-city] [--no-worlds]
+            [--world NAME[,NAME...]] [--entity-ids FILE]
+
+qualify-corpus: snapshots active Genesis City deployments from the configured
+  Catalyst and all deployed scenes from the paginated Worlds API, converts
+  immutable entity hashes into scratch output with bounded workers, rechecks
+  the snapshot, and writes a versioned JSON report plus Explorer risk
+  candidates. It never publishes. Any discovery, generation, self-gate, or
+  snapshot-stability failure produces exit status 1.
 
 bundle: stages <src.glb> as {entityIdLower}_{level}.glb and builds
   {out}/{entityIdLower}/LOD/{level}/{entityIdLower}_{level}_{platform}.
@@ -110,8 +123,8 @@ placements: resolves the scene, then prints its GLB placement list as JSON.
   executes its SDK only when that state is empty or suspicious; it never
   consumes production ISS. --iss FILE is an explicit comparison/test override;
   --iss off is an alias for independent auto derivation. Node is not required;
-  generate --cache persists only green independently-derived descriptors by
-  parcel; a missing baseline forces SDK execution on the first run.
+  generate --cache stores content-addressed inputs only; cached output never
+  authorizes placements or survives an entity redeployment as scene truth.
   --manifest-builder is deprecated and ignored. --diff-iss FILE
   compares the list against a production InitialSceneState as a multiset
   (content hash + TRS within --tol per component, rotation sign-insensitive),
@@ -243,10 +256,9 @@ generate: the full sync chain: resolve scene -> independently derive placements
   exactly as in `simplify` above (default from ABGEN_SIMPLIFIER, else
   meshopt). Every budget-policy capped run adds a tri-cap self-gate
   check (tris_after <= cap); an --allow-unsimplified verbatim copy passes
-  it with a recorded waiver. Zero placements, or a count below 90% of the
-  parcel-keyed abgen baseline after SDK execution, quarantines the run before
-  publication. Only an independently-derived, fully self-gated run may update
-  that baseline; explicit ISS lanes cannot. The crop stage (default on, matching
+  it with a recorded waiver. Zero placements, unresolved glTF sources, or
+  unsupported mesh-renderer-only output quarantines the run before publication.
+  No persistent placement baseline is consulted or written. The crop stage (default on, matching
   production; --no-crop disables) clips merged geometry to the exact parcel
   rect and adds a crop-bounds self-gate check. --platform takes a
   comma-separated list (windows|mac|linux; webgl is refused — upstream webgl
@@ -311,6 +323,7 @@ fn main() {
         "atlas" => cmd_atlas(&argv[1..]),
         "simplify" => cmd_simplify(&argv[1..]),
         "generate" => cmd_generate(&argv[1..]),
+        "qualify-corpus" => qualify::run(&argv[1..]),
         "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
         "-V" | "--version" => abgen::clihelp::print_version(BIN_NAME),
         other => {

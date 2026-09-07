@@ -57,29 +57,23 @@ pub fn acquire_placements(
     ent: &Scene,
     iss: &str,
 ) -> Result<Vec<placements::Placement>> {
-    acquire_placements_with_baseline(client, ent, iss, false)
+    acquire_placements_independently(client, ent, iss).map(|(placements, _)| placements)
 }
 
-fn placement_baseline_path(cache: &Path, base: (i32, i32)) -> PathBuf {
-    cache
-        .join(".abgen-placement-baselines")
-        .join(format!("{}_{}.json", base.0, base.1))
+fn scene_has_executable_path(ent: &Scene) -> bool {
+    if ent.metadata.get("runtimeVersion").and_then(|v| v.as_str()) != Some("7") {
+        return true;
+    }
+    ent.metadata
+        .get("main")
+        .and_then(|v| v.as_str())
+        .is_some_and(|main| !main.eq_ignore_ascii_case("main.crdt"))
 }
 
-fn has_accepted_descriptor(path: &Path) -> bool {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| placements::parse_iss(&bytes).ok())
-        .is_some()
-}
-
-fn placement_suspicion(
-    full: &placements::ManifestPlacements,
-    has_accepted_baseline: bool,
-) -> Vec<&'static str> {
+fn placement_suspicion(ent: &Scene, full: &placements::ManifestPlacements) -> Vec<&'static str> {
     let mut why = Vec::new();
-    if !has_accepted_baseline {
-        why.push("no accepted abgen baseline");
+    if scene_has_executable_path(ent) {
+        why.push("executable scene entrypoint");
     }
     if full.placements.is_empty() {
         why.push("zero placements");
@@ -93,12 +87,11 @@ fn placement_suspicion(
     why
 }
 
-fn acquire_placements_with_baseline(
+fn acquire_placements_independently(
     client: &CatalystClient,
     ent: &Scene,
     iss: &str,
-    has_accepted_baseline: bool,
-) -> Result<Vec<placements::Placement>> {
+) -> Result<(Vec<placements::Placement>, &'static str)> {
     if iss != "auto" && iss != "off" {
         let bytes = std::fs::read(iss).with_context(|| format!("read ISS file {iss}"))?;
         let list = placements::parse_iss(&bytes)?;
@@ -106,23 +99,35 @@ fn acquire_placements_with_baseline(
             bail!("explicit ISS {iss} contains zero placements; refusing to publish an empty LOD");
         }
         eprintln!("source: explicit iss ({} placements)", list.len());
-        return Ok(list);
+        return Ok((list, "explicit-iss"));
     }
 
-    let static_full = crate::lodgen::scenerun::static_scene_placements(client, ent)?;
-    let suspicious = placement_suspicion(&static_full, has_accepted_baseline);
+    let static_result = crate::lodgen::scenerun::static_scene_placements(client, ent);
+    let (static_full, suspicious) = match static_result {
+        Ok(full) => {
+            let suspicious = placement_suspicion(ent, &full);
+            (Some(full), suspicious)
+        }
+        Err(error) => {
+            eprintln!("static placements invalid ({error:#}); executing embedded SDK");
+            (None, vec!["invalid main.crdt"])
+        }
+    };
     if suspicious.is_empty() {
+        let static_full = static_full.expect("clean static result");
         eprintln!(
             "source: current-deployment CRDT ({} placements)",
             static_full.placements.len()
         );
-        return Ok(static_full.placements);
+        return Ok((static_full.placements, "static-crdt"));
     }
 
-    eprintln!(
-        "static placements suspicious ({}); executing embedded SDK",
-        suspicious.join(", ")
-    );
+    if static_full.is_some() {
+        eprintln!(
+            "static placements suspicious ({}); executing embedded SDK",
+            suspicious.join(", ")
+        );
+    }
     let full = crate::lodgen::scenerun::run_scene_placements(client, ent)?.ok_or_else(|| {
         anyhow!(
             "scene {} emitted no renderer state; refusing to publish an empty LOD",
@@ -135,13 +140,21 @@ fn acquire_placements_with_baseline(
             ent.entity_id
         );
     }
+    if full.skipped_mesh_renderer > 0 || full.unresolved_src > 0 {
+        bail!(
+            "scene {} SDK output is incomplete: {} mesh-renderer-only components, {} unresolved glTF sources",
+            ent.entity_id,
+            full.skipped_mesh_renderer,
+            full.unresolved_src
+        );
+    }
     eprintln!(
         "source: embedded-scene-runtime ({} placements, {} mesh-renderer-only skipped, {} unresolved src)",
         full.placements.len(),
         full.skipped_mesh_renderer,
         full.unresolved_src
     );
-    Ok(full.placements)
+    Ok((full.placements, "embedded-sdk"))
 }
 
 pub fn write_iss_descriptor(
@@ -589,19 +602,12 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     let parcel_count = parcels.len();
     log.push(format!("base={},{} parcels={parcel_count}", base.0, base.1));
 
-    let cached_baseline = params
-        .cache
-        .as_deref()
-        .map(|cache| placement_baseline_path(cache, base));
-    let has_accepted_baseline = cached_baseline
-        .as_deref()
-        .is_some_and(has_accepted_descriptor);
-
     let t_total = std::time::Instant::now();
     let t = std::time::Instant::now();
-    let placements =
-        acquire_placements_with_baseline(&client, &ent, &params.iss, has_accepted_baseline)?;
+    let (placements, placement_source) =
+        acquire_placements_independently(&client, &ent, &params.iss)?;
     let placements_ms = t.elapsed().as_millis();
+    log.push(format!("placement-source: {placement_source}"));
     log.push(format!("placements: {}", placements.len()));
     if placements.is_empty() {
         bail!(
@@ -970,26 +976,15 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
             glb_path,
         });
     }
-    let independent_placements = params.iss == "auto" || params.iss == "off";
-    if independent_placements && gate.iter().all(|check| check.ok) {
-        if let Some(path) = cached_baseline {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("mkdir {}", parent.display()))?;
-            }
-            let bytes = std::fs::read(&iss_path)
-                .with_context(|| format!("read accepted descriptor {}", iss_path.display()))?;
-            lods::write_atomic(&path, &bytes)?;
-            log.push(format!(
-                "placement-baseline: {} ({iss_assets} assets)",
-                path.display()
-            ));
-        }
-    }
     if !params.keep_glb {
         let _ = std::fs::remove_file(&pre);
     }
     let finalize_ms = t_finalize.elapsed().as_millis();
+    let io = client.io_stats();
+    log.push(format!(
+        "io: network_requests={} network_bytes={} cache_hits={} cache_bytes={}",
+        io.network_requests, io.network_bytes, io.cache_hits, io.cache_bytes
+    ));
     log.push(format!(
         "timing: placements_ms={placements_ms} assemble_ms={assemble_ms} atlas_ms={atlas_ms} emit_ms={emit_ms} simplify_ms={simplify_ms} bundle_ms={bundle_ms} package_ms={package_ms} finalize_ms={finalize_ms} total_ms={}",
         t_total.elapsed().as_millis()
@@ -1016,12 +1011,31 @@ mod placement_policy_tests {
         }
     }
 
+    fn scene(runtime: &str, main: Option<&str>) -> Scene {
+        let mut metadata = serde_json::json!({"runtimeVersion": runtime});
+        if let Some(main) = main {
+            metadata["main"] = serde_json::Value::String(main.to_string());
+        }
+        Scene {
+            entity_id: "scene".into(),
+            entity_type: "scene".into(),
+            pointers: Vec::new(),
+            content: Vec::new(),
+            metadata,
+        }
+    }
+
     #[test]
-    fn clean_static_state_avoids_sdk_execution_only_with_an_abgen_baseline() {
-        assert!(placement_suspicion(&manifest(12), true).is_empty());
+    fn clean_declarative_state_avoids_sdk_without_a_persistent_baseline() {
+        assert!(placement_suspicion(&scene("7", None), &manifest(12)).is_empty());
+        assert!(placement_suspicion(&scene("7", Some("main.crdt")), &manifest(12)).is_empty());
         assert_eq!(
-            placement_suspicion(&manifest(12), false),
-            ["no accepted abgen baseline"]
+            placement_suspicion(&scene("7", Some("bin/index.js")), &manifest(12)),
+            ["executable scene entrypoint"]
+        );
+        assert_eq!(
+            placement_suspicion(&scene("6", None), &manifest(12)),
+            ["executable scene entrypoint"]
         );
     }
 
@@ -1029,29 +1043,16 @@ mod placement_policy_tests {
     fn incomplete_static_state_requests_sdk_execution() {
         let mut empty = manifest(0);
         assert_eq!(
-            placement_suspicion(&empty, false),
-            ["no accepted abgen baseline", "zero placements"]
+            placement_suspicion(&scene("7", None), &empty),
+            ["zero placements"]
         );
 
         empty.placements.push(Default::default());
         empty.skipped_mesh_renderer = 2;
         empty.unresolved_src = 1;
         assert_eq!(
-            placement_suspicion(&empty, true),
+            placement_suspicion(&scene("7", None), &empty),
             ["mesh-renderer components", "unresolved glTF sources"]
-        );
-    }
-
-    #[test]
-    fn placement_count_drop_does_not_trigger_sdk_execution() {
-        assert!(placement_suspicion(&manifest(1), true).is_empty());
-    }
-
-    #[test]
-    fn cached_baseline_is_stable_across_entity_redeployments() {
-        assert_eq!(
-            placement_baseline_path(Path::new("/cache"), (-126, 144)),
-            Path::new("/cache/.abgen-placement-baselines/-126_144.json")
         );
     }
 }

@@ -21,6 +21,7 @@ pub fn fetch_cached(
 ) -> Result<Vec<u8>> {
     if let Some(dir) = cache_dir {
         if let Ok(b) = std::fs::read(dir.join(hash)) {
+            client.record_cache_hit(b.len());
             return Ok(b);
         }
     }

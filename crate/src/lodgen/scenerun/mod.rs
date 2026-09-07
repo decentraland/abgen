@@ -141,7 +141,8 @@ pub fn static_scene_placements(
     let bytes = client
         .fetch_content(hash)
         .with_context(|| format!("fetch main.crdt for scene {}", ent.entity_id))?;
-    Ok(crdt::placements_from_crdt(&bytes, &content))
+    crdt::placements_from_crdt_checked(&bytes, &content)
+        .with_context(|| format!("parse main.crdt for scene {}", ent.entity_id))
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]

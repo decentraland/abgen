@@ -143,6 +143,49 @@ impl LwwState {
     }
 }
 
+fn validate_stream(bytes: &[u8]) -> anyhow::Result<()> {
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let len = read_u32(bytes, off)
+            .ok_or_else(|| anyhow::anyhow!("truncated CRDT message header at byte {off}"))?
+            as usize;
+        if len < HEADER_LEN {
+            anyhow::bail!("invalid CRDT message length {len} at byte {off}");
+        }
+        let end = off
+            .checked_add(len)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| anyhow::anyhow!("truncated CRDT message at byte {off}: length {len}"))?;
+        let ty = read_u32(bytes, off + 4).expect("validated CRDT header");
+        if ty == PUT_COMPONENT {
+            let body = &bytes[off + HEADER_LEN..end];
+            if body.len() < 16 {
+                anyhow::bail!("truncated CRDT put-component body at byte {off}");
+            }
+            let data_len = read_u32(body, 12).expect("validated put-component header") as usize;
+            let data_end = 16usize
+                .checked_add(data_len)
+                .filter(|need| *need <= body.len())
+                .ok_or_else(|| anyhow::anyhow!("truncated CRDT component payload at byte {off}"))?;
+            let component = read_u32(body, 4).expect("validated put-component header");
+            let data = &body[16..data_end];
+            if !data.is_empty() {
+                match component {
+                    TRANSFORM if decode_transform(data).is_none() => {
+                        anyhow::bail!("invalid transform payload at byte {off}");
+                    }
+                    GLTF_CONTAINER if gltf_src(data).is_none() => {
+                        anyhow::bail!("invalid glTF-container payload at byte {off}");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        off = end;
+    }
+    Ok(())
+}
+
 /// Field 1 (`visible`) of PBVisibilityComponent. A payload without the field
 /// reads as `false`: the manifest builder writes it as `{}` and `JsonUtility`
 /// defaults the missing bool, so production drops that entity. Field 2
@@ -291,6 +334,14 @@ pub fn placements_from_crdt(
     state.project(content_by_file)
 }
 
+pub fn placements_from_crdt_checked(
+    stream: &[u8],
+    content_by_file: &HashMap<String, String>,
+) -> anyhow::Result<ManifestPlacements> {
+    validate_stream(stream)?;
+    Ok(placements_from_crdt(stream, content_by_file))
+}
+
 /// The folded GltfContainer srcs in entity insertion order, before content
 /// resolution: what the scene asked to place, whether or not the entity's
 /// content lists the file (a placement needs a resolved hash, this does not).
@@ -364,6 +415,27 @@ mod tests {
         assert_eq!(cell.0, 3);
         assert_eq!(cell.2, b"second");
         assert_eq!(state.cells.len(), 1);
+    }
+
+    #[test]
+    fn checked_stream_rejects_invalid_tracked_components() {
+        let mut stream = Vec::new();
+        encode_put(&mut stream, 7, TRANSFORM, 1, &[1, 2, 3]);
+        assert!(placements_from_crdt_checked(&stream, &HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn checked_stream_rejects_a_truncated_tail() {
+        let mut stream = Vec::new();
+        encode_put(&mut stream, 7, GLTF_CONTAINER, 1, &gltf_bytes("ok.glb"));
+        stream.extend_from_slice(&[16, 0, 0]);
+        assert!(placements_from_crdt_checked(&stream, &HashMap::new()).is_err());
+        assert_eq!(
+            placements_from_crdt(&stream, &HashMap::new())
+                .placements
+                .len(),
+            0
+        );
     }
 
     #[test]
