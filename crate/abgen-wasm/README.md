@@ -47,8 +47,8 @@ stream back through the imported `env.host_emit`).
   meshopt lane compiles, built here by the wasi toolchain), GLB emit, the
   `LodBuildParams` bundle path (`DCL/Scene_TexArray` binding, parcel
   clipping/root placement from scene.json), the LOD self-gate. Scene
-  uploads bake a `LOD/1/{id}_1_{platform}` bundle (plus `.br` and
-  `LOD.manifest.json` sidecars) next to the scene bundles. Placements
+  uploads bake a `LOD/1/{id}_1_{platform}` bundle plus
+  `LOD.manifest.json` metadata next to the scene bundles. Placements
   acquisition stays native-only (running the scene against the Node
   manifest-builder's game.js does not happen in the browser), as does the
   gltfpack decimation backend (external binary).
@@ -82,7 +82,7 @@ unconditionally - byte-neutral vs glibc libm on real bundles.
   headers); anything missing degrades to the CPU-SIMD path with a note. The native
   per-device self-qualification contract carries over: `gpu_init` refuses
   any adapter whose output is not bit-identical to the in-module CPU oracle
-  across the native qualification matrix. Status: Chrome's WGSL compiler
+  across a non-power-of-two full-mip probe for each BC7 profile. Status: Chrome's WGSL compiler
   (Tint→MSL) is not bit-exact on Apple Metal — the same kernels
   qualify under native wgpu (Naga) on the same GPU — so the lane arms only
   on adapters that pass; hardening the WGSL against Tint codegen is the
@@ -130,9 +130,8 @@ Coverage boundaries, stated exactly:
 
 - Wearable bundles are byte-compared on all three platforms.
 - The scene fixtures byte-compare the scene bundle on all three platforms
-  (`scene-lod`), and on windows/mac the baked `LOD/1` bundle plus its
-  deterministic sidecars (`<bundle>.br`, `LOD.manifest.json`,
-  `LOD.manifest.json.br`); the harness skips the LOD1 bake for webgl on
+  (`scene-lod`), and on windows/mac the baked `LOD/1` bundle plus the
+  deterministic metadata (`LOD.manifest.json`); the harness skips the LOD1 bake for webgl on
   both sides. Decimation is byte-gated by `dense-decimate-lod` (wasm
   simplify vs the native `abgen-lod atlas`/`simplify --simplifier meshopt`/
   `bundle` chain), crop by `crop-overhang-lod` (vs `atlas --crop-base

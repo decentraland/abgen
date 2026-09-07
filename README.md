@@ -13,7 +13,7 @@ resolves it for embedding tools - see [npm/abgen](npm/abgen/README.md)). From so
 ```bash
 git clone <this-repo> abgen && cd abgen
 cargo build --release            # no postgres, no openssl, no protobuf
-cargo build --release --examples # bundle dump tools (objdump/texdump/matdump/texcmp/texpng)
+cargo build --release --examples # bundle dump tools (objdump/texdump/matdump)
 scripts/bootstrap-runtime.sh     # integrity-check the vendored runtime data
 ```
 There is also a wasm build: `crate/abgen-wasm/` compiles the converter to wasm32 — see its README.
@@ -29,7 +29,7 @@ There is also a wasm build: `crate/abgen-wasm/` compiles the converter to wasm32
 | `abgen-lod` | LOD lane CLI: `bundle`, `compare`, `placements`, `assemble`, `atlas`, `simplify`, `generate` |
 | `abgen-lambda` | AWS Lambda handler (deployment event in, bundles + manifests to S3; from the `lambda/` workspace member) - see [lambda/README.md](lambda/README.md) |
 
-Plus bundle-inspection examples (`texdump`, `matdump`, `objdump`, `texcmp`, `texpng`) under
+Plus bundle-inspection examples (`texdump`, `matdump`, `objdump`) under
 `target/release/examples/`.
 ## Server
 ```bash
@@ -59,6 +59,9 @@ header semantics, and the DB-vs-proxy source selection: [docs/ROUTES.md](docs/RO
 ABGEN_ROOT="$PWD" cargo test --workspace --lib -- --test-threads=1
 ```
 `--test-threads=1` is required: the lib tests share process-wide `ABGEN_ROOT` state.
+LOD assembly frame conformance against the production `_1.glb` references: `cargo test --release
+--test lod_handedness` (offline fixtures; add `-- --ignored` to assemble from the catalyst).
+
 ## wasm
 `crate/abgen-wasm/` compiles the converter lib (default features off) to `wasm32-unknown-unknown` behind
 a hand-rolled C ABI; the JS runtime in `crate/abgen-wasm/js/` (worker pool + WebGPU bridge) is what a
@@ -71,20 +74,17 @@ template paths in `crate/src/builder/templates.rs` assume the source layout wher
 the crate — an in-repo wasm32 build needs those relative paths bumped one level (`../../template/` ->
 `../../../template/`). No workspace target compiles for wasm32, so the divergence never touches CI.
 ## Features
-One compile-time feature flag: `server` (on by default) gates the abcdn HTTP server + registry stack
-(axum/tokio/sqlx and the `dcl-contents` crate); the `abgen` bin has `required-features = ["server"]`.
-Library consumers - `lambda/`, `crate/abgen-native/`, `crate/abgen-wasm/` - build with
-`default-features = false` and get the converter without the server stack. Under the default
-features every capability below builds into every native binary; `wasm32` builds target-gate the
-server, content-DB, and GPU code off automatically. Each capability is activated at runtime, not at
-build time.
+The default `server` feature builds the complete service. Reusable consumers should select only the lanes they need; the smallest native converter is `cargo build --release --lib --no-default-features`.
 
-| Capability | Built | Enable at runtime |
+| Feature | Adds | Enabled by |
 |---|---|---|
-| tokio/axum HTTP JIT server (`abcdn` module + `abgen` bin) | always (native targets) | run the `abgen` bin |
-| catalyst content-DB index (sqlx/postgres, via the in-tree `dcl-contents` crate) for real timestamps + deployer on `/entities/*` and the unsigned registry routes (`/profiles*`, `/entities/status/{id}`, `/worlds/{name}/manifest`) | always | set a content-DB connection (`CONTENT_PG_CONNECTION_STRING` or `POSTGRES_CONTENT_*`); without one the built-in content-client fallback serves the index routes with `timestamp: 0`, empty deployer, and the registry routes proxy the upstream catalyst |
-| CUDA GPU BC7/BC5 encode path (`libcuda` dlopen'd at runtime, no toolkit needed to build; PTX kernels vendored in `crate/src/gpu/kernel.ptx`, regen from `crate/kernel-ptx/`) | always | opt in per run with `--gpu` / `ABGEN_GPU=1`, backend pick via `ABGEN_GPU_BACKEND=auto\|cuda\|wgpu\|off` |
-| portable `wgpu` compute backend (Vulkan/Metal/DX12), same dispatch + qualification gate | always | `ABGEN_GPU_BACKEND=wgpu` (or `auto`, which tries CUDA first) |
+| `server` (default) | HTTP/registry stack, `gpu`, `cli`, `web-pack`, and `scene-runtime` | `abgen` server |
+| `gpu` | native wgpu/CUDA dispatch | server, build/corpus/verify CLIs, Lambda |
+| `web-pack` | BV WebGPU pack emission plus DDS/glTF JSON dependencies | server, build/corpus CLIs |
+| `scene-runtime` | embedded QuickJS fallback for suspicious static LOD placements | server, LOD CLI, Lambda |
+| `cli` | tracing subscriber and CLI logging | server and LOD CLI |
+
+`crate/abgen-native`, `crate/abgen-node`, and converter WASM use no default features. The standalone `crate/wasm-gpu` package compiles the shared BC7/WebGPU source directly and does not depend on the full `abgen` graph; its worker ships only `gpu_init` and `gpu_encode`. Static CRDT placement interpretation remains available without `scene-runtime`; if that result is empty or suspicious, the minimal build fails explicitly instead of publishing an empty LOD.
 
 GPU backends self-qualify per device at enable time: the selected backend (`auto` tries CUDA, then
 wgpu) must reproduce the CPU BC7 encoder bit-for-bit on a probe matrix (sizes x srgb x perceptual x
@@ -148,8 +148,7 @@ Uploads carry each key family's production writer's object metadata, derived fro
 (cdn-uploader's comma-joined spelling), scene sources (`.js`/`.json`/`.crdt`) the direct-upload
 spelling `public, max-age=31536000, immutable`, manifests (`manifest/…`) `application/json` +
 `private, max-age=0, no-cache`, ISS descriptors (`lods-unity/manifests/…`)
-`public, max-age=31536000` (lod-generator-unity's spelling), `.br` keys
-`public,no-transform,max-age=31536000,immutable` + `Content-Encoding: br` (as cdn-uploader sets).
+`public, max-age=31536000` (lod-generator-unity's spelling).
 
 ### Asset-reuse mode (upstream converter parity)
 ON by default, matching the ab-cdn deployment's asset-reuse naming from v49 onward: scene
@@ -182,12 +181,17 @@ request waits up to the deadline, builds finish in the background. Knobs: `ABGEN
 `ABGEN_INDEX_BUILD_CONCURRENCY` (default: CPU count), `ABGEN_INDEX_BUILD_DEADLINE_MS` (default
 `20000`), `ABGEN_INDEX_BUILD_MAX_QUEUE` (default `0` = unlimited; when exceeded, new builds are skipped).
 ### LOD JIT lane
-`ABGEN_LOD_JIT=1` enables JIT LOD builds on `GET /LOD/{0|1}/...` misses; needs `gltfpack`
+`ABGEN_LOD_JIT=1` enables JIT LOD builds on `GET /LOD/1/...` misses (level 1 only, the production
+shape: level 0 is the client-side ISS assembly, so `LOD/0/...` answers `lod-level-unsupported` and
+`abgen-lod generate --level 0,1` is the offline opt-in); needs `gltfpack`
 (`ABGEN_GLTFPACK` or `$PATH`), fails closed without it. Knobs: `ABGEN_LOD_MANIFEST_BUILDER` (unset
 limits JIT to scenes with a published ISS descriptor), `ABGEN_LOD_CACHE_DIR` (default:
 `ABGEN_CACHE_DIR`), `ABGEN_LOD_JIT_TIMEOUT_S` / `ABGEN_LOD_JIT_FAIL_TTL_S` (defaults `600` / `3600`),
 `ABGEN_LOD_BUILD_CONCURRENCY` (default `1`). Builds stage in a per-build workdir; only gate-passed
-output is promoted into the serving root, so rejected bundles are never servable.
+output is promoted into the serving root, so rejected bundles are never servable. A passed build is
+written back to the space with the production key set: `LOD/1/{sid}_1_{platform}`,
+`lods-unity/manifests/{sid}_InitialSceneState.json` and the gltfpack-layout
+`lods-unity/lods/{sid}_1.glb`.
 ### Conversion / parity knobs
 - `ABGEN_SHADER_BUNDLE` - path to `scene_ignore_windows` (default `crate/shader/scene_ignore_windows`; siblings like `scene_ignore_mac` resolve from the same dir)
 - `ABGEN_CONTENT_ROOT` - local sharded content store root (default `./content`)
