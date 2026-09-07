@@ -170,7 +170,7 @@ fn parse(argv: &[String]) -> Result<Options> {
     let mut out = PathBuf::from("lod-qualification");
     let mut report = None;
     let mut cache = None;
-    let mut jobs = abgen::clihelp::default_file_concurrency().max(1);
+    let mut jobs = abgen::clihelp::default_lod_concurrency();
     let mut max_attempts = DEFAULT_ATTEMPTS;
     let mut snapshot_passes = DEFAULT_SNAPSHOT_PASSES;
     let mut city_min = -150;
@@ -1421,7 +1421,7 @@ mod tests {
     #[test]
     fn defaults_are_memory_aware_and_retries_are_bounded() {
         let opts = parse(&["--out".into(), "/tmp/qualify".into()]).unwrap();
-        assert_eq!(opts.jobs, abgen::clihelp::default_file_concurrency());
+        assert_eq!(opts.jobs, abgen::clihelp::default_lod_concurrency());
         assert_eq!(opts.max_attempts, DEFAULT_ATTEMPTS);
         assert_eq!(opts.snapshot_passes, DEFAULT_SNAPSHOT_PASSES);
         assert_eq!(opts.levels, vec![1]);

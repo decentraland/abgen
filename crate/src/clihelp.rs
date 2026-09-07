@@ -73,6 +73,32 @@ pub fn default_file_concurrency() -> usize {
     })
 }
 
+fn lod_concurrency_for(cores: usize, ram_gib: Option<u64>) -> usize {
+    let cpu_limit = cores.saturating_sub(1).max(1);
+    ram_gib
+        .map(|gib| cpu_limit.min(((gib / 2) as usize).max(1)))
+        .unwrap_or(cpu_limit)
+}
+
+pub fn default_lod_concurrency() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        for name in ["ABGEN_LOD_CONCURRENCY", "ABGEN_FILE_CONCURRENCY"] {
+            if let Some(n) = std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+            {
+                return n;
+            }
+        }
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        lod_concurrency_for(cores, available_memory_gib())
+    })
+}
+
 /// Default bounded concurrency for network-bound work (content fetch, S3
 /// probes): `(4 * cores).clamp(8, 32)`, uncoupled from the ~4 GiB/file RAM
 /// budget behind [`default_file_concurrency`]. `ABGEN_FETCH_CONCURRENCY` /
@@ -161,6 +187,20 @@ mod tests {
     #[test]
     fn default_file_concurrency_is_at_least_one() {
         assert!(default_file_concurrency() >= 1);
+    }
+
+    #[test]
+    fn lod_concurrency_reserves_a_core_and_budgets_two_gib_per_job() {
+        assert_eq!(lod_concurrency_for(16, Some(60)), 15);
+        assert_eq!(lod_concurrency_for(192, Some(22)), 11);
+        assert_eq!(lod_concurrency_for(4, Some(4)), 2);
+        assert_eq!(lod_concurrency_for(1, Some(1)), 1);
+        assert_eq!(lod_concurrency_for(8, None), 7);
+    }
+
+    #[test]
+    fn default_lod_concurrency_is_at_least_one() {
+        assert!(default_lod_concurrency() >= 1);
     }
 
     #[test]
