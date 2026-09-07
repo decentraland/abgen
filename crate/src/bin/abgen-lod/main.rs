@@ -122,8 +122,8 @@ bundle: stages <src.glb> as {entityIdLower}_{level}.glb and builds
 placements: resolves the scene, then prints its GLB placement list as JSON.
   --iss auto (default) folds the current deployment's main.crdt first and
   executes its SDK only when that state is empty or suspicious; it never
-  consumes production ISS. --iss FILE is an explicit comparison/test override;
-  --iss off is an alias for independent auto derivation. Node is not required;
+  consumes production ISS. --iss accepts only auto or off (an alias for auto).
+  --diff-iss FILE is comparison-only and never supplies placements. Node is not required;
   generate --cache stores content-addressed inputs only; cached output never
   authorizes placements or survives an entity redeployment as scene truth.
   --manifest-builder is deprecated and ignored. --diff-iss FILE
@@ -257,8 +257,8 @@ generate: the full sync chain: resolve scene -> independently derive placements
   exactly as in `simplify` above (default from ABGEN_SIMPLIFIER, else
   meshopt). Every budget-policy capped run adds a tri-cap self-gate
   check (tris_after <= cap); an --allow-unsimplified verbatim copy passes
-  it with a recorded waiver. Zero placements, unresolved glTF sources, or
-  unsupported mesh-renderer-only output quarantines the run before publication.
+  it with a recorded waiver. Unsupported renderer state forces SDK execution;
+  zero placements or unresolved glTF sources afterward quarantine the run before publication.
   No persistent placement baseline is consulted or written. The crop stage
   (default on, matching
   production; --no-crop disables) clips merged geometry to the exact parcel
