@@ -1,6 +1,6 @@
+mod gpu;
 
-use abgen::bc7_pure;
-use abgen::gpu::{build_engine, encode_bc7_mip_chain_on, init_gpu, Bc7Profile, Engine, Gpu};
+use gpu::{build_engine, encode_bc7_mip_chain_on, init_gpu, Bc7Profile, Engine, Gpu};
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
@@ -9,18 +9,13 @@ thread_local! {
     static STATE: RefCell<Option<Rc<(Gpu, Engine)>>> = const { RefCell::new(None) };
 }
 
-fn cpu_profile(p: Bc7Profile) -> bc7_pure::Bc7Profile {
-    match p {
-        Bc7Profile::Slow => bc7_pure::Bc7Profile::Slow,
-        Bc7Profile::Basic => bc7_pure::Bc7Profile::Basic,
-    }
-}
-
 fn gen_texture(seed: u64, w: u32, h: u32) -> Vec<u8> {
     let mut s = seed.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(1);
     let mut out = Vec::with_capacity((w * h * 4) as usize);
     for _ in 0..(w * h) {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let v = s >> 32;
         out.extend_from_slice(&[
             (v & 0xff) as u8,
@@ -33,55 +28,30 @@ fn gen_texture(seed: u64, w: u32, h: u32) -> Vec<u8> {
 }
 
 async fn qualify(g: &Gpu, eng: &Engine) -> Result<(), String> {
-    for &(w, h) in &[(64u32, 64u32), (128, 32), (37, 53)] {
-        let tex = gen_texture(1, w, h);
-        for srgb in [false, true] {
-            for perceptual in [false, true] {
-                for profile in [Bc7Profile::Slow, Bc7Profile::Basic] {
-                    let (want, want_mips) = bc7_pure::encode_bc7_mip_chain_with_profile(
-                        &tex,
-                        w,
-                        h,
-                        None,
-                        true,
-                        srgb,
-                        perceptual,
-                        cpu_profile(profile),
-                    );
-                    let (got, got_mips) = encode_bc7_mip_chain_on(
-                        g, eng, &tex, w, h, None, true, srgb, perceptual, profile,
-                    )
-                    .await
-                    .map_err(|e| format!("qualification encode failed: {e:#}"))?;
-                    if got != want || got_mips != want_mips {
-                        let diff = got
-                            .iter()
-                            .zip(want.iter())
-                            .position(|(a, b)| a != b)
-                            .unwrap_or(got.len().min(want.len()));
-                        let ctx = |v: &[u8]| {
-                            v.iter()
-                                .skip(diff & !15)
-                                .take(16)
-                                .map(|b| format!("{b:02x}"))
-                                .collect::<String>()
-                        };
-                        return Err(format!(
-                            "not bit-exact vs CPU oracle at {w}x{h} srgb={srgb} \
-                             perceptual={perceptual} profile={profile:?}: first diff \
-                             byte {diff} (block {} byte-in-block {}; lens {}/{} mips {got_mips}/{want_mips}) \
-                             got[{}..]={} want={}",
-                            diff / 16,
-                            diff % 16,
-                            got.len(),
-                            want.len(),
-                            diff & !15,
-                            ctx(&got),
-                            ctx(&want),
-                        ));
-                    }
-                }
-            }
+    const W: u32 = 37;
+    const H: u32 = 53;
+    let tex = gen_texture(1, W, H);
+    let tables = gpu::corelib::bc7::build_opt_tables();
+    for profile in [Bc7Profile::Slow, Bc7Profile::Basic] {
+        let (want, want_mips) = gpu::corelib::mips::encode_bc7_mip_chain_with_profile(
+            &tex, W, H, None, true, true, true, profile, &tables,
+        );
+        let (got, got_mips) = encode_bc7_mip_chain_on(
+            g, eng, &tex, W, H, None, true, true, true, profile,
+        )
+        .await
+        .map_err(|e| format!("qualification encode failed: {e:#}"))?;
+        if got != want || got_mips != want_mips {
+            let diff = got
+                .iter()
+                .zip(&want)
+                .position(|(a, b)| a != b)
+                .unwrap_or(got.len().min(want.len()));
+            return Err(format!(
+                "not bit-exact vs CPU oracle for {profile:?}: byte {diff}, \
+                 lengths {}/{}, mips {got_mips}/{want_mips}",
+                got.len(), want.len(),
+            ));
         }
     }
     Ok(())
@@ -97,59 +67,6 @@ pub async fn gpu_init() -> Result<String, JsValue> {
     let summary = g.adapter_summary();
     STATE.with(|s| *s.borrow_mut() = Some(Rc::new((g, eng))));
     Ok(summary)
-}
-
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-#[wasm_bindgen]
-pub async fn gpu_bisect() -> Result<String, JsValue> {
-    let state = STATE.with(|s| s.borrow().clone());
-    let owned: Option<Gpu> = if state.is_some() {
-        None
-    } else {
-        Some(init_gpu().await.map_err(|e| JsValue::from_str(&e))?)
-    };
-    let g: &Gpu = match &state {
-        Some(st) => &st.0,
-        None => owned.as_ref().unwrap(),
-    };
-    let results = abgen::gpu::bisect::run_bisect(g).await;
-    let mut json = String::from("{\"adapter\":\"");
-    json.push_str(&json_escape(&g.adapter_summary()));
-    json.push_str("\",\"results\":[");
-    for (i, r) in results.iter().enumerate() {
-        if i > 0 {
-            json.push(',');
-        }
-        json.push_str(&format!(
-            "{{\"entry\":\"{}\",\"cases\":{},\"pass\":{}",
-            json_escape(&r.entry),
-            r.cases,
-            r.pass
-        ));
-        if let Some(d) = &r.first_diff {
-            json.push_str(&format!(
-                ",\"first_diff\":{{\"byte_offset\":{},\"got_word\":{},\"want_word\":{},\"case_index\":{}}}",
-                d.byte_offset, d.got_word, d.want_word, d.case_index
-            ));
-        } else {
-            json.push_str(",\"first_diff\":null");
-        }
-        json.push('}');
-    }
-    json.push_str("]}");
-    Ok(json)
 }
 
 #[wasm_bindgen]

@@ -9,8 +9,11 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+
 [dependencies]
-abgen = { path = "..", package = "abgen", default-features = false }
+anyhow = "1"
+wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "webgpu"] }
 wasm-bindgen = "=0.2.121"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
