@@ -11,6 +11,7 @@ const DEFAULT_CATALYST: &str = "https://peer.decentraland.org/content";
 const DEFAULT_WORLDS: &str = "https://worlds-content-server.decentraland.org";
 const DEFAULT_ATTEMPTS: u32 = 3;
 const DEFAULT_SNAPSHOT_PASSES: usize = 8;
+const REPORT_SCHEMA_VERSION: u32 = 3;
 const CITY_DISCOVERY_BATCH: usize = 100;
 const RISK_SCENES: [&str; 4] = [
     "bafkreiceqm43l33evsc43jtotf2fs27efizwxn76cdnd3ypd6mcsdnpf6a",
@@ -32,6 +33,19 @@ impl Job {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct Shard {
+    count: usize,
+    index: usize,
+}
+
+fn in_shard(job: &Job, shard: Option<Shard>) -> bool {
+    let Some(shard) = shard else { return true };
+    let hash = abgen::hashes::sha256_hex(job.key().as_bytes());
+    let prefix = u64::from_str_radix(&hash[..16], 16).expect("sha256 hex prefix");
+    prefix % shard.count as u64 == shard.index as u64
+}
+
 struct Options {
     catalyst: String,
     worlds_url: String,
@@ -49,6 +63,7 @@ struct Options {
     entity_ids: Vec<String>,
     platforms: Vec<String>,
     levels: Vec<u32>,
+    shard: Option<Shard>,
 }
 
 #[derive(Serialize)]
@@ -116,6 +131,7 @@ struct SceneRecord {
 #[derive(Serialize)]
 struct Summary {
     discovered: usize,
+    selected: usize,
     processed: usize,
     passed: usize,
     failed: usize,
@@ -145,6 +161,7 @@ struct Report {
     platforms: Vec<String>,
     levels: Vec<u32>,
     workers: usize,
+    shard: Option<Shard>,
     texture_encoder: TextureEncoderRecord,
     max_attempts: u32,
     snapshot_limit: usize,
@@ -181,6 +198,8 @@ fn parse(argv: &[String]) -> Result<Options> {
     let mut entity_ids = Vec::new();
     let mut platforms = vec!["windows".to_string(), "mac".to_string()];
     let mut levels = vec![1];
+    let mut shard_count = None;
+    let mut shard_index = None;
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -194,6 +213,12 @@ fn parse(argv: &[String]) -> Result<Options> {
             "--attempts" => max_attempts = value(argv, &mut i)?.parse().context("--attempts")?,
             "--snapshot-passes" => {
                 snapshot_passes = value(argv, &mut i)?.parse().context("--snapshot-passes")?
+            }
+            "--shard-count" => {
+                shard_count = Some(value(argv, &mut i)?.parse().context("--shard-count")?)
+            }
+            "--shard-index" => {
+                shard_index = Some(value(argv, &mut i)?.parse().context("--shard-index")?)
             }
             "--city-min" => city_min = value(argv, &mut i)?.parse().context("--city-min")?,
             "--city-max" => city_max = value(argv, &mut i)?.parse().context("--city-max")?,
@@ -250,6 +275,13 @@ fn parse(argv: &[String]) -> Result<Options> {
     if city_min > city_max {
         bail!("--city-min must not exceed --city-max");
     }
+    let shard = match (shard_count, shard_index) {
+        (None, None) => None,
+        (Some(count), Some(index)) if count > 0 && index < count => Some(Shard { count, index }),
+        (Some(0), Some(_)) => bail!("--shard-count must be greater than zero"),
+        (Some(count), Some(index)) => bail!("--shard-index {index} is outside 0..{count}"),
+        _ => bail!("--shard-count and --shard-index must be used together"),
+    };
     if !city && !worlds && entity_ids.is_empty() {
         bail!("qualification has no source: enable city/worlds or pass --entity-ids");
     }
@@ -278,6 +310,7 @@ fn parse(argv: &[String]) -> Result<Options> {
         entity_ids,
         platforms,
         levels,
+        shard,
     })
 }
 
@@ -933,6 +966,7 @@ where
         let snapshot_keys: Vec<String> = snapshot.iter().map(Job::key).collect();
         let pending: Vec<Job> = snapshot
             .iter()
+            .filter(|job| in_shard(job, opts.shard))
             .filter(|job| processed.insert(job.key()))
             .cloned()
             .collect();
@@ -1039,14 +1073,20 @@ pub fn run(argv: &[String]) -> Result<i32> {
         .map(Job::key)
         .collect::<Vec<_>>()
         .join("\n");
+    let selected = qualification
+        .snapshot
+        .iter()
+        .filter(|job| in_shard(job, opts.shard))
+        .count();
     let report = Report {
-        schema_version: 2,
+        schema_version: REPORT_SCHEMA_VERSION,
         started_unix_ms: started_wall,
         catalyst: opts.catalyst.clone(),
         worlds_url: opts.worlds_url.clone(),
         platforms: opts.platforms.clone(),
         levels: opts.levels.clone(),
         workers: opts.jobs,
+        shard: opts.shard,
         texture_encoder,
         max_attempts: opts.max_attempts,
         snapshot_limit: opts.snapshot_passes,
@@ -1055,6 +1095,7 @@ pub fn run(argv: &[String]) -> Result<i32> {
         snapshot_stable: qualification.stable,
         summary: Summary {
             discovered: qualification.snapshot.len(),
+            selected,
             processed: qualification.records.len(),
             passed,
             failed,
@@ -1148,6 +1189,7 @@ mod tests {
             entity_ids: Vec::new(),
             platforms: vec!["windows".to_string(), "mac".to_string()],
             levels: vec![1],
+            shard: None,
         }
     }
 
@@ -1405,14 +1447,77 @@ mod tests {
     }
 
     #[test]
+    fn shard_assignment_is_deterministic_disjoint_and_complete() {
+        let jobs: Vec<Job> = (0..1_000).map(|index| job(&index.to_string())).collect();
+        let mut union = HashSet::new();
+        for index in 0..7 {
+            let shard = Some(Shard { count: 7, index });
+            let assigned: Vec<String> = jobs
+                .iter()
+                .filter(|job| in_shard(job, shard))
+                .map(|job| job.entity_id.clone())
+                .collect();
+            let repeated: Vec<String> = jobs
+                .iter()
+                .filter(|job| in_shard(job, shard))
+                .map(|job| job.entity_id.clone())
+                .collect();
+            assert_eq!(assigned, repeated);
+            for entity_id in assigned {
+                assert!(union.insert(entity_id));
+            }
+        }
+        assert_eq!(union.len(), jobs.len());
+    }
+
+    #[test]
+    fn qualification_processes_only_its_shard_from_the_global_snapshot() {
+        let mut opts = options("shard");
+        opts.shard = Some(Shard { count: 4, index: 2 });
+        let snapshot: Vec<Job> = (0..100).map(|index| job(&index.to_string())).collect();
+        let expected: HashSet<String> = snapshot
+            .iter()
+            .filter(|job| in_shard(job, opts.shard))
+            .map(|job| job.entity_id.clone())
+            .collect();
+        let result = qualify_with(&opts, || Ok(snapshot.clone()), &|job, _| record(job, true));
+        let actual: HashSet<String> = result
+            .records
+            .iter()
+            .map(|record| record.entity_id.clone())
+            .collect();
+        assert!(result.stable);
+        assert_eq!(result.snapshot.len(), snapshot.len());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn shard_flags_must_form_a_valid_pair() {
+        let args = |tail: &[&str]| {
+            let mut args = vec!["--out".to_string(), "/tmp/q-shard".to_string()];
+            args.extend(tail.iter().map(|value| value.to_string()));
+            args
+        };
+        assert_eq!(
+            parse(&args(&["--shard-count", "8", "--shard-index", "3"]))
+                .unwrap()
+                .shard,
+            Some(Shard { count: 8, index: 3 })
+        );
+        assert!(parse(&args(&["--shard-count", "8"])).is_err());
+        assert!(parse(&args(&["--shard-count", "0", "--shard-index", "0"])).is_err());
+        assert!(parse(&args(&["--shard-count", "8", "--shard-index", "8"])).is_err());
+    }
+
+    #[test]
     fn report_write_is_atomic_and_versioned_json() {
         let opts = options("report");
         std::fs::create_dir_all(opts.report.parent().unwrap()).unwrap();
-        let bytes = br#"{"schema_version":2,"snapshot_stable":false}"#;
+        let bytes = br#"{"schema_version":3,"snapshot_stable":false}"#;
         write_report(&opts.report, bytes).unwrap();
         let value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&opts.report).unwrap()).unwrap();
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["schema_version"], REPORT_SCHEMA_VERSION);
         assert_eq!(value["snapshot_stable"], false);
         assert!(!opts.report.with_extension("json.tmp").exists());
         let _ = std::fs::remove_dir_all(opts.report.parent().unwrap());

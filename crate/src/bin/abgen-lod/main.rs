@@ -104,6 +104,7 @@ USAGE:
             [--city-min -150] [--city-max 150] [--no-city] [--no-worlds]
             [--world NAME[,NAME...]] [--entity-ids FILE]
             [--attempts 3] [--snapshot-passes 8]
+            [--shard-count N --shard-index I]
 
 qualify-corpus: snapshots active Genesis City deployments from the configured
   Catalyst and all deployed scenes from the paginated Worlds API, converts
