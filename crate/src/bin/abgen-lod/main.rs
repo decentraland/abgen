@@ -72,12 +72,12 @@ USAGE:
   abgen-lod bundle <src.glb> --entity <entityId> [--level 1]
             [--platform windows|mac|linux] [--out DIR] [--catalyst URL]
             [--base X,Y --parcels 'x,y;x,y;...'] [--timestamp N] [--vertical-clip H]
-  abgen-lod placements (--coords X,Y | --scene <entityId>) [--iss FILE|auto|off]
+  abgen-lod placements (--coords X,Y | --scene <entityId>) [--iss auto|off]
             [--catalyst URL] [--diff-iss ISS.json [--tol 1e-3]]
   abgen-lod parse-manifest <manifest.json> --scene <pointer|entityId>
             [--catalyst URL] [--diff-iss ISS.json [--tol 1e-3]]
   abgen-lod assemble (--scene <entityId|X,Y> | --entity-json FILE) -o out.glb
-            [--catalyst URL] [--iss FILE|auto|off] [--cache DIR] [--level 1]
+            [--catalyst URL] [--iss auto|off] [--cache DIR] [--level 1]
             [--no-crop] [--no-atlas] [--raw-materials] [--max-size 256]
             [--padding 2] [--atlas-fixed] [--atlas-adaptive]
   abgen-lod atlas -i in.glb -o out.glb [--max-size 256] [--padding 2]
@@ -93,7 +93,7 @@ USAGE:
             [--tri-cap N|auto|parcels|off] [--atlas-max 2048]
             [--atlas-mode meshbaker|native|adaptive|fullbleed]
             [--atlas-fixed] [--atlas-adaptive] [--bake-order pre|post]
-            [--no-crop] [--catalyst URL] [--iss FILE|auto|off]
+            [--no-crop] [--catalyst URL] [--iss auto|off]
             [--workdir DIR] [--cache DIR] [--simplifier meshopt|gltfpack]
             [--gltfpack PATH]
             [--allow-unsimplified] [--keep-glb] [--no-uv-reclamp] [--emissive]
@@ -102,6 +102,7 @@ USAGE:
             [--catalyst URL] [--worlds-url URL] [--platform windows,mac]
             [--city-min -150] [--city-max 150] [--no-city] [--no-worlds]
             [--world NAME[,NAME...]] [--entity-ids FILE]
+            [--attempts 3] [--snapshot-passes 8]
 
 qualify-corpus: snapshots active Genesis City deployments from the configured
   Catalyst and all deployed scenes from the paginated Worlds API, converts
@@ -258,7 +259,8 @@ generate: the full sync chain: resolve scene -> independently derive placements
   check (tris_after <= cap); an --allow-unsimplified verbatim copy passes
   it with a recorded waiver. Zero placements, unresolved glTF sources, or
   unsupported mesh-renderer-only output quarantines the run before publication.
-  No persistent placement baseline is consulted or written. The crop stage (default on, matching
+  No persistent placement baseline is consulted or written. The crop stage
+  (default on, matching
   production; --no-crop disables) clips merged geometry to the exact parcel
   rect and adds a crop-bounds self-gate check. --platform takes a
   comma-separated list (windows|mac|linux; webgl is refused — upstream webgl

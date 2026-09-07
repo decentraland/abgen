@@ -87,22 +87,14 @@ fn placement_suspicion(ent: &Scene, full: &placements::ManifestPlacements) -> Ve
     why
 }
 
-fn acquire_placements_independently(
-    client: &CatalystClient,
+fn finish_auto_placements<F>(
     ent: &Scene,
-    iss: &str,
-) -> Result<(Vec<placements::Placement>, &'static str)> {
-    if iss != "auto" && iss != "off" {
-        let bytes = std::fs::read(iss).with_context(|| format!("read ISS file {iss}"))?;
-        let list = placements::parse_iss(&bytes)?;
-        if list.is_empty() {
-            bail!("explicit ISS {iss} contains zero placements; refusing to publish an empty LOD");
-        }
-        eprintln!("source: explicit iss ({} placements)", list.len());
-        return Ok((list, "explicit-iss"));
-    }
-
-    let static_result = crate::lodgen::scenerun::static_scene_placements(client, ent);
+    static_result: Result<placements::ManifestPlacements>,
+    execute_sdk: F,
+) -> Result<(Vec<placements::Placement>, &'static str)>
+where
+    F: FnOnce() -> Result<Option<placements::ManifestPlacements>>,
+{
     let (static_full, suspicious) = match static_result {
         Ok(full) => {
             let suspicious = placement_suspicion(ent, &full);
@@ -121,14 +113,13 @@ fn acquire_placements_independently(
         );
         return Ok((static_full.placements, "static-crdt"));
     }
-
     if static_full.is_some() {
         eprintln!(
             "static placements suspicious ({}); executing embedded SDK",
             suspicious.join(", ")
         );
     }
-    let full = crate::lodgen::scenerun::run_scene_placements(client, ent)?.ok_or_else(|| {
+    let full = execute_sdk()?.ok_or_else(|| {
         anyhow!(
             "scene {} emitted no renderer state; refusing to publish an empty LOD",
             ent.entity_id
@@ -140,11 +131,10 @@ fn acquire_placements_independently(
             ent.entity_id
         );
     }
-    if full.skipped_mesh_renderer > 0 || full.unresolved_src > 0 {
+    if full.unresolved_src > 0 {
         bail!(
-            "scene {} SDK output is incomplete: {} mesh-renderer-only components, {} unresolved glTF sources",
+            "scene {} SDK output is incomplete: {} unresolved glTF sources",
             ent.entity_id,
-            full.skipped_mesh_renderer,
             full.unresolved_src
         );
     }
@@ -155,6 +145,22 @@ fn acquire_placements_independently(
         full.unresolved_src
     );
     Ok((full.placements, "embedded-sdk"))
+}
+
+fn acquire_placements_independently(
+    client: &CatalystClient,
+    ent: &Scene,
+    iss: &str,
+) -> Result<(Vec<placements::Placement>, &'static str)> {
+    if iss != "auto" && iss != "off" {
+        bail!(
+            "--iss FILE cannot supply generated placements; derive independently and use --diff-iss FILE for comparison"
+        );
+    }
+    let static_result = crate::lodgen::scenerun::static_scene_placements(client, ent);
+    finish_auto_placements(ent, static_result, || {
+        crate::lodgen::scenerun::run_scene_placements(client, ent)
+    })
 }
 
 pub fn write_iss_descriptor(
@@ -268,11 +274,45 @@ pub struct LevelBuild {
     pub glb_path: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlacementStats {
+    pub count: usize,
+    pub rotated: usize,
+    pub non_uniform_scale: usize,
+    pub mirrored: usize,
+    pub extreme_scale: usize,
+}
+
+fn placement_stats(placements: &[placements::Placement]) -> PlacementStats {
+    let mut stats = PlacementStats {
+        count: placements.len(),
+        ..Default::default()
+    };
+    for placement in placements {
+        let [x, y, z, w] = placement.rotation;
+        if x.abs() > 1e-6 || y.abs() > 1e-6 || z.abs() > 1e-6 || (w.abs() - 1.0).abs() > 1e-6 {
+            stats.rotated += 1;
+        }
+        let [x, y, z] = placement.scale;
+        if (x.abs() - y.abs()).abs() > 1e-6 || (y.abs() - z.abs()).abs() > 1e-6 {
+            stats.non_uniform_scale += 1;
+        }
+        if x * y * z < 0.0 {
+            stats.mirrored += 1;
+        }
+        if [x, y, z].iter().any(|v| v.abs() < 0.01 || v.abs() > 100.0) {
+            stats.extreme_scale += 1;
+        }
+    }
+    stats
+}
+
 #[derive(Debug)]
 pub struct GenerateOutcome {
     pub entity_id: String,
     pub scene_id: String,
     pub source_tris: usize,
+    pub placement_stats: PlacementStats,
     pub levels: Vec<LevelBuild>,
     pub gate: Vec<GateCheck>,
     pub log: Vec<String>,
@@ -591,7 +631,8 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         lods::validate_lod_platform(p)?;
     }
     let primary = platforms[0].clone();
-    let client = CatalystClient::from_args(&params.catalyst, None);
+    let client =
+        CatalystClient::from_args(&params.catalyst, None).with_content_cache(params.cache.clone());
     let ent = client
         .resolve_scene(&params.scene)
         .with_context(|| format!("resolve scene {:?}", params.scene))?;
@@ -622,6 +663,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
             placements.len()
         );
     }
+    let placement_stats = placement_stats(&placements);
 
     if let Some(dir) = params.cache.as_deref() {
         std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
@@ -994,6 +1036,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         entity_id: ent.entity_id.clone(),
         scene_id: conv.scene_id.clone(),
         source_tris,
+        placement_stats,
         levels: level_builds,
         gate,
         log,
@@ -1054,5 +1097,103 @@ mod placement_policy_tests {
             placement_suspicion(&scene("7", None), &empty),
             ["mesh-renderer components", "unresolved glTF sources"]
         );
+    }
+
+    #[test]
+    fn authoritative_static_output_never_executes_sdk() {
+        let result = finish_auto_placements(&scene("7", None), Ok(manifest(2)), || {
+            panic!("SDK must not execute for authoritative declarative CRDT")
+        })
+        .unwrap();
+        assert_eq!(result.0.len(), 2);
+        assert_eq!(result.1, "static-crdt");
+    }
+
+    #[test]
+    fn executable_and_invalid_static_scenes_use_sdk_output() {
+        let result =
+            finish_auto_placements(&scene("7", Some("bin/index.js")), Ok(manifest(2)), || {
+                Ok(Some(manifest(3)))
+            })
+            .unwrap();
+        assert_eq!(result.0.len(), 3);
+        assert_eq!(result.1, "embedded-sdk");
+
+        let result = finish_auto_placements(
+            &scene("7", None),
+            Err(anyhow!("truncated deployment CRDT")),
+            || Ok(Some(manifest(1))),
+        )
+        .unwrap();
+        assert_eq!(result.1, "embedded-sdk");
+    }
+
+    #[test]
+    fn sdk_failure_empty_and_incomplete_results_are_rejected() {
+        let executable = scene("7", Some("bin/index.js"));
+        assert!(finish_auto_placements(&executable, Ok(manifest(1)), || {
+            Err(anyhow!("runtime failed"))
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("runtime failed"));
+        assert!(
+            finish_auto_placements(&executable, Ok(manifest(1)), || Ok(None))
+                .unwrap_err()
+                .to_string()
+                .contains("no renderer state")
+        );
+        assert!(
+            finish_auto_placements(&executable, Ok(manifest(1)), || { Ok(Some(manifest(0))) })
+                .unwrap_err()
+                .to_string()
+                .contains("zero placements")
+        );
+        let mut incomplete = manifest(1);
+        incomplete.unresolved_src = 1;
+        assert!(
+            finish_auto_placements(&executable, Ok(manifest(1)), || { Ok(Some(incomplete)) })
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete")
+        );
+        let mut runtime_primitives = manifest(1);
+        runtime_primitives.skipped_mesh_renderer = 3;
+        assert_eq!(
+            finish_auto_placements(&executable, Ok(manifest(1)), || {
+                Ok(Some(runtime_primitives))
+            })
+            .unwrap()
+            .0
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn descriptor_input_cannot_authorize_generated_placements() {
+        let client = CatalystClient::new("http://unused");
+        let error = acquire_placements_independently(&client, &scene("7", None), "upstream.json")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot supply generated placements"));
+    }
+
+    #[test]
+    fn placement_metrics_identify_explorer_transform_outliers() {
+        let placements = vec![
+            placements::Placement::default(),
+            placements::Placement {
+                rotation: [0.0, 0.707, 0.0, 0.707],
+                scale: [-2.0, 3.0, 200.0],
+                ..Default::default()
+            },
+        ];
+        let stats = placement_stats(&placements);
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.rotated, 1);
+        assert_eq!(stats.non_uniform_scale, 1);
+        assert_eq!(stats.mirrored, 1);
+        assert_eq!(stats.extreme_scale, 1);
     }
 }

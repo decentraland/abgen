@@ -8,21 +8,52 @@ use rquickjs::{
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 pub struct QuickJsEngine;
 
+struct EngineRequest {
+    job: SceneJob,
+    reply: mpsc::SyncSender<Result<CaptureOutcome>>,
+}
+
+struct EnginePool {
+    jobs: mpsc::SyncSender<EngineRequest>,
+}
+
+impl EnginePool {
+    fn start() -> Self {
+        let workers = crate::clihelp::default_file_concurrency().max(1);
+        let (jobs, receiver) = mpsc::sync_channel::<EngineRequest>(workers);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..workers {
+            let receiver = Arc::clone(&receiver);
+            std::thread::Builder::new()
+                .name(format!("abgen-scenerun-{index}"))
+                .stack_size(SCENE_THREAD_STACK)
+                .spawn(move || loop {
+                    let request = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                    let Ok(request) = request else { break };
+                    let _ = request.reply.send(run_on_thread(request.job));
+                })
+                .expect("spawn reusable scene runtime worker");
+        }
+        Self { jobs }
+    }
+}
+
 impl SceneEngine for QuickJsEngine {
     fn run_capture(&self, job: SceneJob) -> Result<CaptureOutcome> {
-        let worker = std::thread::Builder::new()
-            .name("abgen-scenerun".into())
-            .stack_size(SCENE_THREAD_STACK)
-            .spawn(move || run_on_thread(job))
-            .map_err(|e| anyhow!("spawn scene runtime thread: {e}"))?;
-        worker
-            .join()
-            .map_err(|_| anyhow!("scene runtime thread panicked"))?
+        static POOL: OnceLock<EnginePool> = OnceLock::new();
+        let pool = POOL.get_or_init(EnginePool::start);
+        let (reply, result) = mpsc::sync_channel(1);
+        pool.jobs
+            .send(EngineRequest { job, reply })
+            .map_err(|_| anyhow!("scene runtime worker pool stopped"))?;
+        result
+            .recv()
+            .map_err(|_| anyhow!("scene runtime worker stopped without a result"))?
     }
 }
 

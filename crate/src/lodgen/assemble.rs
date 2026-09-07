@@ -19,24 +19,28 @@ pub fn fetch_cached(
     cache_dir: Option<&Path>,
     hash: &str,
 ) -> Result<Vec<u8>> {
-    if let Some(dir) = cache_dir {
-        if let Ok(b) = std::fs::read(dir.join(hash)) {
-            client.record_cache_hit(b.len());
-            return Ok(b);
+    let cache_path = cache_dir.map(|dir| dir.join(&*crate::naming::fs_safe_component(hash)));
+    if let Some(path) = &cache_path {
+        if let Ok(bytes) = std::fs::read(path) {
+            client.record_cache_hit(bytes.len());
+            return Ok(bytes);
         }
     }
     let bytes = client
         .fetch_content(hash)
         .with_context(|| format!("fetch content {hash}"))?;
-    if let Some(dir) = cache_dir {
-        let _ = std::fs::create_dir_all(dir);
-        let tmp = dir.join(format!(
-            ".{hash}.{}.{}",
-            std::process::id(),
-            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        if std::fs::write(&tmp, &bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, dir.join(hash));
+    if let (Some(dir), Some(path)) = (cache_dir, cache_path) {
+        if !client.uses_content_cache(dir) {
+            let _ = std::fs::create_dir_all(dir);
+            let tmp = dir.join(format!(
+                ".{}.{}.{}",
+                crate::naming::fs_safe_component(hash),
+                std::process::id(),
+                TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            if std::fs::write(&tmp, &bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
         }
     }
     Ok(bytes)

@@ -1,7 +1,8 @@
 use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 pub const DEFAULT_CATALYST: &str = "http://localhost:5141/content";
@@ -147,6 +148,7 @@ pub struct CatalystClient {
     agent: ureq::Agent,
     local: Option<crate::local_store::LocalContentStore>,
     fallback_bases: Vec<String>,
+    content_cache: Option<PathBuf>,
     stats: Arc<ClientStats>,
 }
 
@@ -166,6 +168,7 @@ impl CatalystClient {
             agent,
             local: None,
             fallback_bases: Vec::new(),
+            content_cache: None,
             stats: Arc::new(ClientStats::default()),
         }
     }
@@ -174,6 +177,15 @@ impl CatalystClient {
         self.fallback_bases
             .push(base.trim_end_matches('/').to_string());
         self
+    }
+
+    pub fn with_content_cache(mut self, root: Option<PathBuf>) -> Self {
+        self.content_cache = root;
+        self
+    }
+
+    pub(crate) fn uses_content_cache(&self, root: &Path) -> bool {
+        self.content_cache.as_deref() == Some(root)
     }
 
     fn with_local_store(mut self, store: crate::local_store::LocalContentStore) -> Self {
@@ -204,11 +216,11 @@ impl CatalystClient {
     fn get_abs(&self, url: &str) -> Result<Vec<u8>> {
         let mut last: Option<String> = None;
         for attempt in 0..HTTP_RETRIES {
+            self.stats.network_requests.fetch_add(1, Ordering::Relaxed);
             match self.agent.get(url).header("User-Agent", UA).call() {
                 Ok(resp) => {
                     let mut buf: Vec<u8> = Vec::new();
                     resp.into_body().into_reader().read_to_end(&mut buf)?;
-                    self.stats.network_requests.fetch_add(1, Ordering::Relaxed);
                     self.stats
                         .network_bytes
                         .fetch_add(buf.len() as u64, Ordering::Relaxed);
@@ -233,6 +245,7 @@ impl CatalystClient {
         let url = format!("{}{}", self.base, path);
         let mut last: Option<String> = None;
         for attempt in 0..HTTP_RETRIES {
+            self.stats.network_requests.fetch_add(1, Ordering::Relaxed);
             match self
                 .agent
                 .post(&url)
@@ -243,7 +256,6 @@ impl CatalystClient {
                 Ok(resp) => {
                     let mut buf: Vec<u8> = Vec::new();
                     resp.into_body().into_reader().read_to_end(&mut buf)?;
-                    self.stats.network_requests.fetch_add(1, Ordering::Relaxed);
                     self.stats
                         .network_bytes
                         .fetch_add(buf.len() as u64, Ordering::Relaxed);
@@ -261,7 +273,20 @@ impl CatalystClient {
         bail!("POST {} failed: {}", url, last.unwrap_or_default())
     }
 
-    pub fn fetch_content(&self, content_hash: &str) -> Result<Vec<u8>> {
+    fn cache_path(&self, content_hash: &str) -> Option<PathBuf> {
+        self.content_cache
+            .as_ref()
+            .map(|root| root.join(&*crate::naming::fs_safe_component(content_hash)))
+    }
+
+    fn content_lock(content_hash: &str) -> MutexGuard<'static, ()> {
+        static LOCKS: OnceLock<[Mutex<()>; 256]> = OnceLock::new();
+        let locks = LOCKS.get_or_init(|| std::array::from_fn(|_| Mutex::new(())));
+        let slot = crate::hashes::crc32(content_hash.as_bytes()) as usize % locks.len();
+        locks[slot].lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn fetch_content_uncached(&self, content_hash: &str) -> Result<Vec<u8>> {
         let primary = if let Some(store) = &self.local {
             store
                 .fetch(content_hash)
@@ -270,21 +295,49 @@ impl CatalystClient {
             self.get(&format!("/contents/{content_hash}"))
         };
         match primary {
-            Ok(b) => {
+            Ok(bytes) => {
                 if self.local.is_some() {
-                    self.record_cache_hit(b.len());
+                    self.record_cache_hit(bytes.len());
                 }
-                Ok(b)
+                Ok(bytes)
             }
             Err(primary_err) => {
                 for base in &self.fallback_bases {
-                    if let Ok(b) = self.get_abs(&format!("{base}/contents/{content_hash}")) {
-                        return Ok(b);
+                    if let Ok(bytes) = self.get_abs(&format!("{base}/contents/{content_hash}")) {
+                        return Ok(bytes);
                     }
                 }
                 Err(primary_err)
             }
         }
+    }
+
+    pub fn fetch_content(&self, content_hash: &str) -> Result<Vec<u8>> {
+        let cache_path = self.cache_path(content_hash);
+        if let Some(path) = &cache_path {
+            if let Ok(bytes) = std::fs::read(path) {
+                self.record_cache_hit(bytes.len());
+                return Ok(bytes);
+            }
+        }
+        let _lock = Self::content_lock(content_hash);
+        if let Some(path) = &cache_path {
+            if let Ok(bytes) = std::fs::read(path) {
+                self.record_cache_hit(bytes.len());
+                return Ok(bytes);
+            }
+        }
+        let bytes = self.fetch_content_uncached(content_hash)?;
+        if let Some(path) = &cache_path {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let tmp = crate::tmppath::tmp_sibling(path);
+            if std::fs::write(&tmp, &bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+        Ok(bytes)
     }
 
     pub fn fetch_entity(&self, entity_id: &str) -> Result<Scene> {
@@ -482,6 +535,9 @@ use std::io::Read;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::sync::Barrier;
 
     #[test]
     fn pointer_detection() {
@@ -620,5 +676,52 @@ mod tests {
 
         let no_display = scene_with(&[("tex/a.png", "h1")], serde_json::json!({"display": "x"}));
         assert!(no_display.metadata_only_hashes().is_empty());
+    }
+    #[test]
+    fn read_through_cache_coalesces_concurrent_content_downloads() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let body = b"shared-payload";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let cache = std::env::temp_dir().join(format!(
+            "abgen-content-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let client = CatalystClient::new(&base).with_content_cache(Some(cache.clone()));
+        let barrier = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let client = client.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                client.fetch_content("payload").unwrap()
+            }));
+        }
+        barrier.wait();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap(), b"shared-payload");
+        }
+        let stats = client.io_stats();
+        assert_eq!(stats.network_requests, 1);
+        assert_eq!(stats.cache_hits, 1);
+        assert_eq!(
+            std::fs::read(cache.join("payload")).unwrap(),
+            b"shared-payload"
+        );
+        let _ = std::fs::remove_dir_all(cache);
     }
 }

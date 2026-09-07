@@ -568,6 +568,7 @@ mod tests {
             entity_id: sid.to_string(),
             scene_id: sid.to_string(),
             source_tris: 0,
+            placement_stats: Default::default(),
             levels: Vec::new(),
             gate: Vec::new(),
             log: Vec::new(),
