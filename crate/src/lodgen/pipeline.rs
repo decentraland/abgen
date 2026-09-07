@@ -5,8 +5,11 @@ use std::path::{Path, PathBuf};
 use crate::catalyst::{CatalystClient, Scene};
 use crate::lods;
 
-use super::gate::{push_check, self_gate_bundle_with, tri_cap_check, GateCheck};
+use super::gate::{
+    push_check, self_gate_bundle_with, tri_cap_check, GateCheck, BUNDLE_TEXTURE_MAX,
+};
 use super::model::LodModel;
+use super::simplify_meshopt::SimplifyPolicy;
 use super::{assemble, atlas, crop, emit, model, placements, reclamp, simplify, simplify_meshopt};
 
 pub fn parse_parcel(s: &str) -> Result<(i32, i32)> {
@@ -54,47 +57,91 @@ pub fn acquire_placements(
     ent: &Scene,
     iss: &str,
 ) -> Result<Vec<placements::Placement>> {
-    let iss_bytes: Option<Vec<u8>> = match iss {
-        "off" => None,
-        "auto" => {
-            let got = placements::fetch_iss(&ent.entity_id)?;
-            if got.is_none() {
-                eprintln!(
-                    "iss: no descriptor for {} (404), falling through",
-                    ent.entity_id
-                );
-            }
-            got
-        }
-        path => Some(std::fs::read(path).with_context(|| format!("read ISS file {path}"))?),
-    };
+    acquire_placements_with_baseline(client, ent, iss, false)
+}
 
-    match iss_bytes {
-        Some(bytes) => {
-            let list = placements::parse_iss(&bytes)?;
-            eprintln!("source: iss ({} placements)", list.len());
-            Ok(list)
-        }
-        None => match crate::lodgen::scenerun::run_scene_placements(client, ent)? {
-            None => {
-                eprintln!(
-                    "scene-runtime: scene ran to completion but emitted no renderer state; \
-                     treating {} as an empty scene",
-                    ent.entity_id
-                );
-                Ok(Vec::new())
-            }
-            Some(full) => {
-                eprintln!(
-                    "source: embedded-scene-runtime ({} placements, {} mesh-renderer-only skipped, {} unresolved src)",
-                    full.placements.len(),
-                    full.skipped_mesh_renderer,
-                    full.unresolved_src
-                );
-                Ok(full.placements)
-            }
-        },
+fn placement_baseline_path(cache: &Path, base: (i32, i32)) -> PathBuf {
+    cache
+        .join(".abgen-placement-baselines")
+        .join(format!("{}_{}.json", base.0, base.1))
+}
+
+fn has_accepted_descriptor(path: &Path) -> bool {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| placements::parse_iss(&bytes).ok())
+        .is_some()
+}
+
+fn placement_suspicion(
+    full: &placements::ManifestPlacements,
+    has_accepted_baseline: bool,
+) -> Vec<&'static str> {
+    let mut why = Vec::new();
+    if !has_accepted_baseline {
+        why.push("no accepted abgen baseline");
     }
+    if full.placements.is_empty() {
+        why.push("zero placements");
+    }
+    if full.skipped_mesh_renderer > 0 {
+        why.push("mesh-renderer components");
+    }
+    if full.unresolved_src > 0 {
+        why.push("unresolved glTF sources");
+    }
+    why
+}
+
+fn acquire_placements_with_baseline(
+    client: &CatalystClient,
+    ent: &Scene,
+    iss: &str,
+    has_accepted_baseline: bool,
+) -> Result<Vec<placements::Placement>> {
+    if iss != "auto" && iss != "off" {
+        let bytes = std::fs::read(iss).with_context(|| format!("read ISS file {iss}"))?;
+        let list = placements::parse_iss(&bytes)?;
+        if list.is_empty() {
+            bail!("explicit ISS {iss} contains zero placements; refusing to publish an empty LOD");
+        }
+        eprintln!("source: explicit iss ({} placements)", list.len());
+        return Ok(list);
+    }
+
+    let static_full = crate::lodgen::scenerun::static_scene_placements(client, ent)?;
+    let suspicious = placement_suspicion(&static_full, has_accepted_baseline);
+    if suspicious.is_empty() {
+        eprintln!(
+            "source: current-deployment CRDT ({} placements)",
+            static_full.placements.len()
+        );
+        return Ok(static_full.placements);
+    }
+
+    eprintln!(
+        "static placements suspicious ({}); executing embedded SDK",
+        suspicious.join(", ")
+    );
+    let full = crate::lodgen::scenerun::run_scene_placements(client, ent)?.ok_or_else(|| {
+        anyhow!(
+            "scene {} emitted no renderer state; refusing to publish an empty LOD",
+            ent.entity_id
+        )
+    })?;
+    if full.placements.is_empty() {
+        bail!(
+            "scene {} produced zero placements after SDK execution; refusing to publish an empty LOD",
+            ent.entity_id
+        );
+    }
+    eprintln!(
+        "source: embedded-scene-runtime ({} placements, {} mesh-renderer-only skipped, {} unresolved src)",
+        full.placements.len(),
+        full.skipped_mesh_renderer,
+        full.unresolved_src
+    );
+    Ok(full.placements)
 }
 
 pub fn write_iss_descriptor(
@@ -117,7 +164,6 @@ pub fn write_iss_descriptor(
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
     let path = dir.join(format!("{scene_id}{}", placements::ISS_SUFFIX));
     lods::write_atomic(&path, text.as_bytes())?;
-    lods::write_brotli_sidecar(&path, text.as_bytes())?;
     Ok((path, assets.len(), skipped))
 }
 
@@ -140,13 +186,18 @@ pub struct GenerateParams {
     pub platform: String,
     pub platforms: Vec<String>,
     pub levels: Vec<u32>,
+    /// `-si` ratio for the budget lanes; `simplify_policy` carries its own.
     pub ratio: f64,
+    /// Level-1 decimation policy (default production `gltfpack -si 0.1 -se 0.01`).
+    pub simplify_policy: SimplifyPolicy,
+    /// Budget-policy cap; consulted only under `SimplifyPolicy::Budget`.
     pub tri_cap: Option<u64>,
+    /// Budget policy: cap at 500 x parcels when no explicit `tri_cap`.
     pub tri_cap_auto: bool,
+    /// Atlas canvas ceiling (MeshBaker's AutoSizeAtlas tops out at 2048).
     pub atlas_max: u32,
     pub atlas_padding: u32,
-    pub atlas_fixed: bool,
-    pub atlas_adaptive: bool,
+    pub atlas_mode: atlas::AtlasMode,
     pub crop: bool,
     pub catalyst: String,
     pub iss: String,
@@ -169,14 +220,14 @@ impl Default for GenerateParams {
             out_dir: "lodgen-out".to_string(),
             platform: "windows".to_string(),
             platforms: Vec::new(),
-            levels: vec![0, 1],
+            levels: vec![1],
             ratio: 0.1,
+            simplify_policy: SimplifyPolicy::default(),
             tri_cap: None,
             tri_cap_auto: true,
-            atlas_max: 256,
+            atlas_max: 2048,
             atlas_padding: 2,
-            atlas_fixed: false,
-            atlas_adaptive: false,
+            atlas_mode: atlas::AtlasMode::MeshBaker,
             crop: true,
             catalyst: "https://peer.decentraland.org/content".to_string(),
             iss: "auto".to_string(),
@@ -238,17 +289,31 @@ pub const TRIS_PER_PARCEL: u64 = 500;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SimplifyLane {
     Passthrough,
-    Uncapped { ratio: f64 },
-    Capped { ratio: f64, cap: u64 },
+    /// Production policy: one `-si ratio -se target_error` pass, no cap.
+    GltfpackSi {
+        ratio: f32,
+        target_error: f32,
+    },
+    Uncapped {
+        ratio: f64,
+    },
+    Capped {
+        ratio: f64,
+        cap: u64,
+    },
 }
 
+/// The tri cap in force at `level`: `None` at level 0 and under the
+/// gltfpack-si policy (which never caps); under the budget policy the
+/// parcel threshold when `tri_cap_auto`, else the explicit cap.
 pub fn effective_tri_cap(
     level: u32,
+    policy: SimplifyPolicy,
     tri_cap: Option<u64>,
     tri_cap_auto: bool,
     threshold: u64,
 ) -> Option<u64> {
-    if level == 0 {
+    if level == 0 || policy != SimplifyPolicy::Budget {
         return None;
     }
     if tri_cap_auto {
@@ -260,6 +325,7 @@ pub fn effective_tri_cap(
 
 pub fn choose_lane(
     level: u32,
+    policy: SimplifyPolicy,
     tri_cap: Option<u64>,
     tri_cap_auto: bool,
     ratio: f64,
@@ -269,7 +335,21 @@ pub fn choose_lane(
     if level == 0 {
         return SimplifyLane::Passthrough;
     }
-    match effective_tri_cap(level, tri_cap, tri_cap_auto, threshold) {
+    if let SimplifyPolicy::GltfpackSi {
+        ratio,
+        target_error,
+    } = policy
+    {
+        return if source_tris == 0 {
+            SimplifyLane::Passthrough
+        } else {
+            SimplifyLane::GltfpackSi {
+                ratio,
+                target_error,
+            }
+        };
+    }
+    match effective_tri_cap(level, policy, tri_cap, tri_cap_auto, threshold) {
         Some(cap) if source_tris as u64 <= cap => SimplifyLane::Passthrough,
         Some(cap) => SimplifyLane::Capped { ratio, cap },
         None if source_tris as u64 <= threshold => SimplifyLane::Passthrough,
@@ -300,6 +380,54 @@ fn run_gltfpack_lane(
         },
         Err(e) if params.allow_unsimplified => {
             eprintln!("WARNING: {e:#}; --allow-unsimplified passthrough");
+            simplify::copy_unsimplified(pre, out)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn run_gltfpack_si_lane(
+    pre: &Path,
+    out: &Path,
+    params: &GenerateParams,
+    ratio: f32,
+    target_error: f32,
+) -> Result<simplify::SimplifyReport> {
+    match simplify::resolve_gltfpack(params.gltfpack.as_deref()) {
+        Ok(bin) => match simplify::simplify_si(pre, out, ratio, target_error, &bin) {
+            Ok(r) => Ok(r),
+            Err(e) if params.allow_unsimplified => {
+                eprintln!("WARNING: gltfpack failed ({e:#}); --allow-unsimplified passthrough");
+                simplify::copy_unsimplified(pre, out)
+            }
+            Err(e) => Err(e),
+        },
+        Err(e) if params.allow_unsimplified => {
+            eprintln!("WARNING: {e:#}; --allow-unsimplified passthrough");
+            simplify::copy_unsimplified(pre, out)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn run_meshopt_si_lane(
+    model: &LodModel,
+    pre: &Path,
+    out: &Path,
+    params: &GenerateParams,
+    ratio: f32,
+    target_error: f32,
+) -> Result<simplify::SimplifyReport> {
+    let attempt = || -> Result<simplify::SimplifyReport> {
+        let (m, report) = simplify_meshopt::simplify_model_si(model, ratio, target_error)?;
+        let glb = emit::emit_glb(&m)?;
+        std::fs::write(out, &glb).with_context(|| format!("write {}", out.display()))?;
+        Ok(report)
+    };
+    match attempt() {
+        Ok(r) => Ok(r),
+        Err(e) if params.allow_unsimplified => {
+            eprintln!("WARNING: meshopt simplify failed ({e:#}); --allow-unsimplified passthrough");
             simplify::copy_unsimplified(pre, out)
         }
         Err(e) => Err(e),
@@ -344,6 +472,7 @@ fn run_simplify(
     let threshold = TRIS_PER_PARCEL * parcel_count as u64;
     let lane = choose_lane(
         level,
+        params.simplify_policy,
         params.tri_cap,
         params.tri_cap_auto,
         params.ratio,
@@ -363,9 +492,19 @@ fn run_simplify(
                     "simplify-lane[0]: level-0 pass-through ({source_tris} tris, ratio 1.0, no gltfpack)"
                 ));
             } else {
-                match effective_tri_cap(level, params.tri_cap, params.tri_cap_auto, threshold) {
+                match effective_tri_cap(
+                    level,
+                    params.simplify_policy,
+                    params.tri_cap,
+                    params.tri_cap_auto,
+                    threshold,
+                ) {
                     Some(cap) => log.push(format!(
                         "simplify-lane[{level}]: pass-through under cap ({source_tris} tris <= cap {cap})"
+                    )),
+                    None if params.simplify_policy != SimplifyPolicy::Budget => log.push(format!(
+                        "simplify-lane[{level}]: pass-through (empty source, {})",
+                        params.simplify_policy.name()
                     )),
                     None => log.push(format!(
                         "simplify-lane[{level}]: pass-through ({source_tris} tris <= {threshold} = {TRIS_PER_PARCEL} x {parcel_count} parcels)"
@@ -373,6 +512,23 @@ fn run_simplify(
                 }
             }
             simplify::passthrough(pre, out)
+        }
+        SimplifyLane::GltfpackSi {
+            ratio,
+            target_error,
+        } => {
+            log.push(format!(
+                "simplify-lane[{level}]: gltfpack-si ratio {ratio} -se {target_error} uncapped ({source_tris} tris, {})",
+                params.simplifier.name()
+            ));
+            match params.simplifier {
+                simplify::SimplifierBackend::Gltfpack => {
+                    run_gltfpack_si_lane(pre, out, params, ratio, target_error)
+                }
+                simplify::SimplifierBackend::Meshopt => {
+                    run_meshopt_si_lane(model, pre, out, params, ratio, target_error)
+                }
+            }
         }
         SimplifyLane::Uncapped { ratio } => {
             log.push(format!(
@@ -433,12 +589,27 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     let parcel_count = parcels.len();
     log.push(format!("base={},{} parcels={parcel_count}", base.0, base.1));
 
+    let cached_baseline = params
+        .cache
+        .as_deref()
+        .map(|cache| placement_baseline_path(cache, base));
+    let has_accepted_baseline = cached_baseline
+        .as_deref()
+        .is_some_and(has_accepted_descriptor);
+
     let t_total = std::time::Instant::now();
     let t = std::time::Instant::now();
-    let placements = acquire_placements(&client, &ent, &params.iss)?;
+    let placements =
+        acquire_placements_with_baseline(&client, &ent, &params.iss, has_accepted_baseline)?;
     let placements_ms = t.elapsed().as_millis();
     log.push(format!("placements: {}", placements.len()));
-    if !placements.is_empty() && placements.iter().all(|p| p.scale.iter().all(|s| *s == 0.0)) {
+    if placements.is_empty() {
+        bail!(
+            "scene {} produced zero placements; refusing to publish an empty LOD",
+            ent.entity_id
+        );
+    }
+    if placements.iter().all(|p| p.scale.iter().all(|s| *s == 0.0)) {
         bail!(
             "scene {} produced {} placements, all scaled to zero; refusing to emit an invisible bundle",
             ent.entity_id,
@@ -449,7 +620,6 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     if let Some(dir) = params.cache.as_deref() {
         std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
     }
-    let expect_content = !placements.is_empty();
     let staging = params
         .workdir
         .clone()
@@ -457,14 +627,14 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     std::fs::create_dir_all(&staging).with_context(|| format!("mkdir {}", staging.display()))?;
     let pre = staging.join(format!("{sid}_pre.glb"));
 
-    let mut assemble_ms = 0;
+    let assemble_ms;
     let mut atlas_ms = 0;
-    let mut emit_ms = 0;
+    let mut emit_ms;
     let mut simplify_ms = 0;
     let mut crop_stats: Option<crop::UnionStats> = None;
-    let mut source_tris = 0usize;
-    let mut staged: Vec<(u32, PathBuf, simplify::SimplifyReport)> = Vec::new();
-    if expect_content {
+    let source_tris;
+    let mut staged: Vec<(u32, PathBuf, simplify::SimplifyReport, Option<u32>)> = Vec::new();
+    {
         let t = std::time::Instant::now();
         let mut model = assemble::assemble(
             &client,
@@ -488,13 +658,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
             }
         }
         let t = std::time::Instant::now();
-        let mode = if params.atlas_fixed {
-            atlas::AtlasMode::FullBleed
-        } else if params.atlas_adaptive {
-            atlas::AtlasMode::Adaptive
-        } else {
-            atlas::AtlasMode::Native
-        };
+        let mode = params.atlas_mode;
         if params.bake_after_simplify {
             log.extend(model.log.iter().cloned());
             let root_name = model.root_name.clone();
@@ -543,7 +707,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
                 if !params.keep_glb {
                     let _ = std::fs::remove_file(&dec);
                 }
-                staged.push((level, out, sim));
+                staged.push((level, out, sim, atlas::max_image_side(&atlased)));
             }
         } else {
             let (model, atlas_rects) = atlas::atlas_with_rects(
@@ -556,6 +720,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
             atlas_ms = t.elapsed().as_millis();
             log.extend(model.log.iter().cloned());
             source_tris = model.total_tris();
+            let atlas_side = atlas::max_image_side(&model);
 
             let t = std::time::Instant::now();
             let glb = emit::emit_glb(&model)?;
@@ -592,25 +757,8 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
                         rep.reclamped, rep.scanned
                     ));
                 }
-                staged.push((level, out, sim));
+                staged.push((level, out, sim, atlas_side));
             }
-        }
-    } else {
-        log.push("empty scene: no placements; emitting content-free LOD bundles".to_string());
-        for &level in &levels {
-            let out = staging.join(staged_glb_name(&sid, level));
-            let t = std::time::Instant::now();
-            let glb = emit::emit_empty_glb(&format!("{}_{}", sid, level))?;
-            std::fs::write(&out, &glb).with_context(|| format!("write {}", out.display()))?;
-            emit_ms += t.elapsed().as_millis();
-            staged.push((
-                level,
-                out,
-                simplify::SimplifyReport {
-                    passthrough: true,
-                    ..Default::default()
-                },
-            ));
         }
     }
 
@@ -627,15 +775,45 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     };
     let sources: Vec<String> = staged
         .iter()
-        .map(|(_, p, _)| p.to_string_lossy().into_owned())
+        .map(|(_, p, _, _)| p.to_string_lossy().into_owned())
         .collect();
-    let t = std::time::Instant::now();
-    let conv = lods::convert_lods_platforms(&client, &sources, &params.out_dir, &opts, &platforms)?;
-    let bundle_ms = t.elapsed().as_millis();
-    log.push(format!(
-        "timing: placements_ms={placements_ms} assemble_ms={assemble_ms} atlas_ms={atlas_ms} emit_ms={emit_ms} simplify_ms={simplify_ms} bundle_ms={bundle_ms} total_ms={}",
-        t_total.elapsed().as_millis()
-    ));
+    let t_package = std::time::Instant::now();
+    let scene_dir = PathBuf::from(&params.out_dir).join(&sid);
+    let (conv, mut published, bundle_ms) = std::thread::scope(|scope| -> Result<_> {
+        let jobs: Vec<_> = staged
+            .iter()
+            .filter(|(level, _, _, _)| *level >= 1)
+            .map(|(level, staged_glb, _, _)| {
+                let level = *level;
+                let scene_dir = &scene_dir;
+                let sid = &sid;
+                (
+                    level,
+                    scope.spawn(move || -> Result<(PathBuf, u64, usize)> {
+                        let float_glb = std::fs::read(staged_glb)
+                            .with_context(|| format!("read staged glb {}", staged_glb.display()))?;
+                        let path = lods::write_published_glb(scene_dir, sid, level, &float_glb)?;
+                        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        Ok((path, bytes, float_glb.len()))
+                    }),
+                )
+            })
+            .collect();
+        let t_bundle = std::time::Instant::now();
+        let conv =
+            lods::convert_lods_platforms(&client, &sources, &params.out_dir, &opts, &platforms)?;
+        let bundle_ms = t_bundle.elapsed().as_millis();
+        let mut published = HashMap::with_capacity(jobs.len());
+        for (level, job) in jobs {
+            let result = job
+                .join()
+                .map_err(|_| anyhow!("published GLB worker panicked"))??;
+            published.insert(level, result);
+        }
+        Ok((conv, published, bundle_ms))
+    })?;
+    let package_ms = t_package.elapsed().as_millis();
+    let t_finalize = std::time::Instant::now();
     if !conv.skipped.is_empty() {
         bail!("convert_lods skipped sources: {:?}", conv.skipped);
     }
@@ -708,22 +886,20 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         );
     }
     let mut level_builds: Vec<LevelBuild> = Vec::new();
-    for (level, staged_glb, sim) in staged {
-        if expect_content {
-            if let Some(cap) = effective_tri_cap(
-                level,
-                params.tri_cap,
-                params.tri_cap_auto,
-                TRIS_PER_PARCEL * parcel_count as u64,
-            ) {
-                let c = tri_cap_check(cap, sim.tris_after, sim.unsimplified);
-                push_check(&mut gate, format!("L{level}:{}", c.label), c.ok, c.detail);
-            }
+    for (level, staged_glb, sim, atlas_side) in staged {
+        if let Some(cap) = effective_tri_cap(
+            level,
+            params.simplify_policy,
+            params.tri_cap,
+            params.tri_cap_auto,
+            TRIS_PER_PARCEL * parcel_count as u64,
+        ) {
+            let c = tri_cap_check(cap, sim.tris_after, sim.unsimplified);
+            push_check(&mut gate, format!("L{level}:{}", c.label), c.ok, c.detail);
         }
         let mut primary_path = PathBuf::new();
         let mut primary_bytes = 0usize;
-        let gate_budget = (expect_content && !params.atlas_fixed && !params.atlas_adaptive)
-            .then(|| atlas::budget_pot(params.atlas_max));
+        let gate_budget = atlas_side.map(|s| s.next_power_of_two().min(BUNDLE_TEXTURE_MAX));
         for plat in &platforms {
             let rel = expected_rel_path(&sid, level, plat);
             let path = PathBuf::from(&params.out_dir)
@@ -731,8 +907,15 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
                 .join(&rel);
             let data = std::fs::read(&path)
                 .with_context(|| format!("read built bundle {}", path.display()))?;
-            let checks =
-                self_gate_bundle_with(&data, &sid, level, plat, expect_content, gate_budget)?;
+            let checks = self_gate_bundle_with(
+                &data,
+                &sid,
+                level,
+                plat,
+                true,
+                gate_budget,
+                params.fidelity,
+            )?;
             for c in checks {
                 push_check(
                     &mut gate,
@@ -747,21 +930,30 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
                 conv.results.iter().any(|r| r.rel_path == rel),
                 rel.clone(),
             );
-            let br = {
-                let mut s = path.as_os_str().to_owned();
-                s.push(".br");
-                PathBuf::from(s)
-            };
-            push_check(
-                &mut gate,
-                format!("L{level}:{plat}:brotli-sidecar"),
-                br.is_file(),
-                br.display().to_string(),
-            );
             if plat == &primary {
                 primary_bytes = data.len();
                 primary_path = path;
             }
+        }
+        let published = published.remove(&level);
+        if level >= 1 && published.is_none() {
+            bail!(
+                "published GLB worker returned no result for scene {} level {level}",
+                conv.scene_id
+            );
+        }
+        if let Some((published, published_bytes, float_len)) = published {
+            push_check(
+                &mut gate,
+                format!("L{level}:published-glb"),
+                published_bytes > 0,
+                format!("{} ({published_bytes} bytes)", published.display()),
+            );
+            log.push(format!(
+                "published-glb[{level}]: {} ({published_bytes} bytes; float glb {} bytes)",
+                published.display(),
+                float_len
+            ));
         }
         let glb_path = if params.keep_glb {
             Some(staged_glb)
@@ -778,9 +970,30 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
             glb_path,
         });
     }
+    let independent_placements = params.iss == "auto" || params.iss == "off";
+    if independent_placements && gate.iter().all(|check| check.ok) {
+        if let Some(path) = cached_baseline {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("mkdir {}", parent.display()))?;
+            }
+            let bytes = std::fs::read(&iss_path)
+                .with_context(|| format!("read accepted descriptor {}", iss_path.display()))?;
+            lods::write_atomic(&path, &bytes)?;
+            log.push(format!(
+                "placement-baseline: {} ({iss_assets} assets)",
+                path.display()
+            ));
+        }
+    }
     if !params.keep_glb {
         let _ = std::fs::remove_file(&pre);
     }
+    let finalize_ms = t_finalize.elapsed().as_millis();
+    log.push(format!(
+        "timing: placements_ms={placements_ms} assemble_ms={assemble_ms} atlas_ms={atlas_ms} emit_ms={emit_ms} simplify_ms={simplify_ms} bundle_ms={bundle_ms} package_ms={package_ms} finalize_ms={finalize_ms} total_ms={}",
+        t_total.elapsed().as_millis()
+    ));
 
     Ok(GenerateOutcome {
         entity_id: ent.entity_id.clone(),
@@ -790,4 +1003,55 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         gate,
         log,
     })
+}
+
+#[cfg(test)]
+mod placement_policy_tests {
+    use super::*;
+
+    fn manifest(count: usize) -> placements::ManifestPlacements {
+        placements::ManifestPlacements {
+            placements: vec![placements::Placement::default(); count],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn clean_static_state_avoids_sdk_execution_only_with_an_abgen_baseline() {
+        assert!(placement_suspicion(&manifest(12), true).is_empty());
+        assert_eq!(
+            placement_suspicion(&manifest(12), false),
+            ["no accepted abgen baseline"]
+        );
+    }
+
+    #[test]
+    fn incomplete_static_state_requests_sdk_execution() {
+        let mut empty = manifest(0);
+        assert_eq!(
+            placement_suspicion(&empty, false),
+            ["no accepted abgen baseline", "zero placements"]
+        );
+
+        empty.placements.push(Default::default());
+        empty.skipped_mesh_renderer = 2;
+        empty.unresolved_src = 1;
+        assert_eq!(
+            placement_suspicion(&empty, true),
+            ["mesh-renderer components", "unresolved glTF sources"]
+        );
+    }
+
+    #[test]
+    fn placement_count_drop_does_not_trigger_sdk_execution() {
+        assert!(placement_suspicion(&manifest(1), true).is_empty());
+    }
+
+    #[test]
+    fn cached_baseline_is_stable_across_entity_redeployments() {
+        assert_eq!(
+            placement_baseline_path(Path::new("/cache"), (-126, 144)),
+            Path::new("/cache/.abgen-placement-baselines/-126_144.json")
+        );
+    }
 }

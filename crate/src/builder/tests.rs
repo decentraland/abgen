@@ -1158,6 +1158,158 @@ fn lod_mat_keywords(tree: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn lod_mat_color(tree: &Value, name: &str) -> Option<[f64; 4]> {
+    let colors = tree.get("m_SavedProperties")?.get("m_Colors")?.as_array()?;
+    for e in colors {
+        let pair = e.as_array()?;
+        if let Value::Str(n) = &pair[0] {
+            if n == name {
+                let c = &pair[1];
+                let g = |k: &str| c.get(k).and_then(|v| v.as_f64());
+                return Some([g("r")?, g("g")?, g("b")?, g("a")?]);
+            }
+        }
+    }
+    None
+}
+
+fn lod_mat_tag(tree: &Value, key: &str) -> Option<String> {
+    let tags = tree.get("stringTagMap")?.as_array()?;
+    for e in tags {
+        let pair = e.as_array()?;
+        if pair.first()?.as_str()? == key {
+            return pair.get(1)?.as_str().map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// The converter's HDRP-named SetFloat calls (LODConversion.cs:519-525,
+/// 540-547) target properties DCL/Scene_TexArray does not declare; the
+/// shipped material carries none of them (measured on the production Tea
+/// Park LOD/1 bundle), only the URP-named blend state.
+const LOD_UNDECLARED_RECIPE_FLOATS: [&str; 5] = [
+    "_BlendMode",
+    "_AlphaCutoffEnable",
+    "_AlphaSrcBlend",
+    "_AlphaDstBlend",
+    "_ZTestDepthEqualForOpaque",
+];
+
+#[test]
+fn lod_transparent_material_recipe() {
+    let t = lod_test_tree(&lod_test_material("TextureBakeResult-mat-transparent"));
+    assert_eq!(
+        lod_mat_keywords(&t),
+        vec![
+            "_ALPHAPREMULTIPLY_ON".to_string(),
+            "_SURFACE_TYPE_TRANSPARENT".to_string()
+        ]
+    );
+    assert_eq!(
+        t.get("m_CustomRenderQueue").and_then(|v| v.as_i64()),
+        Some(3000)
+    );
+    assert_eq!(lod_mat_tag(&t, "RenderType"), None);
+    for (name, want) in [
+        ("_Surface", 1.0),
+        ("_Blend", 0.0),
+        ("_AlphaClip", 0.0),
+        ("_AlphaToMask", 0.0),
+        ("_Cutoff", 0.5),
+        ("_SrcBlend", 1.0),
+        ("_DstBlend", 10.0),
+        ("_SrcBlendAlpha", 1.0),
+        ("_DstBlendAlpha", 10.0),
+        ("_ZWrite", 0.0),
+    ] {
+        assert_eq!(lod_mat_float(&t, name), Some(want), "{name}");
+    }
+    for name in LOD_UNDECLARED_RECIPE_FLOATS {
+        assert_eq!(lod_mat_float(&t, name), None, "{name} must not ship");
+    }
+    assert_eq!(
+        lod_mat_color(&t, "_BaseColor"),
+        Some([1.0, 1.0, 1.0, 0.8_f32 as f64])
+    );
+}
+
+#[test]
+fn lod_cutout_material_recipe_keeps_surface_type_transparent() {
+    let t = lod_test_tree(&lod_test_material("TextureBakeResult-mat-cutout"));
+    assert_eq!(
+        lod_mat_keywords(&t),
+        vec![
+            "_ALPHATEST_ON".to_string(),
+            "_SURFACE_TYPE_TRANSPARENT".to_string()
+        ]
+    );
+    assert_eq!(
+        t.get("m_CustomRenderQueue").and_then(|v| v.as_i64()),
+        Some(2450)
+    );
+    assert_eq!(
+        lod_mat_tag(&t, "RenderType").as_deref(),
+        Some("TransparentCutout")
+    );
+    for (name, want) in [
+        ("_Surface", 1.0),
+        ("_Blend", 0.0),
+        ("_AlphaClip", 1.0),
+        ("_AlphaToMask", 1.0),
+        ("_Cutoff", 0.5),
+        ("_SrcBlend", 1.0),
+        ("_DstBlend", 0.0),
+        ("_SrcBlendAlpha", 1.0),
+        ("_DstBlendAlpha", 0.0),
+        ("_ZWrite", 1.0),
+    ] {
+        assert_eq!(lod_mat_float(&t, name), Some(want), "{name}");
+    }
+    for name in LOD_UNDECLARED_RECIPE_FLOATS {
+        assert_eq!(lod_mat_float(&t, name), None, "{name} must not ship");
+    }
+    assert_eq!(lod_mat_color(&t, "_BaseColor"), Some([1.0, 1.0, 1.0, 1.0]));
+
+    let t = lod_test_tree(&lod_test_material("TextureBakeResult-mat"));
+    assert!(lod_mat_keywords(&t).is_empty());
+    assert_eq!(lod_mat_float(&t, "_Surface"), Some(0.0));
+    assert_eq!(lod_mat_float(&t, "_ZWrite"), Some(1.0));
+    assert_eq!(lod_mat_float(&t, "_DstBlend"), Some(0.0));
+    assert_eq!(lod_mat_float(&t, "_DstBlendAlpha"), Some(0.0));
+}
+
+#[test]
+fn lod_base_color_is_white_with_transparent_alpha() {
+    // The source factor is never copied: the bake folds it into the atlas.
+    let source = [0.2, 0.4, 0.6, 1.0];
+    for name in ["TextureBakeResult-mat", "TextureBakeResult-mat-cutout"] {
+        let m = lod_test_material(name);
+        assert_eq!(m.base_color, source);
+        assert_eq!(
+            lod_mat_color(&lod_test_tree(&m), "_BaseColor"),
+            Some([1.0, 1.0, 1.0, 1.0]),
+            "{name}"
+        );
+    }
+    let m = lod_test_material("TextureBakeResult-mat-transparent");
+    assert_eq!(
+        lod_mat_color(&lod_test_tree(&m), "_BaseColor"),
+        Some([1.0, 1.0, 1.0, 0.8_f32 as f64])
+    );
+    // Fidelity keeps the per-texel atlas alpha: white, alpha 1.
+    assert_eq!(
+        lod_mat_color(&lod_test_tree_with(&m, true), "_BaseColor"),
+        Some([1.0, 1.0, 1.0, 1.0])
+    );
+    let mut m = lod_test_material("TextureBakeResult-mat-transparent");
+    m.base_color = [0.0, 0.0, 0.0, 0.25];
+    assert_eq!(
+        lod_mat_color(&lod_test_tree(&m), "_BaseColor"),
+        Some([1.0, 1.0, 1.0, 0.8_f32 as f64])
+    );
+}
+
 fn lod_mat_base_color_alpha(tree: &Value) -> Option<f64> {
     let colors = tree.get("m_SavedProperties")?.get("m_Colors")?.as_array()?;
     for e in colors {
@@ -1224,8 +1376,8 @@ fn lod_material_class_comes_from_name_suffix_like_upstream() {
     );
     assert_eq!(lod_mat_float(&t, "_SrcBlend"), Some(1.0));
     assert_eq!(lod_mat_float(&t, "_DstBlend"), Some(10.0));
-    assert_eq!(lod_mat_float(&t, "_DstBlendAlpha"), Some(0.0));
-    assert_eq!(lod_mat_float(&t, "_ZWrite"), Some(1.0));
+    assert_eq!(lod_mat_float(&t, "_DstBlendAlpha"), Some(10.0));
+    assert_eq!(lod_mat_float(&t, "_ZWrite"), Some(0.0));
     assert_eq!(lod_mat_float(&t, "_AlphaCutoffEnable"), None);
     assert_eq!(lod_mat_float(&t, "_AlphaDstBlend"), None);
     assert_eq!(lod_mat_float(&t, "_BlendMode"), None);
@@ -1267,4 +1419,250 @@ fn lod_material_class_comes_from_name_suffix_like_upstream() {
     let mut sorted = names.clone();
     sorted.sort_unstable();
     assert_eq!(names, sorted, "m_Floats not alphabetically ordered");
+}
+
+fn lod_test_params() -> LodBuildParams {
+    LodBuildParams {
+        level: 1,
+        plane_clipping: [1.0, 2.0, 3.0, 4.0],
+        vertical_clipping: [0.0, 5.0, 0.0, 0.0],
+        root_position: [0.0, 0.0, 0.0],
+        main_asset: "bafkreilodtest_1.prefab".to_string(),
+        timestamp: None,
+        fidelity: false,
+    }
+}
+
+fn lod_png_bytes(w: u32, h: u32) -> Vec<u8> {
+    let img = RgbaImage::from_fn(w, h, |x, y| {
+        image::Rgba([(x * 90 + 20) as u8, (y * 90 + 40) as u8, 200, 255])
+    });
+    let mut out: Vec<u8> = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .expect("encode test png");
+    out
+}
+
+fn lod_jpg_bytes(w: u32, h: u32) -> Vec<u8> {
+    let img =
+        image::RgbImage::from_fn(w, h, |x, y| image::Rgb([(x * 7) as u8, (y * 7) as u8, 120]));
+    let mut out: Vec<u8> = Vec::new();
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(
+            &mut std::io::Cursor::new(&mut out),
+            image::ImageFormat::Jpeg,
+        )
+        .expect("encode test jpeg");
+    out
+}
+
+fn lod_tri(material: usize, y: f32) -> crate::lodgen::model::LodPrimitive {
+    crate::lodgen::model::LodPrimitive {
+        positions: vec![[0.0, y, 0.0], [1.0, y, 0.0], [0.0, y + 1.0, 0.0]],
+        normals: vec![[0.0, 0.0, 1.0]; 3],
+        uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+        indices: vec![0, 1, 2],
+        material,
+        ..Default::default()
+    }
+}
+
+fn lod_image(bytes: Vec<u8>, mime: &str) -> crate::lodgen::model::LodImage {
+    crate::lodgen::model::LodImage {
+        bytes,
+        mime: mime.to_string(),
+    }
+}
+
+fn lod_material_with_image(
+    name: &str,
+    class: crate::lodgen::model::AlphaClass,
+    image: usize,
+) -> crate::lodgen::model::LodMaterial {
+    crate::lodgen::model::LodMaterial {
+        name: name.to_string(),
+        class,
+        base_color: [0.2, 0.4, 0.6, 1.0],
+        cutoff: 0.5,
+        image: Some(image),
+        double_sided: false,
+        ..Default::default()
+    }
+}
+
+/// Builds a level-1 LOD bundle (windows) from a synthetic LOD model, the
+/// way `lods::build_lod_bundle` drives the builder.
+fn lod_bundle_from_model(model: &crate::lodgen::model::LodModel) -> Vec<u8> {
+    let glb = crate::lodgen::emit::emit_glb(model).expect("emit synthetic lod glb");
+    let lod = lod_test_params();
+    let opts = BuildOpts {
+        source_file: Some("bafkreilodtest_1.glb"),
+        lod: Some(&lod),
+        ..BuildOpts::default()
+    };
+    build_bundle(&glb, "bafkreilodtest_1_windows", "bafkreilodtest_1", &opts)
+        .expect("build lod bundle")
+        .data
+}
+
+fn lod_container_keys(data: &[u8]) -> Vec<String> {
+    let b = ReadBundle::load_bytes(data).expect("bundle parses");
+    let mut keys = Vec::new();
+    for f in &b.files {
+        let FileContent::Serialized(sf) = &f.content else {
+            continue;
+        };
+        for o in &sf.objects {
+            if o.class_id != 142 {
+                continue;
+            }
+            let v = sf.read_typetree(o).unwrap();
+            if let Some(Value::Array(cont)) = v.get("m_Container") {
+                for e in cont {
+                    let Value::Array(pair) = e else { continue };
+                    if let Some(k) = pair.first().and_then(|k| k.as_str()) {
+                        keys.push(k.to_string());
+                    }
+                }
+            }
+        }
+    }
+    keys.sort();
+    keys
+}
+
+/// (name, format, width, height, mip count, image bytes) of every Texture2D.
+fn lod_textures_of(data: &[u8]) -> Vec<(String, i64, i64, i64, i64, usize)> {
+    let b = ReadBundle::load_bytes(data).expect("bundle parses");
+    let mut out = Vec::new();
+    for f in &b.files {
+        let FileContent::Serialized(sf) = &f.content else {
+            continue;
+        };
+        for o in &sf.objects {
+            if o.class_id != 28 {
+                continue;
+            }
+            let v = sf.read_typetree(o).unwrap();
+            let g = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(-1);
+            let bytes = match v.get("image data") {
+                Some(Value::Bytes(b)) => b.len(),
+                _ => 0,
+            };
+            let stream = v
+                .get("m_StreamData")
+                .and_then(|s| s.get("size"))
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0) as usize;
+            out.push((
+                v.get("m_Name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                g("m_TextureFormat"),
+                g("m_Width"),
+                g("m_Height"),
+                g("m_MipCount"),
+                bytes.max(stream),
+            ));
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn lod_texture_key_extension_follows_alpha_need() {
+    use crate::lodgen::model::{AlphaClass, LodModel};
+    // image 0: PNG container, sampled only by the opaque material -> .jpg
+    // image 1: JPEG container, sampled by the cutout material -> .png
+    // image 2: JPEG container, sampled by the transparent material -> .png
+    let model = LodModel {
+        root_name: "bafkreilodtest_1".to_string(),
+        primitives: vec![lod_tri(0, 0.0), lod_tri(1, 2.0), lod_tri(2, 4.0)],
+        materials: vec![
+            lod_material_with_image("TextureBakeResult-mat", AlphaClass::Opaque, 0),
+            lod_material_with_image("TextureBakeResult-mat-cutout", AlphaClass::Mask, 1),
+            lod_material_with_image("TextureBakeResult-mat-transparent", AlphaClass::Blend, 2),
+        ],
+        images: vec![
+            lod_image(lod_png_bytes(8, 8), "image/png"),
+            lod_image(lod_jpg_bytes(8, 8), "image/jpeg"),
+            lod_image(lod_jpg_bytes(8, 8), "image/jpeg"),
+        ],
+        log: Vec::new(),
+    };
+    let keys = lod_container_keys(&lod_bundle_from_model(&model));
+    let tex_keys: Vec<&String> = keys.iter().filter(|k| k.starts_with("image_")).collect();
+    assert_eq!(
+        tex_keys,
+        vec!["image_0.jpg", "image_1.png", "image_2.png"],
+        "container keys: {keys:?}"
+    );
+}
+
+#[test]
+fn lod_orphan_image_is_pruned() {
+    use crate::lodgen::model::{AlphaClass, LodModel};
+    // Material 1 owns image 1 but no primitive references it, so the
+    // material never enters the bundle and its texture must not either.
+    let model = LodModel {
+        root_name: "bafkreilodtest_1".to_string(),
+        primitives: vec![lod_tri(0, 0.0)],
+        materials: vec![
+            lod_material_with_image("TextureBakeResult-mat", AlphaClass::Opaque, 0),
+            lod_material_with_image("TextureBakeResult-mat-transparent", AlphaClass::Blend, 1),
+        ],
+        images: vec![
+            lod_image(lod_png_bytes(8, 8), "image/png"),
+            lod_image(lod_png_bytes(8, 8), "image/png"),
+        ],
+        log: Vec::new(),
+    };
+    let data = lod_bundle_from_model(&model);
+    let keys = lod_container_keys(&data);
+    let tex_keys: Vec<&String> = keys.iter().filter(|k| k.starts_with("image_")).collect();
+    assert_eq!(tex_keys, vec!["image_0.jpg"], "container keys: {keys:?}");
+    assert!(
+        !keys.iter().any(|k| k.ends_with("-transparent.mat")),
+        "unreferenced material must stay out of the bundle: {keys:?}"
+    );
+    let textures = lod_textures_of(&data);
+    assert_eq!(textures.len(), 1, "Texture2D objects: {textures:?}");
+    assert_eq!(textures[0].0, "image_0");
+}
+
+#[test]
+fn lod_tiny_texture_padded_to_bc7() {
+    use crate::lodgen::model::{AlphaClass, LodModel};
+    let model = LodModel {
+        root_name: "bafkreilodtest_1".to_string(),
+        primitives: vec![lod_tri(0, 0.0)],
+        materials: vec![lod_material_with_image(
+            "TextureBakeResult-mat",
+            AlphaClass::Opaque,
+            0,
+        )],
+        images: vec![lod_image(lod_png_bytes(2, 2), "image/png")],
+        log: Vec::new(),
+    };
+    let textures = lod_textures_of(&lod_bundle_from_model(&model));
+    assert_eq!(textures.len(), 1, "{textures:?}");
+    let (name, fmt, w, h, mips, bytes) = &textures[0];
+    assert_eq!(name, "image_0");
+    assert_eq!(*fmt, texprofile::TF_BC7, "format {fmt} (want BC7 25)");
+    assert_eq!((*w, *h), (4, 4), "padded to one BC7 block");
+    assert_eq!(*mips, 3, "4x4 -> 2x2 -> 1x1");
+    assert_eq!(*bytes, 48, "three 16-byte BC7 blocks");
+
+    let src = RgbaImage::from_fn(2, 1, |x, _| image::Rgba([x as u8 * 100, 7, 9, 255]));
+    let padded = super::texture::pad_sub_block_rgba(&src, 4, 4, true);
+    assert_eq!(padded.dimensions(), (4, 4));
+    for y in 0..4 {
+        for x in 0..4 {
+            let want = if x < 2 { 0 } else { 100 };
+            assert_eq!(padded.get_pixel(x, y)[0], want, "texel ({x},{y})");
+        }
+    }
 }

@@ -8,14 +8,21 @@ pub struct SimplifyReport {
     pub passthrough: bool,
     pub unsimplified: bool,
     pub rescued_classes: Vec<String>,
+    /// Policy label (`gltfpack-si` | `budget`); empty for pass-through copies.
+    pub policy: &'static str,
 }
 
 impl SimplifyReport {
     pub fn summary(&self) -> String {
         format!(
-            "tris {} -> {} (ratios {:?}{}{}{}{}{})",
+            "tris {} -> {} ({}ratios {:?}{}{}{}{}{})",
             self.tris_before,
             self.tris_after,
+            if self.policy.is_empty() {
+                String::new()
+            } else {
+                format!("policy {}, ", self.policy)
+            },
             self.ratios_run,
             if self.se_run.is_empty() {
                 String::new()

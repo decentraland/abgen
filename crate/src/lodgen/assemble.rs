@@ -111,6 +111,7 @@ struct Counters {
     kept: usize,
     dropped_collider: usize,
     skipped_skin: usize,
+    skipped_zero_scale: usize,
 }
 
 fn unique_name(base: &str, used: &mut HashSet<String>) -> String {
@@ -498,7 +499,7 @@ pub fn assemble_from(
                 )
             };
             key.base_color = eff.map(f64::to_bits);
-            key.class = AlphaClass::from_alpha_mode(&m.alpha_mode);
+            key.class = AlphaClass::for_material(&m.alpha_mode, m.uses_transmission);
             key.cutoff = m.alpha_cutoff.to_bits();
             key.double_sided = m.double_sided;
             key.image = image;
@@ -548,6 +549,20 @@ pub fn assemble_from(
     let mut counters = Counters::default();
     for &(pi, p, ref hash) in &placed {
         let prep = &prepared[hash.as_str()];
+        if p.scale.contains(&0.0) {
+            let n: usize = prep
+                .scene
+                .root_nodes
+                .iter()
+                .map(|&r| subtree_prim_count(&prep.scene, r))
+                .sum();
+            counters.skipped_zero_scale += n;
+            model.log.push(format!(
+                "placement {pi} {hash} ({}): skipped zero scale {:?} prims={n}",
+                prep.name, p.scale
+            ));
+            continue;
+        }
         let parent = model::mat4_from_trs(p.position, p.rotation, p.scale);
         let prims_before = model.primitives.len();
         let tris_before = model.total_tris();
@@ -565,12 +580,13 @@ pub fn assemble_from(
         model.log.push(format!("skipped unresolvable {u}"));
     }
     model.log.push(format!(
-        "summary: instances={} unique_glbs={} prims_kept={} prims_collider_dropped={} prims_skinned_skipped={}",
+        "summary: instances={} unique_glbs={} prims_kept={} prims_collider_dropped={} prims_skinned_skipped={} prims_zero_scale_skipped={}",
         placed.len(),
         uniq.len(),
         counters.kept,
         counters.dropped_collider,
-        counters.skipped_skin
+        counters.skipped_skin,
+        counters.skipped_zero_scale
     ));
     Ok(model)
 }
@@ -909,6 +925,301 @@ mod tests {
         assert!((center[0] - -88.8968276977539).abs() < 1e-4, "{center:?}");
         assert!((center[1] - 0.2825070321559906).abs() < 1e-4, "{center:?}");
         assert!((center[2] - 13.414548873901368).abs() < 1e-4, "{center:?}");
+    }
+
+    /// Descriptor TRS (Unity, left-handed) applied to a glTF-space point:
+    /// `T(-tx, ty, tz) * R(qx, -qy, -qz, qw) * S(s)`, the closed form of
+    /// mirror -> Unity TRS -> mirror with `M = diag(-1, 1, 1)`.
+    fn gltf_frame_apply(p: &Placement, v: [f64; 3]) -> [f64; 3] {
+        let scaled = [v[0] * p.scale[0], v[1] * p.scale[1], v[2] * p.scale[2]];
+        let q = [p.rotation[0], -p.rotation[1], -p.rotation[2], p.rotation[3]];
+        let r = quat_rotate(q, scaled);
+        [
+            r[0] - p.position[0],
+            r[1] + p.position[1],
+            r[2] + p.position[2],
+        ]
+    }
+
+    struct Roundtrip {
+        positions: Vec<[f64; 3]>,
+        uvs: Vec<[f32; 2]>,
+        indices: Vec<u32>,
+    }
+
+    /// What glTFast import + Unity + glTFast export do to a primitive: import flips x,
+    /// `v = 1 - v` and reorders each triangle `(i0, i2, i1)`; Unity applies the descriptor
+    /// TRS verbatim; export applies the same three flips again.
+    fn unity_roundtrip_prim(p: &Placement, src: &LodPrimitive) -> Roundtrip {
+        let flip_x = |v: [f64; 3]| [-v[0], v[1], v[2]];
+        let flip_v = |uvs: &[[f32; 2]]| -> Vec<[f32; 2]> {
+            uvs.iter().map(|t| [t[0], 1.0 - t[1]]).collect()
+        };
+        let flip_winding = |idx: &[u32]| -> Vec<u32> {
+            idx.chunks_exact(3)
+                .flat_map(|t| [t[0], t[2], t[1]])
+                .collect()
+        };
+        let imported: Vec<[f64; 3]> = src
+            .positions
+            .iter()
+            .map(|v| flip_x(v.map(|x| x as f64)))
+            .collect();
+        let imported_uvs = flip_v(&src.uvs);
+        let imported_indices = flip_winding(&src.indices);
+        let unity: Vec<[f64; 3]> = imported
+            .iter()
+            .map(|v| {
+                let scaled = [v[0] * p.scale[0], v[1] * p.scale[1], v[2] * p.scale[2]];
+                let r = quat_rotate(p.rotation, scaled);
+                [
+                    r[0] + p.position[0],
+                    r[1] + p.position[1],
+                    r[2] + p.position[2],
+                ]
+            })
+            .collect();
+        Roundtrip {
+            positions: unity.into_iter().map(flip_x).collect(),
+            uvs: flip_v(&imported_uvs),
+            indices: flip_winding(&imported_indices),
+        }
+    }
+
+    fn quarter_turn_placement(h: &str) -> Placement {
+        let half = std::f64::consts::FRAC_1_SQRT_2;
+        Placement {
+            position: [10.0, 0.0, 20.0],
+            rotation: [0.0, half, 0.0, half],
+            scale: [1.0, 1.0, 1.0],
+            ..place(h)
+        }
+    }
+
+    fn assert_close3(got: [f32; 3], want: [f64; 3], tol: f64, what: &str) {
+        for i in 0..3 {
+            assert!(
+                (got[i] as f64 - want[i]).abs() < tol,
+                "{what}: got {got:?} want {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn handedness_closed_form_matches_unity_roundtrip() {
+        let src = tri_prim(0.0, [0.0, 0.0]);
+        let glb = tri_glb();
+        let cache = temp_cache("closedform");
+        stage(&cache, "htri", &glb);
+        let placement = quarter_turn_placement("htri");
+        let model = asm(
+            &entity(&[("tri.glb", "htri")]),
+            std::slice::from_ref(&placement),
+            &cache,
+        );
+        assert_eq!(model.primitives.len(), 1);
+        let out = &model.primitives[0];
+        assert_eq!(out.positions.len(), 3);
+        let sim = unity_roundtrip_prim(&placement, &src);
+        for (i, p) in src.positions.iter().enumerate() {
+            let v = p.map(|x| x as f64);
+            let closed = gltf_frame_apply(&placement, v);
+            let roundtrip = sim.positions[i];
+            for k in 0..3 {
+                assert!(
+                    (closed[k] - roundtrip[k]).abs() < 1e-9,
+                    "closed form {closed:?} vs unity roundtrip {roundtrip:?}"
+                );
+            }
+            assert_close3(out.positions[i], closed, 1e-6, "vertex");
+        }
+        // Import reorders (i0, i2, i1) and export reorders it back: the simulated round trip
+        // lands on the source order, and the assembly matches it.
+        assert_eq!(sim.indices, src.indices);
+        assert_eq!(out.indices, sim.indices);
+        // v = 1 - v on import and again on export: the simulated uv is the source uv.
+        assert_eq!(sim.uvs.len(), src.uvs.len());
+        for ((got, want), source) in out.uvs.iter().zip(&sim.uvs).zip(&src.uvs) {
+            assert!(
+                (got[0] - want[0]).abs() < 1e-6 && (got[1] - want[1]).abs() < 1e-6,
+                "uv {got:?} want {want:?}"
+            );
+            assert!(
+                (want[1] - source[1]).abs() < 1e-6,
+                "uv {want:?} source {source:?}"
+            );
+        }
+        // The source normal (0,0,1) rotated a quarter turn about Y in glTF space.
+        let n = gltf_frame_apply(
+            &Placement {
+                position: [0.0; 3],
+                ..placement.clone()
+            },
+            [0.0, 0.0, 1.0],
+        );
+        assert_close3(out.normals[0], n, 1e-6, "normal");
+    }
+
+    #[test]
+    fn handedness_mirror_flips_index_order_only() {
+        let cube = cube_model();
+        let glb = emit_glb(&cube).unwrap();
+        let cache = temp_cache("mirroridx");
+        stage(&cache, "hcube", &glb);
+        let ent = entity(&[("cube.glb", "hcube")]);
+        let plain = asm(&ent, &[place("hcube")], &cache);
+        let mirrored = asm(
+            &ent,
+            &[Placement {
+                scale: [-1.0, 1.0, 1.0],
+                ..place("hcube")
+            }],
+            &cache,
+        );
+        assert!((signed_volume(&plain) - 1.0).abs() < 1e-4);
+        assert!((signed_volume(&mirrored) - 1.0).abs() < 1e-4);
+        let (a, b) = (&plain.primitives[0], &mirrored.primitives[0]);
+        assert_eq!(a.positions.len(), b.positions.len());
+        for (p, m) in a.positions.iter().zip(&b.positions) {
+            assert_close3(
+                *m,
+                [-(p[0] as f64), p[1] as f64, p[2] as f64],
+                1e-6,
+                "position",
+            );
+        }
+        for (p, m) in a.normals.iter().zip(&b.normals) {
+            assert_close3(
+                *m,
+                [-(p[0] as f64), p[1] as f64, p[2] as f64],
+                1e-6,
+                "normal",
+            );
+        }
+        assert_eq!(a.uvs, b.uvs);
+        assert_eq!(a.indices.len(), b.indices.len());
+        for (ta, tb) in a.indices.chunks_exact(3).zip(b.indices.chunks_exact(3)) {
+            assert_eq!(
+                [tb[0], tb[1], tb[2]],
+                [ta[0], ta[2], ta[1]],
+                "det<0 reorders (i0, i2, i1)"
+            );
+        }
+    }
+
+    #[test]
+    fn handedness_uv_v_unchanged() {
+        let src = tri_prim(0.0, [0.25, 0.125]);
+        let glb = emit_glb(&model_of(
+            "tri",
+            vec![src.clone()],
+            vec![base_material()],
+            Vec::new(),
+        ))
+        .unwrap();
+        let cache = temp_cache("uvv");
+        stage(&cache, "htri", &glb);
+        let ent = entity(&[("tri.glb", "htri")]);
+        for placement in [
+            place("htri"),
+            quarter_turn_placement("htri"),
+            Placement {
+                scale: [-1.0, 1.0, 1.0],
+                ..place("htri")
+            },
+        ] {
+            let model = asm(&ent, std::slice::from_ref(&placement), &cache);
+            let out = &model.primitives[0];
+            assert_eq!(out.uvs.len(), src.uvs.len());
+            for (got, want) in out.uvs.iter().zip(&src.uvs) {
+                assert!(
+                    (got[0] - want[0]).abs() < 1e-7 && (got[1] - want[1]).abs() < 1e-7,
+                    "uv {got:?} want {want:?} under {:?}",
+                    placement.scale
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn winding_preserved_under_even_negative_scale() {
+        let cube = cube_model();
+        let glb = emit_glb(&cube).unwrap();
+        let cache = temp_cache("evenneg");
+        stage(&cache, "hcube", &glb);
+        let ent = entity(&[("cube.glb", "hcube")]);
+        let plain = asm(&ent, &[place("hcube")], &cache);
+        let turned = asm(
+            &ent,
+            &[Placement {
+                scale: [-1.0, -1.0, 1.0],
+                ..place("hcube")
+            }],
+            &cache,
+        );
+        assert!((signed_volume(&turned) - 1.0).abs() < 1e-4);
+        let (a, b) = (&plain.primitives[0], &turned.primitives[0]);
+        assert_eq!(a.indices, b.indices, "det>0 keeps the source index order");
+        for (p, m) in a.positions.iter().zip(&b.positions) {
+            assert_close3(
+                *m,
+                [-(p[0] as f64), -(p[1] as f64), p[2] as f64],
+                1e-6,
+                "position",
+            );
+        }
+        assert_eq!(a.uvs, b.uvs);
+    }
+
+    #[test]
+    fn zero_scale_placement_is_skipped() {
+        let cube = cube_model();
+        let glb = emit_glb(&cube).unwrap();
+        let cache = temp_cache("zeroscale");
+        stage(&cache, "hcube", &glb);
+        let ent = entity(&[("cube.glb", "hcube")]);
+        let model = asm(
+            &ent,
+            &[
+                place("hcube"),
+                Placement {
+                    position: [5.0, 0.0, 0.0],
+                    scale: [1.0, 0.0, 1.0],
+                    ..place("hcube")
+                },
+            ],
+            &cache,
+        );
+        assert_eq!(model.primitives.len(), 1);
+        assert_eq!(model.total_tris(), 12);
+        let (mn, mx) = model.bounds();
+        assert!(
+            (mn[0] + 0.5).abs() < 1e-6 && (mx[0] - 0.5).abs() < 1e-6,
+            "{mn:?} {mx:?}"
+        );
+        let s = summary_line(&model);
+        assert!(s.contains("instances=2"), "{s}");
+        assert!(s.contains("prims_kept=1"), "{s}");
+        assert!(s.contains("prims_zero_scale_skipped=1"), "{s}");
+        assert!(
+            model
+                .log
+                .iter()
+                .any(|l| l.starts_with("placement 1 hcube") && l.contains("skipped zero scale")),
+            "{:?}",
+            model.log
+        );
+
+        let all_zero = asm(
+            &ent,
+            &[Placement {
+                scale: [0.0, 0.0, 0.0],
+                ..place("hcube")
+            }],
+            &cache,
+        );
+        assert!(all_zero.primitives.is_empty());
+        assert!(summary_line(&all_zero).contains("prims_zero_scale_skipped=1"));
     }
 
     #[test]

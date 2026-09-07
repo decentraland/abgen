@@ -1,12 +1,12 @@
 pub mod crdt;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
 mod driver;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
 mod engine;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
 pub use engine::QuickJsEngine;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -58,6 +58,7 @@ pub trait SceneEngine {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "scene-runtime")]
 pub(crate) fn initial_state_parts(main_crdt: Option<&[u8]>) -> Vec<Vec<u8>> {
     let stream = crdt::synthetic_initial_state(None);
     let mut parts = Vec::new();
@@ -76,7 +77,7 @@ pub(crate) fn initial_state_parts(main_crdt: Option<&[u8]>) -> Vec<Vec<u8>> {
     parts
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
 fn fetch_sdk6_adaption_layer() -> anyhow::Result<String> {
     use anyhow::Context;
     let source = std::env::var(SDK6_ADAPTION_URL_ENV)
@@ -102,12 +103,12 @@ fn fetch_sdk6_adaption_layer() -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
 fn default_engine() -> impl SceneEngine {
     QuickJsEngine
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
 pub fn run_scene_placements(
     client: &crate::catalyst::CatalystClient,
     ent: &crate::catalyst::Scene,
@@ -115,7 +116,35 @@ pub fn run_scene_placements(
     run_scene_with(&default_engine(), client, ent)
 }
 
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "scene-runtime")))]
+pub fn run_scene_placements(
+    _client: &crate::catalyst::CatalystClient,
+    _ent: &crate::catalyst::Scene,
+) -> anyhow::Result<Option<crate::lodgen::placements::ManifestPlacements>> {
+    anyhow::bail!("embedded scene execution requires the scene-runtime feature")
+}
+
+/// Statically fold the current deployment's `main.crdt` without executing
+/// scene code. The content hash comes from the entity itself, so this never
+/// consults (or inherits the staleness of) a separately published ISS.
 #[cfg(not(target_arch = "wasm32"))]
+pub fn static_scene_placements(
+    client: &crate::catalyst::CatalystClient,
+    ent: &crate::catalyst::Scene,
+) -> anyhow::Result<crate::lodgen::placements::ManifestPlacements> {
+    use anyhow::Context;
+
+    let content = ent.content_by_file();
+    let Some(hash) = content.get("main.crdt") else {
+        return Ok(Default::default());
+    };
+    let bytes = client
+        .fetch_content(hash)
+        .with_context(|| format!("fetch main.crdt for scene {}", ent.entity_id))?;
+    Ok(crdt::placements_from_crdt(&bytes, &content))
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
 fn run_scene_with(
     engine: &dyn SceneEngine,
     client: &crate::catalyst::CatalystClient,
@@ -166,7 +195,7 @@ fn run_scene_with(
     Ok(Some(crdt::placements_from_crdt(&outcome.stream, &content)))
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, not(target_arch = "wasm32"), feature = "scene-runtime"))]
 mod tests {
     use super::*;
 

@@ -107,6 +107,7 @@ impl LwwState {
         let mut transforms: HashMap<i64, Trs> = HashMap::new();
         let mut gltf_srcs: Vec<(i64, String)> = Vec::new();
         let mut mesh_renderer_entities: HashSet<i64> = HashSet::new();
+        let mut visibility: HashMap<i64, bool> = HashMap::new();
         for ((entity, component), (_, _, data)) in ordered {
             let eid = i64::from(*entity);
             match *component {
@@ -126,6 +127,9 @@ impl LwwState {
                 MESH_RENDERER => {
                     mesh_renderer_entities.insert(eid);
                 }
+                VISIBILITY => {
+                    visibility.insert(eid, visible_flag(data));
+                }
                 _ => {}
             }
         }
@@ -133,9 +137,46 @@ impl LwwState {
             transforms,
             gltf_srcs,
             mesh_renderer_entities,
+            visibility,
             content_by_file,
         )
     }
+}
+
+/// Field 1 (`visible`) of PBVisibilityComponent. A payload without the field
+/// reads as `false`: the manifest builder writes it as `{}` and `JsonUtility`
+/// defaults the missing bool, so production drops that entity. Field 2
+/// (`propagate_to_children`) is not consulted, like the descriptor builder.
+fn visible_flag(data: &[u8]) -> bool {
+    let mut off = 0usize;
+    let mut visible = false;
+    while off < data.len() {
+        let Some((tag, next)) = read_varint(data, off) else {
+            break;
+        };
+        off = next;
+        match tag & 7 {
+            0 => {
+                let Some((value, next)) = read_varint(data, off) else {
+                    break;
+                };
+                off = next;
+                if tag >> 3 == 1 {
+                    visible = value != 0;
+                }
+            }
+            1 => off += 8,
+            2 => {
+                let Some((len, next)) = read_varint(data, off) else {
+                    break;
+                };
+                off = next.saturating_add(usize::try_from(len).unwrap_or(usize::MAX));
+            }
+            5 => off += 4,
+            _ => break,
+        }
+    }
+    visible
 }
 
 fn decode_transform(data: &[u8]) -> Option<Trs> {
@@ -248,6 +289,26 @@ pub fn placements_from_crdt(
     let mut state = LwwState::default();
     state.ingest(stream);
     state.project(content_by_file)
+}
+
+/// The folded GltfContainer srcs in entity insertion order, before content
+/// resolution: what the scene asked to place, whether or not the entity's
+/// content lists the file (a placement needs a resolved hash, this does not).
+#[cfg(test)]
+pub(crate) fn gltf_srcs_from_crdt(stream: &[u8]) -> Vec<(u32, String)> {
+    let mut state = LwwState::default();
+    state.ingest(stream);
+    let mut cells: Vec<(&(u32, u32), &(u32, u64, Vec<u8>))> = state
+        .cells
+        .iter()
+        .filter(|((_, component), _)| *component == GLTF_CONTAINER)
+        .collect();
+    cells.sort_by_key(|(_, (_, seq, _))| *seq);
+    cells
+        .into_iter()
+        .filter(|(_, (_, _, data))| !data.is_empty())
+        .filter_map(|((entity, _), (_, _, data))| gltf_src(data).map(|src| (*entity, src)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -448,7 +509,102 @@ mod tests {
         assert!(!got_json.contains("-0.0"));
         let rot = got.placements[0].rotation;
         assert!(rot.iter().all(|v| v.to_bits() != (-0.0f64).to_bits()));
-        assert_eq!(rot[3], f64::from(-s2));
+        assert!((rot[1] + f64::from(s2)).abs() < 1e-6, "{rot:?}");
+        assert!((rot[3] - f64::from(s2)).abs() < 1e-6, "{rot:?}");
+    }
+
+    #[test]
+    fn invisible_entity_is_skipped() {
+        let mut stream = Vec::new();
+        let rows: [(u32, u32, Option<&[u8]>); 5] = [
+            (600, 0, Some(&[0x08, 0x00])),
+            (601, 0, Some(&[0x08, 0x01])),
+            (602, 0, Some(&[])),
+            (603, 0, None),
+            (604, 603, None),
+        ];
+        for (eid, parent, vis) in rows {
+            encode_put(
+                &mut stream,
+                eid,
+                TRANSFORM,
+                1,
+                &transform_bytes(
+                    [eid as f32, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                    [1.0; 3],
+                    parent,
+                ),
+            );
+            encode_put(
+                &mut stream,
+                eid,
+                GLTF_CONTAINER,
+                1,
+                &gltf_bytes("models/a.glb"),
+            );
+            if let Some(v) = vis {
+                encode_put(&mut stream, eid, VISIBILITY, 1, v);
+            }
+        }
+        encode_put(&mut stream, 600, VISIBILITY, 2, &[0x08, 0x01]);
+        encode_put(&mut stream, 603, VISIBILITY, 1, &[0x08, 0x00, 0x10, 0x01]);
+        let mut content = HashMap::new();
+        content.insert("models/a.glb".to_string(), "ha".to_string());
+        let got = placements_from_crdt(&stream, &content);
+        let xs: Vec<f64> = got.placements.iter().map(|p| p.position[0]).collect();
+        assert_eq!(xs, [600.0, 601.0, 1207.0]);
+        assert_eq!(got.invisible_skipped, 2);
+        assert!(visible_flag(&[0x08, 0x01]));
+        assert!(!visible_flag(&[0x08, 0x00]));
+        assert!(!visible_flag(&[]));
+        assert!(visible_flag(&[0x10, 0x01, 0x08, 0x01]));
+        assert!(!visible_flag(&[0x10, 0x01]));
+        let transform = |eid: u32, parent: u32| {
+            serde_json::json!({
+                "entityId": eid,
+                "componentName": "core::Transform",
+                "data": {
+                    "position": {"x": eid, "y": 0.0, "z": 0.0},
+                    "rotation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                    "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+                    "parent": parent
+                }
+            })
+        };
+        let gltf = |eid: u32| {
+            serde_json::json!({
+                "entityId": eid,
+                "componentName": "core::GltfContainer",
+                "data": {"src": "models/a.glb"}
+            })
+        };
+        let vis = |eid: u32, data: serde_json::Value| {
+            serde_json::json!({
+                "entityId": eid,
+                "componentName": "core::VisibilityComponent",
+                "data": data
+            })
+        };
+        let manifest = serde_json::json!([
+            transform(600, 0),
+            gltf(600),
+            vis(600, serde_json::json!({"visible": true})),
+            transform(601, 0),
+            gltf(601),
+            vis(601, serde_json::json!({"visible": true})),
+            transform(602, 0),
+            gltf(602),
+            vis(602, serde_json::json!({})),
+            transform(603, 0),
+            gltf(603),
+            vis(603, serde_json::json!({"visible": false})),
+            transform(604, 603),
+            gltf(604),
+        ]);
+        let want =
+            parse_lod_manifest_full(&serde_json::to_vec(&manifest).unwrap(), &content).unwrap();
+        assert_eq!(got, want);
     }
 
     #[test]
@@ -584,15 +740,26 @@ mod tests {
         let want =
             parse_lod_manifest_full(&serde_json::to_vec(&manifest).unwrap(), &content).unwrap();
         assert_eq!(got, want);
-        assert_eq!(got.placements.len(), 2);
+        assert_eq!(got.placements.len(), 1);
         assert_eq!(got.skipped_mesh_renderer, 1);
         assert_eq!(got.unresolved_src, 1);
+        assert_eq!(
+            gltf_srcs_from_crdt(&stream),
+            [
+                (601, "Models/Child.GLB".to_string()),
+                (701, "models/missing.glb".to_string())
+            ]
+        );
         let child = got
             .placements
             .iter()
             .find(|p| p.glb_hash.as_deref() == Some("hchild"))
             .unwrap();
         assert_eq!(child.glb_file.as_deref(), Some("Models/Child.GLB"));
-        assert_eq!(child.scale, [2.0, 2.0, 2.0]);
+        assert!(
+            child.scale.iter().all(|s| (s - 2.0).abs() < 1e-6),
+            "{:?}",
+            child.scale
+        );
     }
 }

@@ -150,6 +150,10 @@ pub(super) struct Bucket {
     pub(super) prims: Vec<(usize, usize, UvMap)>,
     pub(super) refs: usize,
     pub(super) fallbacks: usize,
+    /// Distinct decoded base-colour sources referenced by this bucket:
+    /// image hash -> (model image index, width, height). Drives MeshBaker's
+    /// natural-size sum and the single-texture pass-through.
+    pub(super) sources: HashMap<String, (usize, u32, u32)>,
     pub(super) met_sum: f64,
     pub(super) rough_sum: f64,
     pub(super) met_tris: f64,

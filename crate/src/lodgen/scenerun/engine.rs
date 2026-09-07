@@ -366,10 +366,9 @@ module.exports.onUpdate = async function (_dt) {{
         assert!(outcome.sent);
         assert_eq!(outcome.stream.len(), 2 * main.len());
         assert_eq!(&outcome.stream[..main.len()], &main[..]);
-        let content = HashMap::new();
-        let got = crdt::placements_from_crdt(&outcome.stream, &content);
-        assert_eq!(got.placements.len(), 1);
-        assert_eq!(got.placements[0].glb_file.as_deref(), Some("main.glb"));
+        let got = crdt::gltf_srcs_from_crdt(&outcome.stream);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, "main.glb");
     }
 
     #[test]
@@ -414,12 +413,9 @@ module.exports = {{
         for engine in engines {
             let outcome = engine.run_capture(job(code.clone(), None)).unwrap();
             assert!(outcome.sent);
-            let got = crdt::placements_from_crdt(&outcome.stream, &HashMap::new());
-            assert_eq!(got.placements.len(), 1);
-            assert_eq!(
-                got.placements[0].glb_file.as_deref(),
-                Some("models/clean.glb")
-            );
+            let got = crdt::gltf_srcs_from_crdt(&outcome.stream);
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].1.as_str(), "models/clean.glb");
         }
     }
 
@@ -526,9 +522,9 @@ module.exports.onUpdate = async function (_dt) {{
         );
         let outcome = QuickJsEngine.run_capture(job(code, None)).unwrap();
         assert!(outcome.sent);
-        let got = crdt::placements_from_crdt(&outcome.stream, &HashMap::new());
-        assert_eq!(got.placements.len(), 1);
-        assert_eq!(got.placements[0].glb_file.as_deref(), Some("start.glb"));
+        let got = crdt::gltf_srcs_from_crdt(&outcome.stream);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, "start.glb");
     }
 
     #[test]
@@ -567,9 +563,9 @@ module.exports.onUpdate = async function (_dt) {{}};
         j.limits.memory_bytes = 32 << 20;
         let outcome = QuickJsEngine.run_capture(j).unwrap();
         assert!(outcome.sent);
-        let got = crdt::placements_from_crdt(&outcome.stream, &HashMap::new());
-        assert_eq!(got.placements.len(), 1);
-        assert_eq!(got.placements[0].glb_file.as_deref(), Some("before.glb"));
+        let got = crdt::gltf_srcs_from_crdt(&outcome.stream);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, "before.glb");
     }
 
     #[test]
@@ -590,9 +586,9 @@ module.exports.onUpdate = async function (_dt) {{
 "
         );
         let outcome = QuickJsEngine.run_capture(job(code, None)).unwrap();
-        let got = crdt::placements_from_crdt(&outcome.stream, &HashMap::new());
-        assert_eq!(got.placements.len(), 1);
-        let file = got.placements[0].glb_file.clone().unwrap();
+        let got = crdt::gltf_srcs_from_crdt(&outcome.stream);
+        assert_eq!(got.len(), 1);
+        let file = got[0].1.clone();
         let ms: i64 = file
             .trim_start_matches("delta-")
             .trim_end_matches(".glb")

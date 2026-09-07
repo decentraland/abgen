@@ -271,6 +271,10 @@ pub(super) fn parse_impl(
         let spec_gloss_ext = m
             .get("extensions")
             .and_then(|e| e.get("KHR_materials_pbrSpecularGlossiness"));
+        let uses_transmission = m
+            .get("extensions")
+            .and_then(|e| e.get("KHR_materials_transmission"))
+            .is_some();
         let (
             uses_spec_gloss,
             sg_diffuse_factor,
@@ -415,6 +419,7 @@ pub(super) fn parse_impl(
             specular_factor: sg_specular_factor,
             glossiness_factor: sg_glossiness_factor,
             specular_color_image: tex_ref(specular_color_tex_info),
+            uses_transmission,
             uses_emissive_strength,
             emissive_strength,
         });

@@ -6,7 +6,7 @@ use crate::lodgen::model::{AlphaClass, LodImage, LodModel, LodPrimitive};
 
 use super::pack::expand_axis;
 use super::tile::{Bucket, Tile, UvMap};
-use super::{JPEG_QUALITY, LOSSLESS_OPAQUE_MIN_BUDGET, NATIVE_SOLID_DIM};
+use super::{JPEG_QUALITY, NATIVE_SOLID_DIM};
 
 pub(super) fn compose(
     tiles: &[Tile],
@@ -122,11 +122,13 @@ fn fill_background(rgba: &mut [u8], size: u32) {
     }
 }
 
+/// Opaque canvases are JPEG q85 unless `lossless_opaque`; cutout and
+/// transparent canvases are always PNG (alpha survives).
 pub(super) fn encode_atlas(
     class: AlphaClass,
     mut rgba: Vec<u8>,
     canvas: u32,
-    budget: u32,
+    lossless_opaque: bool,
 ) -> Result<LodImage> {
     if class == AlphaClass::Opaque {
         fill_background(&mut rgba, canvas);
@@ -137,7 +139,7 @@ pub(super) fn encode_atlas(
         let img = image::RgbImage::from_raw(canvas, canvas, rgb)
             .ok_or_else(|| anyhow!("atlas rgb buffer"))?;
         let mut cur = std::io::Cursor::new(Vec::new());
-        if budget >= LOSSLESS_OPAQUE_MIN_BUDGET {
+        if lossless_opaque {
             img.write_to(&mut cur, image::ImageFormat::Png)?;
             return Ok(LodImage {
                 bytes: cur.into_inner(),

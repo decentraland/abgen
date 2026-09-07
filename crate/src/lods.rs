@@ -1,10 +1,10 @@
 use crate::builder::{build_bundle, BuildOpts, LodBuildParams};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::catalyst::CatalystClient;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::compress;
 use crate::naming;
 use anyhow::{anyhow, bail, Context, Result};
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
 use std::collections::BTreeMap;
 #[cfg(not(target_arch = "wasm32"))]
@@ -171,6 +171,15 @@ pub fn validate_lod_platform(p: &str) -> Result<()> {
 
 pub fn lod_bundle_name(scene_id: &str, level: u32, platform: &str) -> String {
     format!("{}_{}_{}", scene_id.to_lowercase(), level, platform)
+}
+
+/// Scene-relative directory of the published GLB family (`lods-unity/lods/{file}`).
+pub const PUBLISHED_GLB_DIR: &str = "lods-unity/lods";
+
+/// File name of the published GLB: abgen lower-cases every LOD key, production
+/// names it with the verbatim entity id (identical for `bafk…` ids).
+pub fn published_glb_name(scene_id: &str, level: u32) -> String {
+    format!("{}_{}.glb", scene_id.to_lowercase(), level)
 }
 
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -370,8 +379,17 @@ pub fn convert_lods_platforms(
                         .or_insert_with(|| resolve_scene_meta(client, &sid))
                         .clone(),
                 };
-                for platform in &platform_list {
-                    match build_lod_bundle(&glb, locator, &sid, level, platform, opts, &meta) {
+                let builds: Vec<_> = platform_list
+                    .par_iter()
+                    .map(|platform| {
+                        (
+                            platform,
+                            build_lod_bundle(&glb, locator, &sid, level, platform, opts, &meta),
+                        )
+                    })
+                    .collect();
+                for (platform, build) in builds {
+                    match build {
                         Ok((r, data)) => {
                             scene_id.get_or_insert_with(|| r.scene_id.clone());
                             written.insert(r.bundle_name.clone(), (r.rel_path.clone(), data));
@@ -405,14 +423,15 @@ pub fn convert_lods_platforms(
     conv.scene_id = sid.clone();
 
     let entity_dir = PathBuf::from(out_dir).join(&sid);
-    for (rel, data) in written.values() {
-        let path = entity_dir.join(rel);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        write_atomic(&path, data)?;
-        write_brotli_sidecar(&path, data)?;
-    }
+    written
+        .par_iter()
+        .try_for_each(|(_, (rel, data))| -> Result<()> {
+            let path = entity_dir.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            write_atomic(&path, data)
+        })?;
 
     write_lod_manifest(&entity_dir, &conv, &opts.ab_version)?;
     Ok(conv)
@@ -441,11 +460,12 @@ pub struct PublishedObject {
     pub path: PathBuf,
 }
 
-/// Space objects a generated LOD scene directory publishes, keyed the way the
-/// abcdn asks for them: bundles at `LOD/{level}/{file}` and the ISS descriptor
-/// at `lods-unity/manifests/{file}` — both unversioned, unlike asset bundles.
-/// Upload metadata (Content-Type/Cache-Control/Content-Encoding) is derived
-/// from the key by `space::object_headers`, not carried here.
+/// Space objects a generated LOD scene directory publishes, keyed the way
+/// production lays them out: bundles at `LOD/{level}/{file}`, the ISS
+/// descriptor at `lods-unity/manifests/{file}` and the published GLB at
+/// `lods-unity/lods/{file}` — all unversioned, unlike asset bundles. Upload
+/// metadata (Content-Type/Cache-Control/Content-Encoding) is derived from the
+/// key by `space::object_headers`, not carried here.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn published_objects(scene_dir: &Path, levels: &[u32]) -> Vec<PublishedObject> {
     let mut out: Vec<PublishedObject> = Vec::new();
@@ -459,13 +479,19 @@ pub fn published_objects(scene_dir: &Path, levels: &[u32]) -> Vec<PublishedObjec
         }
     }
     for name in dir_file_names(scene_dir) {
-        let base = name.strip_suffix(".br").unwrap_or(&name);
-        if !base.ends_with(crate::lodgen::placements::ISS_SUFFIX) {
+        if !name.ends_with(crate::lodgen::placements::ISS_SUFFIX) {
             continue;
         }
         out.push(PublishedObject {
             key: format!("lods-unity/manifests/{name}"),
             path: scene_dir.join(&name),
+        });
+    }
+    let glb_dir = scene_dir.join(PUBLISHED_GLB_DIR);
+    for name in dir_file_names(&glb_dir) {
+        out.push(PublishedObject {
+            key: format!("{PUBLISHED_GLB_DIR}/{name}"),
+            path: glb_dir.join(&name),
         });
     }
     out
@@ -480,7 +506,7 @@ fn dir_file_names(dir: &Path) -> Vec<String> {
         .flatten()
         .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         .filter_map(|e| e.file_name().to_str().map(str::to_string))
-        .filter(|n| !n.contains(".tmp."))
+        .filter(|n| !n.contains(".tmp.") && !n.ends_with(".br"))
         .collect();
     names.sort();
     names
@@ -497,12 +523,22 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Writes `<scene_dir>/lods-unity/lods/<sidLower>_<level>.glb` in the
+/// gltfpack layout from the staged float GLB, which stays the bundle input.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn write_brotli_sidecar(path: &Path, data: &[u8]) -> Result<()> {
-    let mut br = path.as_os_str().to_owned();
-    br.push(".br");
-    write_atomic(&PathBuf::from(br), &compress::brotli(data)?)?;
-    Ok(())
+pub fn write_published_glb(
+    scene_dir: &Path,
+    scene_id: &str,
+    level: u32,
+    float_glb: &[u8],
+) -> Result<PathBuf> {
+    let bytes = crate::lodgen::quantize::write_gltfpack_layout(float_glb, scene_id)
+        .with_context(|| format!("quantize {scene_id} level {level}"))?;
+    let dir = scene_dir.join(PUBLISHED_GLB_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
+    let path = dir.join(published_glb_name(scene_id, level));
+    write_atomic(&path, &bytes)?;
+    Ok(path)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -530,7 +566,6 @@ fn write_lod_manifest(entity_dir: &Path, conv: &LodConversion, ab_version: &str)
     let text = serde_json::to_string_pretty(&manifest)?;
     let mpath = entity_dir.join("LOD.manifest.json");
     write_atomic(&mpath, text.as_bytes())?;
-    write_brotli_sidecar(&mpath, text.as_bytes())?;
     Ok(())
 }
 
@@ -686,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn published_objects_lists_bundles_and_iss_with_cdn_keys() {
+    fn published_objects_lists_bundles_and_iss_and_glb() {
         let base = std::env::temp_dir().join(format!("lods-pub-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let scene = base.join("bafkscene");
@@ -700,6 +735,10 @@ mod tests {
         std::fs::write(scene.join("bafkscene_InitialSceneState.json"), b"{}").unwrap();
         std::fs::write(scene.join("bafkscene_InitialSceneState.json.br"), b"z").unwrap();
         std::fs::write(scene.join("LOD.manifest.json"), b"{}").unwrap();
+        std::fs::create_dir_all(scene.join("lods-unity/lods")).unwrap();
+        std::fs::write(scene.join("lods-unity/lods/bafkscene_1.glb"), b"g").unwrap();
+        std::fs::write(scene.join("lods-unity/lods/bafkscene_1.glb.br"), b"h").unwrap();
+        std::fs::write(scene.join("lods-unity/lods/bafkscene_1.glb.tmp.3"), b"i").unwrap();
 
         let objs = published_objects(&scene, &[0, 1]);
         let keys: Vec<&str> = objs.iter().map(|o| o.key.as_str()).collect();
@@ -707,14 +746,55 @@ mod tests {
             keys,
             vec![
                 "LOD/0/bafkscene_0_windows",
-                "LOD/0/bafkscene_0_windows.br",
                 "LOD/1/bafkscene_1_mac",
                 "lods-unity/manifests/bafkscene_InitialSceneState.json",
-                "lods-unity/manifests/bafkscene_InitialSceneState.json.br",
+                "lods-unity/lods/bafkscene_1.glb",
             ]
         );
-        assert_eq!(objs[2].path, scene.join("LOD/1/bafkscene_1_mac"));
+        assert_eq!(objs[1].path, scene.join("LOD/1/bafkscene_1_mac"));
+        assert_eq!(objs[3].path, scene.join("lods-unity/lods/bafkscene_1.glb"));
         assert!(published_objects(&base.join("missing"), &[0, 1]).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn write_published_glb_writes_only_gltfpack_layout() {
+        use crate::lodgen::model::{LodMaterial, LodModel, LodPrimitive};
+        let model = LodModel {
+            root_name: "bafkscene_1".to_string(),
+            primitives: vec![LodPrimitive {
+                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                normals: vec![[0.0, 0.0, 1.0]; 3],
+                uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+                indices: vec![0, 1, 2],
+                material: 0,
+                ..Default::default()
+            }],
+            materials: vec![LodMaterial {
+                name: "TextureBakeResult-mat".to_string(),
+                ..Default::default()
+            }],
+            images: Vec::new(),
+            log: Vec::new(),
+        };
+        let float = crate::lodgen::emit::emit_glb(&model).unwrap();
+        let base = std::env::temp_dir().join(format!("lods-glb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let scene = base.join("BafkScene");
+        std::fs::create_dir_all(&scene).unwrap();
+
+        let path = write_published_glb(&scene, "BafkScene", 1, &float).unwrap();
+        assert_eq!(path, scene.join("lods-unity/lods/bafkscene_1.glb"));
+        let bytes = std::fs::read(&path).unwrap();
+        let (json, _) = crate::gltf::load_gltf_inputs(&bytes, ".glb", None).unwrap();
+        assert_eq!(json["scenes"][0]["name"], "BafkScene");
+        assert_eq!(json["extensionsRequired"][0], "KHR_mesh_quantization");
+        assert!(!scene.join("lods-unity/lods/bafkscene_1.glb.br").exists());
+        let keys: Vec<String> = published_objects(&scene, &[1])
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        assert_eq!(keys, vec!["lods-unity/lods/bafkscene_1.glb"]);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

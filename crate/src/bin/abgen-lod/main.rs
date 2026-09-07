@@ -4,13 +4,10 @@
 use abgen::catalyst::CatalystClient;
 use abgen::lodgen::assemble;
 use abgen::lodgen::simplify;
+use abgen::lodgen::simplify_meshopt::SimplifyPolicy;
 use abgen::lods;
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::PathBuf;
-
-mod compare;
-
-use compare::cmd_compare;
 
 const BIN_NAME: &str = "abgen-lod";
 const CATALYST: &str = "https://peer.decentraland.org/content";
@@ -67,29 +64,32 @@ fn ensure_parent(path: &std::path::Path) -> Result<()> {
 }
 
 fn usage_text() -> &'static str {
-    "abgen-lod — LOD asset-bundle builder + structural comparator
+    "abgen-lod — LOD asset-bundle builder
 
 USAGE:
   abgen-lod bundle <src.glb> --entity <entityId> [--level 1]
             [--platform windows|mac|linux] [--out DIR] [--catalyst URL]
             [--base X,Y --parcels 'x,y;x,y;...'] [--timestamp N] [--vertical-clip H]
-  abgen-lod compare <ours> <prod> [--prod-ab vNN] [--allow-legacy]
   abgen-lod placements (--coords X,Y | --scene <entityId>) [--iss FILE|auto|off]
-            [--catalyst URL]
+            [--catalyst URL] [--diff-iss ISS.json [--tol 1e-3]]
   abgen-lod parse-manifest <manifest.json> --scene <pointer|entityId>
-            [--catalyst URL]
+            [--catalyst URL] [--diff-iss ISS.json [--tol 1e-3]]
   abgen-lod assemble (--scene <entityId|X,Y> | --entity-json FILE) -o out.glb
             [--catalyst URL] [--iss FILE|auto|off] [--cache DIR] [--level 1]
             [--no-crop] [--no-atlas] [--raw-materials] [--max-size 256]
             [--padding 2] [--atlas-fixed] [--atlas-adaptive]
   abgen-lod atlas -i in.glb -o out.glb [--max-size 256] [--padding 2]
+            [--atlas-mode meshbaker|native|adaptive|fullbleed]
             [--atlas-fixed] [--atlas-adaptive] [--crop-base X,Y --crop-parcels 'x,y;x,y;...']
   abgen-lod simplify -i in.glb -o out.glb [--ratio 0.1] [--tri-cap N]
+            [--simplify-policy gltfpack-si|budget]
             [--simplifier meshopt|gltfpack] [--gltfpack PATH]
             [--allow-unsimplified]
   abgen-lod generate --scene <pointer|entityId> --out DIR
             [--platform windows|mac|linux[,windows|mac|linux...]]
-            [--level 0,1] [--ratio 0.1] [--tri-cap N|auto|off] [--atlas-max 256]
+            [--level 1] [--ratio 0.1] [--simplify-policy gltfpack-si|budget]
+            [--tri-cap N|auto|parcels|off] [--atlas-max 2048]
+            [--atlas-mode meshbaker|native|adaptive|fullbleed]
             [--atlas-fixed] [--atlas-adaptive] [--bake-order pre|post]
             [--no-crop] [--catalyst URL] [--iss FILE|auto|off]
             [--workdir DIR] [--cache DIR] [--simplifier meshopt|gltfpack]
@@ -98,27 +98,31 @@ USAGE:
             [--fidelity] [--gpu]
 
 bundle: stages <src.glb> as {entityIdLower}_{level}.glb and builds
-  {out}/{entityIdLower}/LOD/{level}/{entityIdLower}_{level}_{platform} (+.br).
+  {out}/{entityIdLower}/LOD/{level}/{entityIdLower}_{level}_{platform}.
   Scene base/parcels are resolved the way the upstream converter does, unless
   --base/--parcels override: POST /entities/active on catalyst-style hosts
   (a stale/redeployed entity id does NOT resolve), GET /contents/{id} when
   the host is a worlds-content-server. An unresolvable entity is a warning,
   not an error: the bundle is built with zeroed plane/vertical clipping and
   a zero root position, matching the upstream Unity LOD converter.
-compare: parses both bundles and prints PASS/FAIL per structural check; exits 1 on FAIL.
-  --prod-ab passes the reference build's asset-bundle version (from the
-  asset-bundle-registry — it is NOT recorded inside the bundle): versions
-  before v49 predate the current LOD lane and are skipped with exit 2
-  instead of compared (--allow-legacy forces the comparison anyway).
 placements: resolves the scene, then prints its GLB placement list as JSON.
-  --iss auto (default) tries the production InitialSceneState descriptor first
-  (404 falls through); --iss FILE reads a local descriptor; --iss off skips ISS.
-  Without ISS the scene runs in the embedded scene runtime (node is not
-  required); --manifest-builder is deprecated and ignored.
+  --iss auto (default) folds the current deployment's main.crdt first and
+  executes its SDK only when that state is empty or suspicious; it never
+  consumes production ISS. --iss FILE is an explicit comparison/test override;
+  --iss off is an alias for independent auto derivation. Node is not required;
+  generate --cache persists only green independently-derived descriptors by
+  parcel; a missing baseline forces SDK execution on the first run.
+  --manifest-builder is deprecated and ignored. --diff-iss FILE
+  compares the list against a production InitialSceneState as a multiset
+  (content hash + TRS within --tol per component, rotation sign-insensitive),
+  prints `iss-diff: ours=N ref=M missing=A extra=B trs-mismatch=C` instead of
+  the JSON and exits 1 when A+B+C > 0; pass --catalyst explicitly, the
+  default resolves on peer.decentraland.org.
 parse-manifest: reads a <sceneId>-lod-manifest.json written by the npm
   scene-lod-entities-manifest-builder, resolves the scene for its file->hash
   map, and prints the same pretty placement JSON as `placements` — the
   bridge scripts/lod-parity-oracle.sh diffs against the embedded runtime.
+  --diff-iss / --tol behave as for `placements`.
 assemble: resolves placements like `placements`, fetches every referenced GLB
   (--cache DIR caches content by hash; --entity-json FILE reads a catalyst
   entity document from disk instead of resolving --scene, for offline runs
@@ -137,45 +141,69 @@ assemble: resolves placements like `placements`, fetches every referenced GLB
   emissiveFactor/emissiveTexture (+KHR_materials_emissive_strength) — the
   ground-truth reference lane for material-fidelity comparisons.
 atlas: re-runs only the atlas stage on an existing merged GLB: dedupe +
-  skyline-pack tiles into one square power-of-two atlas per alpha class
-  (opaque JPEG, mask/transparent PNG after alpha bleed), merge each class
-  into a single primitive (welding duplicate verts), remap uvs. Default
-  matches production's fixed per-level budget: every canvas is pinned to
-  --max-size (256, production's current LOD budget; 512 for the pre-2025
-  vintage), tiles composited at native texels, solid tiles fill the whole
-  canvas, remainder alpha-bled. The client copies each atlas into a
-  fixed-size shared texture-array slot, so undersized or mixed sizes get
-  skipped and render untextured. --atlas-adaptive selects the old
+  skyline-pack tiles into one square power-of-two atlas per alpha class,
+  merge each class into a single primitive (welding duplicate verts), remap
+  uvs. Buckets follow the glTF alphaMode: OPAQUE -> TextureBakeResult-mat,
+  MASK -> TextureBakeResult-mat-cutout, BLEND ->
+  TextureBakeResult-mat-transparent (the production MeshBaker names; the
+  -metal bucket exists only under generate --fidelity), with one production
+  quirk kept: KHR_materials_transmission materials land in -transparent
+  whatever their alphaMode, because glTFast imports transmission as a
+  blended surface. --atlas-mode picks
+  the sizing policy. meshbaker (generate's default) reproduces
+  lod-generator-unity's MeshBaker bake: sources over 1024 are downscaled
+  first, the natural edge per bucket is ceil(sqrt(sum(min(w,1024) x
+  min(h,1024)))) over its distinct textures, and every bucket shares ONE
+  canvas edge clamp(next_pow2(max(ceil(max_natural x 0.1), 512)), 512,
+  2048) capped by --max-size; padding 2, tiles at native texels, opaque
+  atlas JPEG q85, cutout/transparent PNG; a bucket fed by exactly one source
+  texture (untextured materials do not count) ships that texture with its
+  tiling uvs instead of an atlas, unchanged unless its edge exceeds
+  min(1024, --max-size), in which case it is downscaled to that edge as
+  PNG. native (this subcommand's
+  default, with --max-size 256) pins every canvas to --max-size, tiles at
+  native texels, solid tiles fill the canvas, remainder alpha-bled, opaque
+  JPEG under 512 else PNG. adaptive (--atlas-adaptive) is the old
   shrink-to-content bake (canvas shrunk to the packed extent, flat tiles
-  8x8) for non-Unity consumers; --atlas-fixed selects the retired-lane
-  full-bleed bake (tiles scaled to fill). --crop-base/--crop-parcels
-  clip the model to the parcel-union rects before atlasing (the generate
-  stage order), for staged crop runs without a catalyst entity.
-simplify: decimates a GLB. --simplifier picks the backend (default from
-  ABGEN_SIMPLIFIER, else meshopt). meshopt runs the in-crate meshoptimizer
-  simplifier: the tri budget (--tri-cap, else ratio x input tris) is
-  apportioned per primitive by triangle share, each primitive gets one
-  topology-preserving pass with a loose error bound so the count target
-  dominates, a sloppy (topology-ignoring) retry when that stops early
-  above target, then orphan-vertex compaction; a capped result still over
-  budget is a hard error. gltfpack shells out (-si <ratio> -noq;
-  binary resolved --gltfpack > ABGEN_GLTFPACK > PATH): --tri-cap N: when
-  the plain quality pass stays over the cap, the ladder re-runs at the
-  budget-true ratio (cap/source) escalating the error limit
-  (-sp -se 0.03|0.1|0.3|1.0) and stops at the mildest rung that fits; -sa
-  is a genuine last resort. A fit below 0.8*cap fills back toward the cap
-  by bisecting -se on the quality path (ratio without -sa on a plain fit;
-  -sa bisection only when the fit itself was -sa). In both backends inputs
-  already satisfying ratio>=1 + cap pass through untouched.
-  --allow-unsimplified copies the input through verbatim (loud warning)
-  when the simplifier is unavailable or fails.
-generate/placements/assemble run without node: scenes lacking an ISS
-  descriptor are executed by the embedded scene runtime.
-generate: the full sync chain: resolve scene -> placements (iss|embedded
-  scene runtime) -> assemble -> crop -> atlas -> simplify -> bundle via the LOD build mode
-  into {out}/{sceneId}/LOD/{level}/{sceneId}_{level}_{platform} (+.br,
-  LOD.manifest.json). --level takes a comma-separated list (default 0,1;
-  level 2 is refused; production stopped emitting it): every level shares
+  8x8) for non-Unity consumers; fullbleed (--atlas-fixed) is the retired
+  full-bleed bake (tiles scaled to fill). The LOD bundle converter clamps
+  every texture to 512 BC7, so the GLB canvas edge above 512 only buys
+  source fidelity for the bake. --crop-base/--crop-parcels clip the model to
+  the parcel-union rects before atlasing (the generate stage order), for
+  staged crop runs without a catalyst entity.
+simplify: decimates a GLB. --simplify-policy picks the triangle target
+  (default gltfpack-si; --tri-cap N selects budget). gltfpack-si is the
+  production recipe `gltfpack -si <ratio> -se 0.01 -kn`: every primitive
+  gets exactly one topology-preserving pass toward ceil(tris x ratio)
+  bounded by the 1e-2 relative error, no cap, no sloppy retry, so the
+  output scales with the source. budget is the parcel-scaled cap lane
+  (--tri-cap, else ratio x input tris). --simplifier picks the backend
+  (default from ABGEN_SIMPLIFIER, else meshopt). meshopt runs the in-crate
+  meshoptimizer simplifier; under budget the tri budget is apportioned per
+  primitive by triangle share, each primitive gets one topology-preserving
+  pass with a loose error bound so the count target dominates, a sloppy
+  (topology-ignoring) retry when that stops early above target, then
+  orphan-vertex compaction; a capped result still over budget is a hard
+  error. gltfpack shells out (gltfpack-si: -si <ratio> -se 0.01 -kn -noq;
+  budget: -si <ratio> -noq; binary resolved --gltfpack > ABGEN_GLTFPACK >
+  PATH): under budget with --tri-cap N, when the plain quality pass stays
+  over the cap the ladder re-runs at the budget-true ratio (cap/source)
+  escalating the error limit (-sp -se 0.03|0.1|0.3|1.0) and stops at the
+  mildest rung that fits; -sa is a genuine last resort. A fit below 0.8*cap
+  fills back toward the cap by bisecting -se on the quality path (ratio
+  without -sa on a plain fit; -sa bisection only when the fit itself was
+  -sa). In both backends inputs already satisfying ratio>=1 (+ cap) pass
+  through untouched. The report names the policy. --allow-unsimplified
+  copies the input through verbatim (loud warning) when the simplifier is
+  unavailable or fails.
+generate/placements/assemble run without node: abgen statically interprets the
+  current deployment first and selectively executes its SDK in-process.
+generate: the full sync chain: resolve scene -> independently derive placements
+  -> assemble -> crop -> atlas -> simplify -> bundle via the LOD build mode
+  into {out}/{sceneId}/LOD/{level}/{sceneId}_{level}_{platform}, plus
+  {out}/{sceneId}/LOD.manifest.json. --level takes a comma-separated list (default 1, the
+  production level set; level 2 is refused; production stopped emitting
+  it): every level shares
   ONE assemble/crop/atlas bake and gets its own simplify pass, staged
   {sceneId}_{level}.glb, bundles and self-gate table (labels L{level}: /
   L{level}:{platform}:). Level 0 = that bake un-decimated (ratio 1.0):
@@ -184,41 +212,53 @@ generate: the full sync chain: resolve scene -> placements (iss|embedded
   production LOD0 (a real-scene bundle with per-source meshes/materials on
   dcl/scene_ignore_windows per prod-inspection.md and the LOD0 section of
   PROD-CHARACTERIZATION.md); the ISS path is the
-  production-current LOD0 replacement. At level 1 the tri budget defaults to
-  --tri-cap auto: cap = 500 x parcels, the production budget, so the final
-  mesh is min(source, 500 x parcels) tris. Scenes at or under the cap pass
-  through bit-identically (without resolving gltfpack); larger scenes are
-  decimated with the -se escalation ladder into [0.8*cap, cap] (hard error
-  if the cap is unreachable).
-  --tri-cap N overrides the cap; --tri-cap off restores the legacy
-  ratio-only lane (pass-through at or under 500 x parcels, else an
-  uncapped ratio decimation). --bake-order post reorders the chain to
+  production-current LOD0 replacement. At level 1 the decimation policy
+  defaults to --simplify-policy gltfpack-si, production's `gltfpack -si 0.1
+  -kn` recipe (default -se 1e-2): every primitive gets one
+  topology-preserving pass toward ceil(tris x --ratio) bounded by the 1e-2
+  relative error, never a cap, so the final mesh scales with the source
+  (Tea Park, 28 parcels: 272542 source tris -> ~27k, production's _1.glb
+  has 26758). --tri-cap N|auto|parcels|off switches to the budget policy:
+  auto and parcels cap at 500 x parcels (the pre-parity default; scenes at
+  or under the cap pass through bit-identically, larger ones are decimated
+  with the -se escalation ladder into [0.8*cap, cap], hard error if the cap
+  is unreachable), N caps at N, off is the uncapped ratio lane
+  (pass-through at or under 500 x parcels, else ratio decimation).
+  --simplify-policy gltfpack-si|budget names the policy explicitly; the
+  last of --tri-cap/--simplify-policy wins and --ratio feeds both. Textures:
+  --atlas-mode (default meshbaker, see atlas above) with --atlas-max 2048
+  capping the canvas edge and the single-texture pass-through;
+  --atlas-fixed/--atlas-adaptive are the fullbleed/adaptive shorthands.
+  Bundle textures are BC7 square POT <= 512 (the LOD converter clamps) and
+  the self-gate checks exactly that per texture, at or under
+  min(next_pow2(largest image edge in the level's GLB), 512), plus
+  material-buckets (every bundle material is one of the three
+  production bucket names, four under --fidelity). --bake-order post
+  reorders the chain to
   production's ordering: assemble -> crop -> raw multi-material GLB ->
   simplify -> re-ingest -> atlas -> bundle, so atlas UVs are baked onto the
   final decimated triangles and simplification can never smear them across
   atlas tiles; the default pre keeps the atlas-then-simplify chain.
   --simplifier picks the decimation backend
   exactly as in `simplify` above (default from ABGEN_SIMPLIFIER, else
-  meshopt). Every capped run adds a tri-cap self-gate
+  meshopt). Every budget-policy capped run adds a tri-cap self-gate
   check (tris_after <= cap); an --allow-unsimplified verbatim copy passes
-  it with a recorded waiver. A scene whose
-  placements resolve to nothing (e.g. the scene runtime captures no
-  renderer state) builds a content-free bundle: no meshes, materials or
-  textures, metadata dependencies []. The crop stage (default on, matching
+  it with a recorded waiver. Zero placements, or a count below 90% of the
+  parcel-keyed abgen baseline after SDK execution, quarantines the run before
+  publication. Only an independently-derived, fully self-gated run may update
+  that baseline; explicit ISS lanes cannot. The crop stage (default on, matching
   production; --no-crop disables) clips merged geometry to the exact parcel
   rect and adds a crop-bounds self-gate check. --platform takes a
   comma-separated list (windows|mac|linux; webgl is refused — upstream webgl
   LOD bundles use an empty suffix and are unsupported here): every platform
-  bundle is built from the same bake and simplify pass, written with its own
-  .br sidecar, listed in ONE union LOD.manifest.json, and self-gated
+  bundle is built from the same bake and simplify pass, listed in ONE union LOD.manifest.json, and self-gated
   separately (one gate table per platform, including a target-platform
   check: windows=19 mac=2 linux=24). Every run also writes the ISS
-  descriptor {out}/{sceneId}/{sceneId}_InitialSceneState.json (+.br)
+  descriptor {out}/{sceneId}/{sceneId}_InitialSceneState.json
   next to LOD.manifest.json — the production InitialSceneState shape
   ({version, sceneId, assets:[{hash, position, rotation, scale}]}) with the
-  acquired placements serialized verbatim in the pinned base-relative
-  frame, in BOTH lanes (ISS pass-through and embedded scene runtime;
-  empty scene => assets []); the abcdn server serves it at
+  independently derived placements serialized verbatim in the pinned
+  base-relative frame; the abcdn server serves it at
   /lods-unity/manifests/{sceneId}_InitialSceneState.json and an
   iss-descriptor self-gate check re-parses it. Every run ends with a
   structural self-gate; any FAIL exits nonzero. --keep-glb keeps the
@@ -265,7 +305,6 @@ fn main() {
     let Some(cmd) = argv.first() else { usage() };
     let rc = match cmd.as_str() {
         "bundle" => cmd_bundle(&argv[1..]),
-        "compare" => cmd_compare(&argv[1..]),
         "placements" => cmd_placements(&argv[1..]),
         "parse-manifest" => cmd_parse_manifest(&argv[1..]),
         "assemble" => cmd_assemble(&argv[1..]),
@@ -428,11 +467,44 @@ fn warn_manifest_builder_ignored() {
     eprintln!("deprecated: --manifest-builder is ignored; the scene runtime is embedded");
 }
 
+/// `--diff-iss`: compares `ours` against a production InitialSceneState as a
+/// multiset, prints the one-line summary on stdout (details on stderr) and
+/// maps any difference to exit code 1.
+fn report_iss_diff(
+    ours: &[abgen::lodgen::placements::Placement],
+    reference_path: &str,
+    tol: f64,
+) -> Result<i32> {
+    let bytes =
+        std::fs::read(reference_path).with_context(|| format!("read ISS {reference_path}"))?;
+    let reference = abgen::lodgen::placements::parse_iss(&bytes)?;
+    let diff = abgen::lodgen::placements::diff_iss(ours, &reference, tol);
+    for line in &diff.details {
+        eprintln!("{line}");
+    }
+    println!("{}", diff.summary());
+    Ok(if diff.is_clean() { 0 } else { 1 })
+}
+
+fn parse_tol(v: &str) -> Result<f64> {
+    let tol: f64 = v
+        .parse()
+        .with_context(|| format!("--tol {v:?} is not a number"))?;
+    if tol.is_nan() || tol < 0.0 {
+        bail!("--tol must be >= 0");
+    }
+    Ok(tol)
+}
+
+const ISS_DIFF_DEFAULT_TOL: f64 = 1e-3;
+
 fn cmd_placements(argv: &[String]) -> Result<i32> {
     let mut coords: Option<String> = None;
     let mut scene: Option<String> = None;
     let mut iss = "auto".to_string();
     let mut catalyst = CATALYST.to_string();
+    let mut diff_iss: Option<String> = None;
+    let mut tol = ISS_DIFF_DEFAULT_TOL;
 
     let mut a = Args::new(argv);
     while let Some(arg) = a.next() {
@@ -441,6 +513,8 @@ fn cmd_placements(argv: &[String]) -> Result<i32> {
             "--scene" => scene = Some(a.val()?.clone()),
             "--iss" => iss = a.val()?.clone(),
             "--catalyst" => catalyst = a.val()?.clone(),
+            "--diff-iss" => diff_iss = Some(a.val()?.clone()),
+            "--tol" => tol = parse_tol(a.val()?)?,
             "--manifest-builder" => {
                 a.val()?;
                 warn_manifest_builder_ignored();
@@ -465,6 +539,9 @@ fn cmd_placements(argv: &[String]) -> Result<i32> {
     eprintln!("scene entity: {}", ent.entity_id);
 
     let list = abgen::lodgen::acquire_placements(&client, &ent, &iss)?;
+    if let Some(reference) = diff_iss {
+        return report_iss_diff(&list, &reference, tol);
+    }
     println!("{}", serde_json::to_string_pretty(&list)?);
     Ok(0)
 }
@@ -473,12 +550,16 @@ fn cmd_parse_manifest(argv: &[String]) -> Result<i32> {
     let mut manifest: Option<String> = None;
     let mut scene: Option<String> = None;
     let mut catalyst = CATALYST.to_string();
+    let mut diff_iss: Option<String> = None;
+    let mut tol = ISS_DIFF_DEFAULT_TOL;
 
     let mut a = Args::new(argv);
     while let Some(arg) = a.next() {
         match arg.as_str() {
             "--scene" => scene = Some(a.val()?.clone()),
             "--catalyst" => catalyst = a.val()?.clone(),
+            "--diff-iss" => diff_iss = Some(a.val()?.clone()),
+            "--tol" => tol = parse_tol(a.val()?)?,
             "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
             other if other.starts_with("--") => bail!("unknown parse-manifest flag {other:?}"),
             other => {
@@ -501,11 +582,17 @@ fn cmd_parse_manifest(argv: &[String]) -> Result<i32> {
     eprintln!("scene entity: {}", ent.entity_id);
     let full = abgen::lodgen::placements::parse_lod_manifest_full(&bytes, &ent.content_by_file())?;
     eprintln!(
-        "source: manifest ({} placements, {} mesh-renderer-only skipped, {} unresolved src)",
+        "source: manifest ({} placements, {} mesh-renderer-only skipped, {} unresolved src, \
+         {} invisible skipped, {} excluded src)",
         full.placements.len(),
         full.skipped_mesh_renderer,
-        full.unresolved_src
+        full.unresolved_src,
+        full.invisible_skipped,
+        full.excluded_src
     );
+    if let Some(reference) = diff_iss {
+        return report_iss_diff(&full.placements, &reference, tol);
+    }
     println!("{}", serde_json::to_string_pretty(&full.placements)?);
     Ok(0)
 }
@@ -671,6 +758,7 @@ fn cmd_atlas(argv: &[String]) -> Result<i32> {
     let mut padding: u32 = 2;
     let mut atlas_fixed = false;
     let mut atlas_adaptive = false;
+    let mut mode_flag: Option<abgen::lodgen::atlas::AtlasMode> = None;
     let mut crop_base: Option<String> = None;
     let mut crop_parcels: Option<String> = None;
 
@@ -681,6 +769,7 @@ fn cmd_atlas(argv: &[String]) -> Result<i32> {
             "-o" | "--out" => out = Some(a.val()?.clone()),
             "--max-size" => max_size = a.val()?.parse().context("--max-size")?,
             "--padding" => padding = a.val()?.parse().context("--padding")?,
+            "--atlas-mode" => mode_flag = Some(abgen::lodgen::atlas::AtlasMode::parse(a.val()?)?),
             "--atlas-fixed" => atlas_fixed = true,
             "--atlas-adaptive" => atlas_adaptive = true,
             "--crop-base" => crop_base = Some(a.val()?.clone()),
@@ -711,7 +800,8 @@ fn cmd_atlas(argv: &[String]) -> Result<i32> {
         (None, None) => {}
         _ => bail!("--crop-base and --crop-parcels must be given together"),
     }
-    let mode = atlas_mode(atlas_fixed, atlas_adaptive);
+    let mode = mode_flag.unwrap_or_else(|| atlas_mode(atlas_fixed, atlas_adaptive));
+    eprintln!("atlas mode: {}", mode.name());
     let atlased = abgen::lodgen::atlas::atlas_with(&model, max_size, padding, mode, false)?;
     for line in atlased.log.iter().filter(|l| l.starts_with("atlas:")) {
         println!("{line}");
@@ -743,6 +833,7 @@ fn cmd_simplify(argv: &[String]) -> Result<i32> {
     let mut out: Option<String> = None;
     let mut ratio: f64 = 0.1;
     let mut tri_cap: Option<u64> = None;
+    let mut policy = SimplifyPolicy::default();
     let mut backend = simplify::SimplifierBackend::from_env();
     let mut gltfpack: Option<String> = None;
     let mut allow_unsimplified = false;
@@ -753,7 +844,11 @@ fn cmd_simplify(argv: &[String]) -> Result<i32> {
             "-i" | "--in" => input = Some(a.val()?.clone()),
             "-o" | "--out" => out = Some(a.val()?.clone()),
             "--ratio" => ratio = a.val()?.parse().context("--ratio")?,
-            "--tri-cap" => tri_cap = Some(a.val()?.parse().context("--tri-cap")?),
+            "--tri-cap" => {
+                tri_cap = Some(a.val()?.parse().context("--tri-cap")?);
+                policy = SimplifyPolicy::Budget;
+            }
+            "--simplify-policy" => policy = SimplifyPolicy::parse(a.val()?)?,
             "--simplifier" => backend = simplify::SimplifierBackend::parse(a.val()?)?,
             "--gltfpack" => gltfpack = Some(a.val()?.clone()),
             "--allow-unsimplified" => allow_unsimplified = true,
@@ -765,10 +860,30 @@ fn cmd_simplify(argv: &[String]) -> Result<i32> {
     let out = PathBuf::from(out.ok_or_else(|| anyhow!("simplify needs -o <out.glb>"))?);
     ensure_parent(&out)?;
 
+    let policy = policy.with_ratio(ratio as f32);
+    let run_meshopt = || match policy {
+        SimplifyPolicy::GltfpackSi {
+            ratio,
+            target_error,
+        } => abgen::lodgen::simplify_meshopt::simplify_file_si(&input, &out, ratio, target_error),
+        SimplifyPolicy::Budget => {
+            abgen::lodgen::simplify_meshopt::simplify_file(&input, &out, ratio, tri_cap)
+        }
+    };
+    let run_gltfpack = |bin: &std::path::Path| match policy {
+        SimplifyPolicy::GltfpackSi {
+            ratio,
+            target_error,
+        } => simplify::simplify_si(&input, &out, ratio, target_error, bin),
+        SimplifyPolicy::Budget => simplify::simplify(&input, &out, ratio, tri_cap, bin),
+    };
     let report = match backend {
         simplify::SimplifierBackend::Meshopt => {
-            eprintln!("simplifier: meshopt (in-crate meshoptimizer)");
-            match abgen::lodgen::simplify_meshopt::simplify_file(&input, &out, ratio, tri_cap) {
+            eprintln!(
+                "simplifier: meshopt (in-crate meshoptimizer), policy {}",
+                policy.name()
+            );
+            match run_meshopt() {
                 Ok(r) => r,
                 Err(e) if allow_unsimplified => {
                     eprintln!(
@@ -782,8 +897,8 @@ fn cmd_simplify(argv: &[String]) -> Result<i32> {
         simplify::SimplifierBackend::Gltfpack => {
             match simplify::resolve_gltfpack(gltfpack.as_deref().map(std::path::Path::new)) {
                 Ok(bin) => {
-                    eprintln!("gltfpack: {}", bin.display());
-                    match simplify::simplify(&input, &out, ratio, tri_cap, &bin) {
+                    eprintln!("gltfpack: {} (policy {})", bin.display(), policy.name());
+                    match run_gltfpack(&bin) {
                         Ok(r) => r,
                         Err(e) if allow_unsimplified => {
                             eprintln!(
@@ -848,23 +963,28 @@ fn cmd_generate(argv: &[String]) -> Result<i32> {
                 params.levels = abgen::lodgen::normalize_levels(&list)?;
             }
             "--ratio" => params.ratio = a.val()?.parse().context("--ratio")?,
-            "--tri-cap" => match a.val()?.as_str() {
-                "auto" => {
-                    params.tri_cap = None;
-                    params.tri_cap_auto = true;
+            "--simplify-policy" => params.simplify_policy = SimplifyPolicy::parse(a.val()?)?,
+            "--tri-cap" => {
+                params.simplify_policy = SimplifyPolicy::Budget;
+                match a.val()?.as_str() {
+                    "auto" | "parcels" => {
+                        params.tri_cap = None;
+                        params.tri_cap_auto = true;
+                    }
+                    "off" => {
+                        params.tri_cap = None;
+                        params.tri_cap_auto = false;
+                    }
+                    v => {
+                        params.tri_cap = Some(v.parse().context("--tri-cap")?);
+                        params.tri_cap_auto = false;
+                    }
                 }
-                "off" => {
-                    params.tri_cap = None;
-                    params.tri_cap_auto = false;
-                }
-                v => {
-                    params.tri_cap = Some(v.parse().context("--tri-cap")?);
-                    params.tri_cap_auto = false;
-                }
-            },
+            }
             "--atlas-max" => params.atlas_max = a.val()?.parse().context("--atlas-max")?,
-            "--atlas-fixed" => params.atlas_fixed = true,
-            "--atlas-adaptive" => params.atlas_adaptive = true,
+            "--atlas-mode" => params.atlas_mode = abgen::lodgen::atlas::AtlasMode::parse(a.val()?)?,
+            "--atlas-fixed" => params.atlas_mode = abgen::lodgen::atlas::AtlasMode::FullBleed,
+            "--atlas-adaptive" => params.atlas_mode = abgen::lodgen::atlas::AtlasMode::Adaptive,
             "--bake-order" => match a.val()?.as_str() {
                 "pre" => params.bake_after_simplify = false,
                 "post" => params.bake_after_simplify = true,
@@ -898,6 +1018,7 @@ fn cmd_generate(argv: &[String]) -> Result<i32> {
     }
     params.scene = scene.ok_or_else(|| anyhow!("generate needs --scene <pointer|entityId>"))?;
     params.out_dir = out.ok_or_else(|| anyhow!("generate needs --out DIR"))?;
+    params.simplify_policy = params.simplify_policy.with_ratio(params.ratio as f32);
 
     let outcome = abgen::lodgen::generate(&params)?;
     for line in &outcome.log {

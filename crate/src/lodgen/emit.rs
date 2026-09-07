@@ -2,24 +2,7 @@ use anyhow::{bail, Result};
 use serde_json::{json, Map, Value};
 
 use crate::lodgen::model::{AlphaClass, LodModel};
-
-fn align4(bin: &mut Vec<u8>) {
-    while !bin.len().is_multiple_of(4) {
-        bin.push(0);
-    }
-}
-
-fn add_view(views: &mut Vec<Value>, offset: usize, len: usize, target: Option<u32>) -> usize {
-    let mut v = Map::new();
-    v.insert("buffer".to_string(), json!(0));
-    v.insert("byteLength".to_string(), json!(len));
-    v.insert("byteOffset".to_string(), json!(offset));
-    if let Some(t) = target {
-        v.insert("target".to_string(), json!(t));
-    }
-    views.push(Value::Object(v));
-    views.len() - 1
-}
+use crate::lodgen::quantize::{add_view, align4};
 
 pub fn emit_empty_glb(root_name: &str) -> Result<Vec<u8>> {
     let mut root = Map::new();
@@ -86,7 +69,13 @@ pub fn emit_glb(model: &LodModel) -> Result<Vec<u8>> {
                 bin.extend_from_slice(&p[i].to_le_bytes());
             }
         }
-        let pos_view = add_view(&mut views, pos_off, prim.positions.len() * 12, Some(34962));
+        let pos_view = add_view(
+            &mut views,
+            pos_off,
+            prim.positions.len() * 12,
+            None,
+            Some(34962),
+        );
         let pos_acc = accessors.len();
         accessors.push(json!({
             "bufferView": pos_view,
@@ -104,7 +93,13 @@ pub fn emit_glb(model: &LodModel) -> Result<Vec<u8>> {
                 bin.extend_from_slice(&c.to_le_bytes());
             }
         }
-        let nrm_view = add_view(&mut views, nrm_off, prim.normals.len() * 12, Some(34962));
+        let nrm_view = add_view(
+            &mut views,
+            nrm_off,
+            prim.normals.len() * 12,
+            None,
+            Some(34962),
+        );
         let nrm_acc = accessors.len();
         accessors.push(json!({
             "bufferView": nrm_view,
@@ -120,7 +115,7 @@ pub fn emit_glb(model: &LodModel) -> Result<Vec<u8>> {
                 bin.extend_from_slice(&c.to_le_bytes());
             }
         }
-        let uv_view = add_view(&mut views, uv_off, prim.uvs.len() * 8, Some(34962));
+        let uv_view = add_view(&mut views, uv_off, prim.uvs.len() * 8, None, Some(34962));
         let uv_acc = accessors.len();
         accessors.push(json!({
             "bufferView": uv_view,
@@ -143,7 +138,13 @@ pub fn emit_glb(model: &LodModel) -> Result<Vec<u8>> {
                 bin.extend_from_slice(&i.to_le_bytes());
             }
         }
-        let idx_view = add_view(&mut views, idx_off, prim.indices.len() * width, Some(34963));
+        let idx_view = add_view(
+            &mut views,
+            idx_off,
+            prim.indices.len() * width,
+            None,
+            Some(34963),
+        );
         let idx_acc = accessors.len();
         accessors.push(json!({
             "bufferView": idx_view,
@@ -164,7 +165,7 @@ pub fn emit_glb(model: &LodModel) -> Result<Vec<u8>> {
         align4(&mut bin);
         let off = bin.len();
         bin.extend_from_slice(&img.bytes);
-        let view = add_view(&mut views, off, img.bytes.len(), None);
+        let view = add_view(&mut views, off, img.bytes.len(), None, None);
         images_json.push(json!({"bufferView": view, "mimeType": img.mime}));
     }
 

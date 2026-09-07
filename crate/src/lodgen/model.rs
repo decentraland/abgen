@@ -26,9 +26,21 @@ pub fn scaled_emissive(m: &crate::scene::Material) -> [f64; 3] {
 }
 
 impl AlphaClass {
+    /// Bucket class of a source material as production's glTFast import sees
+    /// it: the glTF alphaMode, except that `KHR_materials_transmission`
+    /// materials import as a blended (transparent) surface whatever their
+    /// alphaMode says.
+    pub fn for_material(mode: &str, transmission: bool) -> AlphaClass {
+        if transmission {
+            AlphaClass::Blend
+        } else {
+            AlphaClass::from_alpha_mode(mode)
+        }
+    }
+
     pub fn from_alpha_mode(mode: &str) -> AlphaClass {
         match mode {
-            "MASK" => AlphaClass::Blend,
+            "MASK" => AlphaClass::Mask,
             "BLEND" => AlphaClass::Blend,
             _ => AlphaClass::Opaque,
         }
@@ -479,7 +491,7 @@ pub fn from_glb_bytes_with(
         let mr_image = intern(m.metallic_roughness_image);
         model.materials.push(LodMaterial {
             name: m.name.clone(),
-            class: AlphaClass::from_alpha_mode(&m.alpha_mode),
+            class: AlphaClass::for_material(&m.alpha_mode, m.uses_transmission),
             base_color,
             cutoff: m.alpha_cutoff,
             image,
@@ -515,10 +527,17 @@ mod tests {
     #[test]
     fn alpha_mode_mapping() {
         assert_eq!(AlphaClass::from_alpha_mode("OPAQUE"), AlphaClass::Opaque);
-        assert_eq!(AlphaClass::from_alpha_mode("MASK"), AlphaClass::Blend);
+        assert_eq!(AlphaClass::from_alpha_mode("MASK"), AlphaClass::Mask);
         assert_eq!(AlphaClass::from_alpha_mode("BLEND"), AlphaClass::Blend);
         assert_eq!(AlphaClass::from_alpha_mode(""), AlphaClass::Opaque);
         assert_eq!(AlphaClass::from_alpha_mode("mask"), AlphaClass::Opaque);
+        assert_eq!(AlphaClass::for_material("OPAQUE", true), AlphaClass::Blend);
+        assert_eq!(AlphaClass::for_material("MASK", true), AlphaClass::Blend);
+        assert_eq!(AlphaClass::for_material("MASK", false), AlphaClass::Mask);
+        assert_eq!(
+            AlphaClass::for_material("OPAQUE", false),
+            AlphaClass::Opaque
+        );
     }
 
     #[test]
