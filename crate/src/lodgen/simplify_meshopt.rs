@@ -1,6 +1,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 use anyhow::Context;
 use anyhow::{anyhow, bail, Result};
+use rayon::prelude::*;
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
@@ -10,6 +11,36 @@ use super::simplify_report::SimplifyReport;
 
 const LOOSE_TARGET_ERROR: f32 = 1.0;
 const TIGHT_TARGET_ERROR: f32 = 0.01;
+const PARALLEL_MIN_INDICES: usize = 30_000;
+
+fn map_primitives<R: Send>(
+    model: &LodModel,
+    f: impl Fn(usize, &LodPrimitive) -> R + Sync,
+) -> Vec<R> {
+    let parallel = model.primitives.len() > 1
+        && rayon::current_num_threads() > 1
+        && model
+            .primitives
+            .iter()
+            .map(|p| p.indices.len())
+            .sum::<usize>()
+            >= PARALLEL_MIN_INDICES;
+    if parallel {
+        model
+            .primitives
+            .par_iter()
+            .enumerate()
+            .map(|(i, prim)| f(i, prim))
+            .collect()
+    } else {
+        model
+            .primitives
+            .iter()
+            .enumerate()
+            .map(|(i, prim)| f(i, prim))
+            .collect()
+    }
+}
 
 /// gltfpack's `-si` default ratio and `-se` default error bound: the
 /// production LOD-1 recipe (`gltfpack -si 0.1 -kn`).
@@ -154,11 +185,14 @@ fn run_pass(
         .map(|p| p.indices.len() / 3)
         .collect();
     let targets = apportion(&counts, budget);
-    let mut primitives = Vec::with_capacity(model.primitives.len());
+    let results = map_primitives(model, |i, prim| {
+        simplify_prim(prim, targets[i], target_error)
+    });
+    let mut primitives = Vec::with_capacity(results.len());
     let mut sloppy_any = false;
     let mut total = 0usize;
-    for (prim, &target) in model.primitives.iter().zip(targets.iter()) {
-        let (p, sloppy) = simplify_prim(prim, target, target_error)?;
+    for result in results {
+        let (p, sloppy) = result?;
         sloppy_any |= sloppy;
         if !p.indices.is_empty() {
             total += p.indices.len() / 3;
@@ -397,10 +431,13 @@ pub fn simplify_model_si(
             .flat_map(|p| p.positions.iter().copied()),
     )
     .max(1e-6);
-    let mut primitives = Vec::with_capacity(model.primitives.len());
+    let results = map_primitives(model, |_, prim| {
+        simplify_prim_si(prim, ratio, target_error, scene_radius)
+    });
+    let mut primitives = Vec::with_capacity(results.len());
     let mut total = 0usize;
-    for prim in &model.primitives {
-        let p = simplify_prim_si(prim, ratio, target_error, scene_radius)?;
+    for result in results {
+        let p = result?;
         if !p.indices.is_empty() {
             total += p.indices.len() / 3;
             primitives.push(p);
@@ -604,6 +641,37 @@ mod tests {
             })
             .sum::<usize>();
         assert_eq!(orphans, 0);
+    }
+
+    fn repeated_grid_model(n: u32, count: usize) -> LodModel {
+        let mut model = grid_model(n);
+        model.primitives = vec![model.primitives[0].clone(); count];
+        model
+    }
+
+    #[test]
+    fn parallel_results_are_byte_identical_across_thread_counts() {
+        let model = repeated_grid_model(48, 4);
+        let run = |threads, budget| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    if budget {
+                        simplify_model(&model, 2_000, true)
+                    } else {
+                        simplify_model_si(&model, 0.1, 0.01)
+                    }
+                })
+                .unwrap()
+        };
+        for budget in [false, true] {
+            let (serial, serial_report) = run(1, budget);
+            let (parallel, parallel_report) = run(4, budget);
+            assert_eq!(serial_report.summary(), parallel_report.summary());
+            assert_eq!(emit_glb(&serial).unwrap(), emit_glb(&parallel).unwrap());
+        }
     }
 
     #[test]
