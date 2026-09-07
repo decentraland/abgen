@@ -1,28 +1,9 @@
+use crate::gpu::corelib::dxt1::{pack_565, unpack_565};
+use crate::gpu::corelib::mips::pad_to_block_size;
 use std::sync::OnceLock;
 
 const BLOCK_SIZE: usize = 8;
 const PIXELS_PER_BLOCK: usize = 16;
-
-#[inline]
-fn pack_565(r: u8, g: u8, b: u8) -> u16 {
-    let r5 = ((r as u16) >> 3) & 0x1F;
-    let g6 = ((g as u16) >> 2) & 0x3F;
-    let b5 = ((b as u16) >> 3) & 0x1F;
-    (r5 << 11) | (g6 << 5) | b5
-}
-
-#[inline]
-fn unpack_565(c: u16) -> [u8; 3] {
-    let r = ((c >> 11) & 0x1F) as u8;
-    let g = ((c >> 5) & 0x3F) as u8;
-    let b = (c & 0x1F) as u8;
-
-    [
-        (r << 3) | (r >> 2),
-        (g << 2) | (g >> 4),
-        (b << 3) | (b >> 2),
-    ]
-}
 
 /// Detects a solid-RGB block: 16 pixels whose R,G,B bytes are all equal
 /// (alpha is never read by either encoder path, so it is excluded from the
@@ -116,125 +97,7 @@ fn encode_block(rgba: &[u8; 64]) -> [u8; BLOCK_SIZE] {
 
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn encode_block_scalar(rgba: &[u8; 64]) -> [u8; BLOCK_SIZE] {
-    let mut pix = [[0u8; 3]; 16];
-    for i in 0..16 {
-        pix[i] = [rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]];
-    }
-
-    let mut mean = [0f32; 3];
-    for p in &pix {
-        for k in 0..3 {
-            mean[k] += p[k] as f32;
-        }
-    }
-    for k in 0..3 {
-        mean[k] /= 16.0;
-    }
-
-    let mut cov = [[0f32; 3]; 3];
-    for p in &pix {
-        let d = [
-            p[0] as f32 - mean[0],
-            p[1] as f32 - mean[1],
-            p[2] as f32 - mean[2],
-        ];
-        for a in 0..3 {
-            for b in 0..3 {
-                cov[a][b] += d[a] * d[b];
-            }
-        }
-    }
-    let mut axis = [1f32, 1f32, 1f32];
-    for _ in 0..6 {
-        let mut n = [0f32; 3];
-        for a in 0..3 {
-            for b in 0..3 {
-                n[a] += cov[a][b] * axis[b];
-            }
-        }
-        let mag = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-        if mag < 1e-6 {
-            axis = [1.0, 1.0, 1.0];
-            break;
-        }
-        axis = [n[0] / mag, n[1] / mag, n[2] / mag];
-    }
-
-    let mut min_dot = f32::INFINITY;
-    let mut max_dot = f32::NEG_INFINITY;
-    let mut min_i = 0usize;
-    let mut max_i = 0usize;
-    for (i, p) in pix.iter().enumerate() {
-        let d = (p[0] as f32 - mean[0]) * axis[0]
-            + (p[1] as f32 - mean[1]) * axis[1]
-            + (p[2] as f32 - mean[2]) * axis[2];
-        if d < min_dot {
-            min_dot = d;
-            min_i = i;
-        }
-        if d > max_dot {
-            max_dot = d;
-            max_i = i;
-        }
-    }
-    let mut c0 = pack_565(pix[max_i][0], pix[max_i][1], pix[max_i][2]);
-    let mut c1 = pack_565(pix[min_i][0], pix[min_i][1], pix[min_i][2]);
-
-    if c0 == c1 {
-        if c1 > 0 {
-            c1 -= 1;
-        } else {
-            c0 += 1;
-        }
-    }
-    if c0 < c1 {
-        std::mem::swap(&mut c0, &mut c1);
-    }
-
-    let ep0 = unpack_565(c0);
-    let ep1 = unpack_565(c1);
-    let palette: [[u8; 3]; 4] = [
-        ep0,
-        ep1,
-        [
-            ((2u16 * ep0[0] as u16 + ep1[0] as u16) / 3) as u8,
-            ((2u16 * ep0[1] as u16 + ep1[1] as u16) / 3) as u8,
-            ((2u16 * ep0[2] as u16 + ep1[2] as u16) / 3) as u8,
-        ],
-        [
-            ((ep0[0] as u16 + 2u16 * ep1[0] as u16) / 3) as u8,
-            ((ep0[1] as u16 + 2u16 * ep1[1] as u16) / 3) as u8,
-            ((ep0[2] as u16 + 2u16 * ep1[2] as u16) / 3) as u8,
-        ],
-    ];
-
-    let mut bits = 0u32;
-    for (i, p) in pix.iter().enumerate() {
-        let mut best = 0u32;
-        let mut best_err = i32::MAX;
-        for (k, pc) in palette.iter().enumerate() {
-            let dr = p[0] as i32 - pc[0] as i32;
-            let dg = p[1] as i32 - pc[1] as i32;
-            let db = p[2] as i32 - pc[2] as i32;
-            let e = dr * dr + dg * dg + db * db;
-            if e < best_err {
-                best_err = e;
-                best = k as u32;
-            }
-        }
-        bits |= best << (2 * i);
-    }
-
-    let mut out = [0u8; BLOCK_SIZE];
-    out[0] = (c0 & 0xFF) as u8;
-    out[1] = ((c0 >> 8) & 0xFF) as u8;
-    out[2] = (c1 & 0xFF) as u8;
-    out[3] = ((c1 >> 8) & 0xFF) as u8;
-    out[4] = (bits & 0xFF) as u8;
-    out[5] = ((bits >> 8) & 0xFF) as u8;
-    out[6] = ((bits >> 16) & 0xFF) as u8;
-    out[7] = ((bits >> 24) & 0xFF) as u8;
-    out
+    crate::gpu::corelib::dxt1::encode_block(rgba)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -418,26 +281,6 @@ mod neon {
             out
         }
     }
-}
-
-fn pad_to_block_size(rgba: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize) {
-    let pw = (w + 3) & !3;
-    let ph = (h + 3) & !3;
-    if pw == w && ph == h {
-        return (rgba.to_vec(), w, h);
-    }
-
-    let mut out = vec![0u8; pw * ph * 4];
-    for y in 0..ph {
-        let sy = y % h;
-        for x in 0..pw {
-            let sx = x % w;
-            let s = (sy * w + sx) * 4;
-            let d = (y * pw + x) * 4;
-            out[d..d + 4].copy_from_slice(&rgba[s..s + 4]);
-        }
-    }
-    (out, pw, ph)
 }
 
 fn srgb_to_linear_u8(c: u8) -> f32 {

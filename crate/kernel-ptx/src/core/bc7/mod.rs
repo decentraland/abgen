@@ -6,11 +6,11 @@ mod cell;
 mod eval;
 mod handlers;
 mod plan;
-#[cfg(not(target_arch = "nvptx64"))]
+#[cfg(all(test, not(target_arch = "nvptx64")))]
 mod probe_mod;
 mod tables;
 
-#[cfg(not(target_arch = "nvptx64"))]
+#[cfg(all(test, not(target_arch = "nvptx64")))]
 pub use probe_mod::probe;
 
 use super::sqrtf;
