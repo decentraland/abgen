@@ -810,7 +810,6 @@ pub fn build_bundle_multi(
 ) -> Result<Vec<BundleArtifact>> {
     let shareable = bundle_names.len() >= 2
         && opts.expect_hash.is_none()
-        && opts.lod.is_none()
         && bundle_names
             .iter()
             .all(|n| matches!(target_from_bundle_name(n), "windows" | "mac"));
@@ -872,7 +871,7 @@ pub fn build_bundle_multi(
         &gltf_buffers,
         opts.resolve,
         opts.magenta_missing,
-        false,
+        opts.lod.is_some(),
     )
     .context("parse glb")?;
     let image_uri = scene.image_uri.clone();
@@ -897,7 +896,7 @@ pub fn build_bundle_multi(
         None,
         opts.force_default_material,
         Toggles::from_opts(opts),
-        None,
+        opts.lod.cloned(),
     );
     b.build(&scene)?;
     b.finalize_pathids()?;

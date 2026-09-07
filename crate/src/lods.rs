@@ -1,4 +1,4 @@
-use crate::builder::{build_bundle, BuildOpts, LodBuildParams};
+use crate::builder::{build_bundle, build_bundle_multi, BuildOpts, LodBuildParams};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::catalyst::CatalystClient;
 use crate::naming;
@@ -286,17 +286,19 @@ fn resolve_scene_meta(client: &CatalystClient, sid: &str) -> LodGenMeta {
 }
 
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-fn build_lod_bundle(
+fn build_lod_bundles(
     glb: &[u8],
     locator: &str,
     sid: &str,
     level: u32,
-    platform: &str,
+    platforms: &[String],
     opts: &LodOptions,
     meta: &LodGenMeta,
-) -> Result<(LodResult, Vec<u8>)> {
-    let bundle_name = lod_bundle_name(sid, level, platform);
-
+) -> Vec<(String, Result<(LodResult, Vec<u8>)>)> {
+    let bundle_names: Vec<String> = platforms
+        .iter()
+        .map(|platform| lod_bundle_name(sid, level, platform))
+        .collect();
     let root_hash = format!("{}_{}", sid, level);
     let lod_params = LodBuildParams {
         level,
@@ -316,19 +318,56 @@ fn build_lod_bundle(
         lod: Some(&lod_params),
         ..Default::default()
     };
-    let data = build_bundle(glb, &bundle_name, &root_hash, &build_opts)
-        .with_context(|| format!("build LOD bundle for {locator:?}"))?
-        .data;
 
-    let rel = lod_rel_path(level, &bundle_name);
-    let result = LodResult {
-        scene_id: sid.to_string(),
-        level,
-        bytes: data.len(),
-        rel_path: rel,
-        bundle_name,
-    };
-    Ok((result, data))
+    let shareable: Vec<usize> = platforms
+        .iter()
+        .enumerate()
+        .filter_map(|(i, platform)| matches!(platform.as_str(), "windows" | "mac").then_some(i))
+        .collect();
+    let mut artifacts: Vec<Option<Result<crate::builder::BundleArtifact>>> =
+        std::iter::repeat_with(|| None)
+            .take(platforms.len())
+            .collect();
+
+    if shareable.len() >= 2 {
+        let names: Vec<String> = shareable.iter().map(|&i| bundle_names[i].clone()).collect();
+        if let Ok(built) = build_bundle_multi(glb, &names, &root_hash, &build_opts) {
+            for (&i, artifact) in shareable.iter().zip(built) {
+                artifacts[i] = Some(Ok(artifact));
+            }
+        }
+    }
+    for (i, slot) in artifacts.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(
+                build_bundle(glb, &bundle_names[i], &root_hash, &build_opts)
+                    .with_context(|| format!("build LOD bundle for {locator:?}")),
+            );
+        }
+    }
+
+    platforms
+        .iter()
+        .cloned()
+        .zip(bundle_names)
+        .zip(artifacts)
+        .map(|((platform, bundle_name), artifact)| {
+            let result = artifact
+                .expect("every platform build is populated")
+                .map(|artifact| {
+                    let data = artifact.data;
+                    let result = LodResult {
+                        scene_id: sid.to_string(),
+                        level,
+                        bytes: data.len(),
+                        rel_path: lod_rel_path(level, &bundle_name),
+                        bundle_name,
+                    };
+                    (result, data)
+                });
+            (platform, result)
+        })
+        .collect()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -379,15 +418,8 @@ pub fn convert_lods_platforms(
                         .or_insert_with(|| resolve_scene_meta(client, &sid))
                         .clone(),
                 };
-                let builds: Vec<_> = platform_list
-                    .par_iter()
-                    .map(|platform| {
-                        (
-                            platform,
-                            build_lod_bundle(&glb, locator, &sid, level, platform, opts, &meta),
-                        )
-                    })
-                    .collect();
+                let builds =
+                    build_lod_bundles(&glb, locator, &sid, level, &platform_list, opts, &meta);
                 for (platform, build) in builds {
                     match build {
                         Ok((r, data)) => {

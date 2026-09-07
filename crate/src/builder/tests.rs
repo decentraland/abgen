@@ -776,6 +776,42 @@ fn build_bundle_multi_pair_matches_single_platform_builds() {
 }
 
 #[test]
+fn build_bundle_multi_lod_pair_matches_single_platform_builds() {
+    let gltf = tiny_gltf(1);
+    let lod = LodBuildParams {
+        level: 1,
+        plane_clipping: [127.95, 144.05, -1328.05, -1311.95],
+        vertical_clipping: [0.0, 20.0, 0.0, 0.0],
+        root_position: [128.0, 0.0, -1328.0],
+        main_asset: "bafkreitestlodmulti_1.prefab".to_string(),
+        timestamp: Some(638_000_000_000_000_000),
+        fidelity: false,
+    };
+    let opts = BuildOpts {
+        source_file: Some("bafkreitestlodmulti_1.gltf"),
+        lod: Some(&lod),
+        ..BuildOpts::default()
+    };
+    for names in [
+        ["bafkreitestlodmulti_1_windows", "bafkreitestlodmulti_1_mac"],
+        ["bafkreitestlodmulti_1_mac", "bafkreitestlodmulti_1_windows"],
+    ] {
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        let multi =
+            build_bundle_multi(&gltf, &names, "bafkreitestlodmulti_1", &opts).expect("multi LOD");
+        assert_eq!(multi.len(), 2);
+        for (artifact, name) in multi.iter().zip(&names) {
+            let single =
+                build_bundle(&gltf, name, "bafkreitestlodmulti_1", &opts).expect("single LOD");
+            assert_eq!(
+                artifact.data, single.data,
+                "{name}: retargeted LOD must be byte-identical to a fresh build"
+            );
+        }
+    }
+}
+
+#[test]
 fn build_bundle_multi_non_shareable_targets_fall_back_to_full_builds() {
     let gltf = tiny_gltf(1);
     let opts = BuildOpts {
