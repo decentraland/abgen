@@ -793,6 +793,11 @@ fn multi_level_sources_build_both_levels_from_one_bake() {
     assert!(conv.skipped.is_empty(), "{:?}", conv.skipped);
     assert_eq!(conv.results.len(), 2);
     assert_eq!(conv.scene_id, sid);
+    assert_eq!(
+        conv.results.iter().map(|r| r.level).collect::<Vec<_>>(),
+        vec![0, 1],
+        "parallel packaging must preserve source order"
+    );
     for level in [0u32, 1] {
         let rel = expected_rel_path(sid, level, "windows");
         assert!(

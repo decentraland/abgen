@@ -408,9 +408,10 @@ pub fn convert_lods_platforms(
     let mut scene_id: Option<String> = None;
     let mut meta_cache: BTreeMap<String, LodGenMeta> = BTreeMap::new();
 
-    for locator in sources {
-        match prepare_lod_source(client, locator) {
-            Ok((sid, level, glb)) => {
+    let prepared: Vec<_> = sources
+        .iter()
+        .map(|locator| {
+            let source = prepare_lod_source(client, locator).map(|(sid, level, glb)| {
                 let meta = match &opts.lod {
                     Some(m) => m.clone(),
                     None => meta_cache
@@ -418,8 +419,24 @@ pub fn convert_lods_platforms(
                         .or_insert_with(|| resolve_scene_meta(client, &sid))
                         .clone(),
                 };
-                let builds =
-                    build_lod_bundles(&glb, locator, &sid, level, &platform_list, opts, &meta);
+                (sid, level, glb, meta)
+            });
+            (locator, source)
+        })
+        .collect();
+    let packaged: Vec<_> = prepared
+        .into_par_iter()
+        .map(|(locator, source)| {
+            let builds = source.map(|(sid, level, glb, meta)| {
+                build_lod_bundles(&glb, locator, &sid, level, &platform_list, opts, &meta)
+            });
+            (locator, builds)
+        })
+        .collect();
+
+    for (locator, builds) in packaged {
+        match builds {
+            Ok(builds) => {
                 for (platform, build) in builds {
                     match build {
                         Ok((r, data)) => {
