@@ -62,7 +62,7 @@ hash, non-trivial rotation and scale).
 Both placement files are reproduced offline from the committed manifests by
 the descriptor lane (`golden_manifests_cross_check_the_compose_seam`, or
 `abgen-lod parse-manifest crate/src/lodgen/testdata/golden_<C>.manifest.json
---scene <entity> --catalyst https://catalyst.dcl.one/content`), which applies
+--scene <entity> --catalyst https://peer.decentraland.org/content`), which applies
 the production `StaticSceneDescriptorBuilder` rules: 4x4 TRS composition along the parent chain, Unity's
 decomposition (`scale.x` negative under `det < 0`, `MatrixToQuaternion` sign
 convention, NaN rotation -> identity), the entity's own VisibilityComponent,

@@ -7,10 +7,11 @@ use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_CATALYST: &str = "https://catalyst.dcl.one/content";
+const DEFAULT_CATALYST: &str = "https://peer.decentraland.org/content";
 const DEFAULT_WORLDS: &str = "https://worlds-content-server.decentraland.org";
 const DEFAULT_ATTEMPTS: u32 = 3;
 const DEFAULT_SNAPSHOT_PASSES: usize = 8;
+const CITY_DISCOVERY_BATCH: usize = 100;
 const RISK_SCENES: [&str; 4] = [
     "bafkreiceqm43l33evsc43jtotf2fs27efizwxn76cdnd3ypd6mcsdnpf6a",
     "bafkreib3pp3kds7ftnvnaebbr2qzm2nnl4i4yuuc5b572ueuaeaj5rnnga",
@@ -47,6 +48,7 @@ struct Options {
     world_names: Vec<String>,
     entity_ids: Vec<String>,
     platforms: Vec<String>,
+    levels: Vec<u32>,
 }
 
 #[derive(Serialize)]
@@ -141,6 +143,7 @@ struct Report {
     catalyst: String,
     worlds_url: String,
     platforms: Vec<String>,
+    levels: Vec<u32>,
     workers: usize,
     texture_encoder: TextureEncoderRecord,
     max_attempts: u32,
@@ -177,6 +180,7 @@ fn parse(argv: &[String]) -> Result<Options> {
     let mut world_names = Vec::new();
     let mut entity_ids = Vec::new();
     let mut platforms = vec!["windows".to_string(), "mac".to_string()];
+    let mut levels = vec![1];
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -221,6 +225,15 @@ fn parse(argv: &[String]) -> Result<Options> {
                     .map(str::to_string)
                     .collect();
             }
+            "--level" => {
+                let parsed = value(argv, &mut i)?
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.parse().context("--level"))
+                    .collect::<Result<Vec<_>>>()?;
+                levels = abgen::lodgen::normalize_levels(&parsed)?;
+            }
             other => bail!("unknown qualify-corpus argument {other:?}"),
         }
         i += 1;
@@ -264,6 +277,7 @@ fn parse(argv: &[String]) -> Result<Options> {
         world_names,
         entity_ids,
         platforms,
+        levels,
     })
 }
 
@@ -368,7 +382,7 @@ fn discover_city(opts: &Options) -> Result<Vec<Job>> {
     }
     let mut jobs = Vec::new();
     let mut seen = HashSet::new();
-    for chunk in pointers.chunks(2048) {
+    for chunk in pointers.chunks(CITY_DISCOVERY_BATCH) {
         for scene in client.resolve_entities(chunk)? {
             if scene.entity_type == "scene" && seen.insert(scene.entity_id.clone()) {
                 jobs.push(Job {
@@ -667,6 +681,7 @@ fn run_one_attempt(job: &Job, opts: &Options) -> Result<SceneRecord> {
         cache: Some(opts.cache.clone()),
         platform: opts.platforms[0].clone(),
         platforms: opts.platforms.clone(),
+        levels: opts.levels.clone(),
         ..Default::default()
     };
     let encoder_backend = params.simplifier.name().to_string();
@@ -1030,6 +1045,7 @@ pub fn run(argv: &[String]) -> Result<i32> {
         catalyst: opts.catalyst.clone(),
         worlds_url: opts.worlds_url.clone(),
         platforms: opts.platforms.clone(),
+        levels: opts.levels.clone(),
         workers: opts.jobs,
         texture_encoder,
         max_attempts: opts.max_attempts,
@@ -1131,6 +1147,7 @@ mod tests {
             world_names: Vec::new(),
             entity_ids: Vec::new(),
             platforms: vec!["windows".to_string(), "mac".to_string()],
+            levels: vec![1],
         }
     }
 
@@ -1407,6 +1424,15 @@ mod tests {
         assert_eq!(opts.jobs, abgen::clihelp::default_file_concurrency());
         assert_eq!(opts.max_attempts, DEFAULT_ATTEMPTS);
         assert_eq!(opts.snapshot_passes, DEFAULT_SNAPSHOT_PASSES);
+        assert_eq!(opts.levels, vec![1]);
+        let both = parse(&[
+            "--out".into(),
+            "/tmp/qualify-both".into(),
+            "--level".into(),
+            "0,1".into(),
+        ])
+        .unwrap();
+        assert_eq!(both.levels, vec![0, 1]);
         assert!(parse(&[
             "--out".into(),
             "/tmp/q".into(),

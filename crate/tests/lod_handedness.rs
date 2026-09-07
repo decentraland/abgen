@@ -289,7 +289,7 @@ fn reference_glb_aabb_matches_assembly() {
     use abgen::lodgen::scene_geometry;
 
     let catalyst = std::env::var("ABGEN_CATALYST")
-        .unwrap_or_else(|_| "https://catalyst.dcl.one/content".to_string());
+        .unwrap_or_else(|_| "https://peer.decentraland.org/content".to_string());
     let cache = std::env::var_os("ABGEN_LOD_CACHE")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("abgen-lod-handedness-cache"));

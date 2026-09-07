@@ -100,6 +100,7 @@ USAGE:
             [--fidelity] [--gpu]
   abgen-lod qualify-corpus --out DIR [--report FILE] [--cache DIR] [-j JOBS]
             [--catalyst URL] [--worlds-url URL] [--platform windows,mac]
+            [--level 0,1]
             [--city-min -150] [--city-max 150] [--no-city] [--no-worlds]
             [--world NAME[,NAME...]] [--entity-ids FILE]
             [--attempts 3] [--snapshot-passes 8]
