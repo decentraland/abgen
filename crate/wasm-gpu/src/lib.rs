@@ -30,6 +30,7 @@ fn gen_texture(seed: u64, w: u32, h: u32) -> Vec<u8> {
 async fn qualify_case(
     g: &Gpu,
     eng: &Engine,
+    tables: &gpu::corelib::bc7::OptTables,
     w: u32,
     h: u32,
     srgb: bool,
@@ -37,9 +38,8 @@ async fn qualify_case(
     profile: Bc7Profile,
 ) -> Result<(), String> {
     let tex = gen_texture(1, w, h);
-    let tables = gpu::corelib::bc7::build_opt_tables();
     let (want, want_mips) = gpu::corelib::mips::encode_bc7_mip_chain_with_profile(
-        &tex, w, h, None, true, srgb, perceptual, profile, &tables,
+        &tex, w, h, None, true, srgb, perceptual, profile, tables,
     );
     let (got, got_mips) =
         encode_bc7_mip_chain_on(g, eng, &tex, w, h, None, true, srgb, perceptual, profile)
@@ -61,18 +61,20 @@ async fn qualify_case(
 }
 
 async fn qualify(g: &Gpu, eng: &Engine) -> Result<(), String> {
+    let tables = gpu::corelib::bc7::build_opt_tables();
     for profile in [Bc7Profile::Slow, Bc7Profile::Basic] {
-        qualify_case(g, eng, 37, 53, true, true, profile).await?;
+        qualify_case(g, eng, &tables, 7, 13, true, true, profile).await?;
     }
     Ok(())
 }
 
 async fn qualify_full(g: &Gpu, eng: &Engine) -> Result<(), String> {
-    for (w, h) in [(64, 64), (128, 32), (37, 53)] {
+    let tables = gpu::corelib::bc7::build_opt_tables();
+    for (w, h) in [(16, 16), (20, 12), (7, 13)] {
         for srgb in [false, true] {
             for perceptual in [false, true] {
                 for profile in [Bc7Profile::Slow, Bc7Profile::Basic] {
-                    qualify_case(g, eng, w, h, srgb, perceptual, profile).await?;
+                    qualify_case(g, eng, &tables, w, h, srgb, perceptual, profile).await?;
                 }
             }
         }
@@ -83,6 +85,12 @@ async fn qualify_full(g: &Gpu, eng: &Engine) -> Result<(), String> {
 #[wasm_bindgen]
 pub async fn gpu_init() -> Result<String, JsValue> {
     let g = init_gpu().await.map_err(|e| JsValue::from_str(&e))?;
+    if g.is_cpu_adapter() {
+        return Err(JsValue::from_str(&format!(
+            "software WebGPU adapter refused: {}",
+            g.adapter_summary()
+        )));
+    }
     let eng = build_engine(&g);
     qualify(&g, &eng)
         .await

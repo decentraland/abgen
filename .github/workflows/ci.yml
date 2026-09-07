@@ -46,6 +46,33 @@ jobs:
           ABGEN_ROOT="$GITHUB_WORKSPACE" cargo test --locked --workspace --lib \
             --target x86_64-unknown-linux-gnu -- --test-threads=1
 
+  wasm-gpu-qualification:
+    name: wasm WebGPU qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: ./.github/actions/nix-store-cache
+        with:
+          flavor: wasm-gpu
+      - name: build standalone GPU wasm
+        run: |
+          nix develop path:crate/abgen-wasm/toolchain --command bash -euo pipefail -c '
+            cd crate/wasm-gpu
+            RUSTFLAGS="-C target-feature=+simd128" cargo build --release --locked --target wasm32-unknown-unknown
+            mkdir -p ../abgen-wasm/dist/gpu
+            wasm-bindgen --target web --out-dir ../abgen-wasm/dist/gpu target/wasm32-unknown-unknown/release/abgen_wasm_gpu.wasm
+          '
+      - name: run browser GPU qualification or software fallback probe
+        run: |
+          ABGEN_CHROMIUM="$(command -v google-chrome || command -v chromium)" \
+          ABGEN_WEBGPU_SOFTWARE=1 \
+          ABGEN_WASM_GPU_TIMEOUT_MS=600000 \
+            node crate/wasm-gpu/ci-qualify.mjs
+      - uses: ./.github/actions/nix-store-cache/save
+        if: success() || failure()
+        continue-on-error: true
+
   windows-gate:
     name: windows gate
     runs-on: ubuntu-latest
