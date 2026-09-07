@@ -1015,6 +1015,10 @@ fn qualification_exit(stable: bool, failed: usize) -> i32 {
 }
 
 pub fn run(argv: &[String]) -> Result<i32> {
+    abgen::texencode_cache::enable_memory_only_with_profile(
+        abgen::texencode_cache::CacheProfile::Batch,
+    );
+    abgen::decode_cache::enable();
     let opts = parse(argv)?;
     std::fs::create_dir_all(&opts.out)?;
     std::fs::create_dir_all(&opts.cache)?;

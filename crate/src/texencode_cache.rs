@@ -49,6 +49,7 @@ impl CacheProfile {
 }
 
 static FORCED: AtomicBool = AtomicBool::new(false);
+static DISK_DEFAULT_ALLOWED: AtomicBool = AtomicBool::new(true);
 
 static PROFILE: OnceLock<CacheProfile> = OnceLock::new();
 
@@ -87,6 +88,13 @@ pub fn enable_with_profile(p: CacheProfile) {
     enable();
 }
 
+/// Enables the bounded memory cache while leaving persistent storage off
+/// unless the caller explicitly sets `ABGEN_DISK_CACHE`.
+pub fn enable_memory_only_with_profile(p: CacheProfile) {
+    DISK_DEFAULT_ALLOWED.store(false, Ordering::Relaxed);
+    enable_with_profile(p);
+}
+
 fn enabled() -> bool {
     FORCED.load(Ordering::Relaxed) || env_enabled()
 }
@@ -102,6 +110,12 @@ fn store() -> &'static Mutex<Store> {
             misses: 0,
         })
     })
+}
+
+fn flights() -> &'static crate::singleflight::Group<[u8; 32], Option<(Arc<Vec<u8>>, i32)>> {
+    static F: OnceLock<crate::singleflight::Group<[u8; 32], Option<(Arc<Vec<u8>>, i32)>>> =
+        OnceLock::new();
+    F.get_or_init(crate::singleflight::Group::new)
 }
 
 fn lock() -> std::sync::MutexGuard<'static, Store> {
@@ -158,7 +172,9 @@ mod disk {
     fn enabled() -> bool {
         crate::clihelp::env_bool(
             "ABGEN_DISK_CACHE",
-            build_id_pins_encoder() && super::profile().disk_default_on(),
+            build_id_pins_encoder()
+                && super::profile().disk_default_on()
+                && super::DISK_DEFAULT_ALLOWED.load(Ordering::Relaxed),
         )
     }
 
@@ -364,16 +380,27 @@ pub fn get_or_encode_shared(
         }
         s.misses += 1;
     }
-    if let Some((data, mips)) = disk::get(&k) {
+    flights().run(k, || {
+        {
+            let mut s = lock();
+            s.stamp += 1;
+            let stamp = s.stamp;
+            if let Some((data, mips, at)) = s.map.get_mut(&k) {
+                *at = stamp;
+                return Some((Arc::clone(data), *mips));
+            }
+        }
+        if let Some((data, mips)) = disk::get(&k) {
+            let data = Arc::new(data);
+            remember(k, Arc::clone(&data), mips);
+            return Some((data, mips));
+        }
+        let (data, mips) = f()?;
+        disk::put(&k, &data, mips);
         let data = Arc::new(data);
         remember(k, Arc::clone(&data), mips);
-        return Some((data, mips));
-    }
-    let (data, mips) = f()?;
-    disk::put(&k, &data, mips);
-    let data = Arc::new(data);
-    remember(k, Arc::clone(&data), mips);
-    Some((data, mips))
+        Some((data, mips))
+    })
 }
 
 fn remember(k: [u8; 32], data: Arc<Vec<u8>>, mips: i32) {
@@ -497,6 +524,49 @@ mod tests {
 
         let c = get_or_encode(Kind::Bc7, &pixels, 8, 8, &[7], || unreachable!()).unwrap();
         assert_eq!(c, (vec![10, 20, 30], 2), "legacy view sees the same bytes");
+    }
+
+    #[test]
+    fn concurrent_miss_encodes_once_and_returns_identical_bytes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+
+        enable_memory_only_with_profile(CacheProfile::Batch);
+        const THREADS: usize = 12;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(THREADS));
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let pixels = Arc::new(vec![salt as u8; 16 * 16 * 4]);
+        let params = [salt, 771];
+        let flight_key = key(Kind::Bc7, &pixels, 16, 16, &params);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..THREADS {
+                let calls = Arc::clone(&calls);
+                let start = Arc::clone(&start);
+                let pixels = Arc::clone(&pixels);
+                handles.push(scope.spawn(move || {
+                    start.wait();
+                    get_or_encode_shared(Kind::Bc7, &pixels, 16, 16, &params, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        while flights().waiter_count(&flight_key) != THREADS - 1 {
+                            std::thread::yield_now();
+                        }
+                        Some((vec![3, 1, 4, 1, 5, 9], 4))
+                    })
+                    .unwrap()
+                }));
+            }
+            let outputs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            for output in &outputs[1..] {
+                assert_eq!((&*output.0, output.1), (&*outputs[0].0, outputs[0].1));
+                assert!(Arc::ptr_eq(&output.0, &outputs[0].0));
+            }
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

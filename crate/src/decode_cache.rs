@@ -55,6 +55,12 @@ fn store() -> &'static Mutex<Store> {
     })
 }
 
+fn flights() -> &'static crate::singleflight::Group<[u8; 32], Option<Arc<RgbaImage>>> {
+    static F: OnceLock<crate::singleflight::Group<[u8; 32], Option<Arc<RgbaImage>>>> =
+        OnceLock::new();
+    F.get_or_init(crate::singleflight::Group::new)
+}
+
 fn lock() -> std::sync::MutexGuard<'static, Store> {
     store().lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -103,20 +109,31 @@ pub fn get_or_decode(
         }
         s.misses += 1;
     }
-    let img = Arc::new(f()?);
-    let len = img.as_raw().len();
-    let budget = max_bytes();
-    if len <= budget {
-        let mut s = lock();
-        s.stamp += 1;
-        let stamp = s.stamp;
-        if !s.map.contains_key(&k) {
-            make_room(&mut s, len, budget);
-            s.map.insert(k, (Arc::clone(&img), stamp));
-            s.bytes += len;
+    flights().run(k, || {
+        {
+            let mut s = lock();
+            s.stamp += 1;
+            let stamp = s.stamp;
+            if let Some((img, at)) = s.map.get_mut(&k) {
+                *at = stamp;
+                return Some(Arc::clone(img));
+            }
         }
-    }
-    Some(img)
+        let img = Arc::new(f()?);
+        let len = img.as_raw().len();
+        let budget = max_bytes();
+        if len <= budget {
+            let mut s = lock();
+            s.stamp += 1;
+            let stamp = s.stamp;
+            if !s.map.contains_key(&k) {
+                make_room(&mut s, len, budget);
+                s.map.insert(k, (Arc::clone(&img), stamp));
+                s.bytes += len;
+            }
+        }
+        Some(img)
+    })
 }
 
 pub fn stats() -> (u64, u64, usize, usize) {
@@ -166,6 +183,52 @@ mod tests {
 
         let miss = get_or_decode(b"src", b"other-input", || None);
         assert!(miss.is_none());
+    }
+
+    #[test]
+    fn concurrent_miss_decodes_once_and_returns_identical_pixels() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+
+        enable();
+        const THREADS: usize = 12;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(THREADS));
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .to_le_bytes();
+        let flight_key = {
+            let mut h = crate::hashes::Sha256::new();
+            h.update(b"contention");
+            h.update(&salt);
+            h.finalize()
+        };
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..THREADS {
+                let calls = Arc::clone(&calls);
+                let start = Arc::clone(&start);
+                handles.push(scope.spawn(move || {
+                    start.wait();
+                    get_or_decode(b"contention", &salt, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        while flights().waiter_count(&flight_key) != THREADS - 1 {
+                            std::thread::yield_now();
+                        }
+                        Some(img(8, 8, 23))
+                    })
+                    .unwrap()
+                }));
+            }
+            let outputs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            for output in &outputs[1..] {
+                assert_eq!(output.as_raw(), outputs[0].as_raw());
+                assert!(Arc::ptr_eq(output, &outputs[0]));
+            }
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -940,6 +940,10 @@ fn cmd_simplify(argv: &[String]) -> Result<i32> {
 }
 
 fn cmd_generate(argv: &[String]) -> Result<i32> {
+    abgen::texencode_cache::enable_memory_only_with_profile(
+        abgen::texencode_cache::CacheProfile::Batch,
+    );
+    abgen::decode_cache::enable();
     let mut params = abgen::lodgen::GenerateParams::default();
     let mut scene: Option<String> = None;
     let mut out: Option<String> = None;
