@@ -532,15 +532,15 @@ fn curve_entry(m_curve: Vec<Value>, path: &str) -> Value {
     }
 }
 
-fn conv_translation(v: &[f64]) -> Vec<f64> {
+pub(crate) fn conv_translation(v: &[f64]) -> Vec<f64> {
     let g = |i: usize| v.get(i).copied().unwrap_or(0.0);
     vec![-g(0), g(1), g(2)]
 }
-fn conv_scale(v: &[f64]) -> Vec<f64> {
+pub(crate) fn conv_scale(v: &[f64]) -> Vec<f64> {
     let g = |i: usize| v.get(i).copied().unwrap_or(1.0);
     vec![g(0), g(1), g(2)]
 }
-fn conv_rotation(q: &[f64]) -> Vec<f64> {
+pub(crate) fn conv_rotation(q: &[f64]) -> Vec<f64> {
     let g = |i: usize, d: f64| q.get(i).copied().unwrap_or(d);
     vec![g(0, 0.0), -g(1, 0.0), -g(2, 0.0), g(3, 1.0)]
 }

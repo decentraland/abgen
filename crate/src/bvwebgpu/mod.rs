@@ -1,10 +1,16 @@
+#[cfg(feature = "web-pack")]
 pub mod emit;
+#[cfg(feature = "web-pack")]
 mod meshcomp;
 pub mod pack;
 
+#[cfg(feature = "web-pack")]
 use anyhow::{bail, Context, Result};
+#[cfg(feature = "web-pack")]
 use std::collections::HashMap;
+#[cfg(feature = "web-pack")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "web-pack")]
 use std::sync::Arc;
 
 pub const BVW_PLATFORM: &str = "bvwebgpu";
@@ -70,6 +76,7 @@ pub fn client_path(file: &str) -> String {
     file.replace('\\', "/").to_lowercase()
 }
 
+#[cfg(feature = "web-pack")]
 fn file_ext(file: &str) -> &'static str {
     if file.to_lowercase().ends_with(".gltf") {
         ".gltf"
@@ -78,14 +85,17 @@ fn file_ext(file: &str) -> &'static str {
     }
 }
 
+#[cfg(feature = "web-pack")]
 struct SpoolDir(PathBuf);
 
+#[cfg(feature = "web-pack")]
 impl Drop for SpoolDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
+#[cfg(feature = "web-pack")]
 impl crate::live::Proxy {
     pub fn build_bvwebgpu_pack(self: &Arc<Self>, out_root: &Path, cid: &str) -> Result<()> {
         let started = std::time::Instant::now();
@@ -222,15 +232,12 @@ impl crate::live::Proxy {
         }
         std::fs::rename(&pack_tmp, &pack_dst).ok();
         write("pack.json", &plan.index_json)?;
-        let br = crate::compress::brotli(&pack_bytes)?;
-        write(&format!("{pack_name}.br"), &br)?;
 
         if self.space_configured() {
             self.space_put_key(
                 &format!("{BVW_PLATFORM}/{BVW_PROFILE}/{cid}.pack"),
                 &pack_bytes,
             );
-            self.space_put_key(&format!("{BVW_PLATFORM}/{BVW_PROFILE}/{cid}.pack.br"), &br);
         }
         tracing::info!(
             entity = %cid,
@@ -243,7 +250,7 @@ impl crate::live::Proxy {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "web-pack"))]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -342,7 +349,7 @@ mod tests {
                 .join(pack_file_name(entity)),
         )
         .unwrap();
-        assert!(out
+        assert!(!out
             .join(entity)
             .join(BVW_PLATFORM)
             .join(format!("{}.br", pack_file_name(entity)))

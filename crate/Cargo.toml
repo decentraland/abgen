@@ -12,7 +12,17 @@ autobenches = false
 
 [features]
 default = ["server"]
+gpu = ["dep:wgpu"]
+web-pack = ["dep:ddsfile", "dep:gltf-json"]
+scene-runtime = ["dep:rquickjs"]
+cli = ["dep:tracing-subscriber"]
 server = [
+    "web-pack",
+    "scene-runtime",
+    "gpu",
+    "cli",
+    "dep:chrono",
+    "dep:thiserror",
     "dep:axum",
     "dep:dcl-contents",
     "dep:ethers-core",
@@ -36,18 +46,22 @@ required-features = ["server"]
 [[bin]]
 name = "abgen-build"
 path = "src/bin/abgen-build.rs"
+required-features = ["gpu", "web-pack"]
 
 [[bin]]
 name = "abgen-corpus"
 path = "src/bin/abgen-corpus/main.rs"
+required-features = ["gpu", "web-pack"]
 
 [[bin]]
 name = "abgen-verify"
 path = "src/bin/abgen-verify.rs"
+required-features = ["gpu"]
 
 [[bin]]
 name = "abgen-lod"
 path = "src/bin/abgen-lod/main.rs"
+required-features = ["cli", "scene-runtime"]
 
 [[example]]
 name = "texdump"
@@ -62,18 +76,6 @@ name = "objdump"
 path = "examples/objdump.rs"
 
 [[example]]
-name = "texcmp"
-path = "examples/texcmp.rs"
-
-[[example]]
-name = "texpng"
-path = "examples/texpng.rs"
-
-[[example]]
-name = "atlasprobe"
-path = "examples/atlasprobe.rs"
-
-[[example]]
 name = "metadump"
 path = "examples/metadump.rs"
 
@@ -84,57 +86,55 @@ cc = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip", "raw_value"] }
 psd = "0.3"
-libc = "0.2"
 rayon = "1"
-num_cpus = "1"
 anyhow = "1"
-brotli = "8"
 sha1 = "0.11"
 sha2 = "0.11"
-hmac = "0.13"
 libm = "=0.2.16"
 draco_decoder = { path = "third_party/draco_decoder" }
 # rayon feature: deterministic par_chunks_mut block-row split inside compress.
 texpresso = { version = "2", features = ["rayon"] }
 crunch_ffi = { path = "third_party/crunch" }
 libjpeg9c = { path = "third_party/libjpeg9c" }
-texture2ddecoder = "0.1"
-chrono = "0.4"
 tracing = "0.1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+chrono = { version = "0.4", optional = true }
+hmac = "0.13"
+libc = "0.2"
+num_cpus = "1"
 bevy_mikktspace = "=1.0.0"
-ddsfile = "=0.5.2"
-gltf-json = { version = "=1.4.1", features = ["names", "extras", "extensions", "KHR_lights_punctual", "KHR_materials_transmission", "KHR_materials_ior", "KHR_materials_volume", "KHR_materials_unlit", "KHR_materials_emissive_strength", "KHR_texture_transform"] }
-image = "0.25"
+ddsfile = { version = "=0.5.2", optional = true }
+gltf-json = { version = "=1.4.1", optional = true, default-features = false, features = ["names", "extras", "extensions", "KHR_lights_punctual", "KHR_materials_transmission", "KHR_materials_ior", "KHR_materials_volume", "KHR_materials_unlit", "KHR_materials_emissive_strength", "KHR_texture_transform"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif", "tga", "tiff"] }
 ureq = "3"
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 webpki-roots = "1"
 memmap2 = "0.9"
 meshopt = "=0.6.2"
-tokio = { version = "1", features = ["full"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "sync", "time"], optional = true }
 axum = { version = "0.8", optional = true }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, optional = true }
 tower-http = { version = "0.7", features = ["trace"], optional = true }
 tokio-util = { version = "0.7", features = ["io"], optional = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
 moka = { version = "0.12", features = ["future"], optional = true }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "json", "macros", "migrate"], optional = true }
 dcl-contents = { path = "dcl-contents", optional = true }
 ethers-core = { version = "2.0.14", optional = true }
 hex = "0.4"
-thiserror = "2"
-wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12"] }
-rquickjs = { version = "0.12", default-features = false, features = ["std", "array-buffer"] }
+thiserror = { version = "2", optional = true }
+wgpu = { version = "=30.0.0", optional = true, default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12"] }
+rquickjs = { version = "0.12", optional = true, default-features = false, features = ["std", "array-buffer"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif", "tga"] }
 meshopt = "=0.6.2"
-wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "webgpu"] }
+wgpu = { version = "=30.0.0", optional = true, default-features = false, features = ["std", "wgsl", "webgpu"] }
 
 [target.'cfg(all(target_os = "windows", target_arch = "aarch64", target_env = "gnu"))'.dependencies]
-rquickjs = { version = "0.12", default-features = false, features = ["bindgen"] }
+rquickjs = { version = "0.12", optional = true, default-features = false, features = ["bindgen"] }
 
 [target.'cfg(all(not(target_os = "windows"), not(target_arch = "wasm32")))'.dependencies]
 mimalloc = { version = "0.1.52", default-features = false }
@@ -149,6 +149,7 @@ name = "abgen-bench"
 path = "src/bin/abgen-bench.rs"
 
 [dev-dependencies]
+chrono = "0.4"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [[example]]
@@ -172,4 +173,8 @@ path = "tests/crn_parity.rs"
 [[test]]
 name = "dxt1_corpus_hash"
 path = "tests/dxt1_corpus_hash.rs"
+harness = true
+[[test]]
+name = "lod_handedness"
+path = "tests/lod_handedness.rs"
 harness = true
