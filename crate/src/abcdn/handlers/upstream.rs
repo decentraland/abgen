@@ -63,6 +63,9 @@ pub(super) fn upstream_eligible(path: &str) -> bool {
 }
 
 fn upstream_dst(path: &str) -> Option<()> {
+    if path.ends_with(".br") {
+        return None;
+    }
     let root = std::path::Path::new("");
     let segs: Vec<&str> = path.split('/').collect();
     match segs.as_slice() {
@@ -78,8 +81,7 @@ fn upstream_dst(path: &str) -> Option<()> {
             if !resolver::is_safe_component(entity) || !resolver::is_safe_component(file) {
                 return None;
             }
-            let raw = file.strip_suffix(".br").unwrap_or(file);
-            if !is_bundle_name(raw) {
+            if !is_bundle_name(file) {
                 return None;
             }
             Some(())
@@ -88,8 +90,7 @@ fn upstream_dst(path: &str) -> Option<()> {
             if !resolver::is_safe_component(ver) || !resolver::is_safe_component(file) {
                 return None;
             }
-            let raw = file.strip_suffix(".br").unwrap_or(file);
-            if !is_bundle_name(raw) {
+            if !is_bundle_name(file) {
                 return None;
             }
             Some(())

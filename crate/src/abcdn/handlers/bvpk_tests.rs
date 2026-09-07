@@ -114,67 +114,6 @@ async fn warm_pack_serves_with_etag_ranges_and_cors() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn brotli_negotiation_serves_sidecar_on_the_plain_url() {
-    let dir = lane_temp_dir("bvpk-br");
-    let entity = "bafkbvbr";
-    let pack = write_warm_pack(&dir, entity);
-    let br = crate::compress::brotli(&pack).unwrap();
-    std::fs::write(
-        dir.join(entity)
-            .join("bvwebgpu")
-            .join(format!("{entity}_bv4.pack.br")),
-        &br,
-    )
-    .unwrap();
-    let state = mk_lane_state(&dir, None);
-    let path = format!("bvwebgpu/bv4/{entity}.pack");
-
-    let mut ae = HeaderMap::new();
-    ae.insert("accept-encoding", "gzip, br".parse().unwrap());
-    let resp = request(&state, Method::GET, &path, ae).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers()
-            .get("Content-Encoding")
-            .and_then(|v| v.to_str().ok()),
-        Some("br")
-    );
-    assert_eq!(
-        resp.headers().get("Vary").and_then(|v| v.to_str().ok()),
-        Some("Accept-Encoding")
-    );
-    assert_eq!(
-        resp.headers().get("ETag").and_then(|v| v.to_str().ok()),
-        Some(format!("\"{entity}.pack.br\"").as_str())
-    );
-    assert_eq!(body_bytes(resp).await, br);
-
-    let plain = get(&state, &path).await;
-    assert_eq!(plain.status(), StatusCode::OK);
-    assert!(plain.headers().get("Content-Encoding").is_none());
-    assert_eq!(body_bytes(plain).await, pack);
-
-    let mut refuse = HeaderMap::new();
-    refuse.insert("accept-encoding", "br;q=0, gzip".parse().unwrap());
-    let refused = request(&state, Method::GET, &path, refuse).await;
-    assert_eq!(refused.status(), StatusCode::OK);
-    assert!(refused.headers().get("Content-Encoding").is_none());
-    assert_eq!(body_bytes(refused).await, pack);
-
-    let explicit = get(&state, &format!("{path}.br")).await;
-    assert_eq!(explicit.status(), StatusCode::OK);
-    assert_eq!(
-        explicit
-            .headers()
-            .get("Content-Encoding")
-            .and_then(|v| v.to_str().ok()),
-        Some("br")
-    );
-    assert_eq!(body_bytes(explicit).await, br);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn preflight_and_error_reasons() {
     let dir = lane_temp_dir("bvpk-reasons");
     let (space_host, _seen) = crate::live::stub::serve(vec![]);
@@ -217,9 +156,9 @@ async fn preflight_and_error_reasons() {
     assert_eq!(not_pack.status(), StatusCode::NOT_FOUND);
     assert_eq!(reason_of(&not_pack), None);
 
-    let br_cold = get(&state, "bvwebgpu/bv4/bafkx.pack.br").await;
-    assert_eq!(br_cold.status(), StatusCode::NOT_FOUND);
-    assert_eq!(reason_of(&br_cold).as_deref(), Some("br-not-built"));
+    let compressed_sidecar = get(&state, "bvwebgpu/bv4/bafkx.pack.br").await;
+    assert_eq!(compressed_sidecar.status(), StatusCode::NOT_FOUND);
+    assert_eq!(reason_of(&compressed_sidecar), None);
 
     std::env::set_var("ABGEN_BVWEBGPU", "0");
     let disabled = get(&state, "bvwebgpu/bv4/bafkx.pack").await;

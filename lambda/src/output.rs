@@ -228,6 +228,7 @@ mod tests {
             http_secret: None,
             lods_enabled: false,
             max_receive_count: 3,
+            lod_levels: vec![1],
         }
     }
 

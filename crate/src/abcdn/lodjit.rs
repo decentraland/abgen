@@ -15,7 +15,10 @@ pub const FAIL_TTL_ENV: &str = "ABGEN_LOD_JIT_FAIL_TTL_S";
 pub const BUILD_CONCURRENCY_ENV: &str = "ABGEN_LOD_BUILD_CONCURRENCY";
 
 pub const LOD_PLATFORMS: [&str; 3] = ["windows", "mac", "linux"];
-pub const LOD_LEVELS: [u32; 2] = [0, 1];
+/// Levels the JIT lane builds, serves and writes back. Production ships
+/// `LOD/1` only for Unity-era scenes (level 0 is the client-side ISS
+/// assembly); `LOD/0` stays opt-in through the generate CLI (`--level 0,1`).
+pub const LOD_LEVELS: [u32; 1] = [1];
 
 pub type InflightMap = Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 
@@ -61,11 +64,13 @@ pub fn lod_jit_target(path: &str) -> Option<(String, u32, String)> {
         return None;
     }
     let level: u32 = segs[1].parse().ok()?;
-    if level >= 2 || segs[1] != level.to_string() {
+    if !LOD_LEVELS.contains(&level) || segs[1] != level.to_string() {
         return None;
     }
-    let raw = segs[2].strip_suffix(".br").unwrap_or(segs[2]);
-    let (platform, stem) = resolver::split_platform(raw);
+    if segs[2].ends_with(".br") {
+        return None;
+    }
+    let (platform, stem) = resolver::split_platform(segs[2]);
     if !LOD_PLATFORMS.contains(&platform) {
         return None;
     }
@@ -84,7 +89,7 @@ pub fn invalid_lod_reason(path: &str) -> &'static str {
     let segs: Vec<&str> = path.split('/').collect();
     if segs.len() == 3 && segs[0] == "LOD" {
         if let Ok(level) = segs[1].parse::<u32>() {
-            if level >= 2 && segs[1] == level.to_string() {
+            if !LOD_LEVELS.contains(&level) && segs[1] == level.to_string() {
                 return "lod-level-unsupported";
             }
         }
@@ -489,7 +494,9 @@ impl BuildFinish {
                             .iter()
                             .map(|l| l.bundle_bytes)
                             .sum::<usize>(),
-                        "lod jit build ok (levels 0+1, windows+mac+linux written)"
+                        levels = ?LOD_LEVELS,
+                        platforms = ?LOD_PLATFORMS,
+                        "lod jit build ok (every level and platform written)"
                     );
                     invalidate_paths(&self.resolve_cache, &self.path, &self.sid_lower).await;
                     Ok(())
@@ -501,14 +508,9 @@ impl BuildFinish {
 
 async fn invalidate_paths(resolve_cache: &ResolveCache, path: &str, sid_lower: &str) {
     let mut keys: Vec<String> = vec![path.to_string()];
-    match path.strip_suffix(".br") {
-        Some(stripped) => keys.push(stripped.to_string()),
-        None => keys.push(format!("{path}.br")),
-    }
     for level in LOD_LEVELS {
         for plat in LOD_PLATFORMS {
             let p = format!("LOD/{level}/{sid_lower}_{level}_{plat}");
-            keys.push(format!("{p}.br"));
             keys.push(p);
         }
     }
@@ -612,12 +614,16 @@ mod tests {
     }
 
     fn write_bundle(out_dir: &str, scene: &str, lvl: u32, content: &[u8]) {
+        write_platform_bundle(out_dir, scene, lvl, "windows", content);
+    }
+
+    fn write_platform_bundle(out_dir: &str, scene: &str, lvl: u32, plat: &str, content: &[u8]) {
         let dir = PathBuf::from(out_dir)
             .join(scene)
             .join("LOD")
             .join(lvl.to_string());
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{scene}_{lvl}_windows")), content).unwrap();
+        std::fs::write(dir.join(format!("{scene}_{lvl}_{plat}")), content).unwrap();
     }
 
     #[test]
@@ -626,10 +632,7 @@ mod tests {
             lod_jit_target("LOD/1/bafk_1_windows"),
             Some(("bafk".to_string(), 1, "windows".to_string()))
         );
-        assert_eq!(
-            lod_jit_target("LOD/0/bafk_0_mac.br"),
-            Some(("bafk".to_string(), 0, "mac".to_string()))
-        );
+        assert_eq!(lod_jit_target("LOD/1/bafk_1_mac.br"), None);
         assert_eq!(
             lod_jit_target("LOD/1/QmUpper_1_linux"),
             Some(("QmUpper".to_string(), 1, "linux".to_string()))
@@ -639,6 +642,7 @@ mod tests {
     #[test]
     fn target_rejects_invalid_lod_paths() {
         assert_eq!(lod_jit_target("LOD/2/x_2_windows"), None);
+        assert_eq!(lod_jit_target("LOD/0/bafk_0_mac.br"), None);
         assert_eq!(lod_jit_target("LOD/1/bafk_0_windows"), None);
         assert_eq!(lod_jit_target("LOD/1/bafk_1"), None);
         assert_eq!(lod_jit_target("LOD/1/bafk_1_webgl"), None);
@@ -673,6 +677,10 @@ mod tests {
         );
         assert_eq!(
             invalid_lod_reason("LOD/7/x_7_mac.br"),
+            "lod-level-unsupported"
+        );
+        assert_eq!(
+            invalid_lod_reason("LOD/0/bafk_0_windows"),
             "lod-level-unsupported"
         );
         assert_eq!(invalid_lod_reason("LOD/1/bafk_1"), "bad-path");
@@ -754,7 +762,7 @@ mod tests {
             assert_ne!(p.out_dir, or2.to_string_lossy());
             assert!(PathBuf::from(&p.out_dir).starts_with(or2.join("lod-work")));
             assert_eq!(p.platforms, vec!["windows", "mac", "linux"]);
-            assert_eq!(p.levels, vec![0, 1]);
+            assert_eq!(p.levels, LOD_LEVELS.to_vec());
             assert!(p.tri_cap_auto);
             assert!(p.crop);
             assert_eq!(p.iss, "auto");
@@ -788,8 +796,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn mixed_level_requests_coalesce_to_one_build() {
-        let out_root = temp_dir("mixedlevel");
+    async fn mixed_platform_requests_coalesce_to_one_build() {
+        let out_root = temp_dir("mixedplatform");
         let sid = "bafkreimixed";
         let calls = Arc::new(AtomicUsize::new(0));
         let c2 = calls.clone();
@@ -797,7 +805,9 @@ mod tests {
             c2.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(150));
             for lvl in LOD_LEVELS {
-                write_bundle(&p.out_dir, &p.scene, lvl, b"bundle");
+                for plat in LOD_PLATFORMS {
+                    write_platform_bundle(&p.out_dir, &p.scene, lvl, plat, b"bundle");
+                }
             }
             Ok(ok_outcome(&p.scene))
         });
@@ -805,13 +815,13 @@ mod tests {
         let cache = new_cache();
         let mut handles = Vec::new();
         for i in 0..8u32 {
-            let level = i % 2;
+            let plat = LOD_PLATFORMS[(i % 3) as usize];
             let jit = jit.clone();
             let cache = cache.clone();
             let out_root = out_root.clone();
-            let path = format!("LOD/{level}/{sid}_{level}_windows");
+            let path = format!("LOD/1/{sid}_1_{plat}");
             handles.push(tokio::spawn(async move {
-                rb(&jit, &out_root, &cache, &path, sid, level).await
+                rb(&jit, &out_root, &cache, &path, sid, 1).await
             }));
         }
         for h in handles {
@@ -1028,13 +1038,6 @@ mod tests {
         let runner: LodRunner = Arc::new(move |p: crate::lodgen::GenerateParams| {
             let entity_dir = PathBuf::from(&p.out_dir).join(&p.scene);
             write_bundle(&p.out_dir, &p.scene, 1, b"bundle");
-            std::fs::write(
-                entity_dir
-                    .join("LOD/1")
-                    .join(format!("{}_1_windows.br", p.scene)),
-                b"br",
-            )
-            .unwrap();
             std::fs::write(entity_dir.join("LOD.manifest.json"), b"{}").unwrap();
             std::fs::write(
                 entity_dir.join(format!("{}_InitialSceneState.json", p.scene)),
@@ -1051,7 +1054,6 @@ mod tests {
         let entity_dir = out_root.join(sid);
         for rel in [
             format!("LOD/1/{sid}_1_windows"),
-            format!("LOD/1/{sid}_1_windows.br"),
             "LOD.manifest.json".to_string(),
             format!("{sid}_InitialSceneState.json"),
         ] {

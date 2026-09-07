@@ -4,11 +4,10 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub const LEVELS: [u32; 2] = [0, 1];
-
 /// LOD jobs carry the legacy Unity generator's FBX source URLs; abgen has no FBX
 /// importer and regenerates the LOD geometry from the scene entity instead
 /// (the same lodgen chain the abcdn serves JIT), so those URLs are unused.
+///
 pub fn convert(
     cfg: &Config,
     proxy: &Arc<Proxy>,
@@ -56,13 +55,10 @@ pub fn convert(
     }
 
     let scene_dir = staging.join(&outcome.scene_id);
-    let objects = abgen::lods::published_objects(&scene_dir, &LEVELS);
-    let uploaded = publish(cfg, proxy, &objects)?;
+    let objects = abgen::lods::published_objects(&scene_dir, &cfg.lod_levels);
+    let published = publish(cfg, proxy, &objects)?;
 
-    // Prod parity: upstream's conversion-orchestrator publishes one finished
-    // event per completed LOD conversion with `isLods: !!job.lods`
-    // (runFullConversionAndPublish). A publish failure propagates so SQS
-    // redelivers and re-notifies, like the non-LOD lane.
+    // Notify only after every generated object has been published.
     let finished: Vec<crate::notify::Finished> = platforms
         .iter()
         .map(|p| crate::notify::Finished {
@@ -71,11 +67,10 @@ pub fn convert(
         })
         .collect();
     let notified = crate::notify::send_finished(cfg, entity_id, content_server, true, &finished)?;
-
     let bundle_bytes: usize = outcome.levels.iter().map(|l| l.bundle_bytes).sum();
     eprintln!(
         "done: {entity_id} lods scene={} levels={} platforms={} bytes={bundle_bytes} \
-         objects={} uploaded={uploaded} in {:.1}s",
+         objects={} uploaded={} in {:.1}s",
         outcome.scene_id,
         outcome
             .levels
@@ -85,6 +80,7 @@ pub fn convert(
             .join(","),
         platforms.join(","),
         objects.len(),
+        published.uploaded,
         started.elapsed().as_secs_f64(),
     );
     drop(guard);
@@ -94,15 +90,17 @@ pub fn convert(
         .iter()
         .map(|l| (l.level, l.bundle_bytes))
         .collect();
-    Ok(success_summary(
+    let mut summary = success_summary(
         entity_id,
         &outcome.scene_id,
         &platforms,
         &levels,
         objects.len(),
-        uploaded,
+        published.uploaded,
         notified,
-    ))
+    );
+    summary["lods"]["keys"] = serde_json::json!(published.keys);
+    Ok(summary)
 }
 
 /// The success summary a converted LOD job returns. Carries a top-level
@@ -160,19 +158,26 @@ pub fn generate_params(
         scene: entity_id.to_string(),
         out_dir: staging.to_string_lossy().into_owned(),
         platforms: platforms.to_vec(),
-        levels: LEVELS.to_vec(),
+        levels: cfg.lod_levels.clone(),
         catalyst: content_server.to_string(),
         workdir: Some(staging.join("work")),
         cache: Some(PathBuf::from(&cfg.cache_dir).join("lod-content")),
+        iss: "auto".to_string(),
         ..Default::default()
     }
+}
+
+pub struct Published {
+    pub uploaded: bool,
+    pub keys: Vec<String>,
 }
 
 fn publish(
     cfg: &Config,
     proxy: &Arc<Proxy>,
     objects: &[abgen::lods::PublishedObject],
-) -> Result<bool> {
+) -> Result<Published> {
+    let keys: Vec<String> = objects.iter().map(|o| o.key.clone()).collect();
     if !proxy.space_configured() {
         eprintln!(
             "output: no space configured (set ABGEN_S3_ENDPOINT/ABGEN_S3_BUCKET) — \
@@ -180,16 +185,21 @@ fn publish(
             objects.len(),
             cfg.out_root.display(),
         );
-        return Ok(false);
+        return Ok(Published {
+            uploaded: false,
+            keys,
+        });
     }
-    for obj in objects {
+    for (obj, key) in objects.iter().zip(keys.iter()) {
         let bytes =
             std::fs::read(&obj.path).with_context(|| format!("read {}", obj.path.display()))?;
-        // Content-Type/Cache-Control are derived from the key inside the
-        // space client (#60), LOD lanes included.
-        proxy.space_put_key(&obj.key, &bytes);
+        // Content-Type and Cache-Control are derived from the key.
+        proxy.space_put_key(key, &bytes);
     }
-    Ok(true)
+    Ok(Published {
+        uploaded: true,
+        keys,
+    })
 }
 
 // Staged LOD trees are large; drop them on every exit path (including the error
@@ -223,6 +233,7 @@ mod tests {
             http_secret: None,
             lods_enabled: true,
             max_receive_count: 3,
+            lod_levels: crate::config::default_levels(),
         }
     }
 
@@ -255,7 +266,7 @@ mod tests {
         assert_eq!(p.scene, "bafkscene");
         assert_eq!(p.out_dir, "/tmp/out/lod/bafkscene");
         assert_eq!(p.platforms, vec!["windows".to_string()]);
-        assert_eq!(p.levels, vec![0, 1]);
+        assert_eq!(p.levels, vec![1]);
         assert_eq!(p.catalyst, "https://peer.decentraland.org/content");
         assert_eq!(p.workdir.as_deref(), Some(staging.join("work").as_path()));
         assert_eq!(
@@ -265,6 +276,17 @@ mod tests {
         assert!(p.tri_cap_auto);
         assert!(p.crop);
         assert_eq!(p.iss, "auto");
+    }
+
+    #[test]
+    fn levels_follow_the_config() {
+        let staging = PathBuf::from("/tmp/out/lod/bafkscene");
+        let both = Config {
+            lod_levels: vec![0, 1],
+            ..cfg()
+        };
+        let p = generate_params(&both, "bafkscene", "https://c/content", &[], &staging);
+        assert_eq!(p.levels, vec![0, 1]);
     }
 
     #[test]
