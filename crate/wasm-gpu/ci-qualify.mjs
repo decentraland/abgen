@@ -97,7 +97,12 @@ const child = spawn(chromium, [
   ...softwareFlags,
   `--user-data-dir=${profile}`,
   `http://127.0.0.1:${port}/`,
-], { stdio: ['ignore', 'ignore', 'pipe'] });
+], {
+  stdio: ['ignore', 'ignore', 'pipe'],
+  detached: process.platform !== 'win32',
+});
+const processGroup = process.platform === 'win32' || child.pid === undefined
+  ? null : -child.pid;
 let stderr = '';
 child.stderr.on('data', (chunk) => {
   stderr = (stderr + chunk.toString('utf8')).slice(-8192);
@@ -113,26 +118,38 @@ const timeout = new Promise((resolveTimeout) => setTimeout(() => resolveTimeout(
 }), Number(process.env.ABGEN_WASM_GPU_TIMEOUT_MS || 180000)));
 const report = await Promise.race([result, timeout]);
 if (!report.ok && stderr) report.browserStderr = stderr;
-const waitForExit = (milliseconds) => new Promise((resolveExit) => {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    resolveExit(true);
-    return;
+const processTreeAlive = () => {
+  if (processGroup !== null) {
+    try {
+      process.kill(processGroup, 0);
+      return true;
+    } catch (error) {
+      if (error.code === 'ESRCH') return false;
+      throw error;
+    }
   }
-  const timer = setTimeout(() => {
-    child.removeListener('exit', exited);
-    resolveExit(false);
-  }, milliseconds);
-  const exited = () => {
-    clearTimeout(timer);
-    resolveExit(true);
-  };
-  child.once('exit', exited);
-});
-if (!(await waitForExit(0))) {
-  child.kill('SIGTERM');
-  if (!(await waitForExit(5000))) {
-    child.kill('SIGKILL');
-    await waitForExit(5000);
+  return child.exitCode === null && child.signalCode === null;
+};
+const signalProcessTree = (signal) => {
+  try {
+    if (processGroup !== null) process.kill(processGroup, signal);
+    else child.kill(signal);
+  } catch (error) {
+    if (error.code !== 'ESRCH') throw error;
+  }
+};
+const waitForTreeExit = async (milliseconds) => {
+  const deadline = Date.now() + milliseconds;
+  while (processTreeAlive() && Date.now() < deadline) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+  }
+  return !processTreeAlive();
+};
+if (processTreeAlive()) {
+  signalProcessTree('SIGTERM');
+  if (!(await waitForTreeExit(5000))) {
+    signalProcessTree('SIGKILL');
+    await waitForTreeExit(5000);
   }
 }
 await new Promise((resolveClose) => server.close(resolveClose));
