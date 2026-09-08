@@ -152,7 +152,7 @@ pub(super) fn build_lod_material_tree(
     ];
     let floats_v: Vec<Value> = floats.into_iter().map(|(n, v)| arr![n, v]).collect();
 
-    let mut lod_base_color = materials::base_color_verbatim(m.base_color);
+    let mut lod_base_color = materials::base_color_gamma_encoded(m.base_color);
     if transparent && !lod.fidelity {
         lod_base_color[3] = 0.8_f32 as f64;
     }

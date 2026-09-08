@@ -28,8 +28,35 @@ pub const MATERIAL_TEXTURE_SLOTS: [(&str, fn(&Material) -> Option<TexRef>); 6] =
     ("_SpecGlossMap", |m| m.spec_gloss_image),
 ];
 
-pub fn base_color_verbatim(rgba: [f64; 4]) -> [f64; 4] {
-    rgba
+/// `_BaseColor` for the glTF's linear `baseColorFactor`, gamma-encoded per RGB channel
+/// the way glTFast writes `baseColorLinear.gamma` and the client's
+/// `DecentralandMaterialGenerator` does since unity-shared-dependencies#63: URP's
+/// `_BaseColor` is a Color property, which Unity converts sRGB->linear when binding in
+/// a linear-colour-space project, so only the encoded value renders as the factor the
+/// artist authored. Alpha is not colour-managed and stays verbatim.
+pub fn base_color_gamma_encoded(rgba: [f64; 4]) -> [f64; 4] {
+    [
+        linear_to_gamma(rgba[0]),
+        linear_to_gamma(rgba[1]),
+        linear_to_gamma(rgba[2]),
+        rgba[3],
+    ]
+}
+
+/// Unity's `Mathf.LinearToGammaSpace`, evaluated in f32 like the engine so the stored
+/// float matches the reference converter's output.
+fn linear_to_gamma(linear: f64) -> f64 {
+    let v = linear as f32;
+    let encoded = if v <= 0.0 {
+        0.0
+    } else if v <= 0.003_130_8 {
+        12.92 * v
+    } else if v < 1.0 {
+        1.055 * v.powf(0.416_666_7) - 0.055
+    } else {
+        v.powf(0.454_545_45)
+    };
+    encoded as f64
 }
 
 const LINEAR_SLOTS: [&str; 4] = [
@@ -375,7 +402,7 @@ pub fn build_material_tree(
     let (s, o) = xform("_SpecGlossMap");
     set_tex(&mut t, "_SpecGlossMap", or0(spec_gloss_pid), s, o);
 
-    set_color(&mut t, "_BaseColor", base_color_verbatim(m.base_color));
+    set_color(&mut t, "_BaseColor", base_color_gamma_encoded(m.base_color));
     set_color(&mut t, "_Color", [1.0, 1.0, 1.0, 1.0]);
     if emissive_on {
         let hdr32 = EMISSIVE_HDR_INTENSITY as f32;
@@ -665,9 +692,21 @@ mod tests {
     }
 
     #[test]
-    fn base_color_is_verbatim_gltf_factor() {
-        let g = base_color_verbatim([0.0, 1.0, 0.5, 0.25]);
-        assert_eq!(g, [0.0, 1.0, 0.5, 0.25]);
+    fn base_color_is_gamma_encoded_like_gltfast() {
+        // boostRing_desktop material_0 on skychaser.dcl.eth: the ab-cdn converter
+        // (glTFast + DecentralandMaterialGenerator) stores exactly these encoded values.
+        let source = [0.22514408826828003, 0.564719557762146, 0.8009780645370483, 1.0];
+        let encoded = base_color_gamma_encoded(source);
+        for (got, want) in encoded.iter().zip([0.511819, 0.776475, 0.906821, 1.0]) {
+            assert!((got - want).abs() < 2e-6, "{got} vs {want}");
+        }
+        // 0 and 1 are fixed points, mid-grey is the textbook sRGB value, alpha is
+        // not colour-managed.
+        let g = base_color_gamma_encoded([0.0, 1.0, 0.5, 0.25]);
+        assert_eq!(g[0], 0.0);
+        assert_eq!(g[1], 1.0);
+        assert!((g[2] - 0.735357).abs() < 2e-6, "{}", g[2]);
+        assert_eq!(g[3], 0.25);
     }
 
     #[test]
