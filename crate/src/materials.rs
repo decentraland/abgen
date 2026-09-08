@@ -695,7 +695,12 @@ mod tests {
     fn base_color_is_gamma_encoded_like_gltfast() {
         // boostRing_desktop material_0 on skychaser.dcl.eth: the ab-cdn converter
         // (glTFast + DecentralandMaterialGenerator) stores exactly these encoded values.
-        let source = [0.22514408826828003, 0.564719557762146, 0.8009780645370483, 1.0];
+        let source = [
+            0.22514408826828003,
+            0.564719557762146,
+            0.8009780645370483,
+            1.0,
+        ];
         let encoded = base_color_gamma_encoded(source);
         for (got, want) in encoded.iter().zip([0.511819, 0.776475, 0.906821, 1.0]) {
             assert!((got - want).abs() < 2e-6, "{got} vs {want}");

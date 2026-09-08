@@ -156,9 +156,9 @@ fn scan_one(
     }));
     match &parsed {
         Ok(Ok(_)) => {}
-        Ok(Err(e)) => eprintln!(
-            "warn: classify {f}: {e} — its textures will be treated as sRGB colour maps"
-        ),
+        Ok(Err(e)) => {
+            eprintln!("warn: classify {f}: {e} — its textures will be treated as sRGB colour maps")
+        }
         Err(_) => eprintln!(
             "warn: classify {f}: parser panicked — its textures will be treated as sRGB colour maps"
         ),
