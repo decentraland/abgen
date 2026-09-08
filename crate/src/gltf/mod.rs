@@ -3,7 +3,7 @@ mod load;
 mod scene_build;
 mod transform;
 
-pub use load::load_gltf_inputs;
+pub use load::{load_gltf_inputs, load_gltf_inputs_for_classify};
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use load::{base64_decode, decode_data_uri};
 
@@ -51,7 +51,7 @@ pub fn parse_with_inputs(
 }
 
 pub fn parse_classify(glb_bytes: &[u8], ext: &str, resolve: Resolve) -> Result<Scene> {
-    let (gltf, buffers) = load_gltf_inputs(glb_bytes, ext, resolve)?;
+    let (gltf, buffers) = load_gltf_inputs_for_classify(glb_bytes, ext, resolve)?;
     parse_impl(&gltf, &buffers, resolve, false, false, true)
 }
 
@@ -419,5 +419,64 @@ mod tests {
             load_gltf_inputs(EXT_BUF_GLTF.as_bytes(), ".gltf", Some(&ok)).expect("resolves");
         assert_eq!(buffers.len(), 1);
         assert_eq!(buffers[0], vec![7u8; 42]);
+    }
+
+    /// Regression guard for the abgen-cdn colour-space incident: a `.gltf` whose
+    /// external `.bin` was not in the content store at scan time made
+    /// `parse_classify` fail (the loader demanded every buffer), the error was
+    /// swallowed, and every texture of that model — roughness and normal maps
+    /// included — was published as an sRGB colour map. Classification only reads
+    /// the JSON, so it must succeed with no buffers at all, while the geometry
+    /// build keeps its strict contract.
+    const CLASSIFY_WITHOUT_BIN_GLTF: &str = r#"{
+        "asset": {"version": "2.0"},
+        "extensionsRequired": ["KHR_draco_mesh_compression"],
+        "buffers": [{"byteLength": 640, "uri": "rig.bin"}],
+        "bufferViews": [{"buffer": 0, "byteLength": 64}],
+        "accessors": [{"bufferView": 0, "componentType": 5126, "type": "MAT4", "count": 1}],
+        "images": [{"uri": "textures/normal.png"}, {"uri": "textures/orm.png"}],
+        "textures": [{"source": 0}, {"source": 1}],
+        "materials": [{
+            "normalTexture": {"index": 0},
+            "pbrMetallicRoughness": {"metallicRoughnessTexture": {"index": 1}}
+        }],
+        "skins": [{"joints": [0], "inverseBindMatrices": 0}],
+        "nodes": [{"name": "Joint"}],
+        "scene": 0,
+        "scenes": [{"nodes": [0]}]
+    }"#;
+
+    fn assert_classified_roles(scene: &crate::scene::Scene) {
+        let material = &scene.materials[0];
+        let normal = material.normal_image.expect("normal slot bound");
+        assert_eq!(normal.image, 0);
+        let metal_rough = material
+            .metallic_roughness_image
+            .expect("metallic-roughness slot bound");
+        assert_eq!(metal_rough.image, 1);
+        assert_eq!(scene.image_uri[0].as_deref(), Some("textures/normal.png"));
+        assert_eq!(scene.image_uri[1].as_deref(), Some("textures/orm.png"));
+        // The skin survives (export plans count skins) with identity bind poses.
+        assert_eq!(scene.skins.len(), 1);
+        assert_eq!(scene.skins[0].bind_poses.len(), 1);
+    }
+
+    #[test]
+    fn classify_parse_does_not_require_external_buffers() {
+        let bytes = CLASSIFY_WITHOUT_BIN_GLTF.as_bytes();
+
+        let scene = super::parse_classify(bytes, ".gltf", None)
+            .expect("classification must not depend on the external buffer");
+        assert_classified_roles(&scene);
+
+        // A resolver that misses (the content store has not fetched rig.bin yet).
+        let missing = |_: &str| -> Option<Vec<u8>> { None };
+        let scene = super::parse_classify(bytes, ".gltf", Some(&missing))
+            .expect("an unresolved buffer must not fail classification");
+        assert_classified_roles(&scene);
+
+        // The geometry build keeps demanding the buffer.
+        super::load_gltf_inputs(bytes, ".gltf", None)
+            .expect_err("a geometry build must still fail without the buffer");
     }
 }

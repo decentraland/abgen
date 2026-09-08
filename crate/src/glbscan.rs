@@ -154,6 +154,15 @@ fn scan_one(
     let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::gltf::parse_classify(&data, parse_ext, resolve)
     }));
+    match &parsed {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => eprintln!(
+            "warn: classify {f}: {e} — its textures will be treated as sRGB colour maps"
+        ),
+        Err(_) => eprintln!(
+            "warn: classify {f}: parser panicked — its textures will be treated as sRGB colour maps"
+        ),
+    }
     if let Ok(Ok(scene)) = parsed {
         let image_hash = |idx: usize| -> Option<String> {
             let uri = scene.image_uri.get(idx).and_then(|o| o.as_ref())?;
