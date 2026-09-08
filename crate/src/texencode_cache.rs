@@ -380,27 +380,35 @@ pub fn get_or_encode_shared(
         }
         s.misses += 1;
     }
-    flights().run(k, || {
-        {
-            let mut s = lock();
-            s.stamp += 1;
-            let stamp = s.stamp;
-            if let Some((data, mips, at)) = s.map.get_mut(&k) {
-                *at = stamp;
-                return Some((Arc::clone(data), *mips));
+    let mut work = Some(f);
+    loop {
+        let (result, leader) = flights().run_with_leader(k, || {
+            {
+                let mut s = lock();
+                s.stamp += 1;
+                let stamp = s.stamp;
+                if let Some((data, mips, at)) = s.map.get_mut(&k) {
+                    *at = stamp;
+                    return Some((Arc::clone(data), *mips));
+                }
             }
-        }
-        if let Some((data, mips)) = disk::get(&k) {
+            if let Some((data, mips)) = disk::get(&k) {
+                let data = Arc::new(data);
+                remember(k, Arc::clone(&data), mips);
+                return Some((data, mips));
+            }
+            let (data, mips) =
+                work.take()
+                    .expect("single-flight leader owns the encode closure")()?;
+            disk::put(&k, &data, mips);
             let data = Arc::new(data);
             remember(k, Arc::clone(&data), mips);
-            return Some((data, mips));
+            Some((data, mips))
+        });
+        if leader || result.is_some() {
+            return result;
         }
-        let (data, mips) = f()?;
-        disk::put(&k, &data, mips);
-        let data = Arc::new(data);
-        remember(k, Arc::clone(&data), mips);
-        Some((data, mips))
-    })
+    }
 }
 
 fn remember(k: [u8; 32], data: Arc<Vec<u8>>, mips: i32) {
@@ -567,6 +575,48 @@ mod tests {
             }
         });
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn waiter_retries_its_own_work_after_leader_returns_none() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+
+        enable_memory_only_with_profile(CacheProfile::Batch);
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let pixels = Arc::new(vec![salt as u8; 16 * 16 * 4]);
+        let params = [salt, 772];
+        let flight_key = key(Kind::Bc7, &pixels, 16, 16, &params);
+        let leader_started = Arc::new(Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let owner_pixels = Arc::clone(&pixels);
+            let owner_started = Arc::clone(&leader_started);
+            let owner = scope.spawn(move || {
+                get_or_encode_shared(Kind::Bc7, &owner_pixels, 16, 16, &params, || {
+                    owner_started.wait();
+                    while flights().waiter_count(&flight_key) != 1 {
+                        std::thread::yield_now();
+                    }
+                    None
+                })
+            });
+
+            leader_started.wait();
+            let calls = AtomicUsize::new(0);
+            let waiter = get_or_encode_shared(Kind::Bc7, &pixels, 16, 16, &params, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some((vec![2, 7, 1, 8], 3))
+            });
+
+            assert!(owner.join().unwrap().is_none());
+            let waiter = waiter.expect("waiter's successful closure must not inherit None");
+            assert_eq!((&*waiter.0, waiter.1), (&vec![2, 7, 1, 8], 3));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        });
     }
 
     #[test]
