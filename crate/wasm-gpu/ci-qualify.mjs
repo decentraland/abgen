@@ -112,11 +112,14 @@ child.on('exit', (code, signal) => {
   if (code && code !== 0) finish({ ok: false, error: `Chromium exited ${code}/${signal}\n${stderr}` });
 });
 
-const timeout = new Promise((resolveTimeout) => setTimeout(() => resolveTimeout({
-  ok: false,
-  error: `WebGPU qualification timed out\n${stderr}`,
-}), Number(process.env.ABGEN_WASM_GPU_TIMEOUT_MS || 180000)));
-const report = await Promise.race([result, timeout]);
+let timeoutHandle;
+const timeout = new Promise((resolveTimeout) => {
+  timeoutHandle = setTimeout(() => resolveTimeout({
+    ok: false,
+    error: `WebGPU qualification timed out\n${stderr}`,
+  }), Number(process.env.ABGEN_WASM_GPU_TIMEOUT_MS || 180000));
+});
+const report = await Promise.race([result, timeout]).finally(() => clearTimeout(timeoutHandle));
 if (!report.ok && stderr) report.browserStderr = stderr;
 const processTreeAlive = () => {
   if (processGroup !== null) {
