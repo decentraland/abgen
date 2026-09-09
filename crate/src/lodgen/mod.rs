@@ -2,6 +2,7 @@ pub mod assemble;
 pub mod atlas;
 pub mod crop;
 pub mod emit;
+pub mod inventory;
 pub mod model;
 pub mod placements;
 pub mod primitives;
@@ -21,6 +22,7 @@ mod pipeline;
 mod tests;
 
 pub use gate::{gate_failures, self_gate_bundle, self_gate_bundle_with, GateCheck};
+pub use inventory::{inventory, reference_url, BundleInventory, InventoryDelta, TextureEntry};
 #[cfg(not(target_arch = "wasm32"))]
 pub use pipeline::{
     acquire_placements, choose_lane, effective_tri_cap, expected_rel_path, generate,

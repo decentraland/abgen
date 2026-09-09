@@ -98,6 +98,7 @@ USAGE:
             [--gltfpack PATH]
             [--allow-unsimplified] [--keep-glb] [--no-uv-reclamp] [--emissive]
             [--fidelity] [--gpu]
+  abgen-lod compare <ours> <reference> [--json]
   abgen-lod qualify-corpus --out DIR [--report FILE] [--cache DIR] [-j JOBS]
             [--catalyst URL] [--worlds-url URL] [--platform windows,mac]
             [--level 0,1]
@@ -105,13 +106,28 @@ USAGE:
             [--world NAME[,NAME...]] [--entity-ids FILE]
             [--attempts 3] [--snapshot-passes 8]
             [--shard-count N --shard-index I]
+            [--reference-cdn https://ab-cdn.decentraland.org]
 
+compare: structural diff of two LOD bundles, each a local path or an http(s)
+  URL (e.g. https://ab-cdn.decentraland.org/LOD/1/{sid}_1_mac): material,
+  texture, mesh, vertex and triangle counts, bytes, and the per-texture
+  format/size lists side by side, with ours-minus-reference deltas. No byte
+  parity is implied (production textures went through a JPEG q85 round-trip
+  and gltfpack's simplifier, ours do not). --json prints the two inventories
+  and the delta as JSON. Exits 0 whenever both bundles parse.
 qualify-corpus: snapshots active Genesis City deployments from the configured
   Catalyst and all deployed scenes from the paginated Worlds API, converts
   immutable entity hashes into scratch output with bounded workers, rechecks
   the snapshot, and writes a versioned JSON report plus Explorer risk
   candidates. It never publishes. Any discovery, generation, self-gate, or
-  snapshot-stability failure produces exit status 1.
+  snapshot-stability failure produces exit status 1. --reference-cdn BASE
+  additionally fetches the production bundle at
+  BASE/LOD/{level}/{sid}_{level}_{platform} for every built level/platform
+  and records a `compare`-style inventory of both sides plus the delta under
+  each scene's `reference` list (a 404 is recorded as found=false, a fetch
+  error as an error string; neither fails the scene). The summary counts
+  compared/found/missing/errors and how many bundles match production on
+  material count and on texture count.
 
 bundle: stages <src.glb> as {entityIdLower}_{level}.glb and builds
   {out}/{entityIdLower}/LOD/{level}/{entityIdLower}_{level}_{platform}.
@@ -333,6 +349,7 @@ fn main() {
         "atlas" => cmd_atlas(&argv[1..]),
         "simplify" => cmd_simplify(&argv[1..]),
         "generate" => cmd_generate(&argv[1..]),
+        "compare" => cmd_compare(&argv[1..]),
         "qualify-corpus" => qualify::run(&argv[1..]),
         "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
         "-V" | "--version" => abgen::clihelp::print_version(BIN_NAME),
@@ -956,6 +973,74 @@ fn cmd_simplify(argv: &[String]) -> Result<i32> {
     };
     println!("simplify: {}", report.summary());
     println!("wrote {}", out.display());
+    Ok(0)
+}
+
+fn cmd_compare(argv: &[String]) -> Result<i32> {
+    use abgen::lodgen::inventory::{load_locator, BundleInventory};
+
+    let mut positional: Vec<String> = Vec::new();
+    let mut json = false;
+    let mut a = Args::new(argv);
+    while let Some(arg) = a.next() {
+        match arg.as_str() {
+            "--json" => json = true,
+            "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
+            other if other.starts_with('-') => bail!("unknown compare arg {other:?}"),
+            other => positional.push(other.to_string()),
+        }
+    }
+    let [ours_loc, ref_loc] = positional.as_slice() else {
+        bail!("compare needs exactly two bundles: <ours> <reference>");
+    };
+    let load = |locator: &str| -> Result<BundleInventory> {
+        let bytes = load_locator(locator)?
+            .ok_or_else(|| anyhow!("{locator}: not found (404)"))?;
+        abgen::lodgen::inventory(&bytes).with_context(|| format!("inventory {locator}"))
+    };
+    let ours = load(ours_loc)?;
+    let reference = load(ref_loc)?;
+    let delta = ours.delta_from(&reference);
+
+    if json {
+        let textures = |inv: &BundleInventory| {
+            serde_json::to_value(&inv.texture_list).expect("serialize texture list")
+        };
+        let out = serde_json::json!({
+            "ours": { "locator": ours_loc, "inventory": ours, "textures": textures(&ours) },
+            "reference": { "locator": ref_loc, "inventory": reference, "textures": textures(&reference) },
+            "delta": delta,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(0);
+    }
+
+    println!("ours:      {ours_loc}");
+    println!("reference: {ref_loc}");
+    println!("{:<16}{:>14}{:>14}{:>14}", "", "ours", "reference", "delta");
+    let row = |label: &str, a: u64, b: u64| {
+        println!(
+            "{label:<16}{a:>14}{b:>14}{:>+14}",
+            a as i64 - b as i64
+        );
+    };
+    row("bytes", ours.bytes as u64, reference.bytes as u64);
+    row("materials", ours.materials as u64, reference.materials as u64);
+    row("textures", ours.textures as u64, reference.textures as u64);
+    row("texture_pixels", ours.texture_pixels, reference.texture_pixels);
+    row("meshes", ours.meshes as u64, reference.meshes as u64);
+    row("vertices", ours.vertices, reference.vertices);
+    row("triangles", ours.triangles, reference.triangles);
+    println!("vertices delta vs reference: {:+.1}%", delta.vertices_pct);
+    for (side, inv) in [("ours", &ours), ("reference", &reference)] {
+        println!("textures[{side}]:");
+        for t in &inv.texture_list {
+            println!(
+                "  {:<40} fmt={:<3} {}x{} mips={}",
+                t.name, t.format, t.width, t.height, t.mips
+            );
+        }
+    }
     Ok(0)
 }
 

@@ -1,4 +1,5 @@
-use abgen::lodgen::{gate_failures, GenerateParams};
+use abgen::lodgen::inventory::load_locator;
+use abgen::lodgen::{gate_failures, BundleInventory, GenerateParams, InventoryDelta};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet, VecDeque};
@@ -11,7 +12,7 @@ const DEFAULT_CATALYST: &str = "https://peer.decentraland.org/content";
 const DEFAULT_WORLDS: &str = "https://worlds-content-server.decentraland.org";
 const DEFAULT_ATTEMPTS: u32 = 3;
 const DEFAULT_SNAPSHOT_PASSES: usize = 8;
-const REPORT_SCHEMA_VERSION: u32 = 3;
+const REPORT_SCHEMA_VERSION: u32 = 4;
 const CITY_DISCOVERY_BATCH: usize = 100;
 const RISK_SCENES: [&str; 4] = [
     "bafkreiceqm43l33evsc43jtotf2fs27efizwxn76cdnd3ypd6mcsdnpf6a",
@@ -64,6 +65,23 @@ struct Options {
     platforms: Vec<String>,
     levels: Vec<u32>,
     shard: Option<Shard>,
+    /// Production CDN base to compare every built bundle against.
+    reference_cdn: Option<String>,
+}
+
+/// One built bundle held against the production CDN copy of the same key.
+/// `found=false` is a clean 404 (production never built this scene);
+/// `error` covers fetch/parse failures on either side. Never affects `ok`.
+#[derive(Serialize)]
+struct ReferenceRecord {
+    level: u32,
+    platform: String,
+    url: String,
+    found: bool,
+    ours: Option<BundleInventory>,
+    reference: Option<BundleInventory>,
+    delta: Option<InventoryDelta>,
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -125,7 +143,18 @@ struct SceneRecord {
     simplify: Vec<SimplifyRecord>,
     artifacts: Vec<ArtifactRecord>,
     gates: Vec<GateRecord>,
+    reference: Vec<ReferenceRecord>,
     error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ReferenceSummary {
+    compared: usize,
+    found: usize,
+    missing: usize,
+    errors: usize,
+    materials_match: usize,
+    textures_match: usize,
 }
 
 #[derive(Serialize)]
@@ -143,6 +172,7 @@ struct Summary {
     cache_hits: u64,
     cache_bytes: u64,
     scenes_per_second: f64,
+    reference: Option<ReferenceSummary>,
 }
 
 #[derive(Serialize)]
@@ -158,6 +188,7 @@ struct Report {
     started_unix_ms: u128,
     catalyst: String,
     worlds_url: String,
+    reference_cdn: Option<String>,
     platforms: Vec<String>,
     levels: Vec<u32>,
     workers: usize,
@@ -200,12 +231,20 @@ fn parse(argv: &[String]) -> Result<Options> {
     let mut levels = vec![1];
     let mut shard_count = None;
     let mut shard_index = None;
+    let mut reference_cdn = None;
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
             "-h" | "--help" => abgen::clihelp::print_help(super::usage_text()),
             "--catalyst" => catalyst = value(argv, &mut i)?,
             "--worlds-url" => worlds_url = value(argv, &mut i)?,
+            "--reference-cdn" => {
+                let base = value(argv, &mut i)?;
+                if !(base.starts_with("http://") || base.starts_with("https://")) {
+                    bail!("--reference-cdn must be an http(s) base URL, got {base:?}");
+                }
+                reference_cdn = Some(base.trim_end_matches('/').to_string());
+            }
             "--out" => out = PathBuf::from(value(argv, &mut i)?),
             "--report" => report = Some(PathBuf::from(value(argv, &mut i)?)),
             "--cache" => cache = Some(PathBuf::from(value(argv, &mut i)?)),
@@ -311,6 +350,7 @@ fn parse(argv: &[String]) -> Result<Options> {
         platforms,
         levels,
         shard,
+        reference_cdn,
     })
 }
 
@@ -685,6 +725,7 @@ fn failed_record(
         simplify: Vec::new(),
         artifacts: Vec::new(),
         gates: Vec::new(),
+        reference: Vec::new(),
         error: Some(format!("{error:#}")),
     }
 }
@@ -785,6 +826,7 @@ fn run_one_attempt(job: &Job, opts: &Options) -> Result<SceneRecord> {
             .collect(),
         artifacts,
         gates,
+        reference: Vec::new(),
         error: if failed > 0 {
             Some(format!("{failed} self-gate checks failed"))
         } else if !identity_ok {
@@ -825,8 +867,106 @@ where
     unreachable!()
 }
 
+/// Compares one built bundle with the production copy at `url`. Runs outside
+/// the retry loop: a CDN hiccup must never re-run a scene build or fail it.
+fn compare_reference(
+    ours_path: &std::path::Path,
+    url: String,
+    level: u32,
+    platform: &str,
+) -> ReferenceRecord {
+    let mut record = ReferenceRecord {
+        level,
+        platform: platform.to_string(),
+        url,
+        found: false,
+        ours: None,
+        reference: None,
+        delta: None,
+        error: None,
+    };
+    let ours = std::fs::read(ours_path)
+        .with_context(|| format!("read {}", ours_path.display()))
+        .and_then(|bytes| abgen::lodgen::inventory(&bytes));
+    match ours {
+        Ok(inv) => record.ours = Some(inv),
+        Err(error) => {
+            record.error = Some(format!("ours: {error:#}"));
+            return record;
+        }
+    }
+    match load_locator(&record.url) {
+        Ok(None) => {}
+        Ok(Some(bytes)) => match abgen::lodgen::inventory(&bytes) {
+            Ok(inv) => {
+                record.found = true;
+                record.delta = record.ours.as_ref().map(|ours| ours.delta_from(&inv));
+                record.reference = Some(inv);
+            }
+            Err(error) => record.error = Some(format!("reference: {error:#}")),
+        },
+        Err(error) => record.error = Some(format!("reference: {error:#}")),
+    }
+    record
+}
+
+fn attach_references(record: &mut SceneRecord, opts: &Options) {
+    let Some(cdn) = &opts.reference_cdn else { return };
+    if record.artifacts.is_empty() {
+        return;
+    }
+    let scene_dir = opts
+        .out
+        .join(component(&record.source))
+        .join(record.entity_id.to_lowercase());
+    for level in &opts.levels {
+        for platform in &opts.platforms {
+            let rel = abgen::lodgen::expected_rel_path(&record.entity_id, *level, platform);
+            let url = abgen::lodgen::reference_url(cdn, &record.entity_id, *level, platform);
+            record.reference.push(compare_reference(
+                &scene_dir.join(rel),
+                url,
+                *level,
+                platform,
+            ));
+        }
+    }
+}
+
+fn reference_summary(records: &[SceneRecord]) -> ReferenceSummary {
+    let mut summary = ReferenceSummary {
+        compared: 0,
+        found: 0,
+        missing: 0,
+        errors: 0,
+        materials_match: 0,
+        textures_match: 0,
+    };
+    for reference in records.iter().flat_map(|record| &record.reference) {
+        summary.compared += 1;
+        if reference.error.is_some() {
+            summary.errors += 1;
+        } else if !reference.found {
+            summary.missing += 1;
+        } else {
+            summary.found += 1;
+        }
+        if let Some(delta) = &reference.delta {
+            if delta.materials == 0 {
+                summary.materials_match += 1;
+            }
+            if delta.textures == 0 {
+                summary.textures_match += 1;
+            }
+        }
+    }
+    summary
+}
+
 fn run_one(job: Job, opts: &Options) -> SceneRecord {
-    run_with_retry(job, opts, run_one_attempt, std::thread::sleep)
+    let mut record = run_with_retry(job, opts, run_one_attempt, std::thread::sleep);
+    attach_references(&mut record, opts);
+    record
 }
 
 fn process_with<R>(jobs: Vec<Job>, opts: &Options, runner: &R) -> Vec<SceneRecord>
@@ -1087,6 +1227,7 @@ pub fn run(argv: &[String]) -> Result<i32> {
         started_unix_ms: started_wall,
         catalyst: opts.catalyst.clone(),
         worlds_url: opts.worlds_url.clone(),
+        reference_cdn: opts.reference_cdn.clone(),
         platforms: opts.platforms.clone(),
         levels: opts.levels.clone(),
         workers: opts.jobs,
@@ -1115,6 +1256,10 @@ pub fn run(argv: &[String]) -> Result<i32> {
             } else {
                 qualification.records.len() as f64 / elapsed.as_secs_f64()
             },
+            reference: opts
+                .reference_cdn
+                .as_ref()
+                .map(|_| reference_summary(&qualification.records)),
         },
         explorer_candidates: explorer_candidates(&qualification.records),
         scenes: qualification.records,
@@ -1128,6 +1273,20 @@ pub fn run(argv: &[String]) -> Result<i32> {
         report.summary.scenes_per_second,
         opts.report.display()
     );
+    if let Some(reference) = &report.summary.reference {
+        println!(
+            "reference {}: {} compared, {} found, {} missing, {} errors; materials match {}/{}, textures match {}/{}",
+            opts.reference_cdn.as_deref().unwrap_or_default(),
+            reference.compared,
+            reference.found,
+            reference.missing,
+            reference.errors,
+            reference.materials_match,
+            reference.found,
+            reference.textures_match,
+            reference.found
+        );
+    }
     Ok(qualification_exit(report.snapshot_stable, failed))
 }
 
@@ -1194,6 +1353,7 @@ mod tests {
             platforms: vec!["windows".to_string(), "mac".to_string()],
             levels: vec![1],
             shard: None,
+            reference_cdn: None,
         }
     }
 
@@ -1232,8 +1392,68 @@ mod tests {
             simplify: Vec::new(),
             artifacts: Vec::new(),
             gates: Vec::new(),
+            reference: Vec::new(),
             error: (!ok).then(|| "failed".to_string()),
         }
+    }
+
+    fn reference(found: bool, materials: i64, textures: i64, error: Option<&str>) -> ReferenceRecord {
+        ReferenceRecord {
+            level: 1,
+            platform: "mac".to_string(),
+            url: "http://cdn/LOD/1/x_1_mac".to_string(),
+            found,
+            ours: None,
+            reference: None,
+            delta: found.then(|| InventoryDelta {
+                materials,
+                textures,
+                ..Default::default()
+            }),
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn reference_cdn_flag_requires_http_base_and_strips_trailing_slash() {
+        let opts = parse(&[
+            "--out".into(),
+            "/tmp/qualify".into(),
+            "--reference-cdn".into(),
+            "https://ab-cdn.example/".into(),
+        ])
+        .unwrap();
+        assert_eq!(opts.reference_cdn.as_deref(), Some("https://ab-cdn.example"));
+        assert!(parse(&["--reference-cdn".into(), "ab-cdn.example".into()]).is_err());
+    }
+
+    #[test]
+    fn reference_summary_buckets_found_missing_errors_and_matches() {
+        let mut a = record(job("a"), true);
+        a.reference = vec![reference(true, 0, 0, None), reference(true, 1, 0, None)];
+        let mut b = record(job("b"), true);
+        b.reference = vec![reference(false, 0, 0, None), reference(false, 0, 0, Some("boom"))];
+        let summary = reference_summary(&[a, b, record(job("c"), false)]);
+        assert_eq!(summary.compared, 4);
+        assert_eq!(summary.found, 2);
+        assert_eq!(summary.missing, 1);
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.materials_match, 1);
+        assert_eq!(summary.textures_match, 2);
+    }
+
+    #[test]
+    fn references_are_skipped_without_a_cdn_or_without_artifacts() {
+        let opts = options("noref");
+        let mut rec = record(job("a"), true);
+        attach_references(&mut rec, &opts);
+        assert!(rec.reference.is_empty());
+        let with_cdn = Options {
+            reference_cdn: Some("http://cdn".to_string()),
+            ..options("noref-artifacts")
+        };
+        attach_references(&mut rec, &with_cdn);
+        assert!(rec.reference.is_empty(), "no artifacts => nothing to compare");
     }
 
     fn serve<F>(requests: usize, handler: F) -> String
@@ -1517,7 +1737,7 @@ mod tests {
     fn report_write_is_atomic_and_versioned_json() {
         let opts = options("report");
         std::fs::create_dir_all(opts.report.parent().unwrap()).unwrap();
-        let bytes = br#"{"schema_version":3,"snapshot_stable":false}"#;
+        let bytes = br#"{"schema_version":4,"snapshot_stable":false}"#;
         write_report(&opts.report, bytes).unwrap();
         let value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&opts.report).unwrap()).unwrap();
