@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::model::{self, AlphaClass, LodMaterial, LodModel, LodPrimitive};
 use super::placements::Placement;
+use super::primitives::{self, PrimitivePlacement, TextureSource};
 use crate::scene::TexTransform;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -44,6 +45,53 @@ pub fn fetch_cached(
         }
     }
     Ok(bytes)
+}
+
+/// `fetch_cached` for an absolute URL (off-catalyst primitive textures): the cache key
+/// is a digest of the URL, since there is no content hash to address it by.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fetch_cached_url(
+    client: &crate::catalyst::CatalystClient,
+    cache_dir: Option<&Path>,
+    url: &str,
+) -> Result<Vec<u8>> {
+    let key = format!("url_{}", &crate::hashes::sha256_hex(url.as_bytes())[..32]);
+    let cache_path = cache_dir.map(|dir| dir.join(&key));
+    if let Some(path) = &cache_path {
+        if let Ok(bytes) = std::fs::read(path) {
+            client.record_cache_hit(bytes.len());
+            return Ok(bytes);
+        }
+    }
+    let bytes = client
+        .fetch_url(url)
+        .with_context(|| format!("fetch texture {url}"))?;
+    if let (Some(dir), Some(path)) = (cache_dir, cache_path) {
+        let _ = std::fs::create_dir_all(dir);
+        let tmp = dir.join(format!(
+            ".{key}.{}.{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+    Ok(bytes)
+}
+
+/// Resolves a primitive texture through the content cache (scene files) or a plain
+/// URL fetch (external hosts).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fetch_texture_cached(
+    client: &crate::catalyst::CatalystClient,
+    cache_dir: Option<&Path>,
+    source: &TextureSource,
+) -> Result<Vec<u8>> {
+    match source {
+        TextureSource::Hash(hash) => fetch_cached(client, cache_dir, hash),
+        TextureSource::Url(url) => fetch_cached_url(client, cache_dir, url),
+    }
 }
 
 pub fn sanitize_glb_json_padding(bytes: &mut [u8]) {
@@ -117,6 +165,9 @@ struct Counters {
     dropped_collider: usize,
     skipped_skin: usize,
     skipped_zero_scale: usize,
+    primitives_placed: usize,
+    primitives_zero_scale: usize,
+    primitive_textures_failed: usize,
 }
 
 fn unique_name(base: &str, used: &mut HashSet<String>) -> String {
@@ -338,6 +389,7 @@ pub fn assemble(
     client: &crate::catalyst::CatalystClient,
     scene: &crate::catalyst::Scene,
     placements: &[Placement],
+    primitives: &[PrimitivePlacement],
     level: u32,
     cache_dir: Option<&Path>,
     lane: model::MatLane,
@@ -350,25 +402,35 @@ pub fn assemble(
             .or_insert(c.file.as_str());
     }
     let fetch = |hash: &str| fetch_cached(client, cache_dir, hash);
+    let fetch_texture = |source: &TextureSource| fetch_texture_cached(client, cache_dir, source);
     assemble_from(
         &format!("{}_{}", scene.entity_id.to_lowercase(), level),
         &by_file,
         &file_by_hash,
         placements,
+        primitives,
         &fetch,
+        &fetch_texture,
         lane,
     )
 }
 
+/// Assembles the GLB `placements` and the SDK `primitives` into one Unity-space model.
+/// `fetch` resolves a content hash; `fetch_texture` a primitive material texture (hash or
+/// URL). A texture that cannot be fetched or decoded degrades that primitive to its
+/// colour; a GLB that cannot be fetched or parsed fails the assembly.
+#[allow(clippy::too_many_arguments)]
 pub fn assemble_from(
     root_name: &str,
     by_file: &HashMap<String, String>,
     file_by_hash: &HashMap<&str, &str>,
     placements: &[Placement],
+    primitives: &[PrimitivePlacement],
     fetch: &(dyn Fn(&str) -> Result<Vec<u8>> + Sync),
+    fetch_texture: &(dyn Fn(&TextureSource) -> Result<Vec<u8>> + Sync),
     lane: model::MatLane,
 ) -> Result<LodModel> {
-    if placements.is_empty() {
+    if placements.is_empty() && primitives.is_empty() {
         bail!("assemble: no placements");
     }
 
@@ -380,7 +442,7 @@ pub fn assemble_from(
             Err(e) => unresolved.push(format!("placement {i}: {e}")),
         }
     }
-    if placed.is_empty() {
+    if placed.is_empty() && primitives.is_empty() {
         bail!(
             "assemble: all {} placement(s) unresolvable:\n{}",
             unresolved.len(),
@@ -584,16 +646,153 @@ pub fn assemble_from(
     for u in &unresolved {
         model.log.push(format!("skipped unresolvable {u}"));
     }
+    place_primitives(
+        primitives,
+        fetch_texture,
+        &mut model,
+        &mut image_by_hash,
+        &mut mat_by_key,
+        &mut used_names,
+        &mut counters,
+    );
     model.log.push(format!(
-        "summary: instances={} unique_glbs={} prims_kept={} prims_collider_dropped={} prims_skinned_skipped={} prims_zero_scale_skipped={}",
+        "summary: instances={} unique_glbs={} prims_kept={} prims_collider_dropped={} prims_skinned_skipped={} prims_zero_scale_skipped={} primitives={} primitives_zero_scale_skipped={} primitive_textures_failed={}",
         placed.len(),
         uniq.len(),
         counters.kept,
         counters.dropped_collider,
         counters.skipped_skin,
-        counters.skipped_zero_scale
+        counters.skipped_zero_scale,
+        counters.primitives_placed,
+        counters.primitives_zero_scale,
+        counters.primitive_textures_failed
     ));
     Ok(model)
+}
+
+/// Appends the SDK primitives to `model`. Each one is the explorer's Unity-space mesh
+/// under the entity's world TRS, pushed through the same export conversion as a GLB
+/// instance (`walk_instance`): X negated, winding reversed under a positive determinant,
+/// V flipped. Geometry is built once per distinct spec and materials are interned
+/// through the same key as GLB materials, so identical primitives merge downstream.
+fn place_primitives(
+    primitives: &[PrimitivePlacement],
+    fetch_texture: &(dyn Fn(&TextureSource) -> Result<Vec<u8>> + Sync),
+    model: &mut LodModel,
+    image_by_hash: &mut HashMap<String, usize>,
+    mat_by_key: &mut HashMap<MatKey, usize>,
+    used_names: &mut HashSet<String>,
+    counters: &mut Counters,
+) {
+    let mut geometries: HashMap<String, primitives::PrimitiveGeometry> = HashMap::new();
+    let mut textures: HashMap<TextureSource, Option<usize>> = HashMap::new();
+    for (pi, p) in primitives.iter().enumerate() {
+        let shape = p.spec.shape.name();
+        if p.scale.contains(&0.0) {
+            counters.primitives_zero_scale += 1;
+            model.log.push(format!(
+                "primitive {pi} {shape}: skipped zero scale {:?}",
+                p.scale
+            ));
+            continue;
+        }
+        let image = match &p.material.texture {
+            Some(tex) => *textures.entry(tex.source.clone()).or_insert_with(|| {
+                let interned = fetch_texture(&tex.source)
+                    .map_err(|e| format!("{e:#}"))
+                    .and_then(|bytes| {
+                        model::intern_image_bytes(bytes, image_by_hash, model)
+                            .ok_or_else(|| "undecodable image".to_string())
+                    });
+                match interned {
+                    Ok(i) => Some(i),
+                    Err(e) => {
+                        counters.primitive_textures_failed += 1;
+                        let name = match &tex.source {
+                            TextureSource::Hash(h) => h.clone(),
+                            TextureSource::Url(u) => u.clone(),
+                        };
+                        model
+                            .log
+                            .push(format!("primitive texture {name}: {e}; using colour only"));
+                        eprintln!("assemble: primitive texture {name} unavailable ({e}); using colour only");
+                        None
+                    }
+                }
+            }),
+            None => None,
+        };
+        let mut key = default_mat_key();
+        key.base_color = p.material.color.map(f64::to_bits);
+        key.class = p.material.class;
+        key.cutoff = p.material.cutoff.to_bits();
+        key.image = image;
+        let material = intern_material(
+            key,
+            &format!("primitive_{shape}"),
+            mat_by_key,
+            used_names,
+            model,
+        );
+
+        let geometry = geometries
+            .entry(p.spec.cache_key())
+            .or_insert_with(|| primitives::build_geometry(&p.spec));
+        let world = model::mat4_from_trs(p.position, p.rotation, p.scale);
+        let det = model::det3(&world);
+        let nmat = model::inv_transpose3(&world);
+        let positions: Vec<[f32; 3]> = geometry
+            .positions
+            .iter()
+            .map(|v| {
+                let w = model::mul_point(&world, *v);
+                [(-w[0]) as f32, w[1] as f32, w[2] as f32]
+            })
+            .collect();
+        let normals: Vec<[f32; 3]> = geometry
+            .normals
+            .iter()
+            .map(|n| {
+                let v = match &nmat {
+                    Some(m) => model::mul_normal(m, *n),
+                    None => *n,
+                };
+                let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                let v = if len > 1e-12 {
+                    [v[0] / len, v[1] / len, v[2] / len]
+                } else {
+                    v
+                };
+                [(-v[0]) as f32, v[1] as f32, v[2] as f32]
+            })
+            .collect();
+        let uvs: Vec<[f32; 2]> = geometry
+            .uvs
+            .iter()
+            .map(|uv| [uv[0] as f32, (1.0 - uv[1]) as f32])
+            .collect();
+        let mut indices = Vec::with_capacity(geometry.indices.len());
+        for tri in geometry.indices.chunks_exact(3) {
+            if det >= 0.0 {
+                indices.extend_from_slice(&[tri[0], tri[2], tri[1]]);
+            } else {
+                indices.extend_from_slice(&[tri[0], tri[1], tri[2]]);
+            }
+        }
+        let tris = indices.len() / 3;
+        model.primitives.push(LodPrimitive {
+            positions,
+            normals,
+            uvs,
+            indices,
+            material,
+            ..Default::default()
+        });
+        counters.primitives_placed += 1;
+        model.log.push(format!(
+            "primitive {pi} {shape}: tris={tris} material={material}"
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -800,7 +999,7 @@ mod tests {
         cache: &Path,
         lane: model::MatLane,
     ) -> LodModel {
-        assemble(&dummy_client(), ent, places, 1, Some(cache), lane).unwrap()
+        assemble(&dummy_client(), ent, places, &[], 1, Some(cache), lane).unwrap()
     }
 
     fn asm(ent: &crate::catalyst::Scene, places: &[Placement], cache: &Path) -> LodModel {
@@ -1557,6 +1756,7 @@ mod tests {
                 glb_file: Some("missing.glb".to_string()),
                 ..Default::default()
             }],
+            &[],
             1,
             None,
             Default::default(),
@@ -1637,5 +1837,173 @@ mod tests {
             assert!((a_min[i] - b_min[i]).abs() < 1e-5);
             assert!((a_max[i] - b_max[i]).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn primitives_assemble_like_glb_instances() {
+        use super::super::primitives::{
+            PrimitiveMaterial, PrimitiveShape, PrimitiveSpec, PrimitiveTexture, WrapMode,
+        };
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let by_file: HashMap<String, String> = HashMap::new();
+        let file_by_hash: HashMap<&str, &str> = HashMap::new();
+        let fetch = |hash: &str| -> Result<Vec<u8>> { bail!("no glb {hash}") };
+        let fetch_texture = |src: &TextureSource| -> Result<Vec<u8>> {
+            match src {
+                TextureSource::Hash(h) if h == "hpng" => Ok(png.clone()),
+                other => bail!("unavailable {other:?}"),
+            }
+        };
+        let textured = PrimitiveMaterial {
+            texture: Some(PrimitiveTexture {
+                source: TextureSource::Hash("hpng".to_string()),
+                wrap: WrapMode::Repeat,
+            }),
+            ..Default::default()
+        };
+        let at = |spec: PrimitiveSpec,
+                  material: PrimitiveMaterial,
+                  position: [f64; 3],
+                  scale: [f64; 3]| {
+            PrimitivePlacement {
+                spec,
+                material,
+                position,
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale,
+            }
+        };
+        let prims = vec![
+            at(
+                PrimitiveSpec::simple(PrimitiveShape::Box),
+                textured.clone(),
+                [8.0, 0.5, 8.0],
+                [2.0, 1.0, 2.0],
+            ),
+            at(
+                PrimitiveSpec::simple(PrimitiveShape::Plane),
+                PrimitiveMaterial {
+                    color: [0.0, 0.0, 1.0, 0.5],
+                    class: AlphaClass::Blend,
+                    texture: Some(PrimitiveTexture {
+                        source: TextureSource::Url("https://x.test/t.png".to_string()),
+                        wrap: WrapMode::Clamp,
+                    }),
+                    ..Default::default()
+                },
+                [0.0; 3],
+                [1.0; 3],
+            ),
+            at(
+                PrimitiveSpec::simple(PrimitiveShape::Sphere),
+                PrimitiveMaterial::default(),
+                [1.0; 3],
+                [0.0; 3],
+            ),
+            at(
+                PrimitiveSpec::simple(PrimitiveShape::Box),
+                textured,
+                [-3.0, 0.0, 0.0],
+                [1.0; 3],
+            ),
+        ];
+        let model = assemble_from(
+            "prims_1",
+            &by_file,
+            &file_by_hash,
+            &[],
+            &prims,
+            &fetch,
+            &fetch_texture,
+            Default::default(),
+        )
+        .unwrap();
+
+        // zero-scale sphere skipped; the two textured boxes share one material + image
+        assert_eq!(model.primitives.len(), 3);
+        assert_eq!(model.images.len(), 1);
+        assert_eq!(model.images[0].mime, "image/png");
+        assert_eq!(model.materials.len(), 2);
+        let s = summary_line(&model);
+        assert!(s.contains("primitives=3"), "{s}");
+        assert!(s.contains("primitives_zero_scale_skipped=1"), "{s}");
+        assert!(s.contains("primitive_textures_failed=1"), "{s}");
+
+        let cube = &model.primitives[0];
+        let cube_mat = &model.materials[cube.material];
+        assert_eq!(cube_mat.class, AlphaClass::Opaque);
+        assert_eq!(cube_mat.image, Some(0));
+        assert_eq!(cube_mat.base_color, [1.0; 4]);
+        assert_eq!(model.primitives[2].material, cube.material);
+        assert_eq!(cube.positions.len(), 24);
+        assert_eq!(cube.indices.len(), 36);
+        // descriptor (8, 0.5, 8) scaled (2, 1, 2): x lands mirrored like a GLB instance
+        let mut mn = [f32::INFINITY; 3];
+        let mut mx = [f32::NEG_INFINITY; 3];
+        for p in &cube.positions {
+            for i in 0..3 {
+                mn[i] = mn[i].min(p[i]);
+                mx[i] = mx[i].max(p[i]);
+            }
+        }
+        for (got, want) in mn.iter().zip([-9.0f32, 0.0, 7.0]) {
+            assert!((got - want).abs() < 1e-6, "min {mn:?}");
+        }
+        for (got, want) in mx.iter().zip([-7.0f32, 1.0, 9.0]) {
+            assert!((got - want).abs() < 1e-6, "max {mx:?}");
+        }
+        // Unity's bottom-left V became glTF's top-left
+        assert_eq!(cube.uvs[0], [1.0, 0.0]);
+        assert_eq!(cube.uvs[16], [0.0, 1.0]);
+        // the export conversion (mirror + reversed winding) keeps faces front-facing
+        for t in cube.indices.chunks_exact(3) {
+            let (a, b, c) = (
+                cube.positions[t[0] as usize],
+                cube.positions[t[1] as usize],
+                cube.positions[t[2] as usize],
+            );
+            let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let face = [
+                e1[1] * e2[2] - e1[2] * e2[1],
+                e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0],
+            ];
+            let n = cube.normals[t[0] as usize];
+            assert!(face[0] * n[0] + face[1] * n[1] + face[2] * n[2] > 0.0);
+        }
+
+        // URL texture failed → colour-only blend material
+        let plane = &model.primitives[1];
+        let plane_mat = &model.materials[plane.material];
+        assert_eq!(plane_mat.class, AlphaClass::Blend);
+        assert_eq!(plane_mat.image, None);
+        assert_eq!(plane_mat.base_color, [0.0, 0.0, 1.0, 0.5]);
+        assert_eq!(plane.positions.len(), 8);
+
+        emit_glb(&model).unwrap();
+    }
+
+    #[test]
+    fn nothing_to_assemble_fails() {
+        let by_file: HashMap<String, String> = HashMap::new();
+        let file_by_hash: HashMap<&str, &str> = HashMap::new();
+        let fetch = |hash: &str| -> Result<Vec<u8>> { bail!("no glb {hash}") };
+        let fetch_texture = |_: &TextureSource| -> Result<Vec<u8>> { bail!("no texture") };
+        let err = assemble_from(
+            "empty_1",
+            &by_file,
+            &file_by_hash,
+            &[],
+            &[],
+            &fetch,
+            &fetch_texture,
+            Default::default(),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("no placements"));
     }
 }

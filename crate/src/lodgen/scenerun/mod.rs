@@ -124,27 +124,6 @@ pub fn run_scene_placements(
     anyhow::bail!("embedded scene execution requires the scene-runtime feature")
 }
 
-/// Statically fold the current deployment's `main.crdt` without executing
-/// scene code. The content hash comes from the entity itself, so this never
-/// consults (or inherits the staleness of) a separately published ISS.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn static_scene_placements(
-    client: &crate::catalyst::CatalystClient,
-    ent: &crate::catalyst::Scene,
-) -> anyhow::Result<crate::lodgen::placements::ManifestPlacements> {
-    use anyhow::Context;
-
-    let content = ent.content_by_file();
-    let Some(hash) = content.get("main.crdt") else {
-        return Ok(Default::default());
-    };
-    let bytes = client
-        .fetch_content(hash)
-        .with_context(|| format!("fetch main.crdt for scene {}", ent.entity_id))?;
-    crdt::placements_from_crdt_checked(&bytes, &content)
-        .with_context(|| format!("parse main.crdt for scene {}", ent.entity_id))
-}
-
 #[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
 fn run_scene_with(
     engine: &dyn SceneEngine,

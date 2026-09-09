@@ -52,80 +52,31 @@ pub fn scene_geometry(ent: &Scene) -> Result<((i32, i32), Vec<(i32, i32)>)> {
     Ok((parse_parcel(base)?, parcels))
 }
 
+/// Everything the scene places: GLB `placements` plus SDK `primitives`.
 pub fn acquire_placements(
     client: &CatalystClient,
     ent: &Scene,
     iss: &str,
-) -> Result<Vec<placements::Placement>> {
-    acquire_placements_independently(client, ent, iss).map(|(placements, _)| placements)
+) -> Result<placements::ManifestPlacements> {
+    acquire_placements_independently(client, ent, iss).map(|(full, _)| full)
 }
 
-fn scene_has_executable_path(ent: &Scene) -> bool {
-    if ent.metadata.get("runtimeVersion").and_then(|v| v.as_str()) != Some("7") {
-        return true;
-    }
-    ent.metadata
-        .get("main")
-        .and_then(|v| v.as_str())
-        .is_some_and(|main| !main.eq_ignore_ascii_case("main.crdt"))
-}
-
-fn placement_suspicion(ent: &Scene, full: &placements::ManifestPlacements) -> Vec<&'static str> {
-    let mut why = Vec::new();
-    if scene_has_executable_path(ent) {
-        why.push("executable scene entrypoint");
-    }
-    if full.placements.is_empty() {
-        why.push("zero placements");
-    }
-    if full.skipped_mesh_renderer > 0 {
-        why.push("mesh-renderer components");
-    }
-    if full.unresolved_src > 0 {
-        why.push("unresolved glTF sources");
-    }
-    why
-}
-
-fn finish_auto_placements<F>(
+/// Placements come from executing the scene in the embedded SDK runtime, never from
+/// reading its `main.crdt` as data. That file is the editor's frame-zero snapshot and
+/// is handed to the runtime as initial state; scene code then adds, moves and removes
+/// entities, so the LOD wants the state after the runtime's simulated frames
+/// (`scenerun::driver`: start + 90 timed updates), which only execution produces.
+fn finish_sdk_placements(
     ent: &Scene,
-    static_result: Result<placements::ManifestPlacements>,
-    execute_sdk: F,
-) -> Result<(Vec<placements::Placement>, &'static str)>
-where
-    F: FnOnce() -> Result<Option<placements::ManifestPlacements>>,
-{
-    let (static_full, suspicious) = match static_result {
-        Ok(full) => {
-            let suspicious = placement_suspicion(ent, &full);
-            (Some(full), suspicious)
-        }
-        Err(error) => {
-            eprintln!("static placements invalid ({error:#}); executing embedded SDK");
-            (None, vec!["invalid main.crdt"])
-        }
-    };
-    if suspicious.is_empty() {
-        let static_full = static_full.expect("clean static result");
-        eprintln!(
-            "source: current-deployment CRDT ({} placements)",
-            static_full.placements.len()
-        );
-        return Ok((static_full.placements, "static-crdt"));
-    }
-    if static_full.is_some() {
-        eprintln!(
-            "static placements suspicious ({}); executing embedded SDK",
-            suspicious.join(", ")
-        );
-    }
-    let full = execute_sdk()?.ok_or_else(|| {
+    executed: Result<Option<placements::ManifestPlacements>>,
+) -> Result<placements::ManifestPlacements> {
+    let full = executed?.ok_or_else(|| {
         anyhow!(
             "scene {} emitted no renderer state; refusing to publish an empty LOD",
             ent.entity_id
         )
     })?;
-    if full.placements.is_empty() {
+    if full.placements.is_empty() && full.primitives.is_empty() {
         bail!(
             "scene {} produced zero placements after SDK execution; refusing to publish an empty LOD",
             ent.entity_id
@@ -139,28 +90,30 @@ where
         );
     }
     eprintln!(
-        "source: embedded-scene-runtime ({} placements, {} mesh-renderer-only skipped, {} unresolved src)",
+        "source: embedded-scene-runtime ({} placements, {} primitives, {} mesh-renderer skipped, {} unresolved src)",
         full.placements.len(),
+        full.primitives.len(),
         full.skipped_mesh_renderer,
         full.unresolved_src
     );
-    Ok((full.placements, "embedded-sdk"))
+    Ok(full)
 }
 
 fn acquire_placements_independently(
     client: &CatalystClient,
     ent: &Scene,
     iss: &str,
-) -> Result<(Vec<placements::Placement>, &'static str)> {
+) -> Result<(placements::ManifestPlacements, &'static str)> {
     if iss != "auto" && iss != "off" {
         bail!(
             "--iss FILE cannot supply generated placements; derive independently and use --diff-iss FILE for comparison"
         );
     }
-    let static_result = crate::lodgen::scenerun::static_scene_placements(client, ent);
-    finish_auto_placements(ent, static_result, || {
-        crate::lodgen::scenerun::run_scene_placements(client, ent)
-    })
+    let full = finish_sdk_placements(
+        ent,
+        crate::lodgen::scenerun::run_scene_placements(client, ent),
+    )?;
+    Ok((full, "embedded-sdk"))
 }
 
 pub fn write_iss_descriptor(
@@ -645,22 +598,33 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
 
     let t_total = std::time::Instant::now();
     let t = std::time::Instant::now();
-    let (placements, placement_source) =
+    let (acquired, placement_source) =
         acquire_placements_independently(&client, &ent, &params.iss)?;
     let placements_ms = t.elapsed().as_millis();
+    let placements = acquired.placements;
+    let primitives = acquired.primitives;
     log.push(format!("placement-source: {placement_source}"));
     log.push(format!("placements: {}", placements.len()));
-    if placements.is_empty() {
+    log.push(format!(
+        "primitives: {} (mesh-renderers={} skipped={} missing-textures={})",
+        primitives.len(),
+        acquired.mesh_renderers,
+        acquired.skipped_mesh_renderer,
+        acquired.missing_textures
+    ));
+    if placements.is_empty() && primitives.is_empty() {
         bail!(
             "scene {} produced zero placements; refusing to publish an empty LOD",
             ent.entity_id
         );
     }
-    if placements.iter().all(|p| p.scale.iter().all(|s| *s == 0.0)) {
+    let zero = |scale: &[f64; 3]| scale.iter().all(|s| *s == 0.0);
+    if placements.iter().all(|p| zero(&p.scale)) && primitives.iter().all(|p| zero(&p.scale)) {
         bail!(
-            "scene {} produced {} placements, all scaled to zero; refusing to emit an invisible bundle",
+            "scene {} produced {} placements and {} primitives, all scaled to zero; refusing to emit an invisible bundle",
             ent.entity_id,
-            placements.len()
+            placements.len(),
+            primitives.len()
         );
     }
     let placement_stats = placement_stats(&placements);
@@ -688,6 +652,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
             &client,
             &ent,
             &placements,
+            &primitives,
             levels[0],
             params.cache.as_deref(),
             model::MatLane {
@@ -1054,6 +1019,18 @@ mod placement_policy_tests {
         }
     }
 
+    fn primitive() -> super::super::primitives::PrimitivePlacement {
+        super::super::primitives::PrimitivePlacement {
+            spec: super::super::primitives::PrimitiveSpec::simple(
+                super::super::primitives::PrimitiveShape::Box,
+            ),
+            material: Default::default(),
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+        }
+    }
+
     fn scene(runtime: &str, main: Option<&str>) -> Scene {
         let mut metadata = serde_json::json!({"runtimeVersion": runtime});
         if let Some(main) = main {
@@ -1069,105 +1046,60 @@ mod placement_policy_tests {
     }
 
     #[test]
-    fn clean_declarative_state_avoids_sdk_without_a_persistent_baseline() {
-        assert!(placement_suspicion(&scene("7", None), &manifest(12)).is_empty());
-        assert!(placement_suspicion(&scene("7", Some("main.crdt")), &manifest(12)).is_empty());
-        assert_eq!(
-            placement_suspicion(&scene("7", Some("bin/index.js")), &manifest(12)),
-            ["executable scene entrypoint"]
-        );
-        assert_eq!(
-            placement_suspicion(&scene("6", None), &manifest(12)),
-            ["executable scene entrypoint"]
-        );
-    }
-
-    #[test]
-    fn incomplete_static_state_requests_sdk_execution() {
-        let mut empty = manifest(0);
-        assert_eq!(
-            placement_suspicion(&scene("7", None), &empty),
-            ["zero placements"]
-        );
-
-        empty.placements.push(Default::default());
-        empty.skipped_mesh_renderer = 2;
-        empty.unresolved_src = 1;
-        assert_eq!(
-            placement_suspicion(&scene("7", None), &empty),
-            ["mesh-renderer components", "unresolved glTF sources"]
-        );
-    }
-
-    #[test]
-    fn authoritative_static_output_never_executes_sdk() {
-        let result = finish_auto_placements(&scene("7", None), Ok(manifest(2)), || {
-            panic!("SDK must not execute for authoritative declarative CRDT")
-        })
-        .unwrap();
-        assert_eq!(result.0.len(), 2);
-        assert_eq!(result.1, "static-crdt");
-    }
-
-    #[test]
-    fn executable_and_invalid_static_scenes_use_sdk_output() {
-        let result =
-            finish_auto_placements(&scene("7", Some("bin/index.js")), Ok(manifest(2)), || {
-                Ok(Some(manifest(3)))
-            })
+    fn sdk_output_is_the_only_placement_source() {
+        // a declarative Creator Hub scene is executed like any other
+        let full = finish_sdk_placements(&scene("7", Some("bin/index.js")), Ok(Some(manifest(2))))
             .unwrap();
-        assert_eq!(result.0.len(), 3);
-        assert_eq!(result.1, "embedded-sdk");
-
-        let result = finish_auto_placements(
-            &scene("7", None),
-            Err(anyhow!("truncated deployment CRDT")),
-            || Ok(Some(manifest(1))),
-        )
-        .unwrap();
-        assert_eq!(result.1, "embedded-sdk");
+        assert_eq!(full.placements.len(), 2);
+        let full = finish_sdk_placements(&scene("7", None), Ok(Some(manifest(1)))).unwrap();
+        assert_eq!(full.placements.len(), 1);
     }
 
     #[test]
     fn sdk_failure_empty_and_incomplete_results_are_rejected() {
         let executable = scene("7", Some("bin/index.js"));
-        assert!(finish_auto_placements(&executable, Ok(manifest(1)), || {
-            Err(anyhow!("runtime failed"))
-        })
-        .unwrap_err()
-        .to_string()
-        .contains("runtime failed"));
         assert!(
-            finish_auto_placements(&executable, Ok(manifest(1)), || Ok(None))
+            finish_sdk_placements(&executable, Err(anyhow!("runtime failed")))
                 .unwrap_err()
                 .to_string()
-                .contains("no renderer state")
+                .contains("runtime failed")
         );
-        assert!(
-            finish_auto_placements(&executable, Ok(manifest(1)), || { Ok(Some(manifest(0))) })
-                .unwrap_err()
-                .to_string()
-                .contains("zero placements")
-        );
+        assert!(finish_sdk_placements(&executable, Ok(None))
+            .unwrap_err()
+            .to_string()
+            .contains("no renderer state"));
+        assert!(finish_sdk_placements(&executable, Ok(Some(manifest(0))))
+            .unwrap_err()
+            .to_string()
+            .contains("zero placements"));
         let mut incomplete = manifest(1);
         incomplete.unresolved_src = 1;
-        assert!(
-            finish_auto_placements(&executable, Ok(manifest(1)), || { Ok(Some(incomplete)) })
-                .unwrap_err()
-                .to_string()
-                .contains("incomplete")
-        );
-        let mut runtime_primitives = manifest(1);
-        runtime_primitives.skipped_mesh_renderer = 3;
+        assert!(finish_sdk_placements(&executable, Ok(Some(incomplete)))
+            .unwrap_err()
+            .to_string()
+            .contains("incomplete"));
+
+        // MeshRenderers that named no shape are counted, not fatal
+        let mut skipped = manifest(1);
+        skipped.mesh_renderers = 3;
+        skipped.skipped_mesh_renderer = 3;
         assert_eq!(
-            finish_auto_placements(&executable, Ok(manifest(1)), || {
-                Ok(Some(runtime_primitives))
-            })
-            .unwrap()
-            .0
-            .len(),
+            finish_sdk_placements(&executable, Ok(Some(skipped)))
+                .unwrap()
+                .placements
+                .len(),
             1
         );
+    }
+
+    #[test]
+    fn primitives_only_sdk_output_is_a_valid_scene() {
+        let mut prims_only = manifest(0);
+        prims_only.primitives.push(primitive());
+        prims_only.mesh_renderers = 1;
+        let got = finish_sdk_placements(&scene("7", None), Ok(Some(prims_only))).unwrap();
+        assert!(got.placements.is_empty());
+        assert_eq!(got.primitives.len(), 1);
     }
 
     #[test]

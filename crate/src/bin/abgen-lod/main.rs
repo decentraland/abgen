@@ -122,9 +122,11 @@ bundle: stages <src.glb> as {entityIdLower}_{level}.glb and builds
   not an error: the bundle is built with zeroed plane/vertical clipping and
   a zero root position, matching the upstream Unity LOD converter.
 placements: resolves the scene, then prints its GLB placement list as JSON.
-  --iss auto (default) folds the current deployment's main.crdt first and
-  executes its SDK only when that state is empty or suspicious; it never
-  consumes production ISS. --iss accepts only auto or off (an alias for auto).
+  --iss auto (default) always executes the scene in the embedded SDK runtime
+  (start + 90 simulated frames) and reads the renderer state it produced;
+  main.crdt is only the runtime's initial state, never read as data, and
+  production ISS is never consumed. --iss accepts only auto or off (an alias
+  for auto).
   --diff-iss FILE is comparison-only and never supplies placements. Node is not required;
   generate --cache stores content-addressed inputs only; cached output never
   authorizes placements or survives an entity redeployment as scene truth.
@@ -140,6 +142,9 @@ parse-manifest: reads a <sceneId>-lod-manifest.json written by the npm
   bridge scripts/lod-parity-oracle.sh diffs against the embedded runtime.
   --diff-iss / --tol behave as for `placements`.
 assemble: resolves placements like `placements`, fetches every referenced GLB
+  and generates the scene's SDK primitives (MeshRenderer box/sphere/plane/
+  cylinder with their Material, explorer-exact geometry; production's
+  descriptor never carried these, so `placements` only counts them on stderr)
   (--cache DIR caches content by hash; --entity-json FILE reads a catalyst
   entity document from disk instead of resolving --scene, for offline runs
   against a prestaged cache), bakes all instances into one flat
@@ -212,8 +217,9 @@ simplify: decimates a GLB. --simplify-policy picks the triangle target
   through untouched. The report names the policy. --allow-unsimplified
   copies the input through verbatim (loud warning) when the simplifier is
   unavailable or fails.
-generate/placements/assemble run without node: abgen statically interprets the
-  current deployment first and selectively executes its SDK in-process.
+generate/placements/assemble run without node: abgen executes the current
+  deployment's SDK in-process (QuickJS) and derives every placement from the
+  state the scene reaches after its simulated frames.
 generate: the full sync chain: resolve scene -> independently derive placements
   -> assemble -> crop -> atlas -> simplify -> bundle via the LOD build mode
   into {out}/{sceneId}/LOD/{level}/{sceneId}_{level}_{platform}, plus
@@ -555,7 +561,14 @@ fn cmd_placements(argv: &[String]) -> Result<i32> {
         .with_context(|| format!("resolve scene {target:?}"))?;
     eprintln!("scene entity: {}", ent.entity_id);
 
-    let list = abgen::lodgen::acquire_placements(&client, &ent, &iss)?;
+    let full = abgen::lodgen::acquire_placements(&client, &ent, &iss)?;
+    eprintln!(
+        "primitives: {} ({} mesh-renderer skipped, {} missing textures); not part of the descriptor listing",
+        full.primitives.len(),
+        full.skipped_mesh_renderer,
+        full.missing_textures
+    );
+    let list = full.placements;
     if let Some(reference) = diff_iss {
         return report_iss_diff(&list, &reference, tol);
     }
@@ -599,10 +612,12 @@ fn cmd_parse_manifest(argv: &[String]) -> Result<i32> {
     eprintln!("scene entity: {}", ent.entity_id);
     let full = abgen::lodgen::placements::parse_lod_manifest_full(&bytes, &ent.content_by_file())?;
     eprintln!(
-        "source: manifest ({} placements, {} mesh-renderer-only skipped, {} unresolved src, \
-         {} invisible skipped, {} excluded src)",
+        "source: manifest ({} placements, {} primitives, {} mesh-renderer skipped, {} missing textures, \
+         {} unresolved src, {} invisible skipped, {} excluded src)",
         full.placements.len(),
+        full.primitives.len(),
         full.skipped_mesh_renderer,
+        full.missing_textures,
         full.unresolved_src,
         full.invisible_skipped,
         full.excluded_src
@@ -679,8 +694,12 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
     };
     eprintln!("scene entity: {}", ent.entity_id);
 
-    let list = abgen::lodgen::acquire_placements(&client, &ent, &iss)?;
-    eprintln!("placements: {}", list.len());
+    let full = abgen::lodgen::acquire_placements(&client, &ent, &iss)?;
+    eprintln!(
+        "placements: {} primitives: {}",
+        full.placements.len(),
+        full.primitives.len()
+    );
 
     let cache_dir = cache.as_deref().map(std::path::Path::new);
     if let Some(dir) = cache_dir {
@@ -689,7 +708,8 @@ fn cmd_assemble(argv: &[String]) -> Result<i32> {
     let mut model = assemble::assemble(
         &client,
         &ent,
-        &list,
+        &full.placements,
+        &full.primitives,
         level,
         cache_dir,
         abgen::lodgen::model::MatLane {

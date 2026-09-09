@@ -1215,7 +1215,7 @@ mod tests {
             retry_errors: Vec::new(),
             encoder_backend: Some("meshopt".to_string()),
             elapsed_ms: 1,
-            placement_source: Some("static-crdt".to_string()),
+            placement_source: Some("embedded-sdk".to_string()),
             placements: Some(PlacementRecord {
                 count: 1,
                 rotated: 0,

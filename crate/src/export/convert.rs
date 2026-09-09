@@ -621,12 +621,20 @@ fn bake_lod(job: &LodJob, sink: &dyn Sink) -> crate::Result<()> {
                 .map(|b| (*b).clone())
                 .ok_or_else(|| crate::anyhow!("content {hash} not in the upload"))
         };
+        // An ISS descriptor never carries primitives, so no texture source can occur.
+        let no_textures = |source: &lodgen::primitives::TextureSource| -> crate::Result<Vec<u8>> {
+            Err(crate::anyhow!(
+                "primitive texture {source:?} has no source in an ISS upload"
+            ))
+        };
         merged = lodgen::assemble::assemble_from(
             &root_name,
             job.content_by_file,
             &file_by_hash,
             &list,
+            &[],
             &fetch,
+            &no_textures,
             lmodel::MatLane::default(),
         )?;
         sources = list.len();

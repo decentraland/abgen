@@ -2,6 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
+use super::primitives::{self, MaterialFields, PrimitivePlacement, PrimitiveSpec};
+
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "placements_native.rs"]
 mod placements_native;
@@ -311,9 +313,19 @@ pub fn gltf_src_is_excluded(src: &str) -> bool {
 pub struct ManifestPlacements {
     /// Descriptor order: first-seen gltf src, then entity insertion order.
     pub placements: Vec<Placement>,
-    /// Entities carrying a MeshRenderer but no GltfContainer; primitives are
-    /// never part of the descriptor.
+    /// SDK7 primitives (`core::MeshRenderer` box/sphere/plane/cylinder with their
+    /// `core::Material`), in entity insertion order. Production's descriptor never
+    /// carried these — the Unity pipeline ignored them — so they are kept apart from
+    /// `placements`, which stays comparable to the production ISS.
+    pub primitives: Vec<PrimitivePlacement>,
+    /// Entities carrying a MeshRenderer at all (placed or not).
+    pub mesh_renderers: usize,
+    /// MeshRenderer entities that produced no primitive: unset/unsupported mesh
+    /// (a DELETE or empty payload) or the entity's own `visible == false`.
     pub skipped_mesh_renderer: usize,
+    /// Primitive materials whose texture names a scene file the entity does not
+    /// ship; those primitives keep their colour only.
+    pub missing_textures: usize,
     /// Distinct gltf srcs with no content hash; every placement of such a
     /// src is dropped (`StaticSceneDescriptorBuilder.missingHashes`).
     pub unresolved_src: usize,
@@ -325,12 +337,16 @@ pub struct ManifestPlacements {
 }
 
 /// `StaticSceneDescriptorBuilder.Build` over the LWW-folded components of
-/// one scene. `gltf_srcs` holds one winning src per entity in entity
-/// insertion order; `visibility` holds each entity's own `visible` flag.
+/// one scene, plus the primitives production never read. `gltf_srcs` holds
+/// one winning src per entity in entity insertion order; `mesh_renderers`
+/// one winning MeshRenderer per entity (`None` when it names no shape);
+/// `materials` the winning Material per entity; `visibility` each entity's
+/// own `visible` flag.
 pub(crate) fn placements_from_components(
     transforms: HashMap<i64, Trs>,
     gltf_srcs: Vec<(i64, String)>,
-    mesh_renderer_entities: HashSet<i64>,
+    mesh_renderers: Vec<(i64, Option<PrimitiveSpec>)>,
+    materials: HashMap<i64, MaterialFields>,
     visibility: HashMap<i64, bool>,
     content_by_file: &HashMap<String, String>,
 ) -> ManifestPlacements {
@@ -338,12 +354,8 @@ pub(crate) fn placements_from_components(
         .iter()
         .map(|(k, v)| (k.to_lowercase(), v))
         .collect();
-    let gltf_entities: HashSet<i64> = gltf_srcs.iter().map(|(e, _)| *e).collect();
     let mut out = ManifestPlacements {
-        skipped_mesh_renderer: mesh_renderer_entities
-            .iter()
-            .filter(|e| !gltf_entities.contains(e))
-            .count(),
+        mesh_renderers: mesh_renderers.len(),
         ..Default::default()
     };
     let mut groups: Vec<(String, Vec<i64>)> = Vec::new();
@@ -385,16 +397,44 @@ pub(crate) fn placements_from_components(
             });
         }
     }
+    // Primitives: the explorer renders a MeshRenderer on its own entity whether or
+    // not a GltfContainer sits there too, so every visible shape is placed. The
+    // same transform chain and Unity decomposition as the GLBs apply.
+    for (eid, spec) in mesh_renderers {
+        let Some(spec) = spec else {
+            out.skipped_mesh_renderer += 1;
+            continue;
+        };
+        if visibility.get(&eid) == Some(&false) {
+            out.skipped_mesh_renderer += 1;
+            continue;
+        }
+        let (material, missing) = primitives::resolve_material(materials.get(&eid), &lowered);
+        if missing {
+            out.missing_textures += 1;
+        }
+        let world = world_matrix(eid, &transforms, &mut HashSet::new());
+        let d = decompose_unity(&world);
+        out.primitives.push(PrimitivePlacement {
+            spec,
+            material,
+            position: scrub_negative_zero(d.position),
+            rotation: scrub_negative_zero(d.rotation),
+            scale: scrub_negative_zero(d.scale),
+        });
+    }
     out
 }
 
 /// `ManifestParser.Parse` over a `<sceneId>-lod-manifest.json`: rows are
 /// folded per (entity, component) — by `timestamp` when rows carry one
 /// (`>=` wins), otherwise the last row wins — and rows without an object
-/// `data` (DELETEs) are ignored. Only Transform, GltfContainer and
-/// VisibilityComponent feed the descriptor; MeshRenderer rows are counted
-/// and Material rows ignored. A VisibilityComponent row without a `visible`
-/// field reads as `false`, exactly as `JsonUtility` defaults it.
+/// `data` (DELETEs) are ignored. Transform, GltfContainer and
+/// VisibilityComponent feed the descriptor exactly as production reads them;
+/// MeshRenderer and Material rows, which production dropped, feed the
+/// primitives (a MeshRenderer row whose `data` is not an object still counts
+/// the entity, as a skipped one). A VisibilityComponent row without a
+/// `visible` field reads as `false`, exactly as `JsonUtility` defaults it.
 pub fn parse_lod_manifest_full(
     bytes: &[u8],
     content_by_file: &HashMap<String, String>,
@@ -409,9 +449,9 @@ pub fn parse_lod_manifest_full(
         timestamp: Option<f64>,
         data: &'a serde_json::Value,
     }
+    let null = serde_json::Value::Null;
     let mut cells: Vec<Cell> = Vec::new();
     let mut index: HashMap<(i64, &str), usize> = HashMap::new();
-    let mut mesh_renderer_entities: HashSet<i64> = HashSet::new();
     for row in rows {
         let Some(eid) = row.get("entityId").and_then(|x| x.as_i64()) else {
             continue;
@@ -420,18 +460,21 @@ pub fn parse_lod_manifest_full(
             .get("componentName")
             .and_then(|x| x.as_str())
             .unwrap_or("");
-        if name == "core::MeshRenderer" {
-            mesh_renderer_entities.insert(eid);
-            continue;
-        }
         if !matches!(
             name,
-            "core::Transform" | "core::GltfContainer" | "core::VisibilityComponent"
+            "core::Transform"
+                | "core::GltfContainer"
+                | "core::VisibilityComponent"
+                | "core::MeshRenderer"
+                | "core::Material"
         ) {
             continue;
         }
-        let Some(data) = row.get("data").filter(|d| d.is_object()) else {
-            continue;
+        let data = match row.get("data").filter(|d| d.is_object()) {
+            Some(data) => data,
+            // A MeshRenderer DELETE still marks the entity; every other DELETE is ignored.
+            None if name == "core::MeshRenderer" => &null,
+            None => continue,
         };
         let timestamp = row.get("timestamp").and_then(|t| t.as_f64());
         match index.get(&(eid, name)) {
@@ -458,10 +501,20 @@ pub fn parse_lod_manifest_full(
     }
     let mut transforms: HashMap<i64, Trs> = HashMap::new();
     let mut gltf_srcs: Vec<(i64, String)> = Vec::new();
+    let mut mesh_renderers: Vec<(i64, Option<PrimitiveSpec>)> = Vec::new();
+    let mut materials: HashMap<i64, MaterialFields> = HashMap::new();
     let mut visibility: HashMap<i64, bool> = HashMap::new();
     for cell in &cells {
         let data = cell.data;
         match cell.name {
+            "core::MeshRenderer" => {
+                mesh_renderers.push((cell.eid, primitives::mesh_renderer_from_json(data)));
+            }
+            "core::Material" => {
+                if let Some(m) = primitives::material_from_json(data) {
+                    materials.insert(cell.eid, m);
+                }
+            }
             "core::Transform" => {
                 transforms.insert(
                     cell.eid,
@@ -494,7 +547,8 @@ pub fn parse_lod_manifest_full(
     Ok(placements_from_components(
         transforms,
         gltf_srcs,
-        mesh_renderer_entities,
+        mesh_renderers,
+        materials,
         visibility,
         content_by_file,
     ))
@@ -909,14 +963,133 @@ mod tests {
                 "entityId": 701,
                 "componentName": "core::GltfContainer",
                 "data": {"src": "models/missing.glb"}
+            },
+            {
+                "entityId": 702,
+                "componentName": "core::MeshRenderer",
+                "data": null
             }
         ]);
         let bytes = serde_json::to_vec(&fixture).unwrap();
         let content = HashMap::new();
         let got = parse_lod_manifest_full(&bytes, &content).unwrap();
+        assert_eq!(got.mesh_renderers, 2);
         assert_eq!(got.skipped_mesh_renderer, 1);
         assert_eq!(got.unresolved_src, 1);
         assert!(got.placements.is_empty());
+        assert_eq!(got.primitives.len(), 1);
+        let p = &got.primitives[0];
+        assert_eq!(
+            p.spec,
+            PrimitiveSpec::simple(primitives::PrimitiveShape::Box)
+        );
+        assert_eq!(p.material, primitives::PrimitiveMaterial::default());
+        assert_eq!(p.position, [0.0; 3]);
+        assert_eq!(p.rotation, IDENTITY_ROTATION);
+        assert_eq!(p.scale, [1.0; 3]);
+    }
+
+    #[test]
+    fn lod_manifest_primitives_take_transform_material_and_visibility() {
+        let fixture = serde_json::json!([
+            {
+                "entityId": 600,
+                "componentName": "core::Transform",
+                "data": {
+                    "position": {"x": 8.0, "y": 0.0, "z": 8.0},
+                    "rotation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                    "scale": {"x": 2.0, "y": 2.0, "z": 2.0},
+                    "parent": 0
+                }
+            },
+            {
+                "entityId": 601,
+                "componentName": "core::Transform",
+                "data": {
+                    "position": {"x": 1.0, "y": 2.0, "z": 3.0},
+                    "rotation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                    "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+                    "parent": 600
+                }
+            },
+            {
+                "entityId": 601,
+                "componentName": "core::MeshRenderer",
+                "data": {"mesh": {"$case": "cylinder", "cylinder": {"radiusTop": 0, "radiusBottom": 1}}}
+            },
+            {
+                "entityId": 601,
+                "componentName": "core::Material",
+                "data": {"material": {"$case": "pbr", "pbr": {
+                    "texture": {"tex": {"$case": "texture", "texture": {"src": "Images/Wood.PNG", "wrapMode": 0, "filterMode": 0}}},
+                    "albedoColor": {"r": 1, "g": 0.5, "b": 0, "a": 1},
+                    "transparencyMode": 4
+                }}}
+            },
+            {
+                "entityId": 602,
+                "componentName": "core::MeshRenderer",
+                "data": {"mesh": {"$case": "sphere", "sphere": {}}}
+            },
+            {
+                "entityId": 602,
+                "componentName": "core::VisibilityComponent",
+                "data": {"visible": false}
+            },
+            {
+                "entityId": 603,
+                "componentName": "core::MeshRenderer",
+                "data": {"mesh": {"$case": "plane", "plane": {"uvs": []}}}
+            },
+            {
+                "entityId": 603,
+                "componentName": "core::Material",
+                "data": {"material": {"$case": "pbr", "pbr": {
+                    "texture": {"tex": {"$case": "texture", "texture": {"src": "images/nowhere.png", "wrapMode": 0}}},
+                    "albedoColor": {"r": 1, "g": 1, "b": 1, "a": 0.5}
+                }}}
+            },
+            {
+                "entityId": 603,
+                "componentName": "core::MeshRenderer",
+                "data": {"mesh": {"$case": "box", "box": {"uvs": []}}}
+            }
+        ]);
+        let mut content = HashMap::new();
+        content.insert("images/wood.png".to_string(), "bafkreiwood".to_string());
+        let got =
+            parse_lod_manifest_full(&serde_json::to_vec(&fixture).unwrap(), &content).unwrap();
+        assert_eq!(got.mesh_renderers, 3);
+        assert_eq!(got.skipped_mesh_renderer, 1);
+        assert_eq!(got.missing_textures, 1);
+        assert_eq!(got.primitives.len(), 2);
+
+        let cone = &got.primitives[0];
+        assert_eq!(cone.spec.shape, primitives::PrimitiveShape::Cylinder);
+        assert_eq!(cone.spec.radius_top, Some(0.0));
+        assert_eq!(cone.spec.radius_bottom, Some(1.0));
+        assert!(
+            approx3(cone.position, [10.0, 4.0, 14.0]),
+            "{:?}",
+            cone.position
+        );
+        assert!(approx3(cone.scale, [2.0, 2.0, 2.0]));
+        assert_eq!(cone.material.color, [1.0, 0.5, 0.0, 1.0]);
+        assert_eq!(cone.material.class, super::super::model::AlphaClass::Opaque);
+        assert_eq!(
+            cone.material.texture,
+            Some(primitives::PrimitiveTexture {
+                source: primitives::TextureSource::Hash("bafkreiwood".to_string()),
+                wrap: primitives::WrapMode::Repeat,
+            })
+        );
+
+        // last MeshRenderer row wins; missing texture falls back to colour; alpha < 1 blends
+        let cube = &got.primitives[1];
+        assert_eq!(cube.spec.shape, primitives::PrimitiveShape::Box);
+        assert_eq!(cube.material.class, super::super::model::AlphaClass::Blend);
+        assert!(cube.material.texture.is_none());
+        assert_eq!(cube.position, [0.0; 3]);
     }
 
     #[test]
@@ -1123,6 +1296,36 @@ mod conformance {
         let full = check(AMAIXEN_MANIFEST, AMAIXEN_ISS, AMAIXEN_CONTENT, 26);
         assert_eq!(full.invisible_skipped, 15);
         assert_eq!(full.unresolved_src, 0);
+        // 33 textured planes (publit.io URLs) + 4 translucent cones, two of them hidden.
+        assert_eq!(full.mesh_renderers, 37);
+        assert_eq!(full.skipped_mesh_renderer, 2);
+        assert_eq!(full.primitives.len(), 35);
+        assert_eq!(full.missing_textures, 0);
+        let planes = full
+            .primitives
+            .iter()
+            .filter(|p| p.spec.shape == primitives::PrimitiveShape::Plane)
+            .count();
+        assert_eq!(planes, 33);
+        assert!(full
+            .primitives
+            .iter()
+            .filter(|p| p.spec.shape == primitives::PrimitiveShape::Plane)
+            .all(|p| matches!(
+                p.material.texture.as_ref().map(|t| &t.source),
+                Some(primitives::TextureSource::Url(u)) if u.starts_with("https://")
+            )));
+        let cones: Vec<_> = full
+            .primitives
+            .iter()
+            .filter(|p| p.spec.shape == primitives::PrimitiveShape::Cylinder)
+            .collect();
+        assert_eq!(cones.len(), 2);
+        assert!(cones.iter().all(|p| {
+            p.material.class == super::super::model::AlphaClass::Blend
+                && p.material.texture.is_none()
+                && p.spec.radius_bottom == Some(0.0)
+        }));
     }
 
     #[test]
@@ -1130,6 +1333,18 @@ mod conformance {
         let full = check(LOUNGE_MANIFEST, LOUNGE_ISS, LOUNGE_CONTENT, 52);
         assert_eq!(full.invisible_skipped, 0);
         assert_eq!(full.unresolved_src, 0);
+        // 148 boxes + 8 planes, all visible; 6 scene-file textures of which 3 are not
+        // in the entity's content (AHL_1, AHL_head, ROWSIL_BLACK).
+        assert_eq!(full.mesh_renderers, 156);
+        assert_eq!(full.skipped_mesh_renderer, 0);
+        assert_eq!(full.primitives.len(), 156);
+        assert_eq!(full.missing_textures, 3);
+        let textured = full
+            .primitives
+            .iter()
+            .filter(|p| p.material.texture.is_some())
+            .count();
+        assert_eq!(textured, 3);
         let near_minus_two = full
             .placements
             .iter()

@@ -356,6 +356,35 @@ pub(crate) fn intern_image(
     Some(i)
 }
 
+/// Interns an image from raw bytes (a scene texture fetched outside any GLB). PNG/JPEG
+/// pass through; anything else decodes and re-encodes as PNG. `None` if undecodable.
+pub(crate) fn intern_image_bytes(
+    raw: Vec<u8>,
+    by_hash: &mut HashMap<String, usize>,
+    model: &mut LodModel,
+) -> Option<usize> {
+    let (bytes, mime) = match sniff_mime(&raw) {
+        Some(m) => (raw, m.to_string()),
+        None => {
+            let img = image::load_from_memory(&raw).ok()?;
+            let mut cur = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut cur, image::ImageFormat::Png).ok()?;
+            model
+                .log
+                .push("primitive texture: reencoded to png".to_string());
+            (cur.into_inner(), "image/png".to_string())
+        }
+    };
+    let key = crate::hashes::sha256_hex(&bytes);
+    if let Some(&i) = by_hash.get(&key) {
+        return Some(i);
+    }
+    let i = model.images.len();
+    model.images.push(LodImage { bytes, mime });
+    by_hash.insert(key, i);
+    Some(i)
+}
+
 fn walk(
     scene: &crate::scene::Scene,
     idx: usize,

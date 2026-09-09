@@ -309,6 +309,12 @@ impl CatalystClient {
         }
     }
 
+    /// Plain GET of an absolute URL, with the client's retry policy but no content
+    /// cache: SDK material textures may live off-catalyst (`https://...` srcs).
+    pub fn fetch_url(&self, url: &str) -> Result<Vec<u8>> {
+        self.get_abs(url)
+    }
+
     pub fn fetch_content(&self, content_hash: &str) -> Result<Vec<u8>> {
         let cache_path = self.cache_path(content_hash);
         if let Some(path) = &cache_path {

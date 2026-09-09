@@ -1,5 +1,8 @@
 use crate::lodgen::placements::{placements_from_components, ManifestPlacements, Trs};
-use std::collections::{HashMap, HashSet};
+use crate::lodgen::primitives::{
+    material_from_proto, mesh_renderer_from_proto, MaterialFields, PrimitiveSpec,
+};
+use std::collections::HashMap;
 
 pub const PUT_COMPONENT: u32 = 1;
 
@@ -106,7 +109,8 @@ impl LwwState {
         ordered.sort_by_key(|(_, (_, seq, _))| *seq);
         let mut transforms: HashMap<i64, Trs> = HashMap::new();
         let mut gltf_srcs: Vec<(i64, String)> = Vec::new();
-        let mut mesh_renderer_entities: HashSet<i64> = HashSet::new();
+        let mut mesh_renderers: Vec<(i64, Option<PrimitiveSpec>)> = Vec::new();
+        let mut materials: HashMap<i64, MaterialFields> = HashMap::new();
         let mut visibility: HashMap<i64, bool> = HashMap::new();
         for ((entity, component), (_, _, data)) in ordered {
             let eid = i64::from(*entity);
@@ -125,7 +129,18 @@ impl LwwState {
                     }
                 }
                 MESH_RENDERER => {
-                    mesh_renderer_entities.insert(eid);
+                    // An empty payload is the all-default message: no shape set.
+                    let spec = if data.is_empty() {
+                        None
+                    } else {
+                        mesh_renderer_from_proto(data)
+                    };
+                    mesh_renderers.push((eid, spec));
+                }
+                MATERIAL => {
+                    if let Some(m) = material_from_proto(data) {
+                        materials.insert(eid, m);
+                    }
                 }
                 VISIBILITY => {
                     visibility.insert(eid, visible_flag(data));
@@ -136,7 +151,8 @@ impl LwwState {
         placements_from_components(
             transforms,
             gltf_srcs,
-            mesh_renderer_entities,
+            mesh_renderers,
+            materials,
             visibility,
             content_by_file,
         )
@@ -748,8 +764,37 @@ mod tests {
         );
         encode_put(&mut stream, 800, MATERIAL, 1, &[0x08, 0x01]);
         encode_put(&mut stream, 800, VISIBILITY, 1, &[]);
+        // entity 900: a box under 600 with a textured, half-transparent pbr material
+        encode_put(
+            &mut stream,
+            900,
+            TRANSFORM,
+            1,
+            &transform_bytes([0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0], 600),
+        );
+        encode_put(&mut stream, 900, MESH_RENDERER, 1, &[0x0a, 0x00]);
+        let mut texture = vec![0x0a, 0x0e];
+        texture.extend_from_slice(b"images/box.png");
+        texture.extend_from_slice(&[0x10, 0x00]); // wrap_mode = REPEAT
+        let mut union = vec![0x0a, texture.len() as u8];
+        union.extend_from_slice(&texture);
+        let mut albedo = Vec::new();
+        for (field, v) in [(1u8, 1.0f32), (2, 1.0), (3, 1.0), (4, 0.5)] {
+            albedo.push((field << 3) | 5);
+            albedo.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut pbr = vec![0x0a, union.len() as u8];
+        pbr.extend_from_slice(&union);
+        pbr.push(0x3a); // field 7, length-delimited
+        pbr.push(albedo.len() as u8);
+        pbr.extend_from_slice(&albedo);
+        pbr.extend_from_slice(&[0x50, 0x04]); // transparency_mode = AUTO
+        let mut material = vec![0x12, pbr.len() as u8];
+        material.extend_from_slice(&pbr);
+        encode_put(&mut stream, 900, MATERIAL, 1, &material);
         let mut content = HashMap::new();
         content.insert("models/child.glb".to_string(), "hchild".to_string());
+        content.insert("images/box.png".to_string(), "hbox".to_string());
         let got = placements_from_crdt(&stream, &content);
         let s2d = s2 as f64;
         let manifest = serde_json::json!([
@@ -807,14 +852,62 @@ mod tests {
                 "entityId": 701,
                 "componentName": "core::GltfContainer",
                 "data": {"src": "models/missing.glb"}
+            },
+            {
+                "entityId": 900,
+                "componentName": "core::Transform",
+                "data": {
+                    "position": {"x": 0.0, "y": 1.0, "z": 0.0},
+                    "rotation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                    "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+                    "parent": 600
+                }
+            },
+            {
+                "entityId": 900,
+                "componentName": "core::MeshRenderer",
+                "data": {"mesh": {"$case": "box", "box": {"uvs": []}}}
+            },
+            {
+                "entityId": 900,
+                "componentName": "core::Material",
+                "data": {"material": {"$case": "pbr", "pbr": {
+                    "texture": {"tex": {"$case": "texture", "texture": {"src": "images/box.png", "wrapMode": 0, "filterMode": 0}}},
+                    "albedoColor": {"r": 1, "g": 1, "b": 1, "a": 0.5},
+                    "transparencyMode": 4
+                }}}
             }
         ]);
         let want =
             parse_lod_manifest_full(&serde_json::to_vec(&manifest).unwrap(), &content).unwrap();
         assert_eq!(got, want);
         assert_eq!(got.placements.len(), 1);
+        assert_eq!(got.mesh_renderers, 2);
         assert_eq!(got.skipped_mesh_renderer, 1);
         assert_eq!(got.unresolved_src, 1);
+        assert_eq!(got.primitives.len(), 1);
+        let cube = &got.primitives[0];
+        assert_eq!(
+            cube.spec,
+            PrimitiveSpec::simple(crate::lodgen::primitives::PrimitiveShape::Box)
+        );
+        assert_eq!(cube.material.class, crate::lodgen::model::AlphaClass::Blend);
+        assert_eq!(cube.material.color, [1.0, 1.0, 1.0, 0.5]);
+        assert_eq!(
+            cube.material.texture,
+            Some(crate::lodgen::primitives::PrimitiveTexture {
+                source: crate::lodgen::primitives::TextureSource::Hash("hbox".to_string()),
+                wrap: crate::lodgen::primitives::WrapMode::Repeat,
+            })
+        );
+        assert!(
+            (cube.position[0] - 10.0).abs() < 1e-5
+                && (cube.position[1] - 2.0).abs() < 1e-5
+                && cube.position[2].abs() < 1e-5,
+            "{:?}",
+            cube.position
+        );
+        assert!(cube.scale.iter().all(|s| (s - 2.0).abs() < 1e-6));
         assert_eq!(
             gltf_srcs_from_crdt(&stream),
             [
