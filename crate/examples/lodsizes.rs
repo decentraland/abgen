@@ -108,8 +108,12 @@ fn main() {
                     let img = v
                         .get("image data")
                         .and_then(|x| x.as_bytes())
-                        .map(|b| b.len())
-                        .unwrap_or(0);
+                        .unwrap_or(&[]);
+                    if let Some(dir) = &dump {
+                        let name = v.get("m_Name").and_then(|x| x.as_str()).unwrap_or("tex");
+                        std::fs::write(format!("{dir}/{name}.image.bin"), img).unwrap();
+                    }
+                    let img = img.len();
                     println!(
                         "    Texture2D {:?} obj={}B imagedata={img}B",
                         v.get("m_Name").and_then(|x| x.as_str()).unwrap_or(""),
