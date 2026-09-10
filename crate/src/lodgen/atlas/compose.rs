@@ -122,8 +122,24 @@ fn fill_background(rgba: &mut [u8], size: u32) {
     }
 }
 
+/// Cutout and transparent canvases ship transparent black wherever alpha is
+/// zero, the way the production atlases do: those texels are never visible
+/// (alpha test / premultiplied blend), and constant RGB there is what lets
+/// the BC7 blocks of a mostly-empty alpha atlas compress. Bleeding tile
+/// colour into them (as `fill_background` does for the opaque lane) roughly
+/// doubles the LZ4 size of the cutout/transparent textures for no visual gain.
+fn clear_hidden_rgb(rgba: &mut [u8]) {
+    for px in rgba.chunks_exact_mut(4) {
+        if px[3] == 0 {
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 0;
+        }
+    }
+}
+
 /// Opaque canvases are JPEG q85 unless `lossless_opaque`; cutout and
-/// transparent canvases are always PNG (alpha survives).
+/// transparent canvases are always PNG (alpha survives, hidden RGB is zero).
 pub(super) fn encode_atlas(
     class: AlphaClass,
     mut rgba: Vec<u8>,
@@ -153,7 +169,7 @@ pub(super) fn encode_atlas(
             mime: "image/jpeg".to_string(),
         })
     } else {
-        fill_background(&mut rgba, canvas);
+        clear_hidden_rgb(&mut rgba);
         let img = RgbaImage::from_raw(canvas, canvas, rgba)
             .ok_or_else(|| anyhow!("atlas rgba buffer"))?;
         let mut cur = std::io::Cursor::new(Vec::new());

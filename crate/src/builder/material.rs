@@ -140,12 +140,14 @@ pub(super) fn build_lod_material_tree(
         ("_Parallax", 0.02),
         ("_QueueOffset", 0.0),
         ("_ReceiveShadows", 1.0),
+        // Production never writes _Smoothness, so the DCL/Scene_TexArray
+        // default (0.5) ships on every merged LOD material.
         (
             "_Smoothness",
             if lod.fidelity {
                 (1.0 - m.roughness).clamp(0.0, 1.0)
             } else {
-                0.0
+                0.5
             },
         ),
         ("_SmoothnessTextureChannel", 0.0),

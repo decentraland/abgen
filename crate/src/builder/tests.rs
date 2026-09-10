@@ -1064,7 +1064,7 @@ fn lod_fidelity_metal_material_carries_floats() {
     assert!((lod_mat_float(&t, "_Smoothness").unwrap() - 0.7).abs() < 1e-6);
     let t = mk(false);
     assert_eq!(lod_mat_float(&t, "_Metallic"), Some(0.0));
-    assert_eq!(lod_mat_float(&t, "_Smoothness"), Some(0.0));
+    assert_eq!(lod_mat_float(&t, "_Smoothness"), Some(0.5));
 }
 
 fn lod_keywords_of(t: &Value) -> Vec<String> {

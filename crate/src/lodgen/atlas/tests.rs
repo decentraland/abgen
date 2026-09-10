@@ -363,8 +363,38 @@ fn fully_transparent_fallback_deterministic() {
     let out2 = atlas(&build(), 64, 2).unwrap();
     assert_eq!(out1.images[0].bytes, out2.images[0].bytes);
     let canvas = decode(&out1.images[0]);
-    let g = linear_to_srgb_u8(0.5);
-    assert_eq!(canvas.get_pixel(1, 1).0, [g, g, g, 0]);
+    assert_eq!(canvas.get_pixel(1, 1).0, [0, 0, 0, 0]);
+}
+
+#[test]
+fn alpha_lane_hidden_rgb_is_transparent_black() {
+    // Production atlases carry (0,0,0,0) wherever alpha is zero; source RGB
+    // under alpha 0 and any neighbour bleed must not survive into the lane.
+    for class in [AlphaClass::Mask, AlphaClass::Blend] {
+        let mut img = RgbaImage::new(16, 16);
+        for (x, _y, p) in img.enumerate_pixels_mut() {
+            *p = if x < 8 {
+                image::Rgba([200, 30, 90, 255])
+            } else {
+                image::Rgba([255, 255, 0, 0])
+            };
+        }
+        let m = model1(
+            mat("a", class, [1.0; 4], Some(0)),
+            tri_uvs(),
+            vec![png_bytes(&img)],
+        );
+        let out = atlas(&m, 64, 2).unwrap();
+        let canvas = decode(&out.images[0]);
+        let mut hidden = 0usize;
+        for p in canvas.pixels() {
+            if p.0[3] == 0 {
+                hidden += 1;
+                assert_eq!(p.0, [0, 0, 0, 0], "{class:?}: hidden texel kept RGB");
+            }
+        }
+        assert!(hidden > 0, "{class:?}: canvas has no hidden texels");
+    }
 }
 
 #[test]
