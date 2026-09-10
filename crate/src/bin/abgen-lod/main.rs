@@ -994,8 +994,7 @@ fn cmd_compare(argv: &[String]) -> Result<i32> {
         bail!("compare needs exactly two bundles: <ours> <reference>");
     };
     let load = |locator: &str| -> Result<BundleInventory> {
-        let bytes = load_locator(locator)?
-            .ok_or_else(|| anyhow!("{locator}: not found (404)"))?;
+        let bytes = load_locator(locator)?.ok_or_else(|| anyhow!("{locator}: not found (404)"))?;
         abgen::lodgen::inventory(&bytes).with_context(|| format!("inventory {locator}"))
     };
     let ours = load(ours_loc)?;
@@ -1019,15 +1018,20 @@ fn cmd_compare(argv: &[String]) -> Result<i32> {
     println!("reference: {ref_loc}");
     println!("{:<16}{:>14}{:>14}{:>14}", "", "ours", "reference", "delta");
     let row = |label: &str, a: u64, b: u64| {
-        println!(
-            "{label:<16}{a:>14}{b:>14}{:>+14}",
-            a as i64 - b as i64
-        );
+        println!("{label:<16}{a:>14}{b:>14}{:>+14}", a as i64 - b as i64);
     };
     row("bytes", ours.bytes as u64, reference.bytes as u64);
-    row("materials", ours.materials as u64, reference.materials as u64);
+    row(
+        "materials",
+        ours.materials as u64,
+        reference.materials as u64,
+    );
     row("textures", ours.textures as u64, reference.textures as u64);
-    row("texture_pixels", ours.texture_pixels, reference.texture_pixels);
+    row(
+        "texture_pixels",
+        ours.texture_pixels,
+        reference.texture_pixels,
+    );
     row("meshes", ours.meshes as u64, reference.meshes as u64);
     row("vertices", ours.vertices, reference.vertices);
     row("triangles", ours.triangles, reference.triangles);

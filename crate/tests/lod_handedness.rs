@@ -306,6 +306,7 @@ fn reference_glb_aabb_matches_assembly() {
             &client,
             &scene,
             &placements,
+            &[],
             1,
             Some(&cache),
             MatLane::default(),

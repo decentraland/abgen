@@ -98,7 +98,8 @@ pub fn inventory(data: &[u8]) -> Result<BundleInventory> {
                         mips: get("m_MipCount"),
                     };
                     inv.textures += 1;
-                    inv.texture_pixels += (entry.width.max(0) as u64) * (entry.height.max(0) as u64);
+                    inv.texture_pixels +=
+                        (entry.width.max(0) as u64) * (entry.height.max(0) as u64);
                     inv.texture_list.push(entry);
                 }
                 C_MESH => {
@@ -207,7 +208,10 @@ mod tests {
         assert_eq!(d.vertices, -100);
         assert_eq!(d.triangles, -100);
         assert!((d.vertices_pct + 10.0).abs() < 1e-9);
-        assert_eq!(ours.delta_from(&BundleInventory::default()).vertices_pct, 0.0);
+        assert_eq!(
+            ours.delta_from(&BundleInventory::default()).vertices_pct,
+            0.0
+        );
     }
 
     #[test]

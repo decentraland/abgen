@@ -911,7 +911,9 @@ fn compare_reference(
 }
 
 fn attach_references(record: &mut SceneRecord, opts: &Options) {
-    let Some(cdn) = &opts.reference_cdn else { return };
+    let Some(cdn) = &opts.reference_cdn else {
+        return;
+    };
     if record.artifacts.is_empty() {
         return;
     }
@@ -1397,7 +1399,12 @@ mod tests {
         }
     }
 
-    fn reference(found: bool, materials: i64, textures: i64, error: Option<&str>) -> ReferenceRecord {
+    fn reference(
+        found: bool,
+        materials: i64,
+        textures: i64,
+        error: Option<&str>,
+    ) -> ReferenceRecord {
         ReferenceRecord {
             level: 1,
             platform: "mac".to_string(),
@@ -1423,7 +1430,10 @@ mod tests {
             "https://ab-cdn.example/".into(),
         ])
         .unwrap();
-        assert_eq!(opts.reference_cdn.as_deref(), Some("https://ab-cdn.example"));
+        assert_eq!(
+            opts.reference_cdn.as_deref(),
+            Some("https://ab-cdn.example")
+        );
         assert!(parse(&["--reference-cdn".into(), "ab-cdn.example".into()]).is_err());
     }
 
@@ -1432,7 +1442,10 @@ mod tests {
         let mut a = record(job("a"), true);
         a.reference = vec![reference(true, 0, 0, None), reference(true, 1, 0, None)];
         let mut b = record(job("b"), true);
-        b.reference = vec![reference(false, 0, 0, None), reference(false, 0, 0, Some("boom"))];
+        b.reference = vec![
+            reference(false, 0, 0, None),
+            reference(false, 0, 0, Some("boom")),
+        ];
         let summary = reference_summary(&[a, b, record(job("c"), false)]);
         assert_eq!(summary.compared, 4);
         assert_eq!(summary.found, 2);
@@ -1453,7 +1466,10 @@ mod tests {
             ..options("noref-artifacts")
         };
         attach_references(&mut rec, &with_cdn);
-        assert!(rec.reference.is_empty(), "no artifacts => nothing to compare");
+        assert!(
+            rec.reference.is_empty(),
+            "no artifacts => nothing to compare"
+        );
     }
 
     fn serve<F>(requests: usize, handler: F) -> String
