@@ -107,7 +107,11 @@ const __modules = {
       __abgen.sendToRenderer(data instanceof Uint8Array ? data : new Uint8Array(data));
       return { data: [] };
     },
-    isServer: async () => ({ isServer: true }),
+    // Answer as a client: scenes with SDK7's server/client split (Genesis
+    // Plaza among them) spawn their visual content — the GltfContainers the
+    // LOD exists to capture — only on clients. Answering `true` left such
+    // scenes with zero placements (scene-lod-entities-manifest-builder#19).
+    isServer: async () => ({ isServer: false }),
     ECS6ComponentAttachToAvatar_AttachToAvatarAnchorPointId: {},
     ECS6ComponentCameraModeArea_CameraMode: {},
     ECS6ComponentNftShape_PictureFrameStyle: {},

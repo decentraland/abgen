@@ -319,7 +319,7 @@ module.exports.onStart = async function () {{
   if (state.hasEntities) failures.push('hasEntities');
   if (state.data.length !== 4) failures.push('stateParts=' + state.data.length);
   const server = await engineApi.isServer();
-  if (!server.isServer) failures.push('isServer');
+  if (server.isServer !== false) failures.push('isServer');
   const rf = await require('~system/Runtime').readFile({{ fileName: 'blob.bin' }});
   if (new Uint8Array(rf.content).length !== 3) failures.push('readFile');
   if (rf.hash !== 'hblob') failures.push('readFileHash=' + rf.hash);
