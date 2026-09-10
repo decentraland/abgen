@@ -802,6 +802,38 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         }
     }
 
+    // The published GLB (gltfpack layout: KHR_mesh_quantization u16 positions
+    // dequantized by the mesh node's translation/scale, i8 normals, u16
+    // texcoords dequantized by KHR_texture_transform) is what production's
+    // Unity converter imported, so it is also what the bundles are built
+    // from: the Unity mesh carries the quantized integers and the transform
+    // carries the dequantization, exactly like the CDN's bundles, and LZ4
+    // packs the low-entropy vertex data the same way (Genesis Plaza: 2.42 MB
+    // from the float GLB vs 1.95 MB from this one, production 1.82 MB).
+    // Level 0 has no published GLB and stays on its float bake.
+    let scene_dir = PathBuf::from(&params.out_dir).join(&sid);
+    let t = std::time::Instant::now();
+    let mut published: HashMap<u32, (PathBuf, u64, usize)> = HashMap::new();
+    let mut sources: Vec<String> = Vec::with_capacity(staged.len());
+    for (level, staged_glb, _, _) in &staged {
+        if *level == 0 {
+            sources.push(staged_glb.to_string_lossy().into_owned());
+            continue;
+        }
+        let float_glb = std::fs::read(staged_glb)
+            .with_context(|| format!("read staged glb {}", staged_glb.display()))?;
+        let path = lods::write_published_glb(&scene_dir, &sid, *level, &float_glb)?;
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        log.push(format!(
+            "publish[{level}]: {} ({bytes} bytes, from {} float bytes) is the bundle input",
+            path.display(),
+            float_glb.len()
+        ));
+        sources.push(path.to_string_lossy().into_owned());
+        published.insert(*level, (path, bytes, float_glb.len()));
+    }
+    let publish_ms = t.elapsed().as_millis();
+
     let opts = lods::LodOptions {
         platform: primary.clone(),
         lod: Some(lods::LodGenMeta {
@@ -813,45 +845,10 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         }),
         ..Default::default()
     };
-    let sources: Vec<String> = staged
-        .iter()
-        .map(|(_, p, _, _)| p.to_string_lossy().into_owned())
-        .collect();
     let t_package = std::time::Instant::now();
-    let scene_dir = PathBuf::from(&params.out_dir).join(&sid);
-    let (conv, mut published, bundle_ms) = std::thread::scope(|scope| -> Result<_> {
-        let jobs: Vec<_> = staged
-            .iter()
-            .filter(|(level, _, _, _)| *level >= 1)
-            .map(|(level, staged_glb, _, _)| {
-                let level = *level;
-                let scene_dir = &scene_dir;
-                let sid = &sid;
-                (
-                    level,
-                    scope.spawn(move || -> Result<(PathBuf, u64, usize)> {
-                        let float_glb = std::fs::read(staged_glb)
-                            .with_context(|| format!("read staged glb {}", staged_glb.display()))?;
-                        let path = lods::write_published_glb(scene_dir, sid, level, &float_glb)?;
-                        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                        Ok((path, bytes, float_glb.len()))
-                    }),
-                )
-            })
-            .collect();
-        let t_bundle = std::time::Instant::now();
-        let conv =
-            lods::convert_lods_platforms(&client, &sources, &params.out_dir, &opts, &platforms)?;
-        let bundle_ms = t_bundle.elapsed().as_millis();
-        let mut published = HashMap::with_capacity(jobs.len());
-        for (level, job) in jobs {
-            let result = job
-                .join()
-                .map_err(|_| anyhow!("published GLB worker panicked"))??;
-            published.insert(level, result);
-        }
-        Ok((conv, published, bundle_ms))
-    })?;
+    let t_bundle = std::time::Instant::now();
+    let conv = lods::convert_lods_platforms(&client, &sources, &params.out_dir, &opts, &platforms)?;
+    let bundle_ms = t_bundle.elapsed().as_millis();
     let package_ms = t_package.elapsed().as_millis();
     let t_finalize = std::time::Instant::now();
     if !conv.skipped.is_empty() {
@@ -1020,7 +1017,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         io.network_requests, io.network_bytes, io.cache_hits, io.cache_bytes
     ));
     log.push(format!(
-        "timing: placements_ms={placements_ms} assemble_ms={assemble_ms} atlas_ms={atlas_ms} emit_ms={emit_ms} simplify_ms={simplify_ms} bundle_ms={bundle_ms} package_ms={package_ms} finalize_ms={finalize_ms} total_ms={}",
+        "timing: placements_ms={placements_ms} assemble_ms={assemble_ms} atlas_ms={atlas_ms} emit_ms={emit_ms} simplify_ms={simplify_ms} publish_ms={publish_ms} bundle_ms={bundle_ms} package_ms={package_ms} finalize_ms={finalize_ms} total_ms={}",
         t_total.elapsed().as_millis()
     ));
 

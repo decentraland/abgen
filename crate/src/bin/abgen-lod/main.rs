@@ -249,8 +249,14 @@ generate/placements/assemble run without node: abgen executes the current
   deployment's SDK in-process (QuickJS) and derives every placement from the
   state the scene reaches after its simulated frames.
 generate: the full sync chain: resolve scene -> independently derive placements
-  -> assemble -> crop -> atlas -> simplify -> bundle via the LOD build mode
-  into {out}/{sceneId}/LOD/{level}/{sceneId}_{level}_{platform}, plus
+  -> assemble -> crop -> atlas -> simplify -> publish the gltfpack-layout GLB
+  ({out}/{sceneId}/lods-unity/lods/{sceneId}_{level}.glb: KHR_mesh_quantization
+  u16 positions dequantized by the mesh node transform, i8 normals, u16
+  texcoords dequantized by KHR_texture_transform) -> bundle THAT GLB via the
+  LOD build mode into {out}/{sceneId}/LOD/{level}/{sceneId}_{level}_{platform}
+  (the Unity mesh carries the quantized integers and the transform the
+  dequantization, as production's bundles do; the float bake is only the
+  intermediate), plus
   {out}/{sceneId}/LOD.manifest.json. --level takes a comma-separated list (default 1, the
   production level set; level 2 is refused; production stopped emitting
   it): every level shares

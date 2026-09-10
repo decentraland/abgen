@@ -1,7 +1,9 @@
 //! Published-GLB writer: re-encodes a float LOD GLB into the layout gltfpack
 //! 1.1 emits for production's `lods-unity/lods/{id}_1.glb` so validate-lod
 //! style metrics (fileSize, triangleCount, meshCount, materialCount) compare
-//! like with like. The UnityFS bundles keep being built from the float GLB.
+//! like with like. The UnityFS bundles are built from this layout as well, so
+//! the Unity mesh carries the quantized integers and the mesh node carries
+//! the dequantization, exactly as production's bundles do.
 //!
 //! Layout: one mesh, one primitive per material; `POSITION` as unnormalized
 //! `u16` (14-bit range) dequantized by the mesh node's `translation`/`scale`;
