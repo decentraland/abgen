@@ -31,14 +31,20 @@ pub const KHR_TEXTURE_TRANSFORM: &str = "KHR_texture_transform";
 pub const POSITION_BITS: u32 = 14;
 /// gltfpack default `-vn 8`: normals are normalized `i8` (`-127..=127`).
 pub const NORMAL_BITS: u32 = 8;
-/// Texcoords use the whole normalized `u16` range; gltfpack (`-vt 12`) stores
-/// 12 of the 16 bits and folds the ratio into the transform scale. Same byte
-/// size, 16x finer UVs.
-pub const TEXCOORD_BITS: u32 = 16;
+/// gltfpack default `-vt 12`: texcoords use 12 of the normalized `u16`'s bits
+/// (`q` in `0..=4095`, 4096 steps across the material's UV range — 8 per texel
+/// on the 512 px LOD atlas) and the `65535 / 4095` ratio is folded into the
+/// texture transform's scale, so the mesh holds the same values production's
+/// does and compresses the same way. The full 16 bits were 16x finer at the
+/// same byte size, but no consumer exists past the atlas's own resolution.
+pub const TEXCOORD_BITS: u32 = 12;
 
 const POSITION_MAX: f64 = ((1u32 << POSITION_BITS) - 1) as f64;
 const NORMAL_MAX: f64 = ((1u32 << (NORMAL_BITS - 1)) - 1) as f64;
 const TEXCOORD_MAX: f64 = ((1u32 << TEXCOORD_BITS) - 1) as f64;
+/// Normalized `u16` reads back as `q / 65535`; the transform scale carries
+/// this factor so `offset + (q / 65535) * scale` spans the material's range.
+const TEXCOORD_SCALE_RATIO: f64 = 65535.0 / TEXCOORD_MAX;
 const U16_VERTEX_LIMIT: usize = 65535;
 
 const COMPONENT_BYTE: u32 = 5120;
@@ -101,7 +107,9 @@ impl PositionQuant {
 }
 
 /// Per-material texcoord dequantization carried by `KHR_texture_transform`:
-/// `uv = offset + (q / 65535) * scale`.
+/// `uv = offset + (q / TEXCOORD_MAX) * scale`, written as
+/// `offset + (q / 65535) * (scale * TEXCOORD_SCALE_RATIO)` because the
+/// accessor is a normalized `u16`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TexcoordQuant {
     pub offset: [f32; 2],
@@ -301,7 +309,10 @@ fn apply_texture_transform(info: &mut Value, uv: &TexcoordQuant) -> Result<()> {
         return Ok(());
     };
     let mut offset = [uv.offset[0] as f64, uv.offset[1] as f64];
-    let mut scale = [uv.scale[0] as f64, uv.scale[1] as f64];
+    let mut scale = [
+        uv.scale[0] as f64 * TEXCOORD_SCALE_RATIO,
+        uv.scale[1] as f64 * TEXCOORD_SCALE_RATIO,
+    ];
     let exts = obj
         .entry("extensions".to_string())
         .or_insert_with(|| json!({}));
