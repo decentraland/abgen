@@ -26,7 +26,7 @@ There is also a wasm build: `crate/abgen-wasm/` compiles the converter to wasm32
 | `abgen-build` | single-file local converter CLI (glb -> bundle, `--expect-hash` verify) |
 | `abgen-corpus` | batch corpus builder: manifest / `--entity-ids` (add `--fetch-missing` to pull content from a catalyst) / `--world <name>[,...]` (resolve + fetch + convert a world; upstream via `--worlds-url` or `ABGEN_WORLDS_URL`) / `--live-mode` / `--collection-urn` / `--from-reference`; full-corpus runbook in [docs/BATCH.md](docs/BATCH.md) |
 | `abgen-verify` | parity differ (ours vs reference bundles, ppm-bits, `--tolerant`) |
-| `abgen-lod` | LOD lane CLI: `bundle`, `placements`, `assemble`, `atlas`, `simplify`, `generate`, `compare` (structural diff of two LOD bundles: materials/textures/vertices/triangles, local or CDN URL), `qualify-corpus` (Genesis City + Worlds corpus build; `--reference-cdn` records the same diff against production per scene) |
+| `abgen-lod` | LOD lane CLI: `bundle`, `placements`, `assemble`, `atlas`, `simplify`, `generate`, `compare` (structural diff of two LOD bundles: materials/textures/vertices/triangles plus a per-material property diff — shader, keywords, render queue, floats, clipping colours, texture bindings; local or CDN URL), `qualify-corpus` (Genesis City + Worlds corpus build; `--reference-cdn` records the same diff against production per scene) |
 | `abgen-lambda` | AWS Lambda handler (deployment event in, bundles + manifests to S3; from the `lambda/` workspace member) - see [lambda/README.md](lambda/README.md) |
 
 Plus bundle-inspection examples (`texdump`, `matdump`, `objdump`) under

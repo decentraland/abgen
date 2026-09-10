@@ -1,4 +1,4 @@
-use abgen::lodgen::inventory::load_locator;
+use abgen::lodgen::inventory::{diff_materials, load_locator, MaterialDiff};
 use abgen::lodgen::{gate_failures, BundleInventory, GenerateParams, InventoryDelta};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
@@ -81,6 +81,10 @@ struct ReferenceRecord {
     ours: Option<BundleInventory>,
     reference: Option<BundleInventory>,
     delta: Option<InventoryDelta>,
+    /// Per-material property diff (shader, keywords, render queue, floats,
+    /// clipping colours, texture bindings) — what `SetLODShaderMaterial`
+    /// wrote on the production side vs ours.
+    materials: Option<MaterialDiff>,
     error: Option<String>,
 }
 
@@ -155,6 +159,8 @@ struct ReferenceSummary {
     errors: usize,
     materials_match: usize,
     textures_match: usize,
+    /// Bundles whose paired materials agree on every shared property.
+    materials_identical: usize,
 }
 
 #[derive(Serialize)]
@@ -883,6 +889,7 @@ fn compare_reference(
         ours: None,
         reference: None,
         delta: None,
+        materials: None,
         error: None,
     };
     let ours = std::fs::read(ours_path)
@@ -901,6 +908,7 @@ fn compare_reference(
             Ok(inv) => {
                 record.found = true;
                 record.delta = record.ours.as_ref().map(|ours| ours.delta_from(&inv));
+                record.materials = record.ours.as_ref().map(|ours| diff_materials(ours, &inv));
                 record.reference = Some(inv);
             }
             Err(error) => record.error = Some(format!("reference: {error:#}")),
@@ -943,6 +951,7 @@ fn reference_summary(records: &[SceneRecord]) -> ReferenceSummary {
         errors: 0,
         materials_match: 0,
         textures_match: 0,
+        materials_identical: 0,
     };
     for reference in records.iter().flat_map(|record| &record.reference) {
         summary.compared += 1;
@@ -960,6 +969,13 @@ fn reference_summary(records: &[SceneRecord]) -> ReferenceSummary {
             if delta.textures == 0 {
                 summary.textures_match += 1;
             }
+        }
+        if reference
+            .materials
+            .as_ref()
+            .is_some_and(MaterialDiff::identical)
+        {
+            summary.materials_identical += 1;
         }
     }
     summary
@@ -1277,7 +1293,7 @@ pub fn run(argv: &[String]) -> Result<i32> {
     );
     if let Some(reference) = &report.summary.reference {
         println!(
-            "reference {}: {} compared, {} found, {} missing, {} errors; materials match {}/{}, textures match {}/{}",
+            "reference {}: {} compared, {} found, {} missing, {} errors; materials match {}/{}, textures match {}/{}, material properties identical {}/{}",
             opts.reference_cdn.as_deref().unwrap_or_default(),
             reference.compared,
             reference.found,
@@ -1286,6 +1302,8 @@ pub fn run(argv: &[String]) -> Result<i32> {
             reference.materials_match,
             reference.found,
             reference.textures_match,
+            reference.found,
+            reference.materials_identical,
             reference.found
         );
     }
@@ -1417,6 +1435,7 @@ mod tests {
                 textures,
                 ..Default::default()
             }),
+            materials: None,
             error: error.map(str::to_string),
         }
     }
@@ -1441,6 +1460,12 @@ mod tests {
     fn reference_summary_buckets_found_missing_errors_and_matches() {
         let mut a = record(job("a"), true);
         a.reference = vec![reference(true, 0, 0, None), reference(true, 1, 0, None)];
+        a.reference[0].materials = Some(MaterialDiff::default());
+        a.reference[1].materials = Some(MaterialDiff {
+            matched: 1,
+            mismatches: vec!["glass: _ZWrite ours=0 ref=1".to_string()],
+            ..Default::default()
+        });
         let mut b = record(job("b"), true);
         b.reference = vec![
             reference(false, 0, 0, None),
@@ -1453,6 +1478,7 @@ mod tests {
         assert_eq!(summary.errors, 1);
         assert_eq!(summary.materials_match, 1);
         assert_eq!(summary.textures_match, 2);
+        assert_eq!(summary.materials_identical, 1);
     }
 
     #[test]

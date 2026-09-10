@@ -111,10 +111,16 @@ USAGE:
 compare: structural diff of two LOD bundles, each a local path or an http(s)
   URL (e.g. https://ab-cdn.decentraland.org/LOD/1/{sid}_1_mac): material,
   texture, mesh, vertex and triangle counts, bytes, and the per-texture
-  format/size lists side by side, with ours-minus-reference deltas. No byte
-  parity is implied (production textures went through a JPEG q85 round-trip
-  and gltfpack's simplifier, ours do not). --json prints the two inventories
-  and the delta as JSON. Exits 0 whenever both bundles parse.
+  format/size lists side by side, with ours-minus-reference deltas; then a
+  per-material diff pairing materials by name and comparing everything the
+  production converter's SetLODShaderMaterial writes (shader pptr, keyword
+  set, render queue, RenderType tag, every saved float, colour vectors incl.
+  _PlaneClipping/_VerticalClipping/_BaseColor, texture slot bindings with
+  tiling/offset). Properties declared on one side only are counted, not
+  flagged. No byte parity is implied (production textures went through a
+  JPEG q85 round-trip and gltfpack's simplifier, ours do not). --json prints
+  both inventories, the per-side texture/material detail, the delta and the
+  material diff. Exits 0 whenever both bundles parse.
 qualify-corpus: snapshots active Genesis City deployments from the configured
   Catalyst and all deployed scenes from the paginated Worlds API, converts
   immutable entity hashes into scratch output with bounded workers, rechecks
@@ -123,11 +129,12 @@ qualify-corpus: snapshots active Genesis City deployments from the configured
   snapshot-stability failure produces exit status 1. --reference-cdn BASE
   additionally fetches the production bundle at
   BASE/LOD/{level}/{sid}_{level}_{platform} for every built level/platform
-  and records a `compare`-style inventory of both sides plus the delta under
-  each scene's `reference` list (a 404 is recorded as found=false, a fetch
-  error as an error string; neither fails the scene). The summary counts
-  compared/found/missing/errors and how many bundles match production on
-  material count and on texture count.
+  and records a `compare`-style inventory of both sides, the delta and the
+  per-material property diff under each scene's `reference` list (a 404 is
+  recorded as found=false, a fetch error as an error string; neither fails
+  the scene). The summary counts compared/found/missing/errors, how many
+  bundles match production on material count and on texture count, and how
+  many agree on every shared material property.
 
 bundle: stages <src.glb> as {entityIdLower}_{level}.glb and builds
   {out}/{entityIdLower}/LOD/{level}/{entityIdLower}_{level}_{platform}.
@@ -977,7 +984,7 @@ fn cmd_simplify(argv: &[String]) -> Result<i32> {
 }
 
 fn cmd_compare(argv: &[String]) -> Result<i32> {
-    use abgen::lodgen::inventory::{load_locator, BundleInventory};
+    use abgen::lodgen::inventory::{diff_materials, load_locator, BundleInventory};
 
     let mut positional: Vec<String> = Vec::new();
     let mut json = false;
@@ -1000,15 +1007,20 @@ fn cmd_compare(argv: &[String]) -> Result<i32> {
     let ours = load(ours_loc)?;
     let reference = load(ref_loc)?;
     let delta = ours.delta_from(&reference);
+    let materials = diff_materials(&ours, &reference);
 
     if json {
-        let textures = |inv: &BundleInventory| {
-            serde_json::to_value(&inv.texture_list).expect("serialize texture list")
+        let detail = |inv: &BundleInventory| {
+            serde_json::json!({
+                "textures": inv.texture_list,
+                "materials": inv.material_list,
+            })
         };
         let out = serde_json::json!({
-            "ours": { "locator": ours_loc, "inventory": ours, "textures": textures(&ours) },
-            "reference": { "locator": ref_loc, "inventory": reference, "textures": textures(&reference) },
+            "ours": { "locator": ours_loc, "inventory": ours, "detail": detail(&ours) },
+            "reference": { "locator": ref_loc, "inventory": reference, "detail": detail(&reference) },
             "delta": delta,
+            "materials": materials,
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(0);
@@ -1044,6 +1056,24 @@ fn cmd_compare(argv: &[String]) -> Result<i32> {
                 t.name, t.format, t.width, t.height, t.mips
             );
         }
+    }
+    println!(
+        "materials: {} paired, {} only ours {:?}, {} only reference {:?}, {} shared-property mismatch(es); \
+         properties declared on one side only: ours {} reference {}",
+        materials.matched,
+        materials.only_ours.len(),
+        materials.only_ours,
+        materials.only_reference.len(),
+        materials.only_reference,
+        materials.mismatches.len(),
+        materials.props_only_ours,
+        materials.props_only_reference
+    );
+    for m in &materials.mismatches {
+        println!("  {m}");
+    }
+    if materials.identical() {
+        println!("materials: IDENTICAL on every shared property");
     }
     Ok(0)
 }
