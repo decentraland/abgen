@@ -329,6 +329,9 @@ pub struct ManifestPlacements {
     /// Distinct gltf srcs with no content hash; every placement of such a
     /// src is dropped (`StaticSceneDescriptorBuilder.missingHashes`).
     pub unresolved_src: usize,
+    /// The srcs behind `unresolved_src`, as the scene wrote them, in
+    /// first-seen order — so a failure names what the deployment lacks.
+    pub unresolved_srcs: Vec<String>,
     /// Placements dropped because the entity's own VisibilityComponent says
     /// `visible == false` (never inherited from a parent).
     pub invisible_skipped: usize,
@@ -379,6 +382,7 @@ pub(crate) fn placements_from_components(
     for (src, entities) in groups {
         let Some(hash) = lowered.get(&src.to_lowercase()) else {
             out.unresolved_src += 1;
+            out.unresolved_srcs.push(src);
             continue;
         };
         for eid in entities {

@@ -84,19 +84,35 @@ fn finish_sdk_placements(
     }
     if full.unresolved_src > 0 {
         bail!(
-            "scene {} SDK output is incomplete: {} unresolved glTF sources",
+            "scene {} SDK output is incomplete: {} unresolved glTF sources {}",
             ent.entity_id,
-            full.unresolved_src
+            full.unresolved_src,
+            unresolved_summary(&full.unresolved_srcs)
         );
     }
     eprintln!(
-        "source: embedded-scene-runtime ({} placements, {} primitives, {} mesh-renderer skipped, {} unresolved src)",
+        "source: embedded-scene-runtime ({} placements, {} primitives, {} mesh-renderer skipped, {} unresolved src{})",
         full.placements.len(),
         full.primitives.len(),
         full.skipped_mesh_renderer,
-        full.unresolved_src
+        full.unresolved_src,
+        if full.unresolved_srcs.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", unresolved_summary(&full.unresolved_srcs))
+        }
     );
     Ok(full)
+}
+
+/// Up to the first ten unresolved srcs, bracketed, for error/log lines.
+fn unresolved_summary(srcs: &[String]) -> String {
+    const SHOWN: usize = 10;
+    let mut shown: Vec<String> = srcs.iter().take(SHOWN).map(|s| format!("{s:?}")).collect();
+    if srcs.len() > SHOWN {
+        shown.push(format!("… +{}", srcs.len() - SHOWN));
+    }
+    format!("[{}]", shown.join(", "))
 }
 
 fn acquire_placements_independently(
