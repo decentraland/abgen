@@ -165,7 +165,8 @@ pub(super) fn build_lod_material_tree(
     // own property name, so `_BaseColor` is the shader default, white, and
     // only the transparent class overrides its alpha (LODConversion.cs:527).
     // The bake has already folded the factor into the atlas texels. Fidelity
-    // keeps the per-texel alpha instead of the constant 0.8.
+    // keeps the per-texel alpha instead of the constant 0.8. The regular
+    // material lane gamma-encodes the factor instead (materials.rs).
     let lod_base_color = [
         1.0,
         1.0,

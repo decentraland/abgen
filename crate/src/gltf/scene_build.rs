@@ -787,8 +787,10 @@ pub(super) fn parse_impl(
         let sk_joints: Vec<usize> = jarr(sk, "joints")
             .map(|a| a.iter().map(|v| v.as_i64().unwrap() as usize).collect())
             .unwrap_or_default();
+        // inverseBindMatrices live in the buffers, which a classify-only parse may not
+        // have; texture roles never depend on them, so identity poses stand in.
         let bind_poses: Vec<[f64; 16]> = match ji(sk, "inverseBindMatrices") {
-            Some(a) => read_accessor(gltf, buffers, a)
+            Some(a) if !classify => read_accessor(gltf, buffers, a)
                 .iter()
                 .map(|m| {
                     let mut arr = [0.0f64; 16];
@@ -798,7 +800,7 @@ pub(super) fn parse_impl(
                     mesh_layout::convert_bind_matrix(arr)
                 })
                 .collect(),
-            None => sk_joints
+            _ => sk_joints
                 .iter()
                 .map(|_| {
                     [
