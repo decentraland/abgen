@@ -72,13 +72,11 @@ USAGE:
   abgen-lod bundle <src.glb> --entity <entityId> [--level 1]
             [--platform windows|mac|linux] [--out DIR] [--catalyst URL]
             [--base X,Y --parcels 'x,y;x,y;...'] [--timestamp N] [--vertical-clip H]
-  abgen-lod placements (--coords X,Y | --scene <entityId>) [--iss auto|off]
-            [--catalyst URL] [--diff-iss ISS.json [--tol 1e-3]]
+  abgen-lod placements (--coords X,Y | --scene <entityId>) [--iss auto|off]            [--catalyst URL] [--diff-iss ISS.json [--tol 1e-3]]
   abgen-lod parse-manifest <manifest.json> --scene <pointer|entityId>
             [--catalyst URL] [--diff-iss ISS.json [--tol 1e-3]]
   abgen-lod assemble (--scene <entityId|X,Y> | --entity-json FILE) -o out.glb
-            [--catalyst URL] [--iss auto|off] [--cache DIR] [--level 1]
-            [--no-crop] [--no-atlas] [--raw-materials] [--max-size 256]
+            [--catalyst URL] [--iss auto|off] [--cache DIR] [--level 1]            [--no-crop] [--no-atlas] [--raw-materials] [--max-size 256]
             [--padding 2] [--atlas-fixed] [--atlas-adaptive]
   abgen-lod atlas -i in.glb -o out.glb [--max-size 256] [--padding 2]
             [--atlas-mode meshbaker|native|adaptive|fullbleed]
@@ -107,7 +105,6 @@ USAGE:
             [--attempts 3] [--snapshot-passes 8]
             [--shard-count N --shard-index I]
             [--reference-cdn https://ab-cdn.decentraland.org]
-
 compare: structural diff of two LOD bundles, each a local path or an http(s)
   URL (e.g. https://ab-cdn.decentraland.org/LOD/1/{sid}_1_mac): material,
   texture, mesh, vertex and triangle counts, bytes, and the per-texture
@@ -135,6 +132,14 @@ qualify-corpus: snapshots active Genesis City deployments from the configured
   the scene). The summary counts compared/found/missing/errors, how many
   bundles match production on material count and on texture count, and how
   many agree on every shared material property.
+Unresolved glTF sources: a scene whose code names a model file its deployment
+  does not ship (a filename drift, or a bare identifier that was never a file)
+  is built without those entities. The parser never had a content hash for
+  them, the Explorer renders nothing there, and production's
+  StaticSceneDescriptorBuilder skips them the same way (missingHashes). A WARN
+  names the files, the qualify-corpus report records them per scene
+  (placements.unresolved_src / unresolved_srcs), and the ISS descriptor never
+  carries them downstream. A scene with nothing renderable left still fails.
 
 bundle: stages <src.glb> as {entityIdLower}_{level}.glb and builds
   {out}/{entityIdLower}/LOD/{level}/{entityIdLower}_{level}_{platform}.

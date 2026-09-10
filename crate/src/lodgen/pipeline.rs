@@ -66,6 +66,12 @@ pub fn acquire_placements(
 /// is handed to the runtime as initial state; scene code then adds, moves and removes
 /// entities, so the LOD wants the state after the runtime's simulated frames
 /// (`scenerun::driver`: start + 90 timed updates), which only execution produces.
+/// A GltfContainer naming a file the deployment does not ship is not fatal:
+/// the parser has already dropped those entities (production's
+/// `StaticSceneDescriptorBuilder` does the same via `missingHashes`, and the
+/// Explorer renders nothing for them), so the LOD is built from what
+/// resolves, the names are logged and recorded, and the ISS descriptor never
+/// carries them downstream. Only a scene with nothing renderable left fails.
 fn finish_sdk_placements(
     ent: &Scene,
     executed: Result<Option<placements::ManifestPlacements>>,
@@ -83,8 +89,9 @@ fn finish_sdk_placements(
         );
     }
     if full.unresolved_src > 0 {
-        bail!(
-            "scene {} SDK output is incomplete: {} unresolved glTF sources {}",
+        eprintln!(
+            "WARN: scene {} references {} glTF source(s) its deployment does not ship; \
+             building without them {}",
             ent.entity_id,
             full.unresolved_src,
             unresolved_summary(&full.unresolved_srcs)
@@ -282,6 +289,9 @@ pub struct GenerateOutcome {
     pub scene_id: String,
     pub source_tris: usize,
     pub placement_stats: PlacementStats,
+    /// glTF srcs the scene named that its deployment lacks; their entities
+    /// were dropped before assembly and never reach the ISS descriptor.
+    pub unresolved_srcs: Vec<String>,
     pub levels: Vec<LevelBuild>,
     pub gate: Vec<GateCheck>,
     pub log: Vec<String>,
@@ -619,6 +629,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     let placements_ms = t.elapsed().as_millis();
     let placements = acquired.placements;
     let primitives = acquired.primitives;
+    let unresolved_srcs = acquired.unresolved_srcs;
     log.push(format!("placement-source: {placement_source}"));
     log.push(format!("placements: {}", placements.len()));
     log.push(format!(
@@ -1018,6 +1029,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         scene_id: conv.scene_id.clone(),
         source_tris,
         placement_stats,
+        unresolved_srcs,
         levels: level_builds,
         gate,
         log,
@@ -1072,7 +1084,7 @@ mod placement_policy_tests {
     }
 
     #[test]
-    fn sdk_failure_empty_and_incomplete_results_are_rejected() {
+    fn sdk_failure_and_empty_results_are_rejected_unresolved_srcs_are_not() {
         let executable = scene("7", Some("bin/index.js"));
         assert!(
             finish_sdk_placements(&executable, Err(anyhow!("runtime failed")))
@@ -1088,12 +1100,22 @@ mod placement_policy_tests {
             .unwrap_err()
             .to_string()
             .contains("zero placements"));
+
+        // A model the deployment lacks: its entities were already dropped by
+        // the parser; the rest is built and the names travel with the result.
         let mut incomplete = manifest(1);
         incomplete.unresolved_src = 1;
-        assert!(finish_sdk_placements(&executable, Ok(Some(incomplete)))
+        incomplete.unresolved_srcs = vec!["models/gone.glb".to_string()];
+        let built = finish_sdk_placements(&executable, Ok(Some(incomplete))).unwrap();
+        assert_eq!(built.placements.len(), 1);
+        assert_eq!(built.unresolved_srcs, vec!["models/gone.glb".to_string()]);
+        // ...unless nothing renderable is left.
+        let mut only_missing = manifest(0);
+        only_missing.unresolved_src = 2;
+        assert!(finish_sdk_placements(&executable, Ok(Some(only_missing)))
             .unwrap_err()
             .to_string()
-            .contains("incomplete"));
+            .contains("zero placements"));
 
         // MeshRenderers that named no shape are counted, not fatal
         let mut skipped = manifest(1);

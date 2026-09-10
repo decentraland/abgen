@@ -1504,9 +1504,50 @@ mod conformance {
         let got =
             parse_lod_manifest_full(&serde_json::to_vec(&fixture).unwrap(), &content).unwrap();
         assert_eq!(got.unresolved_src, 2);
+        assert_eq!(
+            got.unresolved_srcs,
+            vec!["models/gone.glb".to_string(), "models/Gone.glb".to_string()]
+        );
         assert_eq!(got.placements.len(), 1);
         assert_eq!(got.placements[0].glb_hash.as_deref(), Some("hhere"));
         assert!(got.placements.iter().all(|p| p.glb_hash.is_some()));
+    }
+
+    /// The downstream contract: a model the deployment lacks never reaches
+    /// the ISS descriptor the Explorer consumes — neither as an asset entry
+    /// nor as a dangling file name.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn unresolved_src_never_reaches_the_iss_descriptor() {
+        let fixture = serde_json::json!([
+            {"entityId": 1, "componentName": "core::GltfContainer", "data": {"src": "models/gone.glb"}},
+            {"entityId": 2, "componentName": "core::GltfContainer", "data": {"src": "models/here.glb"}},
+            {"entityId": 3, "componentName": "core::GltfContainer", "data": {"src": "sittingChair1"}}
+        ]);
+        let mut content = HashMap::new();
+        content.insert("models/here.glb".to_string(), "hhere".to_string());
+        let got =
+            parse_lod_manifest_full(&serde_json::to_vec(&fixture).unwrap(), &content).unwrap();
+        assert_eq!(got.unresolved_src, 2);
+
+        let out = std::env::temp_dir().join(format!(
+            "abgen-iss-unresolved-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (path, written, skipped) =
+            super::super::write_iss_descriptor(&out, "scene", &got.placements, &content).unwrap();
+        assert_eq!((written, skipped), (1, 0));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let assets = doc["assets"].as_array().unwrap();
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0]["hash"], "hhere");
+        assert!(!text.contains("gone.glb") && !text.contains("sittingChair"));
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]

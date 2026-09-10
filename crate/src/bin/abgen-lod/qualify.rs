@@ -117,6 +117,10 @@ struct PlacementRecord {
     non_uniform_scale: usize,
     mirrored: usize,
     extreme_scale: usize,
+    /// glTF srcs the scene named that its deployment lacks; their entities
+    /// were dropped before assembly and are absent from the ISS descriptor.
+    unresolved_src: usize,
+    unresolved_srcs: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -809,6 +813,8 @@ fn run_one_attempt(job: &Job, opts: &Options) -> Result<SceneRecord> {
             non_uniform_scale: placements.non_uniform_scale,
             mirrored: placements.mirrored,
             extreme_scale: placements.extreme_scale,
+            unresolved_src: outcome.unresolved_srcs.len(),
+            unresolved_srcs: outcome.unresolved_srcs.clone(),
         }),
         material_count: gate_count(&outcome.gate, ":material-count"),
         texture_count: gate_count(&outcome.gate, ":texture-count"),
@@ -1402,6 +1408,8 @@ mod tests {
                 non_uniform_scale: 0,
                 mirrored: 0,
                 extreme_scale: 0,
+                unresolved_src: 0,
+                unresolved_srcs: Vec::new(),
             }),
             material_count: 1,
             texture_count: 1,
