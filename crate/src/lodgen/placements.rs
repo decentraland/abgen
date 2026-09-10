@@ -1333,18 +1333,18 @@ mod conformance {
         let full = check(LOUNGE_MANIFEST, LOUNGE_ISS, LOUNGE_CONTENT, 52);
         assert_eq!(full.invisible_skipped, 0);
         assert_eq!(full.unresolved_src, 0);
-        // 148 boxes + 8 planes, all visible; 6 scene-file textures of which 3 are not
-        // in the entity's content (AHL_1, AHL_head, ROWSIL_BLACK).
+        // 148 boxes + 8 planes, all visible; 6 scene-file textures (AHL_1, AHL_head,
+        // ROWSIL_BLACK, kairos, kairos_amargo, rabbit), all present in the entity content.
         assert_eq!(full.mesh_renderers, 156);
         assert_eq!(full.skipped_mesh_renderer, 0);
         assert_eq!(full.primitives.len(), 156);
-        assert_eq!(full.missing_textures, 3);
+        assert_eq!(full.missing_textures, 0);
         let textured = full
             .primitives
             .iter()
             .filter(|p| p.material.texture.is_some())
             .count();
-        assert_eq!(textured, 3);
+        assert_eq!(textured, 6);
         let near_minus_two = full
             .placements
             .iter()
