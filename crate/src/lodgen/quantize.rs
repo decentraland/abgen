@@ -11,7 +11,10 @@
 //! by a `KHR_texture_transform` offset/scale on every texture of the
 //! primitive's material; images first in the buffer, then one interleaved
 //! bufferView per vertex stream shared by all primitives; nodes
-//! `LOD > MeshBaker-mesh-mesh > mesh`; `scenes[0].name` = scene id.
+//! `LOD > mesh`; `scenes[0].name` = scene id. Production's gltfpack output
+//! carries an extra `MeshBaker-mesh-mesh` node between the two (its Unity
+//! bake's combined object); abgen drops it — it holds no transform, so the
+//! grouping level is inert, and the bundle is one GameObject lighter.
 
 use std::collections::BTreeMap;
 
@@ -21,7 +24,6 @@ use serde_json::{json, Map, Value};
 use crate::lodgen::model::{self, LodPrimitive};
 
 pub const GENERATOR: &str = "abgen-lod";
-pub const MESH_NODE_NAME: &str = "MeshBaker-mesh-mesh";
 pub const ROOT_NODE_NAME: &str = "LOD";
 pub const KHR_MESH_QUANTIZATION: &str = "KHR_mesh_quantization";
 pub const KHR_TEXTURE_TRANSFORM: &str = "KHR_texture_transform";
@@ -652,7 +654,7 @@ pub fn write_gltfpack_layout(float_glb: &[u8], scene_id: &str) -> Result<Vec<u8>
     root.insert("scene".to_string(), json!(0));
     root.insert(
         "scenes".to_string(),
-        json!([{"name": scene_id, "nodes": [2]}]),
+        json!([{"name": scene_id, "nodes": [1]}]),
     );
     let scale = f32_json(quant.scale);
     root.insert(
@@ -667,8 +669,7 @@ pub fn write_gltfpack_layout(float_glb: &[u8], scene_id: &str) -> Result<Vec<u8>
                 ],
                 "scale": [scale.clone(), scale.clone(), scale],
             },
-            {"name": MESH_NODE_NAME, "children": [0]},
-            {"name": ROOT_NODE_NAME, "children": [1]},
+            {"name": ROOT_NODE_NAME, "children": [0]},
         ]),
     );
     root.insert("meshes".to_string(), json!([{"primitives": primitives}]));
@@ -951,15 +952,14 @@ mod tests {
             json!([KHR_MESH_QUANTIZATION, KHR_TEXTURE_TRANSFORM])
         );
         assert_eq!(json["scene"], 0);
-        assert_eq!(json["scenes"], json!([{"name": sid, "nodes": [2]}]));
+        assert_eq!(json["scenes"], json!([{"name": sid, "nodes": [1]}]));
         let nodes = json["nodes"].as_array().unwrap();
-        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0]["mesh"], 0);
         assert!(nodes[0].get("name").is_none());
         assert_eq!(nodes[0]["translation"].as_array().unwrap().len(), 3);
         assert_eq!(nodes[0]["scale"].as_array().unwrap().len(), 3);
-        assert_eq!(nodes[1], json!({"name": MESH_NODE_NAME, "children": [0]}));
-        assert_eq!(nodes[2], json!({"name": ROOT_NODE_NAME, "children": [1]}));
+        assert_eq!(nodes[1], json!({"name": ROOT_NODE_NAME, "children": [0]}));
 
         let meshes = json["meshes"].as_array().unwrap();
         assert_eq!(meshes.len(), 1);
