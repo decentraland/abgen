@@ -16,7 +16,7 @@ use pack::pack_skyline;
 use pack::{pack_bucket, Packed};
 use tile::{
     average_color, emissive_pixels, emissive_solid, emissive_tile, fused_repeat_bake, glows,
-    intern_tile, mr_average, mr_pixels, mr_solid_bytes, mr_solid_tile, mr_tile,
+    intern_tile, is_identity_tint, mr_average, mr_pixels, mr_solid_bytes, mr_solid_tile, mr_tile,
     premultiplied_filtering, prim_area, solid_color, solid_tile, tint_bits, tinted_pixels, uv_plan,
     Bucket, EmisKey, MrKey, Tile, TileKey, UvMap, UvPlan,
 };
@@ -296,6 +296,9 @@ pub fn atlas_with_rects(
                 };
                 let mkey = mrkey_solid;
                 let color = solid_color(mat.base_color);
+                // No source image behind this tile: a pass-through copy of some
+                // other material's texture would drop it entirely.
+                bucket.needs_bake = true;
                 let ti = intern_tile(
                     bucket,
                     TileKey::Solid(color, ekey.clone(), mkey.clone()),
@@ -344,6 +347,9 @@ pub fn atlas_with_rects(
                         emis: ekey.clone(),
                         mr: mkey.clone(),
                     };
+                    if !is_identity_tint(mat.base_color) {
+                        bucket.needs_bake = true;
+                    }
                     let ti = intern_tile(bucket, key, || {
                         let tinted = tinted_pixels(img, mat.base_color);
                         let (px, w, h) = fused_repeat_bake(
@@ -391,6 +397,8 @@ pub fn atlas_with_rects(
                 }
                 UvPlan::Fallback => {
                     bucket.fallbacks += 1;
+                    // Collapsed to a solid tile - again nothing a source copy holds.
+                    bucket.needs_bake = true;
                     log.push(format!(
                         "atlas: WARN fallback prim {pi} material {:?}: non-finite uvs, collapsed to average-color tile",
                         mat.name
@@ -473,7 +481,8 @@ pub fn atlas_with_rects(
                 let passthrough = mode == AtlasMode::MeshBaker
                     && !any_glow
                     && ci != METAL_BUCKET
-                    && bucket.sources.len() == 1;
+                    && bucket.sources.len() == 1
+                    && !bucket.needs_bake;
                 if passthrough {
                     let &(idx, w, h) = bucket.sources.values().next().unwrap();
                     if w.max(h) > tile_cap {

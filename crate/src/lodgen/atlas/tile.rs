@@ -154,6 +154,14 @@ pub(super) struct Bucket {
     /// image hash -> (model image index, width, height). Drives MeshBaker's
     /// natural-size sum and the single-texture pass-through.
     pub(super) sources: HashMap<String, (usize, u32, u32)>,
+    /// Set once this bucket holds anything a verbatim copy of its single
+    /// source texture cannot reproduce: a base-colour tint folded into a tile,
+    /// or a solid-colour tile that has no source image behind it at all.
+    /// `sources` is keyed by image hash alone, so without this a mask shared by
+    /// several differently-tinted materials still counts as one source and the
+    /// pass-through ships it untinted - Hall of Fame's green/pink/yellow leaves
+    /// all collapsing to the bare white `Leaf_Mask4` silhouette.
+    pub(super) needs_bake: bool,
     pub(super) met_sum: f64,
     pub(super) rough_sum: f64,
     pub(super) met_tris: f64,
@@ -181,6 +189,12 @@ pub(super) fn prim_area(p: &LodPrimitive) -> f64 {
 
 pub(super) fn tint_bits(c: [f64; 4]) -> [u64; 4] {
     c.map(|v| v.to_bits())
+}
+
+/// The tint `tinted_pixels` treats as a no-op, and so the only one a verbatim
+/// source copy reproduces.
+pub(super) fn is_identity_tint(c: [f64; 4]) -> bool {
+    c.map(|v| v.clamp(0.0, 1.0)) == [1.0; 4]
 }
 
 pub(super) fn srgb_encode(v: f64) -> f64 {

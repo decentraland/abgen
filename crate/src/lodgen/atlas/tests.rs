@@ -992,6 +992,66 @@ fn meshbaker_single_texture_passes_through() {
 }
 
 #[test]
+fn shared_mask_with_per_material_tints_is_baked_not_passed_through() {
+    // Hall of Fame's foliage: one colourless Leaf_Mask silhouette shared by
+    // LeafGreen/LeafPink/LeafYellow, each carrying its colour only in
+    // baseColorFactor. `sources` keys on the image hash alone, so the bucket
+    // still sees a single source - it has to bake anyway, or every leaf in the
+    // scene ships as the bare white mask.
+    let mut mask = RgbaImage::new(16, 16);
+    for (x, _y, p) in mask.enumerate_pixels_mut() {
+        *p = if x < 8 {
+            image::Rgba([255, 255, 255, 255])
+        } else {
+            image::Rgba([255, 255, 255, 0])
+        };
+    }
+    let png = png_bytes(&mask);
+    let m = model_of(
+        vec![
+            mat(
+                "LeafGreen",
+                AlphaClass::Mask,
+                [0.036_888_62, 0.496_933_52, 0.337_163_78, 1.0],
+                Some(0),
+            ),
+            mat(
+                "LeafPink",
+                AlphaClass::Mask,
+                [1.0, 0.057_805_28, 0.254_152_18, 1.0],
+                Some(0),
+            ),
+        ],
+        vec![prim(0, tri_uvs()), prim(1, tri_uvs())],
+        vec![png.clone()],
+    );
+    let out = atlas_with(&m, 2048, 2, AtlasMode::MeshBaker, false).unwrap();
+    assert_ne!(
+        out.images[0].bytes, png,
+        "a tinted bucket must not ship the untinted source"
+    );
+    let line = log_line(&out, "class=mask");
+    assert!(!line.contains("passthrough"), "{line}");
+
+    let canvas = decode(&out.images[0]);
+    let mut shades: Vec<[u8; 3]> = canvas
+        .pixels()
+        .filter(|p| p.0[3] > 0)
+        .map(|p| [p.0[0], p.0[1], p.0[2]])
+        .collect();
+    shades.sort_unstable();
+    shades.dedup();
+    assert!(
+        shades.len() >= 2,
+        "both leaf tints must survive into the canvas: {shades:?}"
+    );
+    assert!(
+        !shades.contains(&[255, 255, 255]),
+        "a tinted leaf stayed white: {shades:?}"
+    );
+}
+
+#[test]
 fn meshbaker_passthrough_honours_atlas_max() {
     // the pass-through cap is min(1024, --atlas-max): a 1024 source under
     // --atlas-max 256 ships at 256, a non-square one keeps its aspect
