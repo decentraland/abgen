@@ -73,9 +73,22 @@ pub fn plane_clipping(parcels: &[(i32, i32)]) -> [f64; 4] {
     ]
 }
 
+/// Slack below the ground plane, mirroring the 0.05 margin `plane_clipping`
+/// already gives the horizontal planes. Production ships a hard 0.0 floor, but a
+/// scene floor sits at exactly y = 0 - the same plane it is clipped against - so
+/// interpolated world-y lands either side of it across a large quad and a share
+/// of the fragments clip. The floor then reads as translucent rather than
+/// missing. Dropping the plane just under the ground keeps whole floors; real
+/// sunken geometry (kerbs, foundations) still clips the way production clips it.
+pub const VERTICAL_CLIP_SLACK: f64 = 0.05;
+
 pub fn vertical_clipping(n_parcels: usize) -> [f64; 4] {
+    // An unresolved scene zeroes every clipping vector, slack included.
+    if n_parcels == 0 {
+        return [0.0; 4];
+    }
     let height = 20.0f32 * crate::detmath::log2f((n_parcels + 1) as f32);
-    [0.0, height as f64, 0.0, 0.0]
+    [-VERTICAL_CLIP_SLACK, height as f64, 0.0, 0.0]
 }
 
 pub fn client_placement(base: (i32, i32)) -> [f64; 3] {
@@ -304,7 +317,7 @@ fn build_lod_bundles(
         level,
         plane_clipping: plane_clipping(&meta.parcels),
         vertical_clipping: match meta.vertical_override {
-            Some(h) => [0.0, h, 0.0, 0.0],
+            Some(h) => [-VERTICAL_CLIP_SLACK, h, 0.0, 0.0],
             None => vertical_clipping(meta.parcels.len()),
         },
         root_position: root_position(meta.base),
@@ -727,14 +740,14 @@ mod tests {
 
     #[test]
     fn vertical_clipping_matches_height_limit_formula() {
-        assert_eq!(vertical_clipping(1), [0.0, 20.0, 0.0, 0.0]);
+        assert_eq!(vertical_clipping(1), [-VERTICAL_CLIP_SLACK, 20.0, 0.0, 0.0]);
         let v = vertical_clipping(70);
         assert!(
             (v[1] - 122.99493).abs() < 1e-3,
             "vertical_clipping(70)[1] = {}",
             v[1]
         );
-        assert_eq!(v[0], 0.0);
+        assert_eq!(v[0], -VERTICAL_CLIP_SLACK);
         assert_eq!(v[2], 0.0);
         assert_eq!(v[3], 0.0);
     }

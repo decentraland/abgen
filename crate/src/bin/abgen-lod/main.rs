@@ -469,7 +469,7 @@ fn cmd_bundle(argv: &[String]) -> Result<i32> {
     );
     let plane = lods::plane_clipping(&parcel_list);
     let vertical = match vertical_clip {
-        Some(h) => [0.0, h, 0.0, 0.0],
+        Some(h) => [-lods::VERTICAL_CLIP_SLACK, h, 0.0, 0.0],
         None => lods::vertical_clipping(parcel_list.len()),
     };
     println!(
