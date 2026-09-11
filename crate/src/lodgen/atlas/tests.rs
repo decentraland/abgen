@@ -891,11 +891,14 @@ fn bucket_by_alpha_mode() {
 #[test]
 fn meshbaker_single_texture_passes_through() {
     let png = flat_image(64, 32, [10, 200, 30, 255]);
+    // Every material has to be an untinted user of the one source texture: a
+    // tint or an untextured solid is colour a verbatim copy cannot carry, and
+    // the bucket bakes instead - see the two tests below.
     let m = model_of(
         vec![
             mat("a", AlphaClass::Opaque, [1.0; 4], Some(0)),
-            mat("b", AlphaClass::Opaque, [0.5, 0.5, 0.5, 1.0], Some(0)),
-            mat("c", AlphaClass::Opaque, [0.2, 0.4, 0.6, 1.0], None),
+            mat("b", AlphaClass::Opaque, [1.0; 4], Some(0)),
+            mat("c", AlphaClass::Opaque, [1.0; 4], Some(0)),
         ],
         vec![
             prim(0, vec![[0.0, 0.0], [3.0, 0.0], [0.0, 3.0]]),
@@ -989,6 +992,29 @@ fn meshbaker_single_texture_passes_through() {
         assert!((*got as i32 - want as i32).abs() <= 1, "{px:?}");
     }
     assert!(log_line(&out3, "class=mask").contains("passthrough=source-texture"));
+}
+
+#[test]
+fn untextured_solid_in_the_bucket_is_baked_not_passed_through() {
+    // One textured material plus an untextured one. `sources` counts image
+    // hashes, so the bucket still sees a single source - but shipping that
+    // source verbatim drops the solid material's colour entirely.
+    let png = flat_image(64, 32, [10, 200, 30, 255]);
+    let m = model_of(
+        vec![
+            mat("textured", AlphaClass::Opaque, [1.0; 4], Some(0)),
+            mat("solid", AlphaClass::Opaque, [0.2, 0.4, 0.6, 1.0], None),
+        ],
+        vec![prim(0, tri_uvs()), prim(1, tri_uvs())],
+        vec![png.clone()],
+    );
+    let out = atlas_with(&m, 2048, 2, AtlasMode::MeshBaker, false).unwrap();
+    assert_ne!(
+        out.images[0].bytes, png,
+        "a bucket carrying a solid tile must not ship the source verbatim"
+    );
+    let line = log_line(&out, "class=opaque");
+    assert!(!line.contains("passthrough"), "{line}");
 }
 
 #[test]
