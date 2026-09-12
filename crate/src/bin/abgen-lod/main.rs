@@ -648,14 +648,15 @@ fn cmd_parse_manifest(argv: &[String]) -> Result<i32> {
     let full = abgen::lodgen::placements::parse_lod_manifest_full(&bytes, &ent.content_by_file())?;
     eprintln!(
         "source: manifest ({} placements, {} primitives, {} mesh-renderer skipped, {} missing textures, \
-         {} unresolved src, {} invisible skipped, {} excluded src)",
+         {} unresolved src, {} invisible skipped, {} excluded src, {} invisible volumes)",
         full.placements.len(),
         full.primitives.len(),
         full.skipped_mesh_renderer,
         full.missing_textures,
         full.unresolved_src,
         full.invisible_skipped,
-        full.excluded_src
+        full.excluded_src,
+        full.invisible_volume_skipped
     );
     if let Some(reference) = diff_iss {
         return report_iss_diff(&full.placements, &reference, tol);
