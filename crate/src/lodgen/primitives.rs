@@ -122,6 +122,24 @@ impl Default for PrimitiveMaterial {
     }
 }
 
+impl PrimitiveMaterial {
+    /// True when the material can never put a pixel on screen: a blended surface whose
+    /// colour is fully transparent, with no texture that could carry an alpha of its own.
+    ///
+    /// Scenes build invisible collision and trigger volumes this way — a box scaled to the
+    /// whole scene, drawn with `albedoColor.a == 0` — and the player never sees them.
+    /// Production's Unity pipeline read only `GltfContainer`, so it never met one; the LOD
+    /// does, and keeping them costs bytes and leaves a ghost surface around the scene
+    /// (Hall of Fame's 32 x 20 x 32 box, found 2026-09-11).
+    ///
+    /// A resolved texture keeps the primitive even at `a == 0`, since the sampled texel
+    /// supplies the alpha. A texture the deployment does not ship resolves to `None`, which
+    /// is also what the explorer renders: colour only, so fully transparent there too.
+    pub fn draws_nothing(&self) -> bool {
+        matches!(self.class, AlphaClass::Blend) && self.texture.is_none() && self.color[3] <= 0.0
+    }
+}
+
 /// One MeshRenderer entity, resolved to a world TRS in descriptor (Unity) space.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PrimitivePlacement {
@@ -1308,6 +1326,59 @@ mod tests {
             "texture": {"tex": {"$case": "videoTexture", "videoTexture": {"videoPlayerEntity": 512}}}
         }}});
         assert!(material_from_json(&video).unwrap().texture.is_none());
+    }
+
+    #[test]
+    fn draws_nothing_only_for_untextured_fully_transparent_blends() {
+        let hash = "bafkreitex".to_string();
+        let mut lowered: HashMap<String, &String> = HashMap::new();
+        lowered.insert("images/a.png".to_string(), &hash);
+
+        // The invisible volume: AUTO + alpha 0 resolves to BLEND, and nothing supplies alpha.
+        let volume = MaterialFields {
+            pbr: true,
+            color: Some([0.0, 0.0, 0.0, 0.0]),
+            ..Default::default()
+        };
+        let (m, _) = resolve_material(Some(&volume), &lowered);
+        assert_eq!(m.class, AlphaClass::Blend);
+        assert!(m.draws_nothing());
+
+        // A resolved texture keeps it: the sampled texel carries the alpha.
+        let textured = MaterialFields {
+            texture: Some(TextureFields {
+                src: "images/a.png".to_string(),
+                wrap_mode: Some(0),
+            }),
+            ..volume.clone()
+        };
+        assert!(!resolve_material(Some(&textured), &lowered).0.draws_nothing());
+
+        // A texture the deployment does not ship falls back to colour only, which is what
+        // the explorer draws too — still nothing.
+        let absent = MaterialFields {
+            texture: Some(TextureFields {
+                src: "images/gone.png".to_string(),
+                wrap_mode: Some(0),
+            }),
+            ..volume.clone()
+        };
+        let (m, missing) = resolve_material(Some(&absent), &lowered);
+        assert!(missing);
+        assert!(m.draws_nothing());
+
+        // Alpha 0 under an explicit OPAQUE mode still draws; so does a merely faint blend.
+        let opaque_zero = MaterialFields {
+            transparency_mode: Some(TRANSPARENCY_OPAQUE),
+            ..volume.clone()
+        };
+        assert!(!resolve_material(Some(&opaque_zero), &lowered).0.draws_nothing());
+        let faint = MaterialFields {
+            color: Some([1.0, 1.0, 1.0, 0.02]),
+            ..volume
+        };
+        assert!(!resolve_material(Some(&faint), &lowered).0.draws_nothing());
+        assert!(!PrimitiveMaterial::default().draws_nothing());
     }
 
     #[test]

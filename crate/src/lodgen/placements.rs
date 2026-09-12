@@ -337,6 +337,9 @@ pub struct ManifestPlacements {
     pub invisible_skipped: usize,
     /// Placements dropped by `EXCLUDED_GLTF_SRCS`.
     pub excluded_src: usize,
+    /// Primitives dropped because their material can never draw a pixel
+    /// (`PrimitiveMaterial::draws_nothing`): invisible collision and trigger volumes.
+    pub invisible_volume_skipped: usize,
 }
 
 /// `StaticSceneDescriptorBuilder.Build` over the LWW-folded components of
@@ -416,6 +419,13 @@ pub(crate) fn placements_from_components(
         let (material, missing) = primitives::resolve_material(materials.get(&eid), &lowered);
         if missing {
             out.missing_textures += 1;
+        }
+        // An invisible volume contributes nothing but bytes and artifacts; drop it before
+        // it reaches the geometry. Counted apart from `skipped_mesh_renderer`, which means
+        // "no usable MeshRenderer", not "nothing to draw".
+        if material.draws_nothing() {
+            out.invisible_volume_skipped += 1;
+            continue;
         }
         let world = world_matrix(eid, &transforms, &mut HashSet::new());
         let d = decompose_unity(&world);
@@ -1094,6 +1104,66 @@ mod tests {
         assert_eq!(cube.material.class, super::super::model::AlphaClass::Blend);
         assert!(cube.material.texture.is_none());
         assert_eq!(cube.position, [0.0; 3]);
+    }
+
+    #[test]
+    fn fully_transparent_untextured_primitive_is_dropped() {
+        // 700: the invisible-volume shape — a box with albedoColor alpha 0 and no texture.
+        // 701: same alpha, but a texture that resolves, so the texel supplies the alpha.
+        // 702: alpha 0 on an OPAQUE transparency mode, which the explorer still draws.
+        let fixture = serde_json::json!([
+            {
+                "entityId": 700,
+                "componentName": "core::MeshRenderer",
+                "data": {"mesh": {"$case": "box", "box": {"uvs": []}}}
+            },
+            {
+                "entityId": 700,
+                "componentName": "core::Material",
+                "data": {"material": {"$case": "pbr", "pbr": {
+                    "albedoColor": {"r": 0, "g": 0, "b": 0, "a": 0}
+                }}}
+            },
+            {
+                "entityId": 701,
+                "componentName": "core::MeshRenderer",
+                "data": {"mesh": {"$case": "box", "box": {"uvs": []}}}
+            },
+            {
+                "entityId": 701,
+                "componentName": "core::Material",
+                "data": {"material": {"$case": "pbr", "pbr": {
+                    "texture": {"tex": {"$case": "texture", "texture": {"src": "images/wood.png", "wrapMode": 0}}},
+                    "albedoColor": {"r": 1, "g": 1, "b": 1, "a": 0}
+                }}}
+            },
+            {
+                "entityId": 702,
+                "componentName": "core::MeshRenderer",
+                "data": {"mesh": {"$case": "box", "box": {"uvs": []}}}
+            },
+            {
+                "entityId": 702,
+                "componentName": "core::Material",
+                "data": {"material": {"$case": "pbr", "pbr": {
+                    "albedoColor": {"r": 1, "g": 1, "b": 1, "a": 0},
+                    "transparencyMode": 0
+                }}}
+            }
+        ]);
+        let mut content = HashMap::new();
+        content.insert("images/wood.png".to_string(), "bafkreiwood".to_string());
+        let got =
+            parse_lod_manifest_full(&serde_json::to_vec(&fixture).unwrap(), &content).unwrap();
+        assert_eq!(got.mesh_renderers, 3);
+        assert_eq!(got.invisible_volume_skipped, 1);
+        assert_eq!(got.skipped_mesh_renderer, 0);
+        assert_eq!(got.primitives.len(), 2);
+        assert!(got.primitives[0].material.texture.is_some());
+        assert_eq!(
+            got.primitives[1].material.class,
+            super::super::model::AlphaClass::Opaque
+        );
     }
 
     #[test]

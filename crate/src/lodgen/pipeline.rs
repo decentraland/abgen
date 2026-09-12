@@ -633,11 +633,12 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     log.push(format!("placement-source: {placement_source}"));
     log.push(format!("placements: {}", placements.len()));
     log.push(format!(
-        "primitives: {} (mesh-renderers={} skipped={} missing-textures={})",
+        "primitives: {} (mesh-renderers={} skipped={} missing-textures={} invisible-volumes={})",
         primitives.len(),
         acquired.mesh_renderers,
         acquired.skipped_mesh_renderer,
-        acquired.missing_textures
+        acquired.missing_textures,
+        acquired.invisible_volume_skipped
     ));
     if placements.is_empty() && primitives.is_empty() {
         bail!(
