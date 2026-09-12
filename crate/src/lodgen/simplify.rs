@@ -30,7 +30,7 @@ pub const LADDER_ERROR_RUNGS: [f64; 4] = [0.03, 0.1, 0.3, 1.0];
 const GLTFPACK_DEFAULT_SE: f64 = 0.01;
 
 pub const GLTFPACK_NIX_RECIPE: &str =
-    "nix-shell -p meshoptimizer --run 'gltfpack -i <in.glb> -o <out.glb> -si 0.1 -noq'";
+    "nix-shell -p meshoptimizer --run 'gltfpack -i <in.glb> -o <out.glb> -si 0.1 -se 0.01 -kn -noq'";
 
 pub const SUBPROC_TIMEOUT_ENV: &str = "ABGEN_LOD_SUBPROC_TIMEOUT_S";
 
@@ -242,13 +242,29 @@ fn run_gltfpack(
     permissive: bool,
     error_limit: Option<f64>,
 ) -> Result<()> {
+    run_gltfpack_argv(
+        gltfpack,
+        input,
+        output,
+        simplify_args(ratio, aggressive, permissive, error_limit),
+        &format!("-si {ratio}{}", if aggressive { " -sa" } else { "" }),
+    )
+}
+
+fn run_gltfpack_argv(
+    gltfpack: &Path,
+    input: &Path,
+    output: &Path,
+    args: Vec<String>,
+    label: &str,
+) -> Result<()> {
     let mut cmd = Command::new(gltfpack);
     cmd.arg("-i").arg(input).arg("-o").arg(output);
-    cmd.args(simplify_args(ratio, aggressive, permissive, error_limit));
+    cmd.args(args);
     let out = run_with_deadline(
         cmd,
         subproc_deadline(),
-        &format!("gltfpack -si {ratio} ({})", gltfpack.display()),
+        &format!("gltfpack {label} ({})", gltfpack.display()),
     )
     .with_context(|| {
         format!(
@@ -258,14 +274,61 @@ fn run_gltfpack(
     })?;
     if !out.status.success() {
         bail!(
-            "gltfpack -si {ratio}{} failed ({}): {}{}",
-            if aggressive { " -sa" } else { "" },
+            "gltfpack {label} failed ({}): {}{}",
             out.status,
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
     }
     Ok(())
+}
+
+/// Production's gltfpack arguments for the `SimplifyPolicy::GltfpackSi` lane:
+/// `-si <ratio> -se <target_error> -kn -noq` (one quality pass per mesh, nodes
+/// kept so meshes are not merged before decimation, no quantization because
+/// the bundle builder re-reads float attributes).
+pub fn si_args(ratio: f32, target_error: f32) -> Vec<String> {
+    vec![
+        "-si".to_string(),
+        format!("{ratio}"),
+        "-se".to_string(),
+        format!("{target_error}"),
+        "-kn".to_string(),
+        "-noq".to_string(),
+    ]
+}
+
+/// `SimplifyPolicy::GltfpackSi` on the gltfpack backend: a single
+/// `-si <ratio> -se <target_error> -kn -noq` run, no cap ladder and no class
+/// rescue; `ratio >= 1` copies the input through.
+pub fn simplify_si(
+    input: &Path,
+    output: &Path,
+    ratio: f32,
+    target_error: f32,
+    gltfpack: &Path,
+) -> Result<SimplifyReport> {
+    let tris_before = glb_tris(input)?;
+    if ratio >= 1.0 {
+        let mut report = passthrough(input, output)?;
+        report.policy = "gltfpack-si";
+        return Ok(report);
+    }
+    run_gltfpack_argv(
+        gltfpack,
+        input,
+        output,
+        si_args(ratio, target_error),
+        &format!("-si {ratio} -se {target_error} -kn"),
+    )?;
+    let tris_after = glb_tris(output)?;
+    Ok(SimplifyReport {
+        tris_before,
+        tris_after,
+        ratios_run: vec![ratio as f64],
+        policy: "gltfpack-si",
+        ..Default::default()
+    })
 }
 
 fn glb_tris(path: &Path) -> Result<usize> {

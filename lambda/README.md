@@ -64,7 +64,8 @@ all hits.
 | `ABGEN_REDIS_URL` | — (off) | `redis://host[:port]` (or `rediss://…` for TLS) — enables the shared hit-cache in front of S3 existence probes (see below) |
 | `ABGEN_REDIS_TTL_SECONDS` | `86400` | TTL on cached positive probes |
 | `ABGEN_HTTP_SECRET` | — (**fail-closed**) | shared secret the Function URL POST path requires in `x-abgen-secret`; unset means every HTTP invocation is refused with `503` |
-| `ENABLE_LODS` | off | generate LOD levels 0+1 for `lods` jobs instead of acking and skipping them (see [LOD jobs](#lod-jobs)) |
+| `ENABLE_LODS` | off | generate `LOD_LEVELS` for `lods` jobs instead of acking and skipping them (see [LOD jobs](#lod-jobs)) |
+| `LOD_LEVELS` | `1` | comma-separated LOD levels the LOD lane builds and publishes (`0,1` for both); level 2 is refused |
 | `ALLOWED_CONTENT_SERVER_HOSTS` | — (**fail-open**) | comma-separated allowlist of hosts an event's `contentServerUrl` may name; **unset means any https host is accepted**, so every deployment should set it. Scheme/shape validation (https only, no userinfo) applies regardless — allowlist or not, a plaintext or internal-IP URL is rejected. The `lambdaImage` bakes in `peer.decentraland.org`; a function env var overrides it. |
 | `ABGEN_EMF_NAMESPACE` | — (off) | CloudWatch namespace for EMF metrics (e.g. `abgen/lambda`); unset means no recorder is installed and every `metrics::` call stays a no-op |
 | `ABGEN_LOG_FORMAT` | plain text | `json` for JSON log lines |
@@ -228,8 +229,16 @@ extra dimensions.
 | wearable & emote bundles (entity-scoped) | `{AB_VERSION}/{entityId}/{bundleName}` |
 | manifests | `manifest/{entityId}_{platform}.json` |
 | scene sources (`main.crdt`, `scene.json`, main script; clean scene builds) | `{AB_VERSION}/{entityId}/{file}` |
-| LOD bundles (+ `.br`), `ENABLE_LODS=1` only | `LOD/{level}/{sceneId}_{level}_{platform}` |
-| ISS descriptor (+ `.br`), `ENABLE_LODS=1` only | `lods-unity/manifests/{sceneId}_InitialSceneState.json` |
+| LOD bundles, `ENABLE_LODS=1` | `LOD/{level}/{sceneId}_{level}_{platform}` |
+| ISS descriptor, `ENABLE_LODS=1` | `lods-unity/manifests/{sceneId}_InitialSceneState.json` |
+| published LOD GLB (gltfpack layout, level 1 only), `ENABLE_LODS=1` | `lods-unity/lods/{sceneId}_1.glb` |
+
+The three LOD families are the production key set (consumer-server keys plus
+the converter's `LOD/1` bundles); `lods::published_objects` lists them for
+the live lane. Production publishes level 1 only — level 0
+is the client-side ISS assembly — so `LOD/0` is opt-in: the abcdn JIT lane
+builds `LOD_LEVELS = [1]`, `abgen-lod generate` takes `--level 0,1`, and the
+lambda's level set is the `LOD_LEVELS` env var (default `1`).
 
 ## Container image & Lambda settings
 
@@ -278,12 +287,10 @@ scene sources (`.js`/`.json`/`.crdt`) the direct-upload spelling
 (`lods-unity/manifests/…`) are `public, max-age=31536000` — the
 lod-generator-unity storage adapter's `CACHE_CONTROL_ONE_YEAR`, whose keys
 these are (they embed the content-addressed entity id; they are *not*
-rewritten-in-place consumer-server manifests). `.br` objects additionally
-carry `Content-Encoding: br`, like every brotli variant cdn-uploader
-writes. That is origin-level defense in depth — **cache policy still must
+rewritten-in-place consumer-server manifests).
+That is origin-level defense in depth — **cache policy still must
 live on the CDN distribution**: long/immutable TTLs for `{AB_VERSION}/…`
-(keys are content-addressed) and TTL 0 for `manifest/…`. No `.br` siblings
-of asset bundles (see step 3 note above). Two remaining divergences from
+(keys are content-addressed) and TTL 0 for `manifest/…`. No `.br` siblings of native AssetBundles or LOD artifacts (see step 3 note above). Two remaining divergences from
 cdn-uploader, both deliberate: no `decompressed-content-length` object
 metadata, and no `ACL: public-read` (grant reads via bucket policy /
 CloudFront OAC, not object ACLs).
@@ -310,16 +317,18 @@ shape bypasses the already-converted skip.
 
 A deployment event with a `lods` array is a LOD job. Those URLs point at the
 legacy Unity generator's **FBX** sources; abgen has no FBX importer, so it
-does not transcode them. With `ENABLE_LODS=1` the handler instead
-*regenerates* the LODs from the scene entity through the same `lodgen` chain
-the abcdn server runs JIT (`abgen-lod generate`): resolve placements (ISS
-descriptor, else the embedded scene runtime) → assemble → crop → atlas →
-simplify → bundle, levels 0 and 1, for every configured platform that has a
-LOD lane (`windows|mac|linux`; `webgl` is dropped with a log line). The
-result passes the same structural self-gate as the JIT lane — a gate failure
-fails the job and publishes nothing — and is then uploaded under the
-unversioned `LOD/…` and `lods-unity/manifests/…` keys above, followed by one
-finished event per platform with `isLods: true` (see
+does not transcode them. With `ENABLE_LODS=1` the handler
+instead *regenerates* the LODs from the scene entity through the same
+`lodgen` chain the abcdn server runs JIT (`abgen-lod generate`): resolve
+placements (ISS descriptor, else the embedded scene runtime) → assemble →
+crop → atlas → simplify → bundle, for every level in `LOD_LEVELS` (default
+`1`; production stopped publishing LOD/0 with the lod-generator-unity
+pipeline — level 0 is the client-side ISS assembly) and every configured
+platform that has a LOD lane (`windows|mac|linux`; `webgl` is dropped with a
+log line). The result passes the same structural self-gate as the JIT lane —
+a gate failure fails the job and publishes nothing — and is then uploaded
+under the unversioned `LOD/…` and `lods-unity/manifests/…` keys above,
+followed by one finished event per platform with `isLods: true` (see
 [Finished events](#finished-events-sns)).
 
 ```bash
@@ -327,16 +336,17 @@ ENABLE_LODS=1 OUT_ROOT=/tmp/ab-out ./target/release/abgen-lambda \
   --once lambda/examples/event-lods.json
 ```
 
-Without `ENABLE_LODS` (the default) LOD jobs are acked and skipped with
-`{"skipped": "lods-disabled"}`, i.e. LOD generation stays on the Unity
-pipeline. Turn it on per environment: a LOD build is a whole-scene bake and
-costs far more CPU/RAM/time than a single-entity conversion, so size the
+Without `ENABLE_LODS` (the default) LOD jobs are acked and
+skipped with `{"skipped": "lods-disabled"}`, i.e. LOD generation stays on the
+Unity pipeline. Turn it on per environment: a LOD build is a whole-scene bake
+and costs far more CPU/RAM/time than a single-entity conversion, so size the
 function (memory, timeout, SQS visibility) for it first.
 
 Known boundaries: level 2 is never emitted (production stopped emitting it),
 the deployment's FBX source URLs are ignored rather than converted, and level
-0 is the ISS-era pass-through bake rather than the retired legacy LOD0 shape
-(same divergence `abgen-lod generate` documents).
+0 (when requested) is the ISS-era pass-through bake rather than the retired
+legacy LOD0 shape (same divergence `abgen-lod generate` documents).
+
 
 ## Partial batch responses
 

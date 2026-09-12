@@ -621,12 +621,20 @@ fn bake_lod(job: &LodJob, sink: &dyn Sink) -> crate::Result<()> {
                 .map(|b| (*b).clone())
                 .ok_or_else(|| crate::anyhow!("content {hash} not in the upload"))
         };
+        // An ISS descriptor never carries primitives, so no texture source can occur.
+        let no_textures = |source: &lodgen::primitives::TextureSource| -> crate::Result<Vec<u8>> {
+            Err(crate::anyhow!(
+                "primitive texture {source:?} has no source in an ISS upload"
+            ))
+        };
         merged = lodgen::assemble::assemble_from(
             &root_name,
             job.content_by_file,
             &file_by_hash,
             &list,
+            &[],
             &fetch,
+            &no_textures,
             lmodel::MatLane::default(),
         )?;
         sources = list.len();
@@ -772,10 +780,6 @@ fn bake_lod(job: &LodJob, sink: &dyn Sink) -> crate::Result<()> {
     sink.emit_output(&bundle_name, &data);
 
     let rel = format!("LOD/{level}/{bundle_name}");
-    sink.emit_output(
-        &format!("{bundle_name}.br"),
-        &crate::compress::brotli(&data)?,
-    );
     let lod_manifest = serde_json::json!({
         "version": crate::manifest::DEFAULT_AB_VERSION,
         "sceneId": sid,
@@ -785,10 +789,6 @@ fn bake_lod(job: &LodJob, sink: &dyn Sink) -> crate::Result<()> {
     });
     let text = serde_json::to_string_pretty(&lod_manifest)?;
     sink.emit_output("LOD.manifest.json", text.as_bytes());
-    sink.emit_output(
-        "LOD.manifest.json.br",
-        &crate::compress::brotli(text.as_bytes())?,
-    );
 
     sink.emit_json(serde_json::json!({
         "ev": "lod-done",
@@ -873,8 +873,6 @@ mod tests {
         assert_eq!(digest(&a), digest(&b));
     }
 
-    /// A distinct-content tiny glTF per tag, so a multi-file scene produces
-    /// distinct bundle names instead of deduping to one.
     fn tiny_gltf_tagged(tag: &str) -> Vec<u8> {
         let base = String::from_utf8(tiny_gltf()).expect("tiny_gltf is utf8");
         base.replace("\"tri\"", &format!("\"tri_{tag}\""))
@@ -903,11 +901,6 @@ mod tests {
         (sink.take(), n)
     }
 
-    /// The whole point of file-level parallelism is that it must be
-    /// invisible from the outside: same bundles, same bytes, same manifest,
-    /// and — because `convert` buffers each file's events and flushes them
-    /// in input order — the exact same JSON event sequence, whether the
-    /// files run one at a time or `jobs` at a time.
     #[test]
     fn concurrency_does_not_change_output_or_event_order() {
         let (serial, n) = convert_multi_glb(1);
@@ -932,16 +925,6 @@ mod tests {
         assert_eq!(serial.manifest, parallel.manifest);
     }
 
-    /// A sink that records `("!raw", sha256(bytes))` when a `Kind::Output`
-    /// event reaches it through the default, framed `emit` path, and
-    /// `(name, sha256(data))` when it reaches it through `emit_output`
-    /// directly — exactly like `abgen-bench`'s `HashSink` and prod's
-    /// `DirSink`, both of which override `emit_output` and never see raw
-    /// `Kind::Output` bytes in normal (serial) operation. This is the
-    /// distinguishing sink that caught round 2's bug: a buffer that only
-    /// ever records/replays through `emit` hands such sinks a framed blob
-    /// on the raw arm instead of the unpacked `(name, data)` pair their
-    /// `emit_output` override expects.
     #[derive(Default)]
     struct DistSink {
         calls: Mutex<Vec<(String, String)>>,
@@ -965,11 +948,6 @@ mod tests {
         }
     }
 
-    /// The exact regression that killed perf/round-2: the buffered replay
-    /// must call the same trait method (`emit_output`, not the default
-    /// `emit`-with-framing) that `convert_one` originally called, so a sink
-    /// overriding `emit_output` sees an identical call sequence whether
-    /// files converted serially or concurrently.
     #[test]
     fn sink_replay_is_trait_method_faithful() {
         let mut b = InputBuilder::new();
@@ -1016,8 +994,6 @@ mod tests {
         );
     }
 
-    /// A tiny 128x128 pseudo-random RGBA PNG, distinct per seed, so each
-    /// model's texture decodes/encodes to different bytes.
     fn noisy_png(seed: u32) -> Vec<u8> {
         let mut img = image::RgbaImage::new(128, 128);
         let mut s = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
@@ -1032,11 +1008,6 @@ mod tests {
         out
     }
 
-    /// A one-triangle glTF with a UV'd, textured material, split into a
-    /// JSON file plus external `.bin` (positions/indices/UVs) and `.png`
-    /// (baseColorTexture) siblings in the same directory — exercises image
-    /// decode and BC7/DXT texture encode in `build_bundle`, not just the
-    /// geometry path `tiny_gltf` covers.
     fn textured_model(dir: &str, tag: &str, seed: u32) -> Vec<(String, Vec<u8>)> {
         let positions: [[f32; 3]; 3] = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let uvs: [[f32; 2]; 3] = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
@@ -1123,9 +1094,6 @@ mod tests {
         sink.take()
     }
 
-    /// Same guarantee as `concurrency_does_not_change_output_or_event_order`,
-    /// but over textured models so the decode + BC7/DXT encode + resS
-    /// layout paths run concurrently, not just plain geometry.
     #[test]
     fn textured_concurrency_matches_serial() {
         let serial = convert_textured_scene(1);
@@ -1148,13 +1116,6 @@ mod tests {
         );
     }
 
-    /// Real-scene reproduction, gated behind `ABGEN_REPRO_SCENE_DIR` so it's
-    /// a no-op (not a failure) when no corpus fixture is provided. Point it
-    /// at a directory containing `_manifest.json` = `[[file, sha256], ...]`
-    /// plus one file per hash (named by hash, content-addressed like a real
-    /// content server), and it converts the resulting scene at jobs=1 vs
-    /// jobs=8 with the texencode/decode caches enabled and cleared between
-    /// runs, then asserts the sorted `(name, sha256)` output lists match.
     #[test]
     fn real_scene_concurrency_repro() {
         let Ok(dir) = std::env::var("ABGEN_REPRO_SCENE_DIR") else {

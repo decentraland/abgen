@@ -44,9 +44,7 @@ pairs() {
 copy_lod() {
   local t="$1" sid="$2" plat="$3" ndir="$4"
   cp "$t/lodout/$sid/LOD/1/${sid}_1_${plat}" "$ndir/${sid}_1_${plat}" &&
-    cp "$t/lodout/$sid/LOD/1/${sid}_1_${plat}.br" "$ndir/${sid}_1_${plat}.br" &&
-    cp "$t/lodout/$sid/LOD.manifest.json" "$ndir/LOD.manifest.json" &&
-    cp "$t/lodout/$sid/LOD.manifest.json.br" "$ndir/LOD.manifest.json.br"
+    cp "$t/lodout/$sid/LOD.manifest.json" "$ndir/LOD.manifest.json"
 }
 
 for fx in $FIXTURES; do
@@ -98,9 +96,7 @@ for fx in $FIXTURES; do
             --platform "$plat" --base 0,0 --parcels "0,0;1,0" \
             --out "$t/lodout" >>"$nlog" 2>&1; then
         cp "$t/lodout/$sid/LOD/1/${sid}_1_${plat}" "$ndir/${sid}_1_${plat}"
-        cp "$t/lodout/$sid/LOD/1/${sid}_1_${plat}.br" "$ndir/${sid}_1_${plat}.br"
         cp "$t/lodout/$sid/LOD.manifest.json" "$ndir/LOD.manifest.json"
-        cp "$t/lodout/$sid/LOD.manifest.json.br" "$ndir/LOD.manifest.json.br"
       else
         sed 's/^/  native-lod: /' "$nlog" >&2
       fi

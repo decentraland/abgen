@@ -155,7 +155,7 @@ pub(super) fn looks_like_normal_map(rgba: &[u8]) -> bool {
     (hits as f64 / n as f64) >= 0.95
 }
 
-pub(super) fn pack_normal_map(rgba: &[u8]) -> Vec<u8> {
+pub(crate) fn pack_normal_map(rgba: &[u8]) -> Vec<u8> {
     let n = rgba.len() / 4;
     let mut out = vec![0u8; n * 4];
     for i in 0..n {
@@ -351,7 +351,7 @@ pub(super) fn standalone_texture_readable(model_referenced: bool, compressed: bo
     !(model_referenced && compressed)
 }
 
-pub(super) fn detect_container(raw: &[u8]) -> String {
+pub(crate) fn detect_container(raw: &[u8]) -> String {
     if raw.len() >= 8 && &raw[0..8] == b"\x89PNG\r\n\x1a\n" {
         "PNG".to_string()
     } else if raw.len() >= 2 && raw[0] == 0xFF && raw[1] == 0xD8 {
@@ -359,6 +359,37 @@ pub(super) fn detect_container(raw: &[u8]) -> String {
     } else {
         String::new()
     }
+}
+
+/// Fills a `tw`x`th` image from a source with a side below
+/// [`texprofile::BC_BLOCK_SIDE`] (the LOD block pad from
+/// [`texprofile::lod_pad_sub_block`]). A side that shrinks is box-filtered
+/// first; a side that grows is filled by texel replication,
+/// `out(x, y) = src(x * sw / tw, y * sh / th)`: a 1-texel side replicates
+/// its edge texel, a 2-texel side doubles each texel, so a UV keeps
+/// addressing the texel it addressed on the source.
+pub(super) fn pad_sub_block_rgba(img: &RgbaImage, tw: u32, th: u32, srgb: bool) -> RgbaImage {
+    let (ow, oh) = img.dimensions();
+    let (dw, dh) = (tw.min(ow), th.min(oh));
+    let shrunk;
+    let base: &RgbaImage = if (dw, dh) != (ow, oh) {
+        let buf = crate::resize::box_downscale_rgba(
+            img.as_raw(),
+            ow as usize,
+            oh as usize,
+            dw as usize,
+            dh as usize,
+            srgb,
+        );
+        shrunk = RgbaImage::from_raw(dw, dh, buf).expect("resize buffer size mismatch");
+        &shrunk
+    } else {
+        img
+    };
+    let (sw, sh) = base.dimensions();
+    RgbaImage::from_fn(tw, th, |x, y| {
+        *base.get_pixel((x * sw / tw).min(sw - 1), (y * sh / th).min(sh - 1))
+    })
 }
 
 pub(super) fn mean_color_image(img: &RgbaImage) -> RgbaImage {
@@ -385,13 +416,6 @@ pub(super) fn mean_color_image(img: &RgbaImage) -> RgbaImage {
     RgbaImage::from_raw(w, h, buf).expect("mean-color buffer size mismatch")
 }
 
-/// Inputs for one deferred per-pixel BC7 slow-profile encode: collected
-/// while building a Texture2D tree instead of encoding inline, so it can be
-/// routed through the cache-aware batch entry point
-/// ([`bc7_pure::encode_bc7_mip_chain_with_profile_batch`]) once every
-/// texture tree for the GLB has been built. Same fields as the arguments
-/// [`encode_texture_bc7`] would otherwise have passed straight through to a
-/// single-request encode.
 pub(super) struct Bc7JobInputs {
     pixels: Vec<u8>,
     width: u32,
@@ -401,25 +425,17 @@ pub(super) struct Bc7JobInputs {
     perceptual: bool,
 }
 
-/// A [`Bc7JobInputs`] tied to the pid of the Texture2D object whose
-/// `m_MipCount` / `m_CompleteImageSize` / `image data` fields it fills in
-/// once the batch encode resolves it.
 pub(super) struct PendingBc7Texture {
     pid: i64,
     job: Bc7JobInputs,
 }
 
-/// Result of building one Texture2D tree: either fully finished (every
-/// path except the plain per-pixel BC7 slow encode), or missing the three
-/// encode-dependent fields pending a batched BC7 encode.
 pub(super) enum TexTree {
     Done(Value),
     Pending(Value, Bc7JobInputs),
 }
 
 impl TexTree {
-    /// Applies a mutation to the underlying tree regardless of which variant
-    /// this is, without disturbing a `Pending` job.
     fn map_value(self, f: impl FnOnce(&mut Value)) -> Self {
         match self {
             TexTree::Done(mut v) => {
@@ -434,17 +450,11 @@ impl TexTree {
     }
 }
 
-/// Either the two encode-dependent bytes/mip-count are already known
-/// (every non-deferred format), or they're waiting on a batched BC7 encode.
 enum DataMips {
     Ready(Vec<u8>, i32),
     Deferred(Bc7JobInputs),
 }
 
-/// Prep half of [`encode_texture_bc7`]: the normal-map detection and
-/// packing, without the encode call. Kept in exact lockstep with
-/// `encode_texture_bc7`'s own inputs so the deferred batch call is
-/// byte-identical to calling that function directly.
 fn bc7_job_inputs(
     img: &RgbaImage,
     mip_count: i32,
@@ -496,8 +506,6 @@ pub(super) fn external_dep_bundle_file(
 }
 
 impl<'a> Builder<'a> {
-    /// Adds a Texture2D tree, queuing its BC7 job (if any) for the batched
-    /// resolve pass instead of encoding it inline.
     fn add_tex_tree(&mut self, tree: TexTree, role: Role) -> i64 {
         match tree {
             TexTree::Done(v) => self.add("Texture2D", v, role),
@@ -509,18 +517,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Batches every BC7 job queued by `add_tex_tree` through the
-    /// cache-aware batch entry point
-    /// ([`bc7_pure::encode_bc7_mip_chain_with_profile_batch`]), in the
-    /// order the jobs were queued (== input order, since `texture()` only
-    /// ever queues a job the first time a given texture is built), then
-    /// patches each job's Texture2D object with `m_MipCount`,
-    /// `m_CompleteImageSize`, and `image data` — exactly the fields the old
-    /// inline `encode_texture_bc7` call filled directly.
-    ///
-    /// Must run after every `texture()` / `material()` call for this GLB
-    /// has finished (so no more jobs can be queued) and before the bundle
-    /// is serialized.
+    /// Queues BC7 work, then resolves queued jobs in input order before serialization.
     pub(super) fn resolve_pending_bc7_textures(&mut self) {
         let pending = std::mem::take(&mut self.pending_bc7);
         if pending.is_empty() {
@@ -710,7 +707,8 @@ impl<'a> Builder<'a> {
             texprofile::texture_profile(&src, colorspace, is_normal, mag, mn, max_size)
         };
 
-        if self.lod.is_some() && bc7_p.compressed {
+        if self.lod.is_some() {
+            bc7_p = texprofile::lod_pad_sub_block(&bc7_p);
             let side = bc7_p.target_w.max(bc7_p.target_h);
             bc7_p.target_w = side;
             bc7_p.target_h = side;
@@ -780,21 +778,23 @@ impl<'a> Builder<'a> {
         let ext = self.add_tex_tree(ext_tree, Role::Tex(name.clone()));
         self.tex_pid.insert(key, ext);
         let entry_key = if self.lod.is_some() {
+            // Container key extension follows the production converter,
+            // which re-encodes every LOD texture and keys it by alpha need
+            // alone: PNG when any `-transparent` / `-cutout` material binds
+            // it in any texture slot, JPEG otherwise
+            // (LODConversion.cs:203-219, 245-246). The source container
+            // plays no part.
             let needs_alpha = scene.materials.iter().any(|m| {
                 let ln = m.name.to_lowercase();
                 (ln.contains("-transparent") || ln.contains("-cutout"))
-                    && m.base_color_image.as_ref().is_some_and(|t| t.image == idx)
+                    && materials::MATERIAL_TEXTURE_SLOTS
+                        .iter()
+                        .any(|(_, accessor)| accessor(m).is_some_and(|t| t.image == idx))
             });
-            let container = scene
-                .image_bytes
-                .get(idx)
-                .and_then(|o| o.as_deref())
-                .map(detect_container)
-                .unwrap_or_default();
-            if container == "JPEG" && !needs_alpha {
-                format!("{name}.jpg")
-            } else {
+            if needs_alpha {
                 format!("{name}.png")
+            } else {
+                format!("{name}.jpg")
             }
         } else {
             format!("{name}.png")
@@ -899,7 +899,17 @@ impl<'a> Builder<'a> {
                 DataMips::Ready(data, mips)
             } else {
                 let resized;
-                let src: &RgbaImage = if (prof.target_w, prof.target_h) != (ow, oh) {
+                let sub_block = self.lod.is_some()
+                    && (ow < texprofile::BC_BLOCK_SIDE || oh < texprofile::BC_BLOCK_SIDE);
+                let src: &RgbaImage = if sub_block {
+                    resized = pad_sub_block_rgba(
+                        img,
+                        prof.target_w,
+                        prof.target_h,
+                        prof.color_space == 1,
+                    );
+                    &resized
+                } else if (prof.target_w, prof.target_h) != (ow, oh) {
                     let buf = crate::resize::box_downscale_rgba(
                         img.as_raw(),
                         ow as usize,
@@ -1157,8 +1167,6 @@ mod external_dep_bundle_file_tests {
 
     #[test]
     fn picks_a_bare_name_from_the_dependency_list_verbatim() {
-        // Known-undecodable images and non-scene entities carry bare names in
-        // the list — the ref must match that upload name, not re-derive it.
         let d = deps(&["Qmtex_windows"]);
         assert_eq!(
             external_dep_bundle_file(&d, "Qmtex", "windows").unwrap(),
@@ -1168,8 +1176,6 @@ mod external_dep_bundle_file_tests {
 
     #[test]
     fn matches_hash_case_insensitively() {
-        // mac dependency lists carry lowercased hashes; the resolver returns
-        // the deployed original case.
         let d = deps(&["qmtex_00ff00ff00ff00ff00ff00ff00ff00ff_mac"]);
         assert_eq!(
             external_dep_bundle_file(&d, "QmTex", "mac").unwrap(),

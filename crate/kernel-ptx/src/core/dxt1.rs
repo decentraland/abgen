@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "nvptx64"))]
+use super::mips::pad_to_block_size;
 pub const BLOCK_SIZE: usize = 8;
 pub const PIXELS_PER_BLOCK: usize = 16;
 
@@ -140,27 +142,6 @@ pub fn encode_block(rgba: &[u8; 64]) -> [u8; BLOCK_SIZE] {
     out[6] = ((bits >> 16) & 0xFF) as u8;
     out[7] = ((bits >> 24) & 0xFF) as u8;
     out
-}
-
-#[cfg(not(target_arch = "nvptx64"))]
-fn pad_to_block_size(rgba: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize) {
-    let pw = (w + 3) & !3;
-    let ph = (h + 3) & !3;
-    if pw == w && ph == h {
-        return (rgba.to_vec(), w, h);
-    }
-
-    let mut out = vec![0u8; pw * ph * 4];
-    for y in 0..ph {
-        let sy = y % h;
-        for x in 0..pw {
-            let sx = x % w;
-            let s = (sy * w + sx) * 4;
-            let d = (y * pw + x) * 4;
-            out[d..d + 4].copy_from_slice(&rgba[s..s + 4]);
-        }
-    }
-    (out, pw, ph)
 }
 
 #[cfg(not(target_arch = "nvptx64"))]

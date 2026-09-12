@@ -98,15 +98,11 @@ pub fn bundle_bytes() -> Result<Vec<u8>> {
     bundle_bytes_named(VENDORED_FILE)
 }
 
-fn sha256_hex(data: &[u8]) -> String {
-    crate::hashes::sha256_hex(data)
-}
-
 pub fn bundle_bytes_verified_named(name: &str) -> Result<Vec<u8>> {
     let expected =
         vendored_sha(name).ok_or_else(|| anyhow::anyhow!("no vendored shader named {name}"))?;
     let data = bundle_bytes_named(name)?;
-    let got = sha256_hex(&data);
+    let got = crate::hashes::sha256_hex(&data);
     if got != expected {
         anyhow::bail!(
             "vendored shader bundle {name} sha256 mismatch: got {got}, expected {expected}"
@@ -199,7 +195,7 @@ mod tests {
     fn vendored_bundles_match_identity() {
         for &(name, sha) in VENDORED {
             let data = bundle_bytes_verified_named(name).expect("verified read");
-            assert_eq!(sha256_hex(&data), sha);
+            assert_eq!(crate::hashes::sha256_hex(&data), sha);
 
             assert!(data.starts_with(b"UnityFS"), "{name}: not a UnityFS bundle");
 

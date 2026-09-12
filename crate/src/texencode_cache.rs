@@ -18,23 +18,14 @@ struct Store {
     misses: u64,
 }
 
-/// Per-context cache defaults (see `crate/src/clihelp.rs` for the matrix).
-/// The `ABGEN_TEX_ENCODE_CACHE_MAX_MB` / `ABGEN_DISK_CACHE` /
-/// `ABGEN_DISK_CACHE_MAX_MB` env vars always win when set — the profile only
-/// decides the defaults. First profile declared wins for the process.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CacheProfile {
-    /// Lambda: full in-memory default, disk cache off (ephemeral scratch).
     Lambda,
-    /// Client machines (JIT server sidecar, node addon, UPM native lib and
-    /// `abgen-host`, CLI convert): 256 MiB memory, 2 GiB disk.
     Client,
-    /// Server/batch hosts (bench, server farm): the historical defaults.
     Batch,
 }
 
 impl CacheProfile {
-    /// Default `ABGEN_TEX_ENCODE_CACHE_MAX_MB` for this context.
     pub fn memory_default_mb(self) -> usize {
         match self {
             CacheProfile::Client => 256,
@@ -42,8 +33,6 @@ impl CacheProfile {
         }
     }
 
-    /// Default `ABGEN_DISK_CACHE` for this context. Never overrides the
-    /// dev-build stale-encoder guard (see the `disk` module).
     pub fn disk_default_on(self) -> bool {
         match self {
             CacheProfile::Lambda => false,
@@ -51,7 +40,6 @@ impl CacheProfile {
         }
     }
 
-    /// Default `ABGEN_DISK_CACHE_MAX_MB` for this context.
     pub fn disk_default_mb(self) -> u64 {
         match self {
             CacheProfile::Client => 2048,
@@ -61,11 +49,10 @@ impl CacheProfile {
 }
 
 static FORCED: AtomicBool = AtomicBool::new(false);
+static DISK_DEFAULT_ALLOWED: AtomicBool = AtomicBool::new(true);
 
 static PROFILE: OnceLock<CacheProfile> = OnceLock::new();
 
-/// Whatever [`enable_with_profile`] set first, else [`CacheProfile::Batch`]
-/// (the historical defaults, so plain [`enable`] callers behave as before).
 fn profile() -> CacheProfile {
     PROFILE.get().copied().unwrap_or(CacheProfile::Batch)
 }
@@ -95,13 +82,17 @@ pub fn enable() {
     FORCED.store(true, Ordering::Relaxed);
 }
 
-/// [`enable`], plus declares which [`CacheProfile`] governs this process's
-/// default cache bounds. First caller wins — a nested declaration (e.g.
-/// `live::Proxy` inside the lambda entrypoint) is a no-op — so call it at
-/// process/host init, before the first encode.
+/// Enables the caches; the first process-level profile declaration wins.
 pub fn enable_with_profile(p: CacheProfile) {
     let _ = PROFILE.set(p);
     enable();
+}
+
+/// Enables the bounded memory cache while leaving persistent storage off
+/// unless the caller explicitly sets `ABGEN_DISK_CACHE`.
+pub fn enable_memory_only_with_profile(p: CacheProfile) {
+    DISK_DEFAULT_ALLOWED.store(false, Ordering::Relaxed);
+    enable_with_profile(p);
 }
 
 fn enabled() -> bool {
@@ -119,6 +110,12 @@ fn store() -> &'static Mutex<Store> {
             misses: 0,
         })
     })
+}
+
+fn flights() -> &'static crate::singleflight::Group<[u8; 32], Option<(Arc<Vec<u8>>, i32)>> {
+    static F: OnceLock<crate::singleflight::Group<[u8; 32], Option<(Arc<Vec<u8>>, i32)>>> =
+        OnceLock::new();
+    F.get_or_init(crate::singleflight::Group::new)
 }
 
 fn lock() -> std::sync::MutexGuard<'static, Store> {
@@ -151,27 +148,10 @@ fn key(kind: Kind, pixels: &[u8], width: u32, height: u32, params: &[i64]) -> [u
     h.finalize()
 }
 
-/// Cross-run, on-disk backing for the in-memory encode cache above.
-///
-/// Same key space (content hash of source pixels + encode params + the
-/// encoder's build id, see [`key`]), same value (the encoded block payload),
-/// so a disk hit is byte-identical to a fresh encode by construction — it
-/// *is* a previous encode's output, not a recomputation. Layout: a shard
-/// dir per key's first two hex chars (keeps directories small), one file
-/// per key, written tmp-then-renamed so a reader never observes a partial
-/// write. Bounded by total bytes with LRU-by-mtime eviction, swept
-/// probabilistically (not on every write — a full directory walk per write
-/// would undercut the point of the cache) after a successful insert.
-///
-/// Default on for any build carrying a real content-addressed
-/// `ABGEN_BUILD_ID` — i.e. everything `flake.nix`/`release.yml` produce —
-/// unless the process's [`CacheProfile`] says otherwise (`Lambda` defaults
-/// it off; `ABGEN_DISK_CACHE=0`/`=1` is the escape hatch either way).
-/// Default *off* for dev builds,
-/// whose fixed `devbuild0000` stamp does not pin the encoder, which also
-/// keeps `cargo test` (unit and integration alike) off a developer's real
-/// cache directory. Tests that exercise it opt back in explicitly and point
-/// `ABGEN_DISK_CACHE_DIR` at a throwaway directory.
+/// Persistent backing keyed like the memory cache plus build id. Entries are
+/// sharded, atomically renamed, and LRU-evicted by mtime. Real release build ids
+/// enable it unless the profile or `ABGEN_DISK_CACHE` disables it; the shared
+/// `devbuild0000` id defaults off to prevent stale cross-tree hits.
 #[cfg(not(target_arch = "wasm32"))]
 mod disk {
     use std::fs;
@@ -179,24 +159,12 @@ mod disk {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::SystemTime;
 
-    /// Only run the (directory-walking) eviction sweep once every this many
-    /// writes: bounds the amortized cost of enforcing the byte budget
-    /// without a persistent index, at the price of letting the cache
-    /// overshoot the budget by a few entries between sweeps.
     const EVICT_EVERY_N_WRITES: u64 = 8;
 
     static WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
 
-    /// The placeholder `build.rs` stamps when `ABGEN_BUILD_ID` is unset. It
-    /// is a fixed string, not a content id, so it does *not* pin the
-    /// encoder: every working tree that builds without an explicit build id
-    /// stamps `devbuild0000` and would share one on-disk key space.
     const DEV_BUILD_ID: &str = "devbuild0000";
 
-    /// True when this binary carries a real content-addressed build id.
-    /// Every build whose output ships has one — `flake.nix` and
-    /// `release.yml` both stamp `nix eval --raw .#buildId` — so the fast
-    /// path is still the default everywhere it matters.
     pub(super) fn build_id_pins_encoder() -> bool {
         env!("ABGEN_BUILD_ID") != DEV_BUILD_ID
     }
@@ -204,7 +172,9 @@ mod disk {
     fn enabled() -> bool {
         crate::clihelp::env_bool(
             "ABGEN_DISK_CACHE",
-            build_id_pins_encoder() && super::profile().disk_default_on(),
+            build_id_pins_encoder()
+                && super::profile().disk_default_on()
+                && super::DISK_DEFAULT_ALLOWED.load(Ordering::Relaxed),
         )
     }
 
@@ -216,12 +186,6 @@ mod disk {
             .saturating_mul(1024 * 1024)
     }
 
-    /// `$ABGEN_DISK_CACHE_DIR`, else `$XDG_CACHE_HOME/abgen`, else the
-    /// platform default (`~/Library/Caches/abgen` on macOS, `~/.cache/abgen`
-    /// elsewhere) — no new dependency, just the env vars every platform
-    /// cache-dir crate reads under the hood. `None` if none of that
-    /// resolves (e.g. `$HOME` unset), in which case the disk cache is
-    /// silently skipped and callers fall back to memory-only behavior.
     fn cache_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var("ABGEN_DISK_CACHE_DIR") {
             if !dir.trim().is_empty() {
@@ -257,8 +221,6 @@ mod disk {
         root.join(&hex[..2]).join(format!("{hex}.bin"))
     }
 
-    /// Walk every shard dir and collect `(path, len, mtime)` for real
-    /// entries (skips in-flight `.tmp.` files from a concurrent writer).
     fn entries(root: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
         let mut out = Vec::new();
         let Ok(shards) = fs::read_dir(root) else {
@@ -292,7 +254,6 @@ mod disk {
         out
     }
 
-    /// Evict oldest-by-mtime entries until the shard tree fits `budget`.
     fn evict_if_needed(root: &Path, budget: u64) {
         let mut items = entries(root);
         let total: u64 = items.iter().map(|(_, len, _)| *len).sum();
@@ -311,9 +272,6 @@ mod disk {
         }
     }
 
-    /// `None` on any miss or error (missing file, disabled, unresolvable
-    /// cache dir, truncated entry) — every case just falls back to a real
-    /// encode, so this never needs to distinguish them for callers.
     pub(super) fn get(key: &[u8; 32]) -> Option<(Vec<u8>, i32)> {
         if !enabled() {
             return None;
@@ -384,7 +342,6 @@ mod disk {
     pub(super) fn put(_key: &[u8; 32], _data: &[u8], _mips: i32) {}
 }
 
-/// Evict least-recently-used entries until `incoming` fits under `budget`.
 fn make_room(s: &mut Store, incoming: usize, budget: usize) {
     while s.bytes + incoming > budget && !s.map.is_empty() {
         let oldest = s
@@ -399,8 +356,6 @@ fn make_room(s: &mut Store, incoming: usize, budget: usize) {
     }
 }
 
-/// Like `get_or_encode`, but hands back the cache's own buffer: hits and
-/// stored misses cost an `Arc` clone instead of copying the encoded chain.
 pub fn get_or_encode_shared(
     kind: Kind,
     pixels: &[u8],
@@ -425,21 +380,37 @@ pub fn get_or_encode_shared(
         }
         s.misses += 1;
     }
-    if let Some((data, mips)) = disk::get(&k) {
-        let data = Arc::new(data);
-        remember(k, Arc::clone(&data), mips);
-        return Some((data, mips));
+    let mut work = Some(f);
+    loop {
+        let (result, leader) = flights().run_with_leader(k, || {
+            {
+                let mut s = lock();
+                s.stamp += 1;
+                let stamp = s.stamp;
+                if let Some((data, mips, at)) = s.map.get_mut(&k) {
+                    *at = stamp;
+                    return Some((Arc::clone(data), *mips));
+                }
+            }
+            if let Some((data, mips)) = disk::get(&k) {
+                let data = Arc::new(data);
+                remember(k, Arc::clone(&data), mips);
+                return Some((data, mips));
+            }
+            let (data, mips) =
+                work.take()
+                    .expect("single-flight leader owns the encode closure")()?;
+            disk::put(&k, &data, mips);
+            let data = Arc::new(data);
+            remember(k, Arc::clone(&data), mips);
+            Some((data, mips))
+        });
+        if leader || result.is_some() {
+            return result;
+        }
     }
-    let (data, mips) = f()?;
-    disk::put(&k, &data, mips);
-    let data = Arc::new(data);
-    remember(k, Arc::clone(&data), mips);
-    Some((data, mips))
 }
 
-/// Insert `data`/`mips` into the in-memory map under `k`, respecting the
-/// byte budget and LRU eviction. No-op if the key already made it in (e.g.
-/// a racing insert) or the entry alone would exceed the whole budget.
 fn remember(k: [u8; 32], data: Arc<Vec<u8>>, mips: i32) {
     let len = data.len();
     let budget = max_bytes();
@@ -486,14 +457,20 @@ mod tests {
     #[test]
     fn caches_and_returns_identical_results() {
         enable();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let salt = [i64::from(std::process::id()), nanos];
+        let key = |tail: i64| [salt[0], salt[1], tail];
         let pixels: Vec<u8> = (0..8u32 * 8 * 4).map(|i| (i * 7 % 251) as u8).collect();
         let mut calls = 0u32;
-        let a = get_or_encode(Kind::Bc7, &pixels, 8, 8, &[42], || {
+        let a = get_or_encode(Kind::Bc7, &pixels, 8, 8, &key(42), || {
             calls += 1;
             Some((vec![1, 2, 3], 4))
         })
         .unwrap();
-        let b = get_or_encode(Kind::Bc7, &pixels, 8, 8, &[42], || {
+        let b = get_or_encode(Kind::Bc7, &pixels, 8, 8, &key(42), || {
             calls += 1;
             Some((vec![9, 9, 9], 9))
         })
@@ -502,12 +479,12 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.0, vec![1, 2, 3]);
 
-        let c = get_or_encode(Kind::Bc7, &pixels, 8, 8, &[43], || Some((vec![5], 1))).unwrap();
+        let c = get_or_encode(Kind::Bc7, &pixels, 8, 8, &key(43), || Some((vec![5], 1))).unwrap();
         assert_eq!(c.0, vec![5]);
 
-        let d = get_or_encode(Kind::Dxt1, &pixels, 8, 8, &[1], || None);
+        let d = get_or_encode(Kind::Dxt1, &pixels, 8, 8, &key(1), || None);
         assert!(d.is_none());
-        let e = get_or_encode(Kind::Dxt1, &pixels, 8, 8, &[1], || Some((vec![7], 1))).unwrap();
+        let e = get_or_encode(Kind::Dxt1, &pixels, 8, 8, &key(1), || Some((vec![7], 1))).unwrap();
         assert_eq!(e.0, vec![7]);
     }
 
@@ -558,6 +535,91 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_miss_encodes_once_and_returns_identical_bytes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+
+        enable_memory_only_with_profile(CacheProfile::Batch);
+        const THREADS: usize = 12;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(THREADS));
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let pixels = Arc::new(vec![salt as u8; 16 * 16 * 4]);
+        let params = [salt, 771];
+        let flight_key = key(Kind::Bc7, &pixels, 16, 16, &params);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..THREADS {
+                let calls = Arc::clone(&calls);
+                let start = Arc::clone(&start);
+                let pixels = Arc::clone(&pixels);
+                handles.push(scope.spawn(move || {
+                    start.wait();
+                    get_or_encode_shared(Kind::Bc7, &pixels, 16, 16, &params, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        while flights().waiter_count(&flight_key) != THREADS - 1 {
+                            std::thread::yield_now();
+                        }
+                        Some((vec![3, 1, 4, 1, 5, 9], 4))
+                    })
+                    .unwrap()
+                }));
+            }
+            let outputs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            for output in &outputs[1..] {
+                assert_eq!((&*output.0, output.1), (&*outputs[0].0, outputs[0].1));
+                assert!(Arc::ptr_eq(&output.0, &outputs[0].0));
+            }
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn waiter_retries_its_own_work_after_leader_returns_none() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+
+        enable_memory_only_with_profile(CacheProfile::Batch);
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let pixels = Arc::new(vec![salt as u8; 16 * 16 * 4]);
+        let params = [salt, 772];
+        let flight_key = key(Kind::Bc7, &pixels, 16, 16, &params);
+        let leader_started = Arc::new(Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let owner_pixels = Arc::clone(&pixels);
+            let owner_started = Arc::clone(&leader_started);
+            let owner = scope.spawn(move || {
+                get_or_encode_shared(Kind::Bc7, &owner_pixels, 16, 16, &params, || {
+                    owner_started.wait();
+                    while flights().waiter_count(&flight_key) != 1 {
+                        std::thread::yield_now();
+                    }
+                    None
+                })
+            });
+
+            leader_started.wait();
+            let calls = AtomicUsize::new(0);
+            let waiter = get_or_encode_shared(Kind::Bc7, &pixels, 16, 16, &params, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some((vec![2, 7, 1, 8], 3))
+            });
+
+            assert!(owner.join().unwrap().is_none());
+            let waiter = waiter.expect("waiter's successful closure must not inherit None");
+            assert_eq!((&*waiter.0, waiter.1), (&vec![2, 7, 1, 8], 3));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
     fn eviction_is_lru_and_bytes_stay_consistent() {
         let mut s = Store {
             map: HashMap::new(),
@@ -599,9 +661,6 @@ mod tests {
         let _ = stats();
     }
 
-    /// RAII guard that restores an env var to unset on drop, even on panic
-    /// unwind — keeps the disk-cache opt-in tests from leaking state (or a
-    /// throwaway directory pointer) into whatever test runs next.
     struct EnvGuard(&'static str);
 
     impl Drop for EnvGuard {
@@ -641,14 +700,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Under a dev build the disk cache must default off: `devbuild0000` is
-    /// a fixed stamp, so an entry written by one source tree is
-    /// indistinguishable from one written by another, and a cross-run hit
-    /// would serve a previous build's bytes.
-    ///
-    /// Asserted on the pure predicate rather than `disk::enabled()`, because
-    /// `enabled()` reads a process-global env var that the opt-in test above
-    /// concurrently sets.
     #[test]
     fn disk_cache_defaults_off_when_build_id_is_the_dev_placeholder() {
         assert_eq!(
@@ -658,9 +709,6 @@ mod tests {
         );
     }
 
-    /// The per-context default matrix, verbatim from the policy. Asserted
-    /// on the pure profile methods rather than the process-global profile,
-    /// which is set-once per process and races across tests.
     #[test]
     fn cache_profile_default_matrix() {
         use CacheProfile::*;

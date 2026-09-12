@@ -1,5 +1,8 @@
 use crate::lodgen::placements::{placements_from_components, ManifestPlacements, Trs};
-use std::collections::{HashMap, HashSet};
+use crate::lodgen::primitives::{
+    material_from_proto, mesh_renderer_from_proto, MaterialFields, PrimitiveSpec,
+};
+use std::collections::HashMap;
 
 pub const PUT_COMPONENT: u32 = 1;
 
@@ -106,7 +109,9 @@ impl LwwState {
         ordered.sort_by_key(|(_, (_, seq, _))| *seq);
         let mut transforms: HashMap<i64, Trs> = HashMap::new();
         let mut gltf_srcs: Vec<(i64, String)> = Vec::new();
-        let mut mesh_renderer_entities: HashSet<i64> = HashSet::new();
+        let mut mesh_renderers: Vec<(i64, Option<PrimitiveSpec>)> = Vec::new();
+        let mut materials: HashMap<i64, MaterialFields> = HashMap::new();
+        let mut visibility: HashMap<i64, bool> = HashMap::new();
         for ((entity, component), (_, _, data)) in ordered {
             let eid = i64::from(*entity);
             match *component {
@@ -124,7 +129,21 @@ impl LwwState {
                     }
                 }
                 MESH_RENDERER => {
-                    mesh_renderer_entities.insert(eid);
+                    // An empty payload is the all-default message: no shape set.
+                    let spec = if data.is_empty() {
+                        None
+                    } else {
+                        mesh_renderer_from_proto(data)
+                    };
+                    mesh_renderers.push((eid, spec));
+                }
+                MATERIAL => {
+                    if let Some(m) = material_from_proto(data) {
+                        materials.insert(eid, m);
+                    }
+                }
+                VISIBILITY => {
+                    visibility.insert(eid, visible_flag(data));
                 }
                 _ => {}
             }
@@ -132,10 +151,91 @@ impl LwwState {
         placements_from_components(
             transforms,
             gltf_srcs,
-            mesh_renderer_entities,
+            mesh_renderers,
+            materials,
+            visibility,
             content_by_file,
         )
     }
+}
+
+fn validate_stream(bytes: &[u8]) -> anyhow::Result<()> {
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let len = read_u32(bytes, off)
+            .ok_or_else(|| anyhow::anyhow!("truncated CRDT message header at byte {off}"))?
+            as usize;
+        if len < HEADER_LEN {
+            anyhow::bail!("invalid CRDT message length {len} at byte {off}");
+        }
+        let end = off
+            .checked_add(len)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| anyhow::anyhow!("truncated CRDT message at byte {off}: length {len}"))?;
+        let ty = read_u32(bytes, off + 4).expect("validated CRDT header");
+        if ty == PUT_COMPONENT {
+            let body = &bytes[off + HEADER_LEN..end];
+            if body.len() < 16 {
+                anyhow::bail!("truncated CRDT put-component body at byte {off}");
+            }
+            let data_len = read_u32(body, 12).expect("validated put-component header") as usize;
+            let data_end = 16usize
+                .checked_add(data_len)
+                .filter(|need| *need <= body.len())
+                .ok_or_else(|| anyhow::anyhow!("truncated CRDT component payload at byte {off}"))?;
+            let component = read_u32(body, 4).expect("validated put-component header");
+            let data = &body[16..data_end];
+            if !data.is_empty() {
+                match component {
+                    TRANSFORM if decode_transform(data).is_none() => {
+                        anyhow::bail!("invalid transform payload at byte {off}");
+                    }
+                    GLTF_CONTAINER if gltf_src(data).is_none() => {
+                        anyhow::bail!("invalid glTF-container payload at byte {off}");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        off = end;
+    }
+    Ok(())
+}
+
+/// Field 1 (`visible`) of PBVisibilityComponent. A payload without the field
+/// reads as `false`: the manifest builder writes it as `{}` and `JsonUtility`
+/// defaults the missing bool, so production drops that entity. Field 2
+/// (`propagate_to_children`) is not consulted, like the descriptor builder.
+fn visible_flag(data: &[u8]) -> bool {
+    let mut off = 0usize;
+    let mut visible = false;
+    while off < data.len() {
+        let Some((tag, next)) = read_varint(data, off) else {
+            break;
+        };
+        off = next;
+        match tag & 7 {
+            0 => {
+                let Some((value, next)) = read_varint(data, off) else {
+                    break;
+                };
+                off = next;
+                if tag >> 3 == 1 {
+                    visible = value != 0;
+                }
+            }
+            1 => off += 8,
+            2 => {
+                let Some((len, next)) = read_varint(data, off) else {
+                    break;
+                };
+                off = next.saturating_add(usize::try_from(len).unwrap_or(usize::MAX));
+            }
+            5 => off += 4,
+            _ => break,
+        }
+    }
+    visible
 }
 
 fn decode_transform(data: &[u8]) -> Option<Trs> {
@@ -250,6 +350,34 @@ pub fn placements_from_crdt(
     state.project(content_by_file)
 }
 
+pub fn placements_from_crdt_checked(
+    stream: &[u8],
+    content_by_file: &HashMap<String, String>,
+) -> anyhow::Result<ManifestPlacements> {
+    validate_stream(stream)?;
+    Ok(placements_from_crdt(stream, content_by_file))
+}
+
+/// The folded GltfContainer srcs in entity insertion order, before content
+/// resolution: what the scene asked to place, whether or not the entity's
+/// content lists the file (a placement needs a resolved hash, this does not).
+#[cfg(test)]
+pub(crate) fn gltf_srcs_from_crdt(stream: &[u8]) -> Vec<(u32, String)> {
+    let mut state = LwwState::default();
+    state.ingest(stream);
+    let mut cells: Vec<(&(u32, u32), &(u32, u64, Vec<u8>))> = state
+        .cells
+        .iter()
+        .filter(|((_, component), _)| *component == GLTF_CONTAINER)
+        .collect();
+    cells.sort_by_key(|(_, (_, seq, _))| *seq);
+    cells
+        .into_iter()
+        .filter(|(_, (_, _, data))| !data.is_empty())
+        .filter_map(|((entity, _), (_, _, data))| gltf_src(data).map(|src| (*entity, src)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +431,27 @@ mod tests {
         assert_eq!(cell.0, 3);
         assert_eq!(cell.2, b"second");
         assert_eq!(state.cells.len(), 1);
+    }
+
+    #[test]
+    fn checked_stream_rejects_invalid_tracked_components() {
+        let mut stream = Vec::new();
+        encode_put(&mut stream, 7, TRANSFORM, 1, &[1, 2, 3]);
+        assert!(placements_from_crdt_checked(&stream, &HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn checked_stream_rejects_a_truncated_tail() {
+        let mut stream = Vec::new();
+        encode_put(&mut stream, 7, GLTF_CONTAINER, 1, &gltf_bytes("ok.glb"));
+        stream.extend_from_slice(&[16, 0, 0]);
+        assert!(placements_from_crdt_checked(&stream, &HashMap::new()).is_err());
+        assert_eq!(
+            placements_from_crdt(&stream, &HashMap::new())
+                .placements
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -448,7 +597,102 @@ mod tests {
         assert!(!got_json.contains("-0.0"));
         let rot = got.placements[0].rotation;
         assert!(rot.iter().all(|v| v.to_bits() != (-0.0f64).to_bits()));
-        assert_eq!(rot[3], f64::from(-s2));
+        assert!((rot[1] + f64::from(s2)).abs() < 1e-6, "{rot:?}");
+        assert!((rot[3] - f64::from(s2)).abs() < 1e-6, "{rot:?}");
+    }
+
+    #[test]
+    fn invisible_entity_is_skipped() {
+        let mut stream = Vec::new();
+        let rows: [(u32, u32, Option<&[u8]>); 5] = [
+            (600, 0, Some(&[0x08, 0x00])),
+            (601, 0, Some(&[0x08, 0x01])),
+            (602, 0, Some(&[])),
+            (603, 0, None),
+            (604, 603, None),
+        ];
+        for (eid, parent, vis) in rows {
+            encode_put(
+                &mut stream,
+                eid,
+                TRANSFORM,
+                1,
+                &transform_bytes(
+                    [eid as f32, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                    [1.0; 3],
+                    parent,
+                ),
+            );
+            encode_put(
+                &mut stream,
+                eid,
+                GLTF_CONTAINER,
+                1,
+                &gltf_bytes("models/a.glb"),
+            );
+            if let Some(v) = vis {
+                encode_put(&mut stream, eid, VISIBILITY, 1, v);
+            }
+        }
+        encode_put(&mut stream, 600, VISIBILITY, 2, &[0x08, 0x01]);
+        encode_put(&mut stream, 603, VISIBILITY, 1, &[0x08, 0x00, 0x10, 0x01]);
+        let mut content = HashMap::new();
+        content.insert("models/a.glb".to_string(), "ha".to_string());
+        let got = placements_from_crdt(&stream, &content);
+        let xs: Vec<f64> = got.placements.iter().map(|p| p.position[0]).collect();
+        assert_eq!(xs, [600.0, 601.0, 1207.0]);
+        assert_eq!(got.invisible_skipped, 2);
+        assert!(visible_flag(&[0x08, 0x01]));
+        assert!(!visible_flag(&[0x08, 0x00]));
+        assert!(!visible_flag(&[]));
+        assert!(visible_flag(&[0x10, 0x01, 0x08, 0x01]));
+        assert!(!visible_flag(&[0x10, 0x01]));
+        let transform = |eid: u32, parent: u32| {
+            serde_json::json!({
+                "entityId": eid,
+                "componentName": "core::Transform",
+                "data": {
+                    "position": {"x": eid, "y": 0.0, "z": 0.0},
+                    "rotation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                    "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+                    "parent": parent
+                }
+            })
+        };
+        let gltf = |eid: u32| {
+            serde_json::json!({
+                "entityId": eid,
+                "componentName": "core::GltfContainer",
+                "data": {"src": "models/a.glb"}
+            })
+        };
+        let vis = |eid: u32, data: serde_json::Value| {
+            serde_json::json!({
+                "entityId": eid,
+                "componentName": "core::VisibilityComponent",
+                "data": data
+            })
+        };
+        let manifest = serde_json::json!([
+            transform(600, 0),
+            gltf(600),
+            vis(600, serde_json::json!({"visible": true})),
+            transform(601, 0),
+            gltf(601),
+            vis(601, serde_json::json!({"visible": true})),
+            transform(602, 0),
+            gltf(602),
+            vis(602, serde_json::json!({})),
+            transform(603, 0),
+            gltf(603),
+            vis(603, serde_json::json!({"visible": false})),
+            transform(604, 603),
+            gltf(604),
+        ]);
+        let want =
+            parse_lod_manifest_full(&serde_json::to_vec(&manifest).unwrap(), &content).unwrap();
+        assert_eq!(got, want);
     }
 
     #[test]
@@ -520,8 +764,37 @@ mod tests {
         );
         encode_put(&mut stream, 800, MATERIAL, 1, &[0x08, 0x01]);
         encode_put(&mut stream, 800, VISIBILITY, 1, &[]);
+        // entity 900: a box under 600 with a textured, half-transparent pbr material
+        encode_put(
+            &mut stream,
+            900,
+            TRANSFORM,
+            1,
+            &transform_bytes([0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0], 600),
+        );
+        encode_put(&mut stream, 900, MESH_RENDERER, 1, &[0x0a, 0x00]);
+        let mut texture = vec![0x0a, 0x0e];
+        texture.extend_from_slice(b"images/box.png");
+        texture.extend_from_slice(&[0x10, 0x00]); // wrap_mode = REPEAT
+        let mut union = vec![0x0a, texture.len() as u8];
+        union.extend_from_slice(&texture);
+        let mut albedo = Vec::new();
+        for (field, v) in [(1u8, 1.0f32), (2, 1.0), (3, 1.0), (4, 0.5)] {
+            albedo.push((field << 3) | 5);
+            albedo.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut pbr = vec![0x0a, union.len() as u8];
+        pbr.extend_from_slice(&union);
+        pbr.push(0x3a); // field 7, length-delimited
+        pbr.push(albedo.len() as u8);
+        pbr.extend_from_slice(&albedo);
+        pbr.extend_from_slice(&[0x50, 0x04]); // transparency_mode = AUTO
+        let mut material = vec![0x12, pbr.len() as u8];
+        material.extend_from_slice(&pbr);
+        encode_put(&mut stream, 900, MATERIAL, 1, &material);
         let mut content = HashMap::new();
         content.insert("models/child.glb".to_string(), "hchild".to_string());
+        content.insert("images/box.png".to_string(), "hbox".to_string());
         let got = placements_from_crdt(&stream, &content);
         let s2d = s2 as f64;
         let manifest = serde_json::json!([
@@ -579,20 +852,79 @@ mod tests {
                 "entityId": 701,
                 "componentName": "core::GltfContainer",
                 "data": {"src": "models/missing.glb"}
+            },
+            {
+                "entityId": 900,
+                "componentName": "core::Transform",
+                "data": {
+                    "position": {"x": 0.0, "y": 1.0, "z": 0.0},
+                    "rotation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                    "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+                    "parent": 600
+                }
+            },
+            {
+                "entityId": 900,
+                "componentName": "core::MeshRenderer",
+                "data": {"mesh": {"$case": "box", "box": {"uvs": []}}}
+            },
+            {
+                "entityId": 900,
+                "componentName": "core::Material",
+                "data": {"material": {"$case": "pbr", "pbr": {
+                    "texture": {"tex": {"$case": "texture", "texture": {"src": "images/box.png", "wrapMode": 0, "filterMode": 0}}},
+                    "albedoColor": {"r": 1, "g": 1, "b": 1, "a": 0.5},
+                    "transparencyMode": 4
+                }}}
             }
         ]);
         let want =
             parse_lod_manifest_full(&serde_json::to_vec(&manifest).unwrap(), &content).unwrap();
         assert_eq!(got, want);
-        assert_eq!(got.placements.len(), 2);
+        assert_eq!(got.placements.len(), 1);
+        assert_eq!(got.mesh_renderers, 2);
         assert_eq!(got.skipped_mesh_renderer, 1);
         assert_eq!(got.unresolved_src, 1);
+        assert_eq!(got.primitives.len(), 1);
+        let cube = &got.primitives[0];
+        assert_eq!(
+            cube.spec,
+            PrimitiveSpec::simple(crate::lodgen::primitives::PrimitiveShape::Box)
+        );
+        assert_eq!(cube.material.class, crate::lodgen::model::AlphaClass::Blend);
+        assert_eq!(cube.material.color, [1.0, 1.0, 1.0, 0.5]);
+        assert_eq!(
+            cube.material.texture,
+            Some(crate::lodgen::primitives::PrimitiveTexture {
+                source: crate::lodgen::primitives::TextureSource::Hash("hbox".to_string()),
+                wrap: crate::lodgen::primitives::WrapMode::Repeat,
+            })
+        );
+        assert!(
+            (cube.position[0] - 10.0).abs() < 1e-5
+                && (cube.position[1] - 2.0).abs() < 1e-5
+                && cube.position[2].abs() < 1e-5,
+            "{:?}",
+            cube.position
+        );
+        assert!(cube.scale.iter().all(|s| (s - 2.0).abs() < 1e-6));
+        assert_eq!(
+            gltf_srcs_from_crdt(&stream),
+            [
+                (601, "Models/Child.GLB".to_string()),
+                (701, "models/missing.glb".to_string())
+            ]
+        );
         let child = got
             .placements
             .iter()
             .find(|p| p.glb_hash.as_deref() == Some("hchild"))
             .unwrap();
         assert_eq!(child.glb_file.as_deref(), Some("Models/Child.GLB"));
-        assert_eq!(child.scale, [2.0, 2.0, 2.0]);
+        assert!(
+            child.scale.iter().all(|s| (s - 2.0).abs() < 1e-6),
+            "{:?}",
+            child.scale
+        );
     }
 }

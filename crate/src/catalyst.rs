@@ -1,5 +1,8 @@
 use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const DEFAULT_CATALYST: &str = "http://localhost:5141/content";
@@ -123,13 +126,34 @@ pub(crate) fn ensure_entity_id(v: &mut serde_json::Value, id: &str) {
     }
 }
 
+#[derive(Default)]
+struct ClientStats {
+    network_requests: AtomicU64,
+    network_bytes: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_bytes: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IoStats {
+    pub network_requests: u64,
+    pub network_bytes: u64,
+    pub cache_hits: u64,
+    pub cache_bytes: u64,
+}
+
 #[derive(Clone)]
 pub struct CatalystClient {
     base: String,
     agent: ureq::Agent,
     local: Option<crate::local_store::LocalContentStore>,
     fallback_bases: Vec<String>,
+    content_cache: Option<PathBuf>,
+    stats: Arc<ClientStats>,
+    content_flights: Arc<crate::singleflight::Group<String, ContentFlightResult>>,
 }
+
+type ContentFlightResult = Option<Arc<std::result::Result<Arc<Vec<u8>>, String>>>;
 
 impl CatalystClient {
     pub fn new(base_url: &str) -> Self {
@@ -147,6 +171,9 @@ impl CatalystClient {
             agent,
             local: None,
             fallback_bases: Vec::new(),
+            content_cache: None,
+            stats: Arc::new(ClientStats::default()),
+            content_flights: Arc::new(crate::singleflight::Group::new()),
         }
     }
 
@@ -154,6 +181,15 @@ impl CatalystClient {
         self.fallback_bases
             .push(base.trim_end_matches('/').to_string());
         self
+    }
+
+    pub fn with_content_cache(mut self, root: Option<PathBuf>) -> Self {
+        self.content_cache = root;
+        self
+    }
+
+    pub(crate) fn uses_content_cache(&self, root: &Path) -> bool {
+        self.content_cache.as_deref() == Some(root)
     }
 
     fn with_local_store(mut self, store: crate::local_store::LocalContentStore) -> Self {
@@ -184,10 +220,14 @@ impl CatalystClient {
     fn get_abs(&self, url: &str) -> Result<Vec<u8>> {
         let mut last: Option<String> = None;
         for attempt in 0..HTTP_RETRIES {
+            self.stats.network_requests.fetch_add(1, Ordering::Relaxed);
             match self.agent.get(url).header("User-Agent", UA).call() {
                 Ok(resp) => {
                     let mut buf: Vec<u8> = Vec::new();
                     resp.into_body().into_reader().read_to_end(&mut buf)?;
+                    self.stats
+                        .network_bytes
+                        .fetch_add(buf.len() as u64, Ordering::Relaxed);
                     return Ok(buf);
                 }
                 Err(ureq::Error::StatusCode(code)) => {
@@ -209,6 +249,7 @@ impl CatalystClient {
         let url = format!("{}{}", self.base, path);
         let mut last: Option<String> = None;
         for attempt in 0..HTTP_RETRIES {
+            self.stats.network_requests.fetch_add(1, Ordering::Relaxed);
             match self
                 .agent
                 .post(&url)
@@ -219,6 +260,9 @@ impl CatalystClient {
                 Ok(resp) => {
                     let mut buf: Vec<u8> = Vec::new();
                     resp.into_body().into_reader().read_to_end(&mut buf)?;
+                    self.stats
+                        .network_bytes
+                        .fetch_add(buf.len() as u64, Ordering::Relaxed);
                     return Ok(buf);
                 }
                 Err(ureq::Error::StatusCode(code)) => {
@@ -233,7 +277,13 @@ impl CatalystClient {
         bail!("POST {} failed: {}", url, last.unwrap_or_default())
     }
 
-    pub fn fetch_content(&self, content_hash: &str) -> Result<Vec<u8>> {
+    fn cache_path(&self, content_hash: &str) -> Option<PathBuf> {
+        self.content_cache
+            .as_ref()
+            .map(|root| root.join(&*crate::naming::fs_safe_component(content_hash)))
+    }
+
+    fn fetch_content_uncached(&self, content_hash: &str) -> Result<Vec<u8>> {
         let primary = if let Some(store) = &self.local {
             store
                 .fetch(content_hash)
@@ -242,15 +292,70 @@ impl CatalystClient {
             self.get(&format!("/contents/{content_hash}"))
         };
         match primary {
-            Ok(b) => Ok(b),
+            Ok(bytes) => {
+                if self.local.is_some() {
+                    self.record_cache_hit(bytes.len());
+                }
+                Ok(bytes)
+            }
             Err(primary_err) => {
                 for base in &self.fallback_bases {
-                    if let Ok(b) = self.get_abs(&format!("{base}/contents/{content_hash}")) {
-                        return Ok(b);
+                    if let Ok(bytes) = self.get_abs(&format!("{base}/contents/{content_hash}")) {
+                        return Ok(bytes);
                     }
                 }
                 Err(primary_err)
             }
+        }
+    }
+
+    /// Plain GET of an absolute URL, with the client's retry policy but no content
+    /// cache: SDK material textures may live off-catalyst (`https://...` srcs).
+    pub fn fetch_url(&self, url: &str) -> Result<Vec<u8>> {
+        self.get_abs(url)
+    }
+
+    pub fn fetch_content(&self, content_hash: &str) -> Result<Vec<u8>> {
+        let cache_path = self.cache_path(content_hash);
+        if let Some(path) = &cache_path {
+            if let Ok(bytes) = std::fs::read(path) {
+                self.record_cache_hit(bytes.len());
+                return Ok(bytes);
+            }
+        }
+        let (outcome, leader) =
+            self.content_flights
+                .run_with_leader(content_hash.to_string(), || {
+                    if let Some(path) = &cache_path {
+                        if let Ok(bytes) = std::fs::read(path) {
+                            self.record_cache_hit(bytes.len());
+                            return Some(Arc::new(Ok(Arc::new(bytes))));
+                        }
+                    }
+                    let result = self
+                        .fetch_content_uncached(content_hash)
+                        .map(Arc::new)
+                        .map_err(|error| format!("{error:#}"));
+                    if let (Some(path), Ok(bytes)) = (&cache_path, &result) {
+                        if let Some(parent) = path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let tmp = crate::tmppath::tmp_sibling(path);
+                        if std::fs::write(&tmp, bytes.as_slice()).is_ok() {
+                            let _ = std::fs::rename(&tmp, path);
+                        }
+                    }
+                    Some(Arc::new(result))
+                });
+        let outcome = outcome.ok_or_else(|| anyhow!("content fetch aborted for {content_hash}"))?;
+        match outcome.as_ref() {
+            Ok(bytes) => {
+                if !leader {
+                    self.record_cache_hit(bytes.len());
+                }
+                Ok(bytes.as_ref().clone())
+            }
+            Err(error) => Err(anyhow!(error.clone())),
         }
     }
 
@@ -264,6 +369,21 @@ impl CatalystClient {
 
     pub fn base_url(&self) -> &str {
         &self.base
+    }
+    pub(crate) fn record_cache_hit(&self, bytes: usize) {
+        self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .cache_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn io_stats(&self) -> IoStats {
+        IoStats {
+            network_requests: self.stats.network_requests.load(Ordering::Relaxed),
+            network_bytes: self.stats.network_bytes.load(Ordering::Relaxed),
+            cache_hits: self.stats.cache_hits.load(Ordering::Relaxed),
+            cache_bytes: self.stats.cache_bytes.load(Ordering::Relaxed),
+        }
     }
 
     pub fn active_entities_by_hash(&self, hash: &str) -> Result<Vec<String>> {
@@ -434,6 +554,9 @@ use std::io::Read;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::sync::Barrier;
 
     #[test]
     fn pointer_detection() {
@@ -572,5 +695,67 @@ mod tests {
 
         let no_display = scene_with(&[("tex/a.png", "h1")], serde_json::json!({"display": "x"}));
         assert!(no_display.metadata_only_hashes().is_empty());
+    }
+    #[test]
+    fn read_through_cache_coalesces_concurrent_content_downloads() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let response = Arc::new(Barrier::new(2));
+        let server_response = Arc::clone(&response);
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let mut request_len = 0;
+            while !request[..request_len].windows(4).any(|v| v == b"\r\n\r\n") {
+                let read = stream.read(&mut request[request_len..]).unwrap();
+                assert!(read > 0 && request_len + read < request.len());
+                request_len += read;
+            }
+            server_response.wait();
+            let body = b"shared-payload";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let cache = std::env::temp_dir().join(format!(
+            "abgen-content-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let client = CatalystClient::new(&base).with_content_cache(Some(cache.clone()));
+        let barrier = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let client = client.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                client.fetch_content("payload").unwrap()
+            }));
+        }
+        barrier.wait();
+        let key = "payload".to_string();
+        while client.content_flights.waiter_count(&key) != 1 {
+            std::thread::yield_now();
+        }
+        response.wait();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap(), b"shared-payload");
+        }
+        let stats = client.io_stats();
+        assert_eq!(stats.network_requests, 1);
+        assert_eq!(stats.cache_hits, 1);
+        assert_eq!(
+            std::fs::read(cache.join("payload")).unwrap(),
+            b"shared-payload"
+        );
+        let _ = std::fs::remove_dir_all(cache);
     }
 }

@@ -118,7 +118,7 @@ fn pot_ceil(v: u32, lo: u32, hi: u32) -> u32 {
 pub(super) fn canvas_size(mode: AtlasMode, budget: u32, content_extent: u32) -> u32 {
     match mode {
         AtlasMode::Adaptive => pot_ceil(content_extent, NATIVE_MIN_CANVAS, budget),
-        AtlasMode::FullBleed | AtlasMode::Native => budget,
+        AtlasMode::FullBleed | AtlasMode::Native | AtlasMode::MeshBaker => budget,
     }
 }
 
@@ -151,7 +151,7 @@ fn pack_single(
                 pot_floor(tiles[0].src_w.max(tiles[0].src_h), MIN_TILE_DIM, max_pot)
             }
         }
-        AtlasMode::Native | AtlasMode::Adaptive => {
+        AtlasMode::Native | AtlasMode::Adaptive | AtlasMode::MeshBaker => {
             let extent = if tiles[0].is_solid() {
                 NATIVE_SOLID_DIM
             } else {
@@ -163,7 +163,7 @@ fn pack_single(
     };
     let (w, h) = match mode {
         AtlasMode::FullBleed => (side, side),
-        AtlasMode::Native | AtlasMode::Adaptive => {
+        AtlasMode::Native | AtlasMode::Adaptive | AtlasMode::MeshBaker => {
             if tiles[0].is_solid() {
                 (side, side)
             } else {
@@ -212,7 +212,7 @@ pub(super) fn pack_bucket(
                     (t.src_w.min(cap), t.src_h.min(cap))
                 }
             }
-            AtlasMode::Native | AtlasMode::Adaptive => {
+            AtlasMode::Native | AtlasMode::Adaptive | AtlasMode::MeshBaker => {
                 if t.is_solid() {
                     (NATIVE_SOLID_DIM.min(cap), NATIVE_SOLID_DIM.min(cap))
                 } else {
@@ -254,7 +254,7 @@ pub(super) fn pack_bucket(
                 }
                 let (bw, bh) = match mode {
                     AtlasMode::FullBleed => (t.src_w, t.src_h),
-                    AtlasMode::Native | AtlasMode::Adaptive => (nw, nh),
+                    AtlasMode::Native | AtlasMode::Adaptive | AtlasMode::MeshBaker => (nw, nh),
                 };
                 (
                     ((bw as f64 * scale).round() as u32)
@@ -288,7 +288,7 @@ pub(super) fn pack_bucket(
         .iter()
         .map(|&(w, h)| (w + 2 * padding) as f64 * (h + 2 * padding) as f64)
         .sum();
-    let mut scale = if area_weighted {
+    let mut scale = if area_weighted || mode == AtlasMode::MeshBaker {
         1.0
     } else {
         (TARGET_OCCUPANCY * canvas as f64 * canvas as f64 / padded_area)

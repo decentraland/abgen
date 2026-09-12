@@ -16,7 +16,7 @@ use pack::pack_skyline;
 use pack::{pack_bucket, Packed};
 use tile::{
     average_color, emissive_pixels, emissive_solid, emissive_tile, fused_repeat_bake, glows,
-    intern_tile, mr_average, mr_pixels, mr_solid_bytes, mr_solid_tile, mr_tile,
+    intern_tile, is_identity_tint, mr_average, mr_pixels, mr_solid_bytes, mr_solid_tile, mr_tile,
     premultiplied_filtering, prim_area, solid_color, solid_tile, tint_bits, tinted_pixels, uv_plan,
     Bucket, EmisKey, MrKey, Tile, TileKey, UvMap, UvPlan,
 };
@@ -33,6 +33,14 @@ const LOSSLESS_OPAQUE_MIN_BUDGET: u32 = 512;
 
 const NATIVE_SOLID_DIM: u32 = 8;
 const NATIVE_MIN_CANVAS: u32 = 8;
+
+/// MeshBaker (lod-generator-unity) atlas sizing: every source texture is
+/// downscaled to at most 1024, the "natural" edge is the square root of the
+/// summed source area, and AutoSizeAtlas keeps 10% of it inside [512, 2048].
+const MESHBAKER_TILE_CAP: u32 = 1024;
+const MESHBAKER_BASELINE_DIM: u32 = 512;
+const MESHBAKER_MAX_DIM: u32 = 2048;
+const MESHBAKER_SHRINK: f64 = 0.1;
 
 const BUCKET_SPECS: [(AlphaClass, &str, &str); 4] = [
     (AlphaClass::Opaque, "TextureBakeResult-mat", "opaque"),
@@ -51,6 +59,51 @@ pub enum AtlasMode {
     FullBleed,
     Native,
     Adaptive,
+    /// Production parity: one square POT canvas per alpha class sized by
+    /// AutoSizeAtlas, tiles at native texels (capped 1024), opaque JPEG q85,
+    /// and a bucket fed by exactly one source texture ships that texture
+    /// unchanged with its tiling UVs.
+    MeshBaker,
+}
+
+impl AtlasMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            AtlasMode::FullBleed => "fullbleed",
+            AtlasMode::Native => "native",
+            AtlasMode::Adaptive => "adaptive",
+            AtlasMode::MeshBaker => "meshbaker",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<AtlasMode> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "meshbaker" | "mesh-baker" => Ok(AtlasMode::MeshBaker),
+            "native" => Ok(AtlasMode::Native),
+            "adaptive" => Ok(AtlasMode::Adaptive),
+            "fullbleed" | "full-bleed" | "fixed" => Ok(AtlasMode::FullBleed),
+            other => {
+                bail!("unknown atlas mode {other:?} (want meshbaker|native|adaptive|fullbleed)")
+            }
+        }
+    }
+}
+
+/// MeshBaker's natural atlas edge for one bucket: `ceil(sqrt(sum(min(w,1024)
+/// * min(h,1024))))` over the bucket's distinct source textures.
+pub fn meshbaker_natural_dim(sizes: impl IntoIterator<Item = (u32, u32)>) -> u32 {
+    let area: f64 = sizes
+        .into_iter()
+        .map(|(w, h)| w.min(MESHBAKER_TILE_CAP) as f64 * h.min(MESHBAKER_TILE_CAP) as f64)
+        .sum();
+    area.sqrt().ceil() as u32
+}
+
+/// AutoSizeAtlas: `clamp(next_pow2(max(ceil(natural * 0.1), 512)), 512, 2048)`.
+pub fn meshbaker_atlas_dim(natural: u32) -> u32 {
+    let want = ((natural as f64 * MESHBAKER_SHRINK).ceil() as u32).max(MESHBAKER_BASELINE_DIM);
+    want.next_power_of_two()
+        .clamp(MESHBAKER_BASELINE_DIM, MESHBAKER_MAX_DIM)
 }
 
 pub fn budget_pot(max_size: u32) -> u32 {
@@ -61,8 +114,30 @@ pub fn budget_pot(max_size: u32) -> u32 {
     pot
 }
 
+/// Largest edge among the model's images (header decode only); `None` when
+/// the model ships no image or none of them decodes.
+pub fn max_image_side(model: &LodModel) -> Option<u32> {
+    model
+        .images
+        .iter()
+        .filter_map(|img| {
+            image::ImageReader::new(std::io::Cursor::new(&img.bytes))
+                .with_guessed_format()
+                .ok()?
+                .into_dimensions()
+                .ok()
+        })
+        .map(|(w, h)| w.max(h))
+        .max()
+}
+
 pub fn class_material_name(class: AlphaClass) -> &'static str {
     BUCKET_SPECS[class_index(class)].1
+}
+
+/// Name of the fourth (`--fidelity`) metal bucket.
+pub fn metal_material_name() -> &'static str {
+    BUCKET_SPECS[METAL_BUCKET].1
 }
 
 fn bucket_index(mat: &LodMaterial, fidelity: bool) -> usize {
@@ -165,6 +240,11 @@ pub fn atlas_with_rects(
     }
     let mut buckets: [Bucket; 4] = std::array::from_fn(|_| Bucket::default());
     let mut class_double_sided = [false; 4];
+    let tile_cap = if mode == AtlasMode::MeshBaker {
+        MESHBAKER_TILE_CAP.min(max_pot)
+    } else {
+        max_pot
+    };
 
     for (pi, prim) in model.primitives.iter().enumerate() {
         if prim.positions.is_empty() || prim.indices.len() < 3 {
@@ -216,6 +296,9 @@ pub fn atlas_with_rects(
                 };
                 let mkey = mrkey_solid;
                 let color = solid_color(mat.base_color);
+                // No source image behind this tile: a pass-through copy of some
+                // other material's texture would drop it entirely.
+                bucket.needs_bake = true;
                 let ti = intern_tile(
                     bucket,
                     TileKey::Solid(color, ekey.clone(), mkey.clone()),
@@ -231,6 +314,13 @@ pub fn atlas_with_rects(
             }
             Some((img, img_hash)) => match uv_plan(&prim.uvs) {
                 UvPlan::Rect { shift, reps } => {
+                    if let Some(idx) = mat.image {
+                        bucket.sources.entry(img_hash.clone()).or_insert((
+                            idx,
+                            img.width(),
+                            img.height(),
+                        ));
+                    }
                     let ekey = if !glows(mat) {
                         EmisKey::Dark
                     } else if let Some((_, ehash)) = emis_ref {
@@ -257,6 +347,9 @@ pub fn atlas_with_rects(
                         emis: ekey.clone(),
                         mr: mkey.clone(),
                     };
+                    if !is_identity_tint(mat.base_color) {
+                        bucket.needs_bake = true;
+                    }
                     let ti = intern_tile(bucket, key, || {
                         let tinted = tinted_pixels(img, mat.base_color);
                         let (px, w, h) = fused_repeat_bake(
@@ -264,7 +357,7 @@ pub fn atlas_with_rects(
                             img.width(),
                             img.height(),
                             reps,
-                            max_pot,
+                            tile_cap,
                             premultiplied_filtering(mat.class),
                             true,
                         );
@@ -274,7 +367,7 @@ pub fn atlas_with_rects(
                                 mat.emissive,
                                 (img.width(), img.height()),
                                 reps,
-                                max_pot,
+                                tile_cap,
                             ),
                             (EmisKey::Solid(c), _) => solid_tile(*c),
                             _ => solid_tile([0, 0, 0, 255]),
@@ -286,7 +379,7 @@ pub fn atlas_with_rects(
                                 mat.roughness,
                                 (img.width(), img.height()),
                                 reps,
-                                max_pot,
+                                tile_cap,
                             ),
                             _ => mr_from_key(&mkey),
                         };
@@ -304,6 +397,8 @@ pub fn atlas_with_rects(
                 }
                 UvPlan::Fallback => {
                     bucket.fallbacks += 1;
+                    // Collapsed to a solid tile - again nothing a source copy holds.
+                    bucket.needs_bake = true;
                     log.push(format!(
                         "atlas: WARN fallback prim {pi} material {:?}: non-finite uvs, collapsed to average-color tile",
                         mat.name
@@ -346,31 +441,96 @@ pub fn atlas_with_rects(
         root_name: model.root_name.clone(),
         ..Default::default()
     };
-    type HeavyOut = (
-        Packed,
-        LodImage,
-        Option<LodImage>,
-        Option<LodImage>,
-        Vec<Option<[u32; 4]>>,
-    );
+    let bucket_pot = if mode == AtlasMode::MeshBaker {
+        let natural = buckets
+            .iter()
+            .map(|b| meshbaker_natural_dim(b.sources.values().map(|&(_, w, h)| (w, h))))
+            .max()
+            .unwrap_or(0);
+        let dim = meshbaker_atlas_dim(natural).min(max_pot);
+        log.push(format!(
+            "atlas: meshbaker natural={natural} dim={dim} (AutoSizeAtlas, max {max_pot})"
+        ));
+        dim
+    } else {
+        max_pot
+    };
+    let lossless_opaque = mode != AtlasMode::MeshBaker && max_pot >= LOSSLESS_OPAQUE_MIN_BUDGET;
+    enum HeavyOut {
+        Atlas {
+            packed: Packed,
+            img: LodImage,
+            emis_img: Option<LodImage>,
+            mr_img: Option<LodImage>,
+            crops: Vec<Option<[u32; 4]>>,
+        },
+        PassThrough {
+            img: LodImage,
+            side: u32,
+        },
+    }
     let heavy: Vec<Option<Result<HeavyOut>>> = BUCKET_SPECS
         .par_iter()
         .zip(buckets.par_iter_mut())
-        .map(|(&(class, _, _), bucket)| {
+        .enumerate()
+        .map(|(ci, (&(class, _, _), bucket))| {
             if bucket.prims.is_empty() {
                 return None;
             }
             Some((|| {
+                let passthrough = mode == AtlasMode::MeshBaker
+                    && !any_glow
+                    && ci != METAL_BUCKET
+                    && bucket.sources.len() == 1
+                    && !bucket.needs_bake;
+                if passthrough {
+                    let &(idx, w, h) = bucket.sources.values().next().unwrap();
+                    if w.max(h) > tile_cap {
+                        let (px, _) = decoded[idx]
+                            .as_ref()
+                            .ok_or_else(|| anyhow!("atlas: source image {idx} vanished"))?;
+                        let scale = tile_cap as f64 / w.max(h) as f64;
+                        let dw = ((w as f64 * scale).round() as u32).max(1);
+                        let dh = ((h as f64 * scale).round() as u32).max(1);
+                        let small = crate::resize::box_downscale_rgba(
+                            px.as_raw(),
+                            w as usize,
+                            h as usize,
+                            dw as usize,
+                            dh as usize,
+                            true,
+                        );
+                        let img = RgbaImage::from_raw(dw, dh, small)
+                            .ok_or_else(|| anyhow!("atlas passthrough buffer"))?;
+                        let mut cur = std::io::Cursor::new(Vec::new());
+                        img.write_to(&mut cur, image::ImageFormat::Png)?;
+                        return Ok(HeavyOut::PassThrough {
+                            img: LodImage {
+                                bytes: cur.into_inner(),
+                                mime: "image/png".to_string(),
+                            },
+                            side: dw.max(dh),
+                        });
+                    }
+                    let src = &model.images[idx];
+                    return Ok(HeavyOut::PassThrough {
+                        img: LodImage {
+                            bytes: src.bytes.clone(),
+                            mime: src.mime.clone(),
+                        },
+                        side: w.max(h),
+                    });
+                }
                 let mut crops = match mode {
                     AtlasMode::Native | AtlasMode::Adaptive => native_crops(bucket, model),
-                    AtlasMode::FullBleed => vec![None; bucket.tiles.len()],
+                    AtlasMode::FullBleed | AtlasMode::MeshBaker => vec![None; bucket.tiles.len()],
                 };
                 let packed = pack_bucket(
                     &mut bucket.tiles,
                     &mut crops,
                     &bucket.weights,
                     mode,
-                    max_pot,
+                    bucket_pot,
                     padding,
                 )?;
                 let canvas_px = compose(
@@ -382,7 +542,7 @@ pub fn atlas_with_rects(
                     premultiplied_filtering(class),
                     true,
                 );
-                let img = encode_atlas(class, canvas_px, packed.canvas, max_pot)?;
+                let img = encode_atlas(class, canvas_px, packed.canvas, lossless_opaque)?;
                 let emis_img = if any_glow {
                     let emis_px = compose(
                         &bucket.emis,
@@ -393,7 +553,12 @@ pub fn atlas_with_rects(
                         false,
                         true,
                     );
-                    Some(encode_atlas(class, emis_px, packed.canvas, max_pot)?)
+                    Some(encode_atlas(
+                        class,
+                        emis_px,
+                        packed.canvas,
+                        lossless_opaque,
+                    )?)
                 } else {
                     None
                 };
@@ -418,7 +583,13 @@ pub fn atlas_with_rects(
                 } else {
                     None
                 };
-                Ok((packed, img, emis_img, mr_img, crops))
+                Ok(HeavyOut::Atlas {
+                    packed,
+                    img,
+                    emis_img,
+                    mr_img,
+                    crops,
+                })
             })())
         })
         .collect();
@@ -428,127 +599,176 @@ pub fn atlas_with_rects(
         let Some(res) = item else {
             continue;
         };
-        let (packed, img, emis_img, mr_img, crops) = res?;
         let (class, mat_name, tag) = BUCKET_SPECS[ci];
         let bucket = &buckets[ci];
-        let mime = img.mime.clone();
-        let img_idx = out.images.len();
-        out.images.push(img);
-        let emis_idx = emis_img.map(|e| {
-            let i = out.images.len();
-            out.images.push(e);
-            i
-        });
-        let mr_idx = mr_img.map(|e| {
-            let i = out.images.len();
-            out.images.push(e);
-            i
-        });
-        let mat_idx = out.materials.len();
-        let (metallic, roughness) = if mr_idx.is_some() {
-            (1.0, 0.0)
-        } else if ci == METAL_BUCKET && bucket.met_tris > 0.0 {
-            (
-                bucket.met_sum / bucket.met_tris,
-                bucket.rough_sum / bucket.met_tris,
-            )
-        } else {
-            (0.0, 1.0)
-        };
-        out.materials.push(LodMaterial {
-            name: mat_name.to_string(),
-            class,
-            base_color: [1.0, 1.0, 1.0, 1.0],
-            cutoff: 0.5,
-            image: Some(img_idx),
-            double_sided: class_double_sided[ci],
-            emissive: if emis_idx.is_some() {
-                [1.0; 3]
+        let push_material = |out: &mut LodModel,
+                             img: LodImage,
+                             emis_img: Option<LodImage>,
+                             mr_img: Option<LodImage>|
+         -> (usize, Option<usize>, Option<usize>, String) {
+            let mime = img.mime.clone();
+            let img_idx = out.images.len();
+            out.images.push(img);
+            let emis_idx = emis_img.map(|e| {
+                let i = out.images.len();
+                out.images.push(e);
+                i
+            });
+            let mr_idx = mr_img.map(|e| {
+                let i = out.images.len();
+                out.images.push(e);
+                i
+            });
+            let mat_idx = out.materials.len();
+            let (metallic, roughness) = if mr_idx.is_some() {
+                (1.0, 0.0)
+            } else if ci == METAL_BUCKET && bucket.met_tris > 0.0 {
+                (
+                    bucket.met_sum / bucket.met_tris,
+                    bucket.rough_sum / bucket.met_tris,
+                )
             } else {
-                [0.0; 3]
-            },
-            emissive_image: emis_idx,
-            metallic,
-            roughness,
-            mr_image: mr_idx,
-            ..Default::default()
-        });
-        let s = packed.canvas as f64;
-        let mut merged = LodPrimitive {
-            material: mat_idx,
-            ..Default::default()
+                (0.0, 1.0)
+            };
+            out.materials.push(LodMaterial {
+                name: mat_name.to_string(),
+                class,
+                base_color: [1.0, 1.0, 1.0, 1.0],
+                cutoff: 0.5,
+                image: Some(img_idx),
+                double_sided: class_double_sided[ci],
+                emissive: if emis_idx.is_some() {
+                    [1.0; 3]
+                } else {
+                    [0.0; 3]
+                },
+                emissive_image: emis_idx,
+                metallic,
+                roughness,
+                mr_image: mr_idx,
+                ..Default::default()
+            });
+            (mat_idx, emis_idx, mr_idx, mime)
         };
-        for (pi, ti, uvmap) in &bucket.prims {
-            let prim = &model.primitives[*pi];
-            let base = merged.positions.len() as u32;
-            merged.positions.extend_from_slice(&prim.positions);
-            merged.normals.extend_from_slice(&prim.normals);
-            let (rx, ry, rw, rh) = packed.rects[*ti];
-            let tile = &bucket.tiles[*ti];
-            let crop = crops[*ti];
-            for uv in &prim.uvs {
-                let (lu, lv) = match uvmap {
-                    UvMap::Center => (0.5, 0.5),
-                    UvMap::Rect { shift, reps } => {
-                        let mut lu = ((uv[0] as f64 - shift[0]) / reps[0]).clamp(0.0, 1.0);
-                        let mut lv = ((uv[1] as f64 - shift[1]) / reps[1]).clamp(0.0, 1.0);
-                        if let Some([cx, cy, cw, ch]) = crop {
-                            lu = ((lu * tile.src_w as f64 - cx as f64) / cw as f64).clamp(0.0, 1.0);
-                            lv = ((lv * tile.src_h as f64 - cy as f64) / ch as f64).clamp(0.0, 1.0);
-                        }
-                        (lu, lv)
-                    }
+        match res? {
+            HeavyOut::PassThrough { img, side } => {
+                let (mat_idx, _, _, mime) = push_material(&mut out, img, None, None);
+                let mut merged = LodPrimitive {
+                    material: mat_idx,
+                    ..Default::default()
                 };
-                merged.uvs.push([
-                    ((rx as f64 + lu * rw as f64) / s) as f32,
-                    ((ry as f64 + lv * rh as f64) / s) as f32,
-                ]);
+                for (pi, _, _) in &bucket.prims {
+                    let prim = &model.primitives[*pi];
+                    let base = merged.positions.len() as u32;
+                    merged.positions.extend_from_slice(&prim.positions);
+                    merged.normals.extend_from_slice(&prim.normals);
+                    for uv in &prim.uvs {
+                        merged.uvs.push([
+                            if uv[0].is_finite() { uv[0] } else { 0.0 },
+                            if uv[1].is_finite() { uv[1] } else { 0.0 },
+                        ]);
+                    }
+                    for &i in &prim.indices {
+                        merged.indices.push(base + i);
+                    }
+                }
+                weld_primitive(&mut merged);
+                log.push(format!(
+                    "atlas: class={} material={} size={} refs={} unique=1 occupancy=100.0% fallbacks={} scale=1.000 mime={} passthrough=source-texture",
+                    tag, mat_name, side, bucket.refs, bucket.fallbacks, mime
+                ));
+                total_fallbacks += bucket.fallbacks;
+                out.primitives.push(merged);
             }
-            for &i in &prim.indices {
-                merged.indices.push(base + i);
+            HeavyOut::Atlas {
+                packed,
+                img,
+                emis_img,
+                mr_img,
+                crops,
+            } => {
+                let (mat_idx, emis_idx, mr_idx, mime) =
+                    push_material(&mut out, img, emis_img, mr_img);
+                let s = packed.canvas as f64;
+                let mut merged = LodPrimitive {
+                    material: mat_idx,
+                    ..Default::default()
+                };
+                for (pi, ti, uvmap) in &bucket.prims {
+                    let prim = &model.primitives[*pi];
+                    let base = merged.positions.len() as u32;
+                    merged.positions.extend_from_slice(&prim.positions);
+                    merged.normals.extend_from_slice(&prim.normals);
+                    let (rx, ry, rw, rh) = packed.rects[*ti];
+                    let tile = &bucket.tiles[*ti];
+                    let crop = crops[*ti];
+                    for uv in &prim.uvs {
+                        let (lu, lv) = match uvmap {
+                            UvMap::Center => (0.5, 0.5),
+                            UvMap::Rect { shift, reps } => {
+                                let mut lu = ((uv[0] as f64 - shift[0]) / reps[0]).clamp(0.0, 1.0);
+                                let mut lv = ((uv[1] as f64 - shift[1]) / reps[1]).clamp(0.0, 1.0);
+                                if let Some([cx, cy, cw, ch]) = crop {
+                                    lu = ((lu * tile.src_w as f64 - cx as f64) / cw as f64)
+                                        .clamp(0.0, 1.0);
+                                    lv = ((lv * tile.src_h as f64 - cy as f64) / ch as f64)
+                                        .clamp(0.0, 1.0);
+                                }
+                                (lu, lv)
+                            }
+                        };
+                        merged.uvs.push([
+                            ((rx as f64 + lu * rw as f64) / s) as f32,
+                            ((ry as f64 + lv * rh as f64) / s) as f32,
+                        ]);
+                    }
+                    for &i in &prim.indices {
+                        merged.indices.push(base + i);
+                    }
+                }
+                weld_primitive(&mut merged);
+                let occupancy = packed
+                    .rects
+                    .iter()
+                    .map(|r| r.2 as f64 * r.3 as f64)
+                    .sum::<f64>()
+                    / (s * s)
+                    * 100.0;
+                let emis_note = match emis_idx {
+                    Some(i) => format!(" emissive_image={} ({})", i, out.images[i].mime),
+                    None => String::new(),
+                };
+                let mr_note = match mr_idx {
+                    Some(i) => format!(" metal_rough_image={} ({})", i, out.images[i].mime),
+                    None => String::new(),
+                };
+                log.push(format!(
+                    "atlas: class={} material={} size={} refs={} unique={} occupancy={:.1}% fallbacks={} scale={:.3} mime={}{}{}",
+                    tag,
+                    mat_name,
+                    packed.canvas,
+                    bucket.refs,
+                    bucket.tiles.len(),
+                    occupancy,
+                    bucket.fallbacks,
+                    packed.scale,
+                    mime,
+                    emis_note,
+                    mr_note
+                ));
+                total_fallbacks += bucket.fallbacks;
+                rect_tables.push(super::reclamp::ClassRects {
+                    material: mat_name.to_string(),
+                    canvas: packed.canvas,
+                    rects: packed
+                        .rects
+                        .iter()
+                        .map(|&(x, y, w, h)| [x, y, w, h])
+                        .collect(),
+                });
+                out.primitives.push(merged);
             }
         }
-        weld_primitive(&mut merged);
-        let occupancy = packed
-            .rects
-            .iter()
-            .map(|r| r.2 as f64 * r.3 as f64)
-            .sum::<f64>()
-            / (s * s)
-            * 100.0;
-        let emis_note = match emis_idx {
-            Some(i) => format!(" emissive_image={} ({})", i, out.images[i].mime),
-            None => String::new(),
-        };
-        let mr_note = match mr_idx {
-            Some(i) => format!(" metal_rough_image={} ({})", i, out.images[i].mime),
-            None => String::new(),
-        };
-        log.push(format!(
-            "atlas: class={} material={} size={} refs={} unique={} occupancy={:.1}% fallbacks={} scale={:.3} mime={}{}{}",
-            tag,
-            mat_name,
-            packed.canvas,
-            bucket.refs,
-            bucket.tiles.len(),
-            occupancy,
-            bucket.fallbacks,
-            packed.scale,
-            mime,
-            emis_note,
-            mr_note
-        ));
-        total_fallbacks += bucket.fallbacks;
-        rect_tables.push(super::reclamp::ClassRects {
-            material: mat_name.to_string(),
-            canvas: packed.canvas,
-            rects: packed
-                .rects
-                .iter()
-                .map(|&(x, y, w, h)| [x, y, w, h])
-                .collect(),
-        });
-        out.primitives.push(merged);
     }
     if out.primitives.is_empty() {
         bail!("atlas: no non-empty primitives");

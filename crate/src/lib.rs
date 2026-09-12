@@ -12,11 +12,50 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[macro_use]
 pub mod value;
 pub mod gpu;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 pub mod gpu_dispatch;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(feature = "gpu"), not(target_arch = "wasm32")))]
+pub mod gpu_dispatch {
+    pub fn enable() -> Result<(), String> {
+        Err("GPU support was not compiled in".to_string())
+    }
+
+    pub fn enabled() -> bool {
+        false
+    }
+
+    pub struct Bc7Job<'a> {
+        pub rgba: &'a [u8],
+        pub width: u32,
+        pub height: u32,
+        pub mip_count: Option<i32>,
+        pub flip: bool,
+        pub srgb: bool,
+        pub perceptual: bool,
+        pub profile: crate::bc7_pure::Bc7Profile,
+    }
+
+    pub fn encode_bc7_mip_chain(
+        _rgba: &[u8],
+        _width: u32,
+        _height: u32,
+        _mip_count: Option<i32>,
+        _flip: bool,
+        _srgb: bool,
+        _perceptual: bool,
+        _profile: crate::bc7_pure::Bc7Profile,
+    ) -> Option<(Vec<u8>, i32)> {
+        None
+    }
+
+    pub fn encode_bc7_mip_chain_batch(_jobs: &[Bc7Job<'_>]) -> Option<Vec<(Vec<u8>, i32)>> {
+        None
+    }
+}
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 pub mod gpuhost;
 pub mod scene;
+mod singleflight;
 
 pub mod alpha_bleed;
 pub mod animation;
@@ -89,7 +128,6 @@ pub mod bundle;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bvwebgpu;
 
-pub mod compress;
 pub mod export;
 pub mod lods;
 #[cfg(not(target_arch = "wasm32"))]

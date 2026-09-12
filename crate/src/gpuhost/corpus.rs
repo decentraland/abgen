@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
+use crate::builder::{detect_container, pack_normal_map};
 use crate::glbscan::{file_ext_lower, scan_entity, UriCache};
 use crate::gpu::corelib::bc7::{Bc7Profile, OptTables, Params};
 use crate::gpu::corelib::mips::{
@@ -284,30 +285,6 @@ fn bucket_params() -> [Params; 4] {
         Params::basic(false),
         Params::basic(true),
     ]
-}
-
-fn detect_container(raw: &[u8]) -> String {
-    if raw.len() >= 8 && &raw[0..8] == b"\x89PNG\r\n\x1a\n" {
-        "PNG".to_string()
-    } else if raw.len() >= 2 && raw[0] == 0xFF && raw[1] == 0xD8 {
-        "JPEG".to_string()
-    } else {
-        String::new()
-    }
-}
-
-fn pack_normal_map(rgba: &[u8]) -> Vec<u8> {
-    let n = rgba.len() / 4;
-    let mut out = vec![0u8; n * 4];
-    for i in 0..n {
-        let r = rgba[i * 4];
-        let g = rgba[i * 4 + 1];
-        out[i * 4] = 255;
-        out[i * 4 + 1] = g;
-        out[i * 4 + 2] = g;
-        out[i * 4 + 3] = r;
-    }
-    out
 }
 
 fn decode_image(raw: &[u8]) -> Option<(Vec<u8>, u32, u32)> {

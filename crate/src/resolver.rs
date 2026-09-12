@@ -45,7 +45,7 @@ pub fn manifest_path(root: &Path, name_with_suffix: &str) -> Option<PathBuf> {
 }
 
 pub fn binary_path(root: &Path, entity: &str, filename: &str) -> Option<PathBuf> {
-    if !is_safe_component(entity) || !is_safe_component(filename) {
+    if !is_safe_component(entity) || !is_safe_component(filename) || filename.ends_with(".br") {
         return None;
     }
     let stored_name = crate::naming::fs_safe_component(filename);
@@ -53,8 +53,7 @@ pub fn binary_path(root: &Path, entity: &str, filename: &str) -> Option<PathBuf>
     if flat.is_file() {
         return Some(flat);
     }
-    let name_for_platform = filename.strip_suffix(".br").unwrap_or(filename);
-    let platform = platform_of(name_for_platform);
+    let platform = platform_of(filename);
     let candidate = root
         .join(&*crate::naming::fs_safe_component(entity))
         .join(platform)
@@ -69,17 +68,15 @@ pub fn binary_path(root: &Path, entity: &str, filename: &str) -> Option<PathBuf>
 }
 
 fn digest_qualified_alias(candidate: &Path, filename: &str) -> Option<PathBuf> {
-    let is_br = filename.ends_with(".br");
-    let raw = filename.strip_suffix(".br").unwrap_or(filename);
-    if crate::naming::bundle_name_has_digest(raw) {
+    if crate::naming::bundle_name_has_digest(filename) {
         return None;
     }
-    let (platform, bare) = split_platform(raw);
-    if bare == raw {
+    let (platform, bare) = split_platform(filename);
+    if bare == filename {
         return None;
     }
     let prefix = format!("{}_", bare.to_lowercase());
-    let suffix = format!("_{platform}{}", if is_br { ".br" } else { "" }).to_lowercase();
+    let suffix = format!("_{platform}").to_lowercase();
     let dir = candidate.parent()?;
     for entry in std::fs::read_dir(dir).ok()? {
         let Ok(entry) = entry else { continue };
@@ -100,11 +97,10 @@ fn digest_qualified_alias(candidate: &Path, filename: &str) -> Option<PathBuf> {
 }
 
 pub fn lod_path(root: &Path, level: &str, filename: &str) -> Option<PathBuf> {
-    if !is_safe_component(level) || !is_safe_component(filename) {
+    if !is_safe_component(level) || !is_safe_component(filename) || filename.ends_with(".br") {
         return None;
     }
-    let raw = filename.strip_suffix(".br").unwrap_or(filename);
-    let (_, no_platform) = split_platform(raw);
+    let (_, no_platform) = split_platform(filename);
     let scene_id = no_platform
         .strip_suffix(&format!("_{level}"))
         .unwrap_or(no_platform);
@@ -115,11 +111,10 @@ pub fn lod_path(root: &Path, level: &str, filename: &str) -> Option<PathBuf> {
 }
 
 pub fn iss_manifest_path(root: &Path, filename: &str) -> Option<PathBuf> {
-    if !is_safe_component(filename) {
+    if !is_safe_component(filename) || filename.ends_with(".br") {
         return None;
     }
-    let stem = filename.strip_suffix(".br").unwrap_or(filename);
-    let sid = stem.strip_suffix(crate::lodgen::placements::ISS_SUFFIX)?;
+    let sid = filename.strip_suffix(crate::lodgen::placements::ISS_SUFFIX)?;
     if sid.is_empty() || !is_safe_component(sid) {
         return None;
     }
@@ -130,15 +125,13 @@ pub fn bvpack_path(root: &Path, entity: &str, filename: &str) -> Option<PathBuf>
     if !is_safe_component(entity) || !is_safe_component(filename) {
         return None;
     }
-    let raw = filename.strip_suffix(".br").unwrap_or(filename);
-    if raw != format!("{entity}.pack") {
+    if filename != format!("{entity}.pack") {
         return None;
     }
-    let br = if filename.ends_with(".br") { ".br" } else { "" };
     Some(
         root.join(entity)
             .join(crate::bvwebgpu::BVW_PLATFORM)
-            .join(format!("{}{br}", crate::bvwebgpu::pack_file_name(entity))),
+            .join(crate::bvwebgpu::pack_file_name(entity)),
     )
 }
 
@@ -199,10 +192,7 @@ mod tests {
             binary_path(root, "bafkScene", "Qmhash_windows").unwrap(),
             Path::new("/out/bafkScene/windows/Qmhash_windows")
         );
-        assert_eq!(
-            binary_path(root, "bafkScene", "Qmhash_mac.br").unwrap(),
-            Path::new("/out/bafkScene/mac/Qmhash_mac.br")
-        );
+        assert!(binary_path(root, "bafkScene", "Qmhash_mac.br").is_none());
     }
 
     #[test]
@@ -212,10 +202,7 @@ mod tests {
             lod_path(root, "1", "bafkscene_1_mac").unwrap(),
             Path::new("/out/bafkscene/LOD/1/bafkscene_1_mac")
         );
-        assert_eq!(
-            lod_path(root, "2", "bafkscene_2_windows.br").unwrap(),
-            Path::new("/out/bafkscene/LOD/2/bafkscene_2_windows.br")
-        );
+        assert!(lod_path(root, "2", "bafkscene_2_windows.br").is_none());
         assert_eq!(
             lod_path(root, "0", "bafkscene_0").unwrap(),
             Path::new("/out/bafkscene/LOD/0/bafkscene_0")
@@ -229,10 +216,7 @@ mod tests {
             iss_manifest_path(root, "bafkscene_InitialSceneState.json").unwrap(),
             Path::new("/out/bafkscene/bafkscene_InitialSceneState.json")
         );
-        assert_eq!(
-            iss_manifest_path(root, "bafkscene_InitialSceneState.json.br").unwrap(),
-            Path::new("/out/bafkscene/bafkscene_InitialSceneState.json.br")
-        );
+        assert!(iss_manifest_path(root, "bafkscene_InitialSceneState.json.br").is_none());
         assert!(iss_manifest_path(root, "bafkscene-lod-manifest.json").is_none());
         assert!(iss_manifest_path(root, "bafkscene_InitialSceneState.jsonx").is_none());
         assert!(iss_manifest_path(root, "LOD.manifest.json").is_none());
@@ -279,10 +263,7 @@ mod tests {
             bvpack_path(root, "bafkEnt", "bafkEnt.pack").unwrap(),
             Path::new("/out/bafkEnt/bvwebgpu/bafkEnt_bv4.pack")
         );
-        assert_eq!(
-            bvpack_path(root, "bafkEnt", "bafkEnt.pack.br").unwrap(),
-            Path::new("/out/bafkEnt/bvwebgpu/bafkEnt_bv4.pack.br")
-        );
+        assert!(bvpack_path(root, "bafkEnt", "bafkEnt.pack.br").is_none());
         assert!(bvpack_path(root, "bafkEnt", "other.pack").is_none());
         assert!(bvpack_path(root, "bafkEnt", "bafkEnt.zip").is_none());
         assert!(bvpack_path(root, "..", "...pack").is_none());

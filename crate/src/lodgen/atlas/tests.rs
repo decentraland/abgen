@@ -363,8 +363,38 @@ fn fully_transparent_fallback_deterministic() {
     let out2 = atlas(&build(), 64, 2).unwrap();
     assert_eq!(out1.images[0].bytes, out2.images[0].bytes);
     let canvas = decode(&out1.images[0]);
-    let g = linear_to_srgb_u8(0.5);
-    assert_eq!(canvas.get_pixel(1, 1).0, [g, g, g, 0]);
+    assert_eq!(canvas.get_pixel(1, 1).0, [0, 0, 0, 0]);
+}
+
+#[test]
+fn alpha_lane_hidden_rgb_is_transparent_black() {
+    // Production atlases carry (0,0,0,0) wherever alpha is zero; source RGB
+    // under alpha 0 and any neighbour bleed must not survive into the lane.
+    for class in [AlphaClass::Mask, AlphaClass::Blend] {
+        let mut img = RgbaImage::new(16, 16);
+        for (x, _y, p) in img.enumerate_pixels_mut() {
+            *p = if x < 8 {
+                image::Rgba([200, 30, 90, 255])
+            } else {
+                image::Rgba([255, 255, 0, 0])
+            };
+        }
+        let m = model1(
+            mat("a", class, [1.0; 4], Some(0)),
+            tri_uvs(),
+            vec![png_bytes(&img)],
+        );
+        let out = atlas(&m, 64, 2).unwrap();
+        let canvas = decode(&out.images[0]);
+        let mut hidden = 0usize;
+        for p in canvas.pixels() {
+            if p.0[3] == 0 {
+                hidden += 1;
+                assert_eq!(p.0, [0, 0, 0, 0], "{class:?}: hidden texel kept RGB");
+            }
+        }
+        assert!(hidden > 0, "{class:?}: canvas has no hidden texels");
+    }
 }
 
 #[test]
@@ -743,6 +773,365 @@ fn canvas_size_policy() {
     assert_eq!(budget_pot(300), 256);
     assert_eq!(budget_pot(512), 512);
     assert_eq!(budget_pot(1), 1);
+}
+
+#[test]
+fn meshbaker_atlas_size_formula() {
+    assert_eq!(meshbaker_atlas_dim(0), 512);
+    assert_eq!(meshbaker_atlas_dim(3000), 512);
+    assert_eq!(meshbaker_atlas_dim(5120), 512);
+    assert_eq!(meshbaker_atlas_dim(5130), 1024);
+    assert_eq!(meshbaker_atlas_dim(8000), 1024);
+    assert_eq!(meshbaker_atlas_dim(20000), 2048);
+    assert_eq!(meshbaker_atlas_dim(40000), 2048);
+    assert_eq!(meshbaker_natural_dim([(1024, 1024)]), 1024);
+    assert_eq!(meshbaker_natural_dim([(4096, 4096)]), 1024);
+    assert_eq!(meshbaker_natural_dim([(512, 512), (512, 512)]), 725);
+    assert_eq!(meshbaker_natural_dim([(64, 64), (64, 64)]), 91);
+    assert_eq!(meshbaker_natural_dim(std::iter::empty()), 0);
+    for extent in [1u32, 8, 40, 256, 600] {
+        assert_eq!(canvas_size(AtlasMode::MeshBaker, 512, extent), 512);
+    }
+    assert_eq!(AtlasMode::parse("MeshBaker").unwrap(), AtlasMode::MeshBaker);
+    assert_eq!(AtlasMode::parse("native").unwrap(), AtlasMode::Native);
+    assert_eq!(AtlasMode::parse("adaptive").unwrap(), AtlasMode::Adaptive);
+    assert_eq!(AtlasMode::parse("fullbleed").unwrap(), AtlasMode::FullBleed);
+    let msg = format!("{:#}", AtlasMode::parse("pixyz").unwrap_err());
+    assert!(msg.contains("meshbaker|native|adaptive|fullbleed"), "{msg}");
+    assert_eq!(AtlasMode::MeshBaker.name(), "meshbaker");
+}
+
+#[test]
+fn bucket_by_alpha_mode() {
+    assert_eq!(
+        class_material_name(AlphaClass::Opaque),
+        "TextureBakeResult-mat"
+    );
+    assert_eq!(
+        class_material_name(AlphaClass::Mask),
+        "TextureBakeResult-mat-cutout"
+    );
+    assert_eq!(
+        class_material_name(AlphaClass::Blend),
+        "TextureBakeResult-mat-transparent"
+    );
+    assert_eq!(metal_material_name(), "TextureBakeResult-mat-metal");
+    let imgs = vec![
+        flat_image(8, 8, [200, 20, 20, 255]),
+        flat_image(8, 8, [20, 200, 20, 128]),
+        flat_image(8, 8, [20, 20, 200, 64]),
+    ];
+    let mut metal = mat("shiny", AlphaClass::Opaque, [1.0; 4], Some(0));
+    metal.metallic = 1.0;
+    metal.roughness = 0.2;
+    let m = model_of(
+        vec![
+            mat(
+                "wood",
+                AlphaClass::from_alpha_mode("OPAQUE"),
+                [1.0; 4],
+                Some(0),
+            ),
+            mat(
+                "leaf",
+                AlphaClass::from_alpha_mode("MASK"),
+                [1.0; 4],
+                Some(1),
+            ),
+            mat(
+                "glass",
+                AlphaClass::from_alpha_mode("BLEND"),
+                [1.0; 4],
+                Some(2),
+            ),
+            metal,
+        ],
+        vec![
+            prim(0, tri_uvs()),
+            prim(1, tri_uvs()),
+            prim(2, tri_uvs()),
+            prim(3, tri_uvs()),
+        ],
+        imgs.clone(),
+    );
+    let out = atlas_with(&m, 2048, 2, AtlasMode::MeshBaker, false).unwrap();
+    let mut names: Vec<&str> = out.materials.iter().map(|m| m.name.as_str()).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "TextureBakeResult-mat",
+            "TextureBakeResult-mat-cutout",
+            "TextureBakeResult-mat-transparent"
+        ]
+    );
+    for mat in &out.materials {
+        assert_eq!(mat.name, class_material_name(mat.class));
+    }
+    let cutout = out
+        .materials
+        .iter()
+        .position(|m| m.class == AlphaClass::Mask)
+        .unwrap();
+    let cutout_prim = out
+        .primitives
+        .iter()
+        .find(|p| p.material == cutout)
+        .unwrap();
+    assert_eq!(cutout_prim.indices.len() / 3, 1);
+    // metal is a separate bucket only under --fidelity
+    let fid = atlas_with(&m, 2048, 2, AtlasMode::MeshBaker, true).unwrap();
+    assert_eq!(fid.materials.len(), 4);
+    assert!(fid
+        .materials
+        .iter()
+        .any(|m| m.name == metal_material_name()));
+}
+
+#[test]
+fn meshbaker_single_texture_passes_through() {
+    let png = flat_image(64, 32, [10, 200, 30, 255]);
+    // Every material has to be an untinted user of the one source texture: a
+    // tint or an untextured solid is colour a verbatim copy cannot carry, and
+    // the bucket bakes instead - see the two tests below.
+    let m = model_of(
+        vec![
+            mat("a", AlphaClass::Opaque, [1.0; 4], Some(0)),
+            mat("b", AlphaClass::Opaque, [1.0; 4], Some(0)),
+            mat("c", AlphaClass::Opaque, [1.0; 4], Some(0)),
+        ],
+        vec![
+            prim(0, vec![[0.0, 0.0], [3.0, 0.0], [0.0, 3.0]]),
+            prim(1, vec![[-1.0, -1.0], [2.0, -1.0], [-1.0, 2.0]]),
+            prim(2, tri_uvs()),
+        ],
+        vec![png.clone()],
+    );
+    let out = atlas_with(&m, 2048, 2, AtlasMode::MeshBaker, false).unwrap();
+    assert_eq!(out.materials.len(), 1);
+    assert_eq!(out.images.len(), 1);
+    assert_eq!(
+        out.images[0].bytes, png,
+        "source texture must ship unchanged"
+    );
+    assert_eq!(out.images[0].mime, "image/png");
+    assert_eq!(out.materials[0].name, "TextureBakeResult-mat");
+    assert_eq!(out.materials[0].base_color, [1.0, 1.0, 1.0, 1.0]);
+    assert_eq!(out.primitives.len(), 1);
+    assert_eq!(out.primitives[0].indices.len() / 3, 3);
+    let uvs = &out.primitives[0].uvs;
+    assert!(
+        uvs.contains(&[3.0, 0.0]),
+        "tiling uvs kept verbatim: {uvs:?}"
+    );
+    assert!(uvs.contains(&[-1.0, -1.0]), "{uvs:?}");
+    let line = log_line(&out, "class=opaque");
+    assert!(line.contains("passthrough=source-texture"), "{line}");
+    assert!(line.contains("size=64"), "{line}");
+
+    // two distinct sources: a real 512 canvas, opaque as JPEG q85, mask as PNG
+    let m2 = model_of(
+        vec![
+            mat("a", AlphaClass::Opaque, [1.0; 4], Some(0)),
+            mat("b", AlphaClass::Opaque, [1.0; 4], Some(1)),
+            mat("m", AlphaClass::Mask, [1.0; 4], Some(0)),
+            mat("n", AlphaClass::Mask, [1.0; 4], Some(1)),
+        ],
+        vec![
+            prim(0, tri_uvs()),
+            prim(1, tri_uvs()),
+            prim(2, tri_uvs()),
+            prim(3, tri_uvs()),
+        ],
+        vec![
+            flat_image(64, 64, [200, 20, 20, 255]),
+            flat_image(64, 64, [20, 200, 20, 255]),
+        ],
+    );
+    let out2 = atlas_with(&m2, 2048, 2, AtlasMode::MeshBaker, false).unwrap();
+    assert_eq!(out2.materials.len(), 2);
+    assert_eq!(out2.images.len(), 2);
+    let opaque = out2
+        .materials
+        .iter()
+        .find(|m| m.class == AlphaClass::Opaque)
+        .unwrap();
+    let mask = out2
+        .materials
+        .iter()
+        .find(|m| m.class == AlphaClass::Mask)
+        .unwrap();
+    let oimg = &out2.images[opaque.image.unwrap()];
+    let mimg = &out2.images[mask.image.unwrap()];
+    assert_eq!(oimg.mime, "image/jpeg");
+    assert_eq!(mimg.mime, "image/png");
+    assert_eq!(decode(oimg).width(), 512);
+    assert_eq!(decode(oimg).height(), 512);
+    assert_eq!(decode(mimg).width(), 512);
+    let line = log_line(&out2, "meshbaker natural=");
+    assert!(line.contains("natural=91 dim=512"), "{line}");
+    assert!(!log_line(&out2, "class=opaque").contains("passthrough"));
+
+    // --atlas-max below the MeshBaker floor still wins
+    let small = atlas_with(&m2, 256, 2, AtlasMode::MeshBaker, false).unwrap();
+    assert_eq!(decode(&small.images[0]).width(), 256);
+
+    // a lone source over 1024 is downscaled to the MeshBaker cap, as PNG
+    let big = model1(
+        mat("big", AlphaClass::Mask, [1.0; 4], Some(0)),
+        tri_uvs(),
+        vec![flat_image(2048, 1024, [1, 2, 3, 200])],
+    );
+    let out3 = atlas_with(&big, 2048, 2, AtlasMode::MeshBaker, false).unwrap();
+    assert_eq!(out3.images.len(), 1);
+    assert_eq!(out3.images[0].mime, "image/png");
+    let d = decode(&out3.images[0]);
+    assert_eq!((d.width(), d.height()), (1024, 512));
+    let px = d.get_pixel(3, 3).0;
+    for (got, want) in px.iter().zip([1u8, 2, 3, 200]) {
+        assert!((*got as i32 - want as i32).abs() <= 1, "{px:?}");
+    }
+    assert!(log_line(&out3, "class=mask").contains("passthrough=source-texture"));
+}
+
+#[test]
+fn untextured_solid_in_the_bucket_is_baked_not_passed_through() {
+    // One textured material plus an untextured one. `sources` counts image
+    // hashes, so the bucket still sees a single source - but shipping that
+    // source verbatim drops the solid material's colour entirely.
+    let png = flat_image(64, 32, [10, 200, 30, 255]);
+    let m = model_of(
+        vec![
+            mat("textured", AlphaClass::Opaque, [1.0; 4], Some(0)),
+            mat("solid", AlphaClass::Opaque, [0.2, 0.4, 0.6, 1.0], None),
+        ],
+        vec![prim(0, tri_uvs()), prim(1, tri_uvs())],
+        vec![png.clone()],
+    );
+    let out = atlas_with(&m, 2048, 2, AtlasMode::MeshBaker, false).unwrap();
+    assert_ne!(
+        out.images[0].bytes, png,
+        "a bucket carrying a solid tile must not ship the source verbatim"
+    );
+    let line = log_line(&out, "class=opaque");
+    assert!(!line.contains("passthrough"), "{line}");
+}
+
+#[test]
+fn shared_mask_with_per_material_tints_is_baked_not_passed_through() {
+    // Hall of Fame's foliage: one colourless Leaf_Mask silhouette shared by
+    // LeafGreen/LeafPink/LeafYellow, each carrying its colour only in
+    // baseColorFactor. `sources` keys on the image hash alone, so the bucket
+    // still sees a single source - it has to bake anyway, or every leaf in the
+    // scene ships as the bare white mask.
+    let mut mask = RgbaImage::new(16, 16);
+    for (x, _y, p) in mask.enumerate_pixels_mut() {
+        *p = if x < 8 {
+            image::Rgba([255, 255, 255, 255])
+        } else {
+            image::Rgba([255, 255, 255, 0])
+        };
+    }
+    let png = png_bytes(&mask);
+    let m = model_of(
+        vec![
+            mat(
+                "LeafGreen",
+                AlphaClass::Mask,
+                [0.036_888_62, 0.496_933_52, 0.337_163_78, 1.0],
+                Some(0),
+            ),
+            mat(
+                "LeafPink",
+                AlphaClass::Mask,
+                [1.0, 0.057_805_28, 0.254_152_18, 1.0],
+                Some(0),
+            ),
+        ],
+        vec![prim(0, tri_uvs()), prim(1, tri_uvs())],
+        vec![png.clone()],
+    );
+    let out = atlas_with(&m, 2048, 2, AtlasMode::MeshBaker, false).unwrap();
+    assert_ne!(
+        out.images[0].bytes, png,
+        "a tinted bucket must not ship the untinted source"
+    );
+    let line = log_line(&out, "class=mask");
+    assert!(!line.contains("passthrough"), "{line}");
+
+    let canvas = decode(&out.images[0]);
+    let mut shades: Vec<[u8; 3]> = canvas
+        .pixels()
+        .filter(|p| p.0[3] > 0)
+        .map(|p| [p.0[0], p.0[1], p.0[2]])
+        .collect();
+    shades.sort_unstable();
+    shades.dedup();
+    assert!(
+        shades.len() >= 2,
+        "both leaf tints must survive into the canvas: {shades:?}"
+    );
+    assert!(
+        !shades.contains(&[255, 255, 255]),
+        "a tinted leaf stayed white: {shades:?}"
+    );
+}
+
+#[test]
+fn meshbaker_passthrough_honours_atlas_max() {
+    // the pass-through cap is min(1024, --atlas-max): a 1024 source under
+    // --atlas-max 256 ships at 256, a non-square one keeps its aspect
+    let big = model1(
+        mat("big", AlphaClass::Mask, [1.0; 4], Some(0)),
+        tri_uvs(),
+        vec![flat_image(1024, 1024, [1, 2, 3, 200])],
+    );
+    let out = atlas_with(&big, 256, 2, AtlasMode::MeshBaker, false).unwrap();
+    assert_eq!(out.images.len(), 1);
+    let d = decode(&out.images[0]);
+    assert_eq!((d.width(), d.height()), (256, 256));
+    let line = log_line(&out, "class=mask");
+    assert!(line.contains("passthrough=source-texture"), "{line}");
+    assert!(line.contains("size=256"), "{line}");
+    assert_eq!(max_image_side(&out), Some(256));
+
+    let wide = model1(
+        mat("wide", AlphaClass::Mask, [1.0; 4], Some(0)),
+        tri_uvs(),
+        vec![flat_image(2048, 512, [1, 2, 3, 200])],
+    );
+    let out = atlas_with(&wide, 300, 2, AtlasMode::MeshBaker, false).unwrap();
+    let d = decode(&out.images[0]);
+    assert_eq!((d.width(), d.height()), (256, 64));
+    assert_eq!(max_image_side(&out), Some(256));
+
+    // a source already under the cap still ships byte-identical
+    let png = flat_image(64, 32, [10, 200, 30, 255]);
+    let small = model1(
+        mat("small", AlphaClass::Opaque, [1.0; 4], Some(0)),
+        tri_uvs(),
+        vec![png.clone()],
+    );
+    let out = atlas_with(&small, 256, 2, AtlasMode::MeshBaker, false).unwrap();
+    assert_eq!(out.images[0].bytes, png);
+    assert_eq!(max_image_side(&out), Some(64));
+
+    // the atlas path reports its canvas edge; an image-free model reports none
+    let two = model_of(
+        vec![
+            mat("a", AlphaClass::Opaque, [1.0; 4], Some(0)),
+            mat("b", AlphaClass::Opaque, [1.0; 4], Some(1)),
+        ],
+        vec![prim(0, tri_uvs()), prim(1, tri_uvs())],
+        vec![
+            flat_image(64, 64, [200, 20, 20, 255]),
+            flat_image(64, 64, [20, 200, 20, 255]),
+        ],
+    );
+    let out = atlas_with(&two, 256, 2, AtlasMode::MeshBaker, false).unwrap();
+    assert_eq!(out.images[0].mime, "image/jpeg");
+    assert_eq!(max_image_side(&out), Some(256));
+    assert_eq!(max_image_side(&LodModel::default()), None);
 }
 
 #[test]
