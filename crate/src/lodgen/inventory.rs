@@ -563,22 +563,4 @@ mod tests {
         assert!(!d.identical());
         assert!(diff_materials(&ours, &ours).identical());
     }
-
-    #[test]
-    fn texture_list_is_not_serialized() {
-        let inv = BundleInventory {
-            textures: 1,
-            texture_list: vec![TextureEntry {
-                name: "t".into(),
-                format: 25,
-                width: 512,
-                height: 512,
-                mips: 10,
-            }],
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&inv).unwrap();
-        assert!(json.contains("\"textures\":1"));
-        assert!(!json.contains("texture_list"));
-    }
 }

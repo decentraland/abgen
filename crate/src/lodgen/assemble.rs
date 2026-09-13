@@ -715,7 +715,6 @@ fn place_primitives(
                         model
                             .log
                             .push(format!("primitive texture {name}: {e}; using colour only"));
-                        eprintln!("assemble: primitive texture {name} unavailable ({e}); using colour only");
                         None
                     }
                 }
