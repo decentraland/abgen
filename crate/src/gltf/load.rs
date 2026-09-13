@@ -187,6 +187,27 @@ pub fn load_gltf_inputs(
     ext: &str,
     resolve: Resolve,
 ) -> Result<(J, Vec<Vec<u8>>)> {
+    load_gltf_inputs_impl(glb_bytes, ext, resolve, false)
+}
+
+/// Loader for classification-only parses: the material/texture role data lives
+/// entirely in the JSON, so an external buffer that cannot be resolved becomes an
+/// empty placeholder instead of an error, and Draco is left unmaterialized.
+/// Never use this for a geometry build.
+pub fn load_gltf_inputs_for_classify(
+    glb_bytes: &[u8],
+    ext: &str,
+    resolve: Resolve,
+) -> Result<(J, Vec<Vec<u8>>)> {
+    load_gltf_inputs_impl(glb_bytes, ext, resolve, true)
+}
+
+fn load_gltf_inputs_impl(
+    glb_bytes: &[u8],
+    ext: &str,
+    resolve: Resolve,
+    classify_only: bool,
+) -> Result<(J, Vec<Vec<u8>>)> {
     let is_gltf =
         ext.to_lowercase() == ".gltf" || (glb_bytes.len() >= 4 && &glb_bytes[0..4] != b"glTF");
 
@@ -218,7 +239,12 @@ pub fn load_gltf_inputs(
             }
             Some(uri) => {
                 let declared = ji(buf, "byteLength").unwrap_or(0).max(0) as usize;
-                let bytes = resolve.and_then(|f| f(uri)).ok_or_else(|| {
+                let resolved = resolve.and_then(|f| f(uri));
+                if classify_only {
+                    buffers.push(resolved.unwrap_or_default());
+                    continue;
+                }
+                let bytes = resolved.ok_or_else(|| {
                     anyhow!(
                         "buffer[{bi}] external uri {uri:?} unresolved (missing content dependency)"
                     )
@@ -237,6 +263,8 @@ pub fn load_gltf_inputs(
         buffers = vec![glb_blob];
     }
 
-    crate::draco::materialize(&mut gltf, &mut buffers)?;
+    if !classify_only {
+        crate::draco::materialize(&mut gltf, &mut buffers)?;
+    }
     Ok((gltf, buffers))
 }

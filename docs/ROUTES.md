@@ -6,28 +6,25 @@ asset-bundle-registry service.
 
 ## Asset delivery (production ab-cdn)
 
-Upstream is a pure static bucket behind a CDN: the cache forwards `Range` and `Origin`,
-negotiates brotli/gzip through `Accept-Encoding` in the cache key, and the bucket CORS exposes
-`ETag`/`Content-Range`/`Accept-Ranges` on GET/HEAD.
+Upstream is a pure static bucket behind a CDN. abgen forwards `Range` and `Origin` semantics and exposes `ETag`/`Content-Range`/`Accept-Ranges` on GET/HEAD.
 
 | Route | Upstream | abgen |
 |---|---|---|
 | `GET /manifest/{entity}_{platform}.json` | static object, cacheable | served from `ABGEN_OUT_ROOT`, JIT-converts on miss; `Cache-Control: private, max-age=0, no-cache` |
-| `GET /{version}/{entity}/{file}` (+`.br`) | static object | served, JIT on miss; `Cache-Control: public,max-age=31536000,immutable` |
+| `GET /{version}/{entity}/{file}` | static object | served, JIT on miss; `Cache-Control: public,max-age=31536000,immutable` |
 | `GET /{version}/{file}` (flat, incl. `{hash}_{platform}`) | static object | served; unresolvable flat hashes are negative-cached (`ABGEN_HASH_RESOLVE_FAIL_TTL_S`) |
 | `GET /LOD/{level}/{file}` | static object | served; JIT only with `ABGEN_LOD_JIT=1` + `gltfpack`, otherwise 404 until primed |
 | `GET /lods-unity/manifests/{scene}_InitialSceneState.json` | static object | served, with an ISS JIT fallback |
+| `GET /bvwebgpu/{profile}/{entity}.pack` | browser pack object | served/generated as a range-friendly uncompressed object |
 | shader bundles (`scene_ignore_{windows,mac}`) | 404 (purged upstream) | self-primed from the vendored copies on first request |
 
 Header semantics abgen implements natively: `ETag` with `If-None-Match` 304; `Range` 206/416 with
 `Content-Range` (responses up to 8 MB buffered, larger streamed; `ABGEN_MAX_RANGE_BUFFER_BYTES`);
-CORS `*` exposing `ETag`/`Content-Range`/`Accept-Ranges`/`Content-Length`/`Content-Encoding`.
+CORS `*` exposing `ETag`/`Content-Range`/`Accept-Ranges`/`Content-Length`.
 
 Deltas an operator must know:
 
-- No `Accept-Encoding` negotiation: brotli is an explicit `.br` path suffix served with
-  `Content-Encoding: br`; the JIT lane never emits `.br` sidecars (fresh conversions 404 on
-  `.br` paths).
+- abgen does not generate, serve, or negotiate Brotli sidecars. Web deployments can apply HTTP compression at their own edge without changing abgen object keys.
 - Manifests are `no-cache` where upstream serves a cacheable TTL. A fronting CDN must forward
   `Range` and honor the `no-cache`.
 

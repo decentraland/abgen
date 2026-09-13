@@ -568,10 +568,10 @@ fn build_bundle_index(root: &Path) -> HashMap<String, PathBuf> {
 }
 
 fn nodeps_key(name: &str) -> Option<String> {
-    let (base, br) = match name.strip_suffix(".br") {
-        Some(b) => (b, ".br"),
-        None => (name, ""),
-    };
+    if name.ends_with(".br") {
+        return None;
+    }
+    let base = name;
     let platform = resolver::PLATFORMS
         .iter()
         .map(|(suffix, _)| *suffix)
@@ -581,7 +581,7 @@ fn nodeps_key(name: &str) -> Option<String> {
     if deps.len() != 32 || !deps.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    Some(format!("{}{}{}", hash.to_ascii_lowercase(), platform, br))
+    Some(format!("{}{}", hash.to_ascii_lowercase(), platform))
 }
 
 #[cfg(test)]
@@ -600,8 +600,8 @@ mod tests {
             Some("qmtivy_mac")
         );
         assert_eq!(
-            nodeps_key("QmTiVy_4f53cda18c2baa0c0354bb5f9a3ecbe5_mac.br").as_deref(),
-            Some("qmtivy_mac.br")
+            nodeps_key("QmTiVy_4f53cda18c2baa0c0354bb5f9a3ecbe5_mac.br"),
+            None
         );
         assert_eq!(
             nodeps_key("bafkabc_0123456789abcdef0123456789abcdef_windows").as_deref(),

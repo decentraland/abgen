@@ -357,6 +357,7 @@ impl Proxy {
         }
     }
 
+    #[cfg(feature = "web-pack")]
     pub(crate) fn content_store(&self) -> &LocalContentStore {
         &self.content
     }
@@ -448,6 +449,7 @@ impl Proxy {
             .collect()
     }
 
+    #[cfg(feature = "web-pack")]
     pub(crate) fn content_bytes_allow_empty(&self, hash: &str) -> Result<Vec<u8>> {
         match self.ensure_content(hash) {
             Ok(()) => self.content_store().fetch(hash),
@@ -1056,8 +1058,13 @@ impl Proxy {
         content_server_url: &str,
     ) -> Result<Vec<String>> {
         if platform == crate::bvwebgpu::BVW_PLATFORM {
-            self.build_bvwebgpu_pack(out_root, cid)?;
-            return Ok(vec![crate::bvwebgpu::pack_file_name(cid)]);
+            #[cfg(feature = "web-pack")]
+            {
+                self.build_bvwebgpu_pack(out_root, cid)?;
+                return Ok(vec![crate::bvwebgpu::pack_file_name(cid)]);
+            }
+            #[cfg(not(feature = "web-pack"))]
+            bail!("bvwebgpu generation requires the web-pack feature");
         }
         let ctx = self.entity_ctx(cid)?;
         let pdir = out_root
@@ -1522,7 +1529,11 @@ fn prune_stale_bundles(
     for ent in rd.flatten() {
         let name = ent.file_name();
         let Some(name) = name.to_str() else { continue };
-        let raw = name.strip_suffix(".br").unwrap_or(name);
+        if name.ends_with(".br") {
+            let _ = std::fs::remove_file(ent.path());
+            continue;
+        }
+        let raw = name;
 
         let h = if raw.starts_with("xn-") {
             match collapsed_names.get(raw) {
@@ -1579,8 +1590,6 @@ pub struct ProxyConfig {
     pub fallback_version: String,
     pub use_space: bool,
 
-    /// Digest names for scene glbs and standalone images + pre-build reuse
-    /// probe; naming only, never placement.
     pub deps_digest: bool,
 
     pub template_root: Option<String>,
@@ -1761,9 +1770,6 @@ pub mod stub {
         (host, seen)
     }
 
-    /// Stateful space stub: `PUT` stores the body under its path; `HEAD`/`GET`
-    /// answer 200 for stored paths (falling back to `routes`), so redeploy
-    /// probe/reuse round-trips can be simulated against one shared space.
     pub fn serve_store(routes: Routes) -> (String, Arc<Mutex<Vec<String>>>, Store) {
         let store: Store = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let (host, seen, _) = serve_inner(routes, None, Some(store.clone()));
@@ -2112,8 +2118,6 @@ mod tests {
             ..Default::default()
         });
 
-        // Scene + digest naming: deps carry the image class digest — the exact
-        // names the corpus loop uploads those images under.
         let ctx = make_ctx("scene");
         let deps = proxy.metadata_dep_names(&ctx, "models/a.gltf", "GHASH", "windows");
         assert_eq!(
@@ -2131,7 +2135,6 @@ mod tests {
         );
         assert!(deps.iter().all(|d| naming::bundle_name_has_digest(d)));
 
-        // Mac lowercases the hash, digest unchanged.
         let deps_mac = proxy.metadata_dep_names(&ctx, "models/a.gltf", "GHASH", "mac");
         assert_eq!(
             deps_mac[0],
@@ -2141,8 +2144,6 @@ mod tests {
             )
         );
 
-        // A known-undecodable image falls back to its bare name, matching the
-        // build path's bare-named upload.
         proxy
             .decode_ok
             .lock()
@@ -2151,7 +2152,6 @@ mod tests {
         let deps = proxy.metadata_dep_names(&ctx, "models/a.gltf", "GHASH", "windows");
         assert_eq!(deps[1], "ThashTWO_windows");
 
-        // Non-scene entities keep bare names — their images are uploaded bare.
         let wctx = make_ctx("wearable");
         let deps = proxy.metadata_dep_names(&wctx, "models/a.gltf", "GHASH", "windows");
         assert_eq!(
@@ -2396,7 +2396,6 @@ mod tests {
             .unwrap()
             .contains(&"PUT /manifest/bafktomb_windows.json".to_string()));
 
-        // Unrouted key: the stub answers non-2xx and the error must surface.
         assert!(proxy
             .space_put_manifest_strict("bafkmissing_windows", b"{}")
             .is_err());
@@ -3074,7 +3073,7 @@ mod prune_tests {
         assert!(!dir.join("xn-changed").exists());
         assert!(!dir.join("xn-changed.br").exists());
         assert!(dir.join("xn-kept").exists());
-        assert!(dir.join("xn-kept.br").exists());
+        assert!(!dir.join("xn-kept.br").exists());
         assert!(!dir.join("xn-unknown").exists());
         assert!(!dir.join("HASHA_mac").exists());
         assert!(dir.join("HASHB_mac").exists());

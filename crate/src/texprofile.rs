@@ -164,6 +164,39 @@ pub fn bc7_profile(src: &SourceImage, color_space: i64, is_normal: bool, max_siz
     }
 }
 
+/// Side of one block-compression block: BC7 encodes 4x4 texels, so a
+/// texture with a side below this cannot be block-compressed as-is.
+pub const BC_BLOCK_SIDE: u32 = 4;
+
+/// LOD-lane counterpart of the sub-block fallback in [`bc7_profile`] (and
+/// the DXT1/BC5 variants): the non-LOD lanes hand a texture with a side
+/// below [`BC_BLOCK_SIDE`] to Unity's RGBA32 fallback, but the client's
+/// texture-array pass accepts only the array's BC7 format and substitutes
+/// its default white slot for anything else
+/// (TextureArrayContainer.cs:40-45). An LOD texture therefore stays BC7
+/// and is padded up to one full block per side; the caller fills the
+/// padded sides by replicating the source texels. Profiles already at or
+/// above one block per side are returned unchanged.
+pub fn lod_pad_sub_block(p: &Profile) -> Profile {
+    if p.compressed || (p.target_w >= BC_BLOCK_SIDE && p.target_h >= BC_BLOCK_SIDE) {
+        return p.clone();
+    }
+    let w = p.target_w.max(BC_BLOCK_SIDE);
+    let h = p.target_h.max(BC_BLOCK_SIDE);
+    Profile {
+        target_w: w,
+        target_h: h,
+        texture_format: TF_BC7,
+        mip_count: default_mip_count(w, h),
+        is_alpha_channel_optional: false,
+        ignore_mipmap_limit: false,
+        filter_mode: FM_BILINEAR,
+        color_space: p.color_space,
+        lightmap_format: p.lightmap_format,
+        compressed: true,
+    }
+}
+
 pub fn standalone_texture_profile_named(
     src: &SourceImage,
     max_size: u32,

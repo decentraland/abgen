@@ -58,9 +58,10 @@ fn main() {
                  \x20    ABGEN_MAX_RECEIVE_COUNT (default 3 — on the final SQS\n\
                  \x20    receive a failed conversion publishes an exitCode-5\n\
                  \x20    tombstone manifest and acks instead of going to the DLQ),\n\
-                 \x20    ENABLE_LODS (off: LOD jobs are acked and skipped; on: levels 0+1\n\
+                 \x20    ENABLE_LODS (off: LOD jobs are acked and skipped; on: LOD_LEVELS\n\
                  \x20    are regenerated from the scene and written to LOD/<level>/ and\n\
-                 \x20    lods-unity/manifests/ — the deployment's FBX sources are unused)"
+                 \x20    lods-unity/manifests/ — the deployment's FBX sources are unused),\n\
+                 \x20    LOD_LEVELS (default 1; 0,1 for both levels)"
             );
         }
         Some(other) => {
@@ -489,6 +490,7 @@ mod tests {
             http_secret: None,
             lods_enabled: false,
             max_receive_count: 3,
+            lod_levels: vec![1],
         }
     }
 

@@ -1,3 +1,4 @@
+use super::simplify_meshopt::SimplifyPolicy;
 use super::*;
 use crate::lodgen::emit::{emit_empty_glb, emit_glb};
 use crate::lodgen::model::{AlphaClass, LodImage, LodMaterial, LodModel, LodPrimitive};
@@ -18,15 +19,17 @@ fn level_path_formatting() {
 
 #[test]
 fn choose_lane_level_0_is_always_passthrough() {
-    for tri_cap in [None, Some(100u64), Some(1_000_000u64)] {
-        for tri_cap_auto in [false, true] {
-            for source_tris in [0usize, 400, 500, 501, 5_000_000] {
-                for ratio in [0.1, 1.0] {
-                    assert_eq!(
-                        choose_lane(0, tri_cap, tri_cap_auto, ratio, source_tris, 500),
-                        SimplifyLane::Passthrough,
-                        "tri_cap={tri_cap:?} auto={tri_cap_auto} tris={source_tris} ratio={ratio}"
-                    );
+    for policy in [SimplifyPolicy::default(), SimplifyPolicy::Budget] {
+        for tri_cap in [None, Some(100u64), Some(1_000_000u64)] {
+            for tri_cap_auto in [false, true] {
+                for source_tris in [0usize, 400, 500, 501, 5_000_000] {
+                    for ratio in [0.1, 1.0] {
+                        assert_eq!(
+                            choose_lane(0, policy, tri_cap, tri_cap_auto, ratio, source_tris, 500),
+                            SimplifyLane::Passthrough,
+                            "policy={policy:?} tri_cap={tri_cap:?} auto={tri_cap_auto} tris={source_tris} ratio={ratio}"
+                        );
+                    }
                 }
             }
         }
@@ -35,72 +38,99 @@ fn choose_lane_level_0_is_always_passthrough() {
 
 #[test]
 fn choose_lane_level_1_matrix() {
+    let b = SimplifyPolicy::Budget;
     assert_eq!(
-        choose_lane(1, None, false, 0.1, 400, 500),
+        choose_lane(1, b, None, false, 0.1, 400, 500),
         SimplifyLane::Passthrough
     );
     assert_eq!(
-        choose_lane(1, None, false, 0.1, 500, 500),
+        choose_lane(1, b, None, false, 0.1, 500, 500),
         SimplifyLane::Passthrough
     );
     assert_eq!(
-        choose_lane(1, None, false, 0.1, 501, 500),
+        choose_lane(1, b, None, false, 0.1, 501, 500),
         SimplifyLane::Uncapped { ratio: 0.1 }
     );
     assert_eq!(
-        choose_lane(1, None, false, 0.25, 5_000_000, 1500),
+        choose_lane(1, b, None, false, 0.25, 5_000_000, 1500),
         SimplifyLane::Uncapped { ratio: 0.25 }
     );
     assert_eq!(
-        choose_lane(1, Some(250), false, 0.25, 400, 500),
+        choose_lane(1, b, Some(250), false, 0.25, 400, 500),
         SimplifyLane::Capped {
             ratio: 0.25,
             cap: 250
         }
     );
     assert_eq!(
-        choose_lane(1, Some(250), false, 0.1, 5_000_000, 500),
+        choose_lane(1, b, Some(250), false, 0.1, 5_000_000, 500),
         SimplifyLane::Capped {
             ratio: 0.1,
             cap: 250
         }
     );
     assert_eq!(
-        choose_lane(1, None, true, 0.1, 5_000_000, 1500),
+        choose_lane(1, b, None, true, 0.1, 5_000_000, 1500),
         SimplifyLane::Capped {
             ratio: 0.1,
             cap: 1500
         }
     );
     assert_eq!(
-        choose_lane(1, None, true, 0.1, 400, 500),
+        choose_lane(1, b, None, true, 0.1, 400, 500),
         SimplifyLane::Passthrough
     );
     assert_eq!(
-        choose_lane(1, None, true, 0.1, 500, 500),
+        choose_lane(1, b, None, true, 0.1, 500, 500),
         SimplifyLane::Passthrough
     );
     assert_eq!(
-        choose_lane(1, None, true, 0.1, 501, 500),
+        choose_lane(1, b, None, true, 0.1, 501, 500),
         SimplifyLane::Capped {
             ratio: 0.1,
             cap: 500
         }
     );
     assert_eq!(
-        choose_lane(1, Some(500), false, 0.1, 400, 9999),
+        choose_lane(1, b, Some(500), false, 0.1, 400, 9999),
         SimplifyLane::Passthrough
     );
     assert_eq!(
-        choose_lane(1, Some(9), true, 0.1, 400, 1500),
+        choose_lane(1, b, Some(9), true, 0.1, 400, 1500),
         SimplifyLane::Passthrough
     );
     assert_eq!(
-        choose_lane(1, Some(9), true, 0.1, 1501, 1500),
+        choose_lane(1, b, Some(9), true, 0.1, 1501, 1500),
         SimplifyLane::Capped {
             ratio: 0.1,
             cap: 1500
         }
+    );
+    // gltfpack-si ignores caps, thresholds and tri_cap_auto: every non-empty
+    // source gets the single -si pass.
+    let si = SimplifyPolicy::GltfpackSi {
+        ratio: 0.1,
+        target_error: 0.01,
+    };
+    for (tri_cap, auto, tris, threshold) in [
+        (None, true, 400usize, 500u64),
+        (None, true, 5_000_000, 500),
+        (Some(9), false, 1, 1500),
+        (Some(9), true, 1501, 1500),
+        (None, false, 501, 500),
+    ] {
+        assert_eq!(
+            choose_lane(1, si, tri_cap, auto, 0.7, tris, threshold),
+            SimplifyLane::GltfpackSi {
+                ratio: 0.1,
+                target_error: 0.01
+            },
+            "tri_cap={tri_cap:?} auto={auto} tris={tris}"
+        );
+    }
+    assert_eq!(
+        choose_lane(1, si, None, true, 0.1, 0, 500),
+        SimplifyLane::Passthrough
     );
 }
 
@@ -109,7 +139,128 @@ fn default_params_cap_tris_to_auto_budget() {
     let p = GenerateParams::default();
     assert!(p.tri_cap_auto);
     assert_eq!(p.tri_cap, None);
-    assert_eq!(p.levels, vec![0, 1]);
+    assert_eq!(p.levels, vec![1]);
+    assert_eq!(p.atlas_max, 2048);
+    assert_eq!(p.atlas_mode, atlas::AtlasMode::MeshBaker);
+    assert_eq!(p.ratio, 0.1);
+    // tri_cap_auto only bites once --tri-cap switches the policy to budget.
+    let budget = GenerateParams {
+        simplify_policy: SimplifyPolicy::Budget,
+        ..Default::default()
+    };
+    assert_eq!(
+        effective_tri_cap(
+            1,
+            budget.simplify_policy,
+            budget.tri_cap,
+            budget.tri_cap_auto,
+            14_000
+        ),
+        Some(14_000)
+    );
+    assert_eq!(
+        effective_tri_cap(1, p.simplify_policy, p.tri_cap, p.tri_cap_auto, 14_000),
+        None
+    );
+}
+
+#[test]
+fn default_policy_is_gltfpack_si() {
+    let p = GenerateParams::default();
+    assert_eq!(
+        p.simplify_policy,
+        SimplifyPolicy::GltfpackSi {
+            ratio: 0.1,
+            target_error: 0.01
+        }
+    );
+    assert_eq!(p.simplify_policy.name(), "gltfpack-si");
+    assert_eq!(
+        choose_lane(
+            1,
+            p.simplify_policy,
+            p.tri_cap,
+            p.tri_cap_auto,
+            p.ratio,
+            272_542,
+            14_000
+        ),
+        SimplifyLane::GltfpackSi {
+            ratio: 0.1,
+            target_error: 0.01
+        }
+    );
+    assert_eq!(
+        choose_lane(
+            1,
+            p.simplify_policy,
+            p.tri_cap,
+            p.tri_cap_auto,
+            p.ratio,
+            400,
+            14_000
+        ),
+        SimplifyLane::GltfpackSi {
+            ratio: 0.1,
+            target_error: 0.01
+        }
+    );
+    assert_eq!(
+        choose_lane(
+            0,
+            p.simplify_policy,
+            p.tri_cap,
+            p.tri_cap_auto,
+            p.ratio,
+            272_542,
+            14_000
+        ),
+        SimplifyLane::Passthrough
+    );
+}
+
+#[test]
+fn mask_material_gets_cutout_bucket() {
+    let m = LodModel {
+        root_name: "mask".to_string(),
+        primitives: vec![LodPrimitive {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            indices: vec![0, 1, 2],
+            material: 0,
+            ..Default::default()
+        }],
+        materials: vec![LodMaterial {
+            name: "leaf".to_string(),
+            class: AlphaClass::from_alpha_mode("MASK"),
+            base_color: [1.0; 4],
+            cutoff: 0.5,
+            image: Some(0),
+            double_sided: true,
+            ..Default::default()
+        }],
+        images: vec![LodImage {
+            bytes: tiny_png(),
+            mime: "image/png".to_string(),
+        }],
+        log: Vec::new(),
+    };
+    assert_eq!(m.materials[0].class, AlphaClass::Mask);
+    let out = atlas::atlas_with(&m, 2048, 2, atlas::AtlasMode::MeshBaker, false).unwrap();
+    assert_eq!(out.materials.len(), 1);
+    assert_eq!(out.materials[0].name, "TextureBakeResult-mat-cutout");
+    assert_eq!(out.materials[0].class, AlphaClass::Mask);
+    let glb = emit_glb(&out).unwrap();
+    let json_len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+    let json = std::str::from_utf8(&glb[20..20 + json_len])
+        .unwrap()
+        .replace(' ', "");
+    assert!(json.contains("\"alphaMode\":\"MASK\""), "{json}");
+    assert!(json.contains("\"alphaCutoff\""), "{json}");
+    let back = model::from_glb_bytes(&glb, "mask").unwrap();
+    assert_eq!(back.materials[0].class, AlphaClass::Mask);
+    assert_eq!(back.materials[0].name, "TextureBakeResult-mat-cutout");
 }
 
 #[test]
@@ -144,12 +295,17 @@ fn normalize_levels_dedupes_and_refuses() {
 
 #[test]
 fn effective_tri_cap_table() {
-    assert_eq!(effective_tri_cap(0, Some(100), true, 500), None);
-    assert_eq!(effective_tri_cap(0, None, true, 500), None);
-    assert_eq!(effective_tri_cap(1, None, true, 500), Some(500));
-    assert_eq!(effective_tri_cap(1, Some(100), true, 500), Some(500));
-    assert_eq!(effective_tri_cap(1, Some(100), false, 500), Some(100));
-    assert_eq!(effective_tri_cap(1, None, false, 500), None);
+    let b = SimplifyPolicy::Budget;
+    assert_eq!(effective_tri_cap(0, b, Some(100), true, 500), None);
+    assert_eq!(effective_tri_cap(0, b, None, true, 500), None);
+    assert_eq!(effective_tri_cap(1, b, None, true, 500), Some(500));
+    assert_eq!(effective_tri_cap(1, b, Some(100), true, 500), Some(500));
+    assert_eq!(effective_tri_cap(1, b, Some(100), false, 500), Some(100));
+    assert_eq!(effective_tri_cap(1, b, None, false, 500), None);
+    let si = SimplifyPolicy::default();
+    assert_eq!(effective_tri_cap(1, si, None, true, 500), None);
+    assert_eq!(effective_tri_cap(1, si, Some(100), true, 500), None);
+    assert_eq!(effective_tri_cap(1, si, Some(100), false, 500), None);
 }
 
 #[test]
@@ -410,7 +566,7 @@ fn empty_scene_bundle_passes_empty_gate_and_fails_content_gate() {
     let bundle_path = out.join(sid).join(&conv.results[0].rel_path);
     let data = std::fs::read(&bundle_path).unwrap();
 
-    let checks = self_gate_bundle_with(&data, sid, 1, "windows", false, None).unwrap();
+    let checks = self_gate_bundle_with(&data, sid, 1, "windows", false, None, false).unwrap();
     for c in &checks {
         assert!(c.ok, "unexpected FAIL {}: {}", c.label, c.detail);
     }
@@ -418,7 +574,7 @@ fn empty_scene_bundle_passes_empty_gate_and_fails_content_gate() {
         checks.iter().any(|c| c.label == "root-position" && c.ok),
         "root-position gate missing"
     );
-    let as_content = self_gate_bundle_with(&data, sid, 1, "windows", true, None).unwrap();
+    let as_content = self_gate_bundle_with(&data, sid, 1, "windows", true, None, false).unwrap();
     let failed: Vec<&str> = as_content
         .iter()
         .filter(|c| !c.ok)
@@ -442,9 +598,7 @@ fn empty_scene_bundle_passes_empty_gate_and_fails_content_gate() {
     assert_eq!(doc["sceneId"], serde_json::json!(sid));
     assert_eq!(doc["version"], serde_json::json!(1));
     assert!(placements::parse_iss(&bytes).unwrap().is_empty());
-    let mut br = iss_path.as_os_str().to_owned();
-    br.push(".br");
-    assert!(PathBuf::from(br).is_file());
+    assert!(!PathBuf::from(format!("{}.br", iss_path.display())).exists());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -512,9 +666,7 @@ fn multi_platform_bundles_union_manifest_and_target_platform_gate() {
         let path = out.join(sid).join(&rel);
         let data = std::fs::read(&path).unwrap();
         assert_eq!(first_target_platform(&data), want_tp, "{plat}");
-        let mut br = path.as_os_str().to_owned();
-        br.push(".br");
-        assert!(PathBuf::from(br).is_file(), "{plat} .br sidecar missing");
+        assert!(!PathBuf::from(format!("{}.br", path.display())).exists());
         let checks = self_gate_bundle(&data, sid, 1, plat).unwrap();
         for c in &checks {
             assert!(c.ok, "{plat} unexpected FAIL {}: {}", c.label, c.detail);
@@ -641,6 +793,11 @@ fn multi_level_sources_build_both_levels_from_one_bake() {
     assert!(conv.skipped.is_empty(), "{:?}", conv.skipped);
     assert_eq!(conv.results.len(), 2);
     assert_eq!(conv.scene_id, sid);
+    assert_eq!(
+        conv.results.iter().map(|r| r.level).collect::<Vec<_>>(),
+        vec![0, 1],
+        "parallel packaging must preserve source order"
+    );
     for level in [0u32, 1] {
         let rel = expected_rel_path(sid, level, "windows");
         assert!(
@@ -655,9 +812,7 @@ fn multi_level_sources_build_both_levels_from_one_bake() {
         for c in &checks {
             assert!(c.ok, "L{level} unexpected FAIL {}: {}", c.label, c.detail);
         }
-        let mut br = path.as_os_str().to_owned();
-        br.push(".br");
-        assert!(PathBuf::from(br).is_file(), "L{level} .br sidecar missing");
+        assert!(!PathBuf::from(format!("{}.br", path.display())).exists());
     }
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(out.join(sid).join("LOD.manifest.json")).unwrap())
@@ -745,13 +900,18 @@ fn self_gate_passes_on_synthetic_lod_bundle_and_catches_mismatches() {
     let wrong_level = self_gate_bundle(&data, sid, 0, "windows").unwrap();
     assert!(gate_failures(&wrong_level) > 0);
 
-    let on_budget = self_gate_bundle_with(&data, sid, 1, "windows", true, Some(4)).unwrap();
+    let on_budget = self_gate_bundle_with(&data, sid, 1, "windows", true, Some(4), false).unwrap();
     assert_eq!(gate_failures(&on_budget), 0);
     assert!(on_budget
         .iter()
-        .any(|c| c.label == "texture-uniform-size" && c.ok));
+        .any(|c| c.label == "material-buckets" && c.ok));
+    assert!(!on_budget.iter().any(|c| c.label == "texture-uniform-size"));
+    // the budget is a ceiling, not an exact size: a 4x4 texture passes under 512
+    let under_budget =
+        self_gate_bundle_with(&data, sid, 1, "windows", true, Some(512), false).unwrap();
+    assert_eq!(gate_failures(&under_budget), 0);
 
-    let off_budget = self_gate_bundle_with(&data, sid, 1, "windows", true, Some(256)).unwrap();
+    let off_budget = self_gate_bundle_with(&data, sid, 1, "windows", true, Some(2), false).unwrap();
     let failed: Vec<&str> = off_budget
         .iter()
         .filter(|c| !c.ok)
