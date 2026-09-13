@@ -573,6 +573,7 @@ mod tests {
             levels: Vec::new(),
             gate: Vec::new(),
             log: Vec::new(),
+            build_signature: String::new(),
         }
     }
 

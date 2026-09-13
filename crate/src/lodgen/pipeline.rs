@@ -10,7 +10,9 @@ use super::gate::{
 };
 use super::model::LodModel;
 use super::simplify_meshopt::SimplifyPolicy;
-use super::{assemble, atlas, crop, emit, model, placements, reclamp, simplify, simplify_meshopt};
+use super::{
+    assemble, atlas, crop, emit, model, placements, primitives, reclamp, simplify, simplify_meshopt,
+};
 
 pub fn parse_parcel(s: &str) -> Result<(i32, i32)> {
     let parts: Vec<&str> = s.trim().split(',').collect();
@@ -139,12 +141,18 @@ fn acquire_placements_independently(
     Ok((full, "embedded-sdk"))
 }
 
-pub fn write_iss_descriptor(
-    out_dir: &Path,
+/// Bump when a pipeline change makes an already published LOD bundle wrong to reuse.
+/// A signature carrying a different generation never matches, so the next deployment of
+/// every scene rebuilds once and republishes under the new generation.
+pub const LOD_GENERATION: &str = "1";
+
+/// The descriptor document a build publishes, with how many placements resolved to a
+/// content hash and how many were dropped because the deployment does not ship one.
+pub fn iss_document(
     scene_id: &str,
     list: &[placements::Placement],
     content_by_file: &HashMap<String, String>,
-) -> Result<(PathBuf, usize, usize)> {
+) -> (serde_json::Value, usize, usize) {
     let mut assets: Vec<(String, &placements::Placement)> = Vec::new();
     let mut skipped = 0usize;
     for p in list {
@@ -153,13 +161,95 @@ pub fn write_iss_descriptor(
             Err(_) => skipped += 1,
         }
     }
-    let doc = placements::iss_descriptor(scene_id, &assets);
+    let resolved = assets.len();
+    (
+        placements::iss_descriptor(scene_id, &assets),
+        resolved,
+        skipped,
+    )
+}
+
+/// Everything about a scene that decides what its LOD bundles contain, as one digest.
+///
+/// The descriptor carries the resolved glTF placements but **not** the SDK primitives,
+/// which `assemble` turns into geometry just like a glTF instance — two deployments can
+/// therefore share a descriptor and still differ in what a player sees. The signature
+/// covers both, plus the generation, so an equal signature means equal LOD geometry and
+/// the second deployment can publish the first's bundles instead of building them.
+///
+/// `sceneId` is excluded on purpose: it is the one field guaranteed to differ between two
+/// deployments of the same scene, and it names the entity rather than describing it.
+pub fn build_signature(
+    doc: &serde_json::Value,
+    primitives: &[primitives::PrimitivePlacement],
+) -> String {
+    let mut descriptor = doc.clone();
+    if let Some(obj) = descriptor.as_object_mut() {
+        obj.remove("sceneId");
+    }
+    let prims: Vec<serde_json::Value> = primitives
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "shape": p.spec.shape.name(),
+                "uvs": p.spec.uvs,
+                "radiusTop": p.spec.radius_top,
+                "radiusBottom": p.spec.radius_bottom,
+                "color": p.material.color,
+                "class": format!("{:?}", p.material.class),
+                "cutoff": p.material.cutoff,
+                "texture": p.material.texture.as_ref().map(|t| format!("{:?}", t.source)),
+                "position": p.position,
+                "rotation": p.rotation,
+                "scale": p.scale,
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "generation": LOD_GENERATION,
+        "descriptor": descriptor,
+        "primitives": prims,
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    crate::hashes::sha256_hex(&bytes)
+}
+
+/// Resolve a scene and derive its descriptor and primitives, and stop there.
+///
+/// This is the front of `generate` — resolve the entity, execute its SDK7 runtime for
+/// placements — without any of the work that follows: no asset download, no assemble, no
+/// atlas, no simplify, no bundling. It exists so a caller can decide whether a rebuild is
+/// needed at all before paying for one.
+pub fn descriptor_only(
+    params: &GenerateParams,
+) -> Result<(String, serde_json::Value, Vec<primitives::PrimitivePlacement>)> {
+    if params.scene.is_empty() {
+        bail!("descriptor_only needs a scene pointer or entity id");
+    }
+    let client =
+        CatalystClient::from_args(&params.catalyst, None).with_content_cache(params.cache.clone());
+    let ent = client
+        .resolve_scene(&params.scene)
+        .with_context(|| format!("resolve scene {:?}", params.scene))?;
+    let sid = ent.entity_id.to_lowercase();
+    let acquired = acquire_placements(&client, &ent, &params.iss)?;
+    let (doc, _, _) = iss_document(&sid, &acquired.placements, &ent.content_by_file());
+    Ok((sid, doc, acquired.primitives))
+}
+
+pub fn write_iss_descriptor(
+    out_dir: &Path,
+    scene_id: &str,
+    list: &[placements::Placement],
+    content_by_file: &HashMap<String, String>,
+) -> Result<(PathBuf, usize, usize)> {
+    let (doc, resolved, skipped) = iss_document(scene_id, list, content_by_file);
     let text = serde_json::to_string_pretty(&doc)?;
     let dir = out_dir.join(scene_id);
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
     let path = dir.join(format!("{scene_id}{}", placements::ISS_SUFFIX));
     lods::write_atomic(&path, text.as_bytes())?;
-    Ok((path, assets.len(), skipped))
+    Ok((path, resolved, skipped))
 }
 
 pub fn staged_glb_name(scene_id: &str, level: u32) -> String {
@@ -295,6 +385,10 @@ pub struct GenerateOutcome {
     pub levels: Vec<LevelBuild>,
     pub gate: Vec<GateCheck>,
     pub log: Vec<String>,
+    /// Digest of everything that decides this scene's LOD geometry, from
+    /// [`build_signature`]. Published beside the descriptor so the next deployment can
+    /// tell whether it would build the same bundles.
+    pub build_signature: String,
 }
 
 pub fn normalize_levels(levels: &[u32]) -> Result<Vec<u32>> {
@@ -630,6 +724,12 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     let placements = acquired.placements;
     let primitives = acquired.primitives;
     let unresolved_srcs = acquired.unresolved_srcs;
+    // Taken here, while both halves of the scene's geometry are still owned by this
+    // function: `assemble` consumes them below.
+    let build_signature = {
+        let (doc, _, _) = iss_document(&sid, &placements, &ent.content_by_file());
+        self::build_signature(&doc, &primitives)
+    };
     log.push(format!("placement-source: {placement_source}"));
     log.push(format!("placements: {}", placements.len()));
     log.push(format!(
@@ -1031,7 +1131,63 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         levels: level_builds,
         gate,
         log,
+        build_signature,
     })
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+
+    fn doc(scene_id: &str, hash: &str) -> serde_json::Value {
+        placements::iss_descriptor(
+            scene_id,
+            &[(
+                hash.to_string(),
+                &placements::Placement {
+                    glb_hash: Some(hash.to_string()),
+                    ..Default::default()
+                },
+            )],
+        )
+    }
+
+    #[test]
+    fn signature_ignores_the_scene_id_but_not_the_placements() {
+        let a = doc("bafkone", "bafkasset");
+        let b = doc("bafktwo", "bafkasset");
+        assert_eq!(
+            build_signature(&a, &[]),
+            build_signature(&b, &[]),
+            "two deployments of the same geometry must sign the same"
+        );
+
+        let moved = doc("bafkone", "bafkother");
+        assert_ne!(build_signature(&a, &[]), build_signature(&moved, &[]));
+    }
+
+    #[test]
+    fn signature_covers_primitives_which_the_descriptor_omits() {
+        // A scene whose only change is an SDK primitive has an identical descriptor, so
+        // descriptor equality alone would wrongly reuse the previous bundles.
+        let d = doc("bafkone", "bafkasset");
+        let mut prim = primitives::PrimitivePlacement {
+            spec: primitives::PrimitiveSpec::simple(primitives::PrimitiveShape::Box),
+            material: primitives::PrimitiveMaterial::default(),
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+        };
+        let one = build_signature(&d, std::slice::from_ref(&prim));
+        assert_ne!(one, build_signature(&d, &[]), "primitives must count");
+
+        prim.scale = [2.0, 1.0, 1.0];
+        assert_ne!(one, build_signature(&d, std::slice::from_ref(&prim)));
+
+        prim.scale = [1.0; 3];
+        prim.material.color = [1.0, 0.0, 0.0, 1.0];
+        assert_ne!(one, build_signature(&d, std::slice::from_ref(&prim)));
+    }
 }
 
 #[cfg(test)]

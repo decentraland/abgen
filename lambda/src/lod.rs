@@ -40,6 +40,18 @@ pub fn convert(
 
     let params = generate_params(cfg, entity_id, content_server, &platforms, &staging);
     let started = std::time::Instant::now();
+
+    match try_reuse(cfg, proxy, entity_id, content_server, &platforms, &params) {
+        Ok(Some(summary)) => {
+            drop(guard);
+            return Ok(summary);
+        }
+        Ok(None) => {}
+        // Reuse is an optimization: a registry that is down, a descriptor that will not
+        // parse or an object that has gone missing must cost a rebuild, never a job.
+        Err(e) => eprintln!("lods: {entity_id}: reuse check failed ({e}); building"),
+    }
+
     let outcome = abgen::lodgen::generate(&params)
         .with_context(|| format!("generate LOD bundles for {entity_id}"))?;
 
@@ -57,6 +69,9 @@ pub fn convert(
     let scene_dir = staging.join(&outcome.scene_id);
     let objects = abgen::lods::published_objects(&scene_dir, &cfg.lod_levels);
     let published = publish(cfg, proxy, &objects)?;
+    if published.uploaded {
+        publish_signature(proxy, &outcome.scene_id, &outcome.build_signature);
+    }
 
     // Notify only after every generated object has been published.
     let finished: Vec<crate::notify::Finished> = platforms
@@ -101,6 +116,178 @@ pub fn convert(
     );
     summary["lods"]["keys"] = serde_json::json!(published.keys);
     Ok(summary)
+}
+
+/// Key the build signature is published under, beside the scene's descriptor.
+fn signature_key(scene_id: &str) -> String {
+    format!("lods-unity/manifests/{scene_id}_lodsig")
+}
+
+fn publish_signature(proxy: &Arc<Proxy>, scene_id: &str, signature: &str) {
+    proxy.space_put_key(&signature_key(scene_id), signature.as_bytes());
+}
+
+/// Publish the previous deployment's LOD bundles for this entity instead of building them,
+/// when the two deployments would produce the same geometry.
+///
+/// The expensive half of a LOD build is everything after placements: downloading every
+/// asset, assembling, atlasing, simplifying and bundling per platform. Deriving the
+/// descriptor stops before all of it, so this check costs one scene execution and a few
+/// small reads, against a full build that costs minutes.
+///
+/// Equality is decided by [`abgen::lodgen::build_signature`], not by the descriptor alone:
+/// the descriptor lists glTF placements but not the scene's SDK primitives, and a scene
+/// whose only change is a primitive would otherwise reuse bundles that no longer match it.
+///
+/// Returns `None` whenever anything is missing or unequal, which always means "build".
+fn try_reuse(
+    cfg: &Config,
+    proxy: &Arc<Proxy>,
+    entity_id: &str,
+    content_server: &str,
+    platforms: &[String],
+    params: &abgen::lodgen::GenerateParams,
+) -> Result<Option<serde_json::Value>> {
+    let started = std::time::Instant::now();
+    let Some(registry) = cfg.ab_registry_url.as_deref() else {
+        return Ok(None);
+    };
+    if !proxy.space_configured() {
+        return Ok(None);
+    }
+    let agent = crate::catalyst::agent();
+    let entity = crate::catalyst::fetch_entity(&agent, content_server, entity_id)?;
+    let pointers: Vec<String> = entity
+        .get("pointers")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let world_name = entity
+        .pointer("/metadata/worldConfiguration/name")
+        .and_then(serde_json::Value::as_str);
+
+    let Some(active) =
+        crate::bundle_registry::active_entity(&agent, registry, &pointers, world_name)?
+    else {
+        return Ok(None);
+    };
+    // The registry still answers with the deployment this job supersedes. If it has already
+    // moved on to this entity there is no earlier build to copy from.
+    if active.entity_id.eq_ignore_ascii_case(entity_id) {
+        return Ok(None);
+    }
+    if !active.lods_complete_for(platforms) {
+        return Ok(None);
+    }
+
+    let previous = active.entity_id.to_lowercase();
+    let Some(published) = proxy.space_get_key(&signature_key(&previous)) else {
+        // Built before signatures were published, or by a different generation.
+        return Ok(None);
+    };
+    let published = String::from_utf8_lossy(&published).trim().to_string();
+
+    let (scene_id, doc, primitives) = abgen::lodgen::descriptor_only(params)?;
+    let signature = abgen::lodgen::build_signature(&doc, &primitives);
+    if signature != published {
+        return Ok(None);
+    }
+
+    // Same geometry: copy the bundles across under this entity's names. The bundle's own
+    // metadata still names the previous scene's prefab as its main asset, which is what the
+    // explorer loads by — it reads the name out of the bundle, never off the file name.
+    let mut keys: Vec<String> = Vec::new();
+    let mut levels: Vec<(u32, usize)> = Vec::new();
+    for &level in &cfg.lod_levels {
+        let mut level_bytes = 0usize;
+        for platform in platforms {
+            let from = format!(
+                "LOD/{level}/{}",
+                abgen::lods::lod_bundle_name(&previous, level, platform)
+            );
+            let to = format!(
+                "LOD/{level}/{}",
+                abgen::lods::lod_bundle_name(&scene_id, level, platform)
+            );
+            let Some(bytes) = proxy.space_get_key(&from) else {
+                eprintln!("lods: {entity_id}: {from} is missing; building instead");
+                return Ok(None);
+            };
+            level_bytes += bytes.len();
+            proxy.space_put_key(&to, &bytes);
+            keys.push(to);
+        }
+        levels.push((level, level_bytes));
+        let glb_from = format!(
+            "{}/{}",
+            abgen::lods::PUBLISHED_GLB_DIR,
+            abgen::lods::published_glb_name(&previous, level)
+        );
+        if let Some(bytes) = proxy.space_get_key(&glb_from) {
+            let glb_to = format!(
+                "{}/{}",
+                abgen::lods::PUBLISHED_GLB_DIR,
+                abgen::lods::published_glb_name(&scene_id, level)
+            );
+            proxy.space_put_key(&glb_to, &bytes);
+            keys.push(glb_to);
+        }
+    }
+
+    // The descriptor is the one thing that is not copied: it names its own scene, so the
+    // freshly derived document is published rather than the previous entity's.
+    let iss_key = format!(
+        "lods-unity/manifests/{scene_id}{}",
+        abgen::lodgen::placements::ISS_SUFFIX
+    );
+    proxy.space_put_key(&iss_key, serde_json::to_string_pretty(&doc)?.as_bytes());
+    keys.push(iss_key);
+    publish_signature(proxy, &scene_id, &signature);
+
+    let notified = crate::notify::send_finished(
+        cfg,
+        entity_id,
+        content_server,
+        true,
+        &platforms
+            .iter()
+            .map(|p| crate::notify::Finished {
+                platform: p,
+                status_code: 0,
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    eprintln!(
+        "reused: {entity_id} lods scene={scene_id} from={previous} levels={} platforms={} \
+         bytes={} objects={} in {:.1}s",
+        levels
+            .iter()
+            .map(|(l, _)| l.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        platforms.join(","),
+        levels.iter().map(|(_, b)| b).sum::<usize>(),
+        keys.len(),
+        started.elapsed().as_secs_f64(),
+    );
+
+    let mut summary = success_summary(
+        entity_id,
+        &scene_id,
+        platforms,
+        &levels,
+        keys.len(),
+        true,
+        notified,
+    );
+    summary["lods"]["reusedFrom"] = serde_json::json!(previous);
+    summary["lods"]["keys"] = serde_json::json!(keys);
+    Ok(Some(summary))
 }
 
 /// The success summary a converted LOD job returns. Carries a top-level
@@ -234,6 +421,7 @@ mod tests {
             lods_enabled: true,
             max_receive_count: 3,
             lod_levels: crate::config::default_levels(),
+            ab_registry_url: None,
         }
     }
 
@@ -283,6 +471,7 @@ mod tests {
         let staging = PathBuf::from("/tmp/out/lod/bafkscene");
         let both = Config {
             lod_levels: vec![0, 1],
+            ab_registry_url: None,
             ..cfg()
         };
         let p = generate_params(&both, "bafkscene", "https://c/content", &[], &staging);

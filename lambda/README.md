@@ -66,6 +66,7 @@ all hits.
 | `ABGEN_HTTP_SECRET` | — (**fail-closed**) | shared secret the Function URL POST path requires in `x-abgen-secret`; unset means every HTTP invocation is refused with `503` |
 | `ENABLE_LODS` | off | generate `LOD_LEVELS` for `lods` jobs instead of acking and skipping them (see [LOD jobs](#lod-jobs)) |
 | `LOD_LEVELS` | `1` | comma-separated LOD levels the LOD lane builds and publishes (`0,1` for both); level 2 is refused |
+| `AB_REGISTRY_URL` | — (off) | asset-bundle registry base, e.g. `https://asset-bundle-registry-abgen.decentraland.org`. With it set, a LOD job first asks the registry which deployment the scene's pointers currently serve and, if the new deployment would build the same geometry, republishes that build's bundles instead of rebuilding (see [Reusing an unchanged build](#reusing-an-unchanged-build)). Unset disables the check. |
 | `ALLOWED_CONTENT_SERVER_HOSTS` | — (**fail-open**) | comma-separated allowlist of hosts an event's `contentServerUrl` may name; **unset means any https host is accepted**, so every deployment should set it. Scheme/shape validation (https only, no userinfo) applies regardless — allowlist or not, a plaintext or internal-IP URL is rejected. The `lambdaImage` bakes in `peer.decentraland.org`; a function env var overrides it. |
 | `ABGEN_EMF_NAMESPACE` | — (off) | CloudWatch namespace for EMF metrics (e.g. `abgen/lambda`); unset means no recorder is installed and every `metrics::` call stays a no-op |
 | `ABGEN_LOG_FORMAT` | plain text | `json` for JSON log lines |
@@ -312,6 +313,38 @@ SQS record batches whose bodies are catalyst `DeploymentToSqs` payloads
 `{"entityId":…, "contentServerUrl":…}` for manual invokes. LOD jobs
 (`lods` present) take the [LOD lane](#lod-jobs). `"force": true` in either
 shape bypasses the already-converted skip.
+
+## Reusing an unchanged build
+
+A scene redeployed with no change to its geometry produces byte-equal LOD bundles, so the
+second build is pure waste. With `AB_REGISTRY_URL` set, a LOD job checks for that before
+paying for one.
+
+1. The job asks the registry, at `POST /entities/active`, which entity the new
+   deployment's pointers currently serve. That is still the previous deployment, because
+   this job is what replaces it. Worlds pass `?world_name=`.
+2. If the registry reports every target platform's LOD as `complete`, the job derives the
+   new deployment's descriptor and primitives and stops there: no asset download, no
+   assemble, no atlas, no simplify, no bundling.
+3. The derived geometry is reduced to one digest and compared against the digest published
+   beside the previous deployment's descriptor, at
+   `lods-unity/manifests/{sceneId}_lodsig`.
+4. On a match the previous bundles are copied to this entity's names and the job finishes.
+   Otherwise it builds normally.
+
+The digest covers the glTF placements **and** the SDK primitives. The descriptor alone
+would not: it lists glTF assets only, so a scene whose only change is a primitive would
+look unchanged and reuse bundles that no longer match it. It also carries a generation
+constant, `abgen::lodgen::LOD_GENERATION` — bump that when a pipeline change makes already
+published bundles wrong to reuse, and every scene rebuilds once before reuse resumes.
+
+The copied bundle keeps the previous scene's prefab name in its own `metadata.json`. That
+is what the explorer loads by: it reads the main asset's name out of the bundle rather than
+off the file name. The descriptor is the one object not copied, since it names its own
+scene; the freshly derived one is published instead.
+
+Reuse is an optimization and never a failure mode. A registry that is unreachable, a
+descriptor that will not parse or a missing object all fall through to a normal build.
 
 ## LOD jobs
 

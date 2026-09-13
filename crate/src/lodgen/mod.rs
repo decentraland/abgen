@@ -25,9 +25,10 @@ pub use gate::{gate_failures, self_gate_bundle, self_gate_bundle_with, GateCheck
 pub use inventory::{inventory, reference_url, BundleInventory, InventoryDelta};
 #[cfg(not(target_arch = "wasm32"))]
 pub use pipeline::{
-    acquire_placements, choose_lane, effective_tri_cap, expected_rel_path, generate,
-    normalize_levels, parse_parcel, scene_geometry, staged_glb_name, write_iss_descriptor,
-    GenerateOutcome, GenerateParams, LevelBuild, PlacementStats, SimplifyLane, TRIS_PER_PARCEL,
+    acquire_placements, build_signature, choose_lane, descriptor_only, effective_tri_cap,
+    expected_rel_path, generate, iss_document, normalize_levels, parse_parcel, scene_geometry,
+    staged_glb_name, write_iss_descriptor, GenerateOutcome, GenerateParams, LevelBuild,
+    PlacementStats, SimplifyLane, LOD_GENERATION, TRIS_PER_PARCEL,
 };
 
 #[cfg(test)]
