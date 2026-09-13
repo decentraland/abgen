@@ -11,6 +11,8 @@ pub struct Active {
     pub entity_id: String,
     /// Per-platform LOD status, e.g. `mac -> "complete"`.
     pub lods: serde_json::Map<String, serde_json::Value>,
+    /// Digest of the deployment's content listing, from [`content_digest`].
+    pub content_digest: String,
 }
 
 impl Active {
@@ -67,7 +69,46 @@ pub fn active_entity(
     Ok(Some(Active {
         entity_id: entity_id.to_string(),
         lods,
+        content_digest: content_digest(first.get("content")),
     }))
+}
+
+/// Digest of a deployment's content listing: every `file -> hash` pair, sorted.
+///
+/// Two deployments with the same digest ship byte-identical files, so they also ship the
+/// same scene code and the same `main.crdt` the runtime starts from, and the LOD build has
+/// nothing left to differ on. That makes it a sound shortcut past deriving the geometry at
+/// all, and it costs nothing: the registry already returns the previous deployment's
+/// listing, and the new one's arrives with the entity.
+///
+/// It is deliberately strict rather than clever. A redeploy that only edits `scene.json`
+/// changes the digest and falls through to the geometry comparison, which is the slower
+/// path but still avoids the build.
+pub fn content_digest(content: Option<&serde_json::Value>) -> String {
+    let Some(entries) = content.and_then(serde_json::Value::as_array) else {
+        return String::new();
+    };
+    let mut pairs: Vec<(&str, &str)> = entries
+        .iter()
+        .filter_map(|e| {
+            Some((
+                e.get("file").and_then(serde_json::Value::as_str)?,
+                e.get("hash").and_then(serde_json::Value::as_str)?,
+            ))
+        })
+        .collect();
+    if pairs.is_empty() {
+        return String::new();
+    }
+    pairs.sort_unstable();
+    let mut buf = String::new();
+    for (file, hash) in pairs {
+        buf.push_str(file);
+        buf.push('\0');
+        buf.push_str(hash);
+        buf.push('\n');
+    }
+    abgen::hashes::sha256_hex(buf.as_bytes())
 }
 
 /// Percent-escape a query value. World names are DNS-like today (`name.dcl.eth`) and pass
@@ -93,7 +134,38 @@ mod tests {
         Active {
             entity_id: "bafkprev".to_string(),
             lods: lods.as_object().cloned().unwrap_or_default(),
+            content_digest: String::new(),
         }
+    }
+
+    #[test]
+    fn content_digest_ignores_order_and_notices_any_change() {
+        let a = serde_json::json!([
+            {"file": "bin/index.js", "hash": "bafkcode"},
+            {"file": "main.crdt", "hash": "bafkcrdt"},
+        ]);
+        let reordered = serde_json::json!([
+            {"file": "main.crdt", "hash": "bafkcrdt"},
+            {"file": "bin/index.js", "hash": "bafkcode"},
+        ]);
+        assert_eq!(content_digest(Some(&a)), content_digest(Some(&reordered)));
+
+        let changed_code = serde_json::json!([
+            {"file": "bin/index.js", "hash": "bafkcode2"},
+            {"file": "main.crdt", "hash": "bafkcrdt"},
+        ]);
+        assert_ne!(content_digest(Some(&a)), content_digest(Some(&changed_code)));
+
+        let extra = serde_json::json!([
+            {"file": "bin/index.js", "hash": "bafkcode"},
+            {"file": "main.crdt", "hash": "bafkcrdt"},
+            {"file": "models/tree.glb", "hash": "bafktree"},
+        ]);
+        assert_ne!(content_digest(Some(&a)), content_digest(Some(&extra)));
+
+        // An absent or empty listing never matches, not even another empty one.
+        assert_eq!(content_digest(None), "");
+        assert_eq!(content_digest(Some(&serde_json::json!([]))), "");
     }
 
     #[test]

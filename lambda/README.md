@@ -323,14 +323,24 @@ paying for one.
 1. The job asks the registry, at `POST /entities/active`, which entity the new
    deployment's pointers currently serve. That is still the previous deployment, because
    this job is what replaces it. Worlds pass `?world_name=`.
-2. If the registry reports every target platform's LOD as `complete`, the job derives the
-   new deployment's descriptor and primitives and stops there: no asset download, no
-   assemble, no atlas, no simplify, no bundling.
-3. The derived geometry is reduced to one digest and compared against the digest published
-   beside the previous deployment's descriptor, at
-   `lods-unity/manifests/{sceneId}_lodsig`.
+2. If the registry reports every target platform's LOD as `complete`, the job compares the
+   two deployments' **content listings**. The registry returns the previous one with the
+   entity and the new one arrives with the job, so this costs nothing. Identical listings
+   mean identical files — the scene's code and the `main.crdt` its runtime starts from
+   included — so nothing is left for a build to do differently. The previous descriptor is
+   renamed to this entity and the scene is never executed.
+3. Otherwise the job derives the new deployment's descriptor and primitives and stops
+   there: no asset download, no assemble, no atlas, no simplify, no bundling. That geometry
+   is reduced to one digest and compared against the digest published beside the previous
+   deployment's descriptor, at `lods-unity/manifests/{sceneId}_lodsig`.
 4. On a match the previous bundles are copied to this entity's names and the job finishes.
-   Otherwise it builds normally.
+   Otherwise it builds normally. The job summary records which check decided it, under
+   `lods.reusedBy`: `content` for the free path, `geometry` for the derived one.
+
+The scene's own `main.crdt` is deliberately not compared directly. It is the editor's
+frame-zero snapshot, and scene code adds, moves and removes entities after it, so two
+scenes can share a `main.crdt` and still render differently. Comparing the whole content
+listing sidesteps that: if the code is identical too, the frames it simulates are identical.
 
 The digest covers the glTF placements **and** the SDK primitives. The descriptor alone
 would not: it lists glTF assets only, so a scene whose only change is a primitive would

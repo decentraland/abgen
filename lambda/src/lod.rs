@@ -123,6 +123,14 @@ fn signature_key(scene_id: &str) -> String {
     format!("lods-unity/manifests/{scene_id}_lodsig")
 }
 
+/// Key the scene's descriptor is published under.
+fn descriptor_key(scene_id: &str) -> String {
+    format!(
+        "lods-unity/manifests/{scene_id}{}",
+        abgen::lodgen::placements::ISS_SUFFIX
+    )
+}
+
 fn publish_signature(proxy: &Arc<Proxy>, scene_id: &str, signature: &str) {
     proxy.space_put_key(&signature_key(scene_id), signature.as_bytes());
 }
@@ -191,12 +199,38 @@ fn try_reuse(
         return Ok(None);
     };
     let published = String::from_utf8_lossy(&published).trim().to_string();
+    let scene_id = entity_id.to_lowercase();
 
-    let (scene_id, doc, primitives) = abgen::lodgen::descriptor_only(params)?;
-    let signature = abgen::lodgen::build_signature(&doc, &primitives);
-    if signature != published {
-        return Ok(None);
-    }
+    // Identical content listings mean identical files, including the scene's code and the
+    // `main.crdt` its runtime starts from, so there is nothing left for a build to do
+    // differently. Both listings are already in hand — the registry returned the previous
+    // one alongside the entity — which makes this the one check that costs nothing.
+    let content_digest = crate::bundle_registry::content_digest(entity.get("content"));
+    let same_content = !content_digest.is_empty() && content_digest == active.content_digest;
+
+    let (doc, signature) = if same_content {
+        // Same files, so the same descriptor apart from the entity it names. Rename the
+        // previous one rather than executing the scene to derive a document already known.
+        let Some(bytes) = proxy.space_get_key(&descriptor_key(&previous)) else {
+            return Ok(None);
+        };
+        let mut doc: serde_json::Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse {}", descriptor_key(&previous)))?;
+        let Some(obj) = doc.as_object_mut() else {
+            return Ok(None);
+        };
+        obj.insert("sceneId".to_string(), serde_json::json!(scene_id));
+        (doc, published)
+    } else {
+        // Files differ, so derive this deployment's geometry and compare digests. Still far
+        // short of a build: placements only, with nothing downstream of them.
+        let (_, doc, primitives) = abgen::lodgen::descriptor_only(params)?;
+        let signature = abgen::lodgen::build_signature(&doc, &primitives);
+        if signature != published {
+            return Ok(None);
+        }
+        (doc, signature)
+    };
 
     // Same geometry: copy the bundles across under this entity's names. The bundle's own
     // metadata still names the previous scene's prefab as its main asset, which is what the
@@ -241,10 +275,7 @@ fn try_reuse(
 
     // The descriptor is the one thing that is not copied: it names its own scene, so the
     // freshly derived document is published rather than the previous entity's.
-    let iss_key = format!(
-        "lods-unity/manifests/{scene_id}{}",
-        abgen::lodgen::placements::ISS_SUFFIX
-    );
+    let iss_key = descriptor_key(&scene_id);
     proxy.space_put_key(&iss_key, serde_json::to_string_pretty(&doc)?.as_bytes());
     keys.push(iss_key);
     publish_signature(proxy, &scene_id, &signature);
@@ -263,8 +294,9 @@ fn try_reuse(
             .collect::<Vec<_>>(),
     )?;
     eprintln!(
-        "reused: {entity_id} lods scene={scene_id} from={previous} levels={} platforms={} \
+        "reused: {entity_id} lods scene={scene_id} from={previous} by={} levels={} platforms={} \
          bytes={} objects={} in {:.1}s",
+        if same_content { "content" } else { "geometry" },
         levels
             .iter()
             .map(|(l, _)| l.to_string())
@@ -286,6 +318,11 @@ fn try_reuse(
         notified,
     );
     summary["lods"]["reusedFrom"] = serde_json::json!(previous);
+    summary["lods"]["reusedBy"] = serde_json::json!(if same_content {
+        "content"
+    } else {
+        "geometry"
+    });
     summary["lods"]["keys"] = serde_json::json!(keys);
     Ok(Some(summary))
 }
