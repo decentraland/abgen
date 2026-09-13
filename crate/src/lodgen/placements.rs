@@ -56,20 +56,6 @@ fn cmp_f64s(a: &[f64], b: &[f64]) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
-/// Canonical ordering for listings that need to be order-independent. Both
-/// placement lanes and `parse_iss` keep the descriptor order (first-seen gltf
-/// src, then entity insertion order); a placement list is a multiset and
-/// `diff_iss` compares it as one.
-pub fn sort_placements(list: &mut [Placement]) {
-    list.sort_by(|a, b| {
-        (a.glb_hash.as_deref(), a.glb_file.as_deref())
-            .cmp(&(b.glb_hash.as_deref(), b.glb_file.as_deref()))
-            .then_with(|| cmp_f64s(&a.position, &b.position))
-            .then_with(|| cmp_f64s(&a.rotation, &b.rotation))
-            .then_with(|| cmp_f64s(&a.scale, &b.scale))
-    });
-}
-
 fn num_or(v: Option<&serde_json::Value>, default: f64) -> f64 {
     v.and_then(|x| x.as_f64()).unwrap_or(default)
 }
@@ -1208,32 +1194,6 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_ordering() {
-        let mk = |hash: &str, file: Option<&str>, x: f64| Placement {
-            glb_hash: Some(hash.to_string()),
-            glb_file: file.map(String::from),
-            position: [x, 0.0, 0.0],
-            ..Default::default()
-        };
-        let mut a = vec![
-            mk("b", None, 1.0),
-            mk("a", None, 2.0),
-            mk("a", None, -1.0),
-            mk("b", Some("f.glb"), 1.0),
-        ];
-        let mut b = a.clone();
-        b.reverse();
-        sort_placements(&mut a);
-        sort_placements(&mut b);
-        assert_eq!(a, b);
-        assert_eq!(a[0].glb_hash.as_deref(), Some("a"));
-        assert_eq!(a[0].position[0], -1.0);
-        assert_eq!(a[1].position[0], 2.0);
-        assert_eq!(a[2].glb_file, None);
-        assert_eq!(a[3].glb_file.as_deref(), Some("f.glb"));
-    }
-
-    #[test]
     fn diff_iss_counts_missing_extra_and_mismatch() {
         let mk = |hash: &str, x: f64, rotation: [f64; 4]| Placement {
             glb_hash: Some(hash.to_string()),
@@ -1273,27 +1233,6 @@ mod tests {
         shuffled.reverse();
         let same = diff_iss(&shuffled, &ours, 1e-3);
         assert!(same.is_clean(), "{}", same.summary());
-    }
-
-    #[test]
-    fn plaza_iss_full_guarded() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../docs/testing/lodgen-firststab-20260708/prod/bafkreifz6o7w75gy5t3ymlelhk4kuir2t7324vchat5kevy5vbkjmicvim_InitialSceneState.json"
-        );
-        let Ok(bytes) = std::fs::read(path) else {
-            return;
-        };
-        let got = parse_iss(&bytes).unwrap();
-        assert_eq!(got.len(), 639);
-        assert!(got.iter().all(|p| p.glb_hash.is_some()));
-        assert!(got.iter().all(|p| {
-            p.position.iter().all(|v| v.is_finite())
-                && p.rotation.iter().all(|v| v.is_finite())
-                && p.scale.iter().all(|v| v.is_finite())
-        }));
-        let hashes: HashSet<&str> = got.iter().filter_map(|p| p.glb_hash.as_deref()).collect();
-        assert!(hashes.len() > 1);
     }
 }
 

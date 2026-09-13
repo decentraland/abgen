@@ -22,7 +22,7 @@ mod pipeline;
 mod tests;
 
 pub use gate::{gate_failures, self_gate_bundle, self_gate_bundle_with, GateCheck};
-pub use inventory::{inventory, reference_url, BundleInventory, InventoryDelta, TextureEntry};
+pub use inventory::{inventory, reference_url, BundleInventory, InventoryDelta};
 #[cfg(not(target_arch = "wasm32"))]
 pub use pipeline::{
     acquire_placements, choose_lane, effective_tri_cap, expected_rel_path, generate,

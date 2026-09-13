@@ -2,7 +2,7 @@ use abgen::lodgen::inventory::{diff_materials, load_locator, MaterialDiff};
 use abgen::lodgen::{gate_failures, BundleInventory, GenerateParams, InventoryDelta};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
@@ -14,12 +14,6 @@ const DEFAULT_ATTEMPTS: u32 = 3;
 const DEFAULT_SNAPSHOT_PASSES: usize = 8;
 const REPORT_SCHEMA_VERSION: u32 = 4;
 const CITY_DISCOVERY_BATCH: usize = 100;
-const RISK_SCENES: [&str; 4] = [
-    "bafkreiceqm43l33evsc43jtotf2fs27efizwxn76cdnd3ypd6mcsdnpf6a",
-    "bafkreib3pp3kds7ftnvnaebbr2qzm2nnl4i4yuuc5b572ueuaeaj5rnnga",
-    "bafkreiavfwe6n4eec6xnxxqkgmzj5fozfywcjxyoffzjwuzbtlvzumaeye",
-    "bafkreifed6j4zxjdv72sxyupsz3kj4mf6hogxaccvwcdmfvribogg3waxa",
-];
 
 #[derive(Clone)]
 struct Job {
@@ -210,7 +204,6 @@ struct Report {
     snapshot_passes: usize,
     snapshot_stable: bool,
     summary: Summary,
-    explorer_candidates: Vec<String>,
     scenes: Vec<SceneRecord>,
 }
 
@@ -1042,58 +1035,6 @@ fn write_report(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))
 }
 
-fn explorer_candidates(records: &[SceneRecord]) -> Vec<String> {
-    let mut selected = BTreeSet::new();
-    for risk in RISK_SCENES {
-        if records.iter().any(|v| v.entity_id == risk) {
-            selected.insert(risk.to_string());
-        }
-    }
-    for metric in 0..5 {
-        let mut rows: Vec<&SceneRecord> = records.iter().filter(|v| v.ok).collect();
-        rows.sort_by_key(|v| {
-            std::cmp::Reverse(match metric {
-                0 => v.elapsed_ms as usize,
-                1 => v.source_tris.unwrap_or(0),
-                2 => v.bundle_bytes,
-                3 => v.material_count,
-                _ => v.texture_count,
-            })
-        });
-        selected.extend(rows.into_iter().take(5).map(|v| v.entity_id.clone()));
-    }
-    selected.extend(
-        records
-            .iter()
-            .filter(|v| v.placement_source.as_deref() == Some("embedded-sdk"))
-            .take(5)
-            .map(|v| v.entity_id.clone()),
-    );
-    let mut unusual: Vec<&SceneRecord> = records
-        .iter()
-        .filter(|record| {
-            record.ok
-                && record.placements.as_ref().is_some_and(|stats| {
-                    stats.rotated + stats.non_uniform_scale + stats.mirrored + stats.extreme_scale
-                        > 0
-                })
-        })
-        .collect();
-    unusual.sort_by_key(|record| {
-        std::cmp::Reverse(record.placements.as_ref().map_or(0, |stats| {
-            stats.rotated + stats.non_uniform_scale + stats.mirrored + stats.extreme_scale
-        }))
-    });
-    selected.extend(
-        unusual
-            .into_iter()
-            .take(5)
-            .map(|record| record.entity_id.clone()),
-    );
-
-    selected.into_iter().collect()
-}
-
 struct Qualification {
     records: Vec<SceneRecord>,
     stable: bool,
@@ -1285,7 +1226,6 @@ pub fn run(argv: &[String]) -> Result<i32> {
                 .as_ref()
                 .map(|_| reference_summary(&qualification.records)),
         },
-        explorer_candidates: explorer_candidates(&qualification.records),
         scenes: qualification.records,
     };
     let bytes = serde_json::to_vec_pretty(&report)?;
