@@ -1,8 +1,12 @@
 """JSON writer for committed fixtures: a container whose compact form fits in WIDTH columns stays
-on one line, anything longer is split one child per line. Keeps each record on a line of its own."""
+on one line, anything longer is split one child per line.
+
+WIDTH is set so that a manifest or descriptor record fits on one line, which is the point of the
+format: at 250 nearly every record wrapped across five to seven lines and the fixtures were four
+times taller than the data they carry."""
 import json
 
-WIDTH = 250
+WIDTH = 1000
 
 
 def dumps_fill(obj, indent=0):
