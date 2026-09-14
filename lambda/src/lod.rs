@@ -147,6 +147,78 @@ pub fn convert(
     Ok(summary)
 }
 
+/// Run the LOD lane for a scene whose asset bundles a conversion job just finished with,
+/// so one deployment's bundles and LODs land in one go.
+///
+/// `None` when there is nothing to do: LODs are off, or the entity is not a scene. Otherwise
+/// the LOD summary, flattened for nesting under the conversion summary's `lods` key. A LOD
+/// failure is reported there and never fails the conversion, whose bundles are already
+/// published and notified; the LOD event upstream stays the retry path.
+pub fn follow_up(
+    cfg: &Config,
+    proxy: &Arc<Proxy>,
+    entity_id: &str,
+    content_server: &str,
+) -> Option<serde_json::Value> {
+    if !cfg.lods_enabled {
+        return None;
+    }
+    let agent = crate::catalyst::agent();
+    let entity = match crate::catalyst::fetch_entity(&agent, content_server, entity_id) {
+        Ok(entity) => entity,
+        Err(e) => {
+            eprintln!("lods: {entity_id}: follow-up could not resolve the entity ({e:#})");
+            return Some(follow_up_summary(Err(e)));
+        }
+    };
+    if !is_scene(&entity) {
+        return None;
+    }
+    let result = convert(cfg, proxy, entity_id, content_server);
+    if let Err(e) = &result {
+        eprintln!("lods: {entity_id}: follow-up failed ({e:#}); the conversion stands");
+    }
+    let summary = follow_up_summary(result);
+    let outcome = if summary.get("error").is_some() {
+        "error"
+    } else if summary.get("skipped").is_some() {
+        "skipped"
+    } else if summary.get("reusedBy").is_some() {
+        "reused"
+    } else {
+        "converted"
+    };
+    metrics::counter!("abgen_lambda_lod_followup_total", "outcome" => outcome).increment(1);
+    Some(summary)
+}
+
+pub fn is_scene(entity: &serde_json::Value) -> bool {
+    entity.get("type").and_then(serde_json::Value::as_str) == Some("scene")
+}
+
+/// A LOD job's result as one object: the `lods` block with `exitCode`, `sceneId` and
+/// `notified` folded in; a skip or an error as a single field.
+pub fn follow_up_summary(result: Result<serde_json::Value>) -> serde_json::Value {
+    match result {
+        Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+        Ok(mut lod) => {
+            if let Some(skipped) = lod.get("skipped") {
+                return serde_json::json!({ "skipped": skipped });
+            }
+            let mut flat = lod
+                .get_mut("lods")
+                .map(serde_json::Value::take)
+                .unwrap_or_else(|| serde_json::json!({}));
+            for field in ["exitCode", "sceneId", "notified"] {
+                if let Some(v) = lod.get(field) {
+                    flat[field] = v.clone();
+                }
+            }
+            flat
+        }
+    }
+}
+
 /// Key the scene's descriptor is published under.
 fn descriptor_key(scene_id: &str) -> String {
     format!(
@@ -687,10 +759,59 @@ mod reuse_tests {
 }
 
 #[cfg(test)]
+mod follow_up_tests {
+    use super::*;
+
+    #[test]
+    fn only_scenes_get_a_lod_follow_up() {
+        assert!(is_scene(&serde_json::json!({"type": "scene", "id": "bafk"})));
+        assert!(!is_scene(&serde_json::json!({"type": "wearable"})));
+        assert!(!is_scene(&serde_json::json!({"id": "bafk"})));
+    }
+
+    #[test]
+    fn follow_up_is_off_without_enable_lods() {
+        let cfg = Config {
+            lods_enabled: false,
+            ..tests::cfg()
+        };
+        let proxy = crate::convert::make_proxy(&cfg, "https://c/content");
+        assert!(follow_up(&cfg, &proxy, "bafk", "https://c/content").is_none());
+    }
+
+    #[test]
+    fn follow_up_summary_flattens_the_lod_block_and_keeps_skips_and_errors_small() {
+        let converted =
+            success_summary("bafkE", "bafke", &["windows".to_string()], &[(1, 9)], 4, true, true);
+        let flat = follow_up_summary(Ok(converted));
+        assert_eq!(flat["exitCode"], 0);
+        assert_eq!(flat["sceneId"], "bafke");
+        assert_eq!(flat["notified"], true);
+        assert_eq!(flat["objects"], 4);
+        assert_eq!(flat["levels"][0]["bundleBytes"], 9);
+        assert!(flat.get("lods").is_none(), "no double nesting: {flat}");
+
+        let mut reused =
+            success_summary("bafkE", "bafke", &["mac".to_string()], &[(1, 9)], 4, true, false);
+        reused["lods"]["reusedBy"] = serde_json::json!("inputs");
+        assert_eq!(follow_up_summary(Ok(reused))["reusedBy"], "inputs");
+
+        let skipped =
+            serde_json::json!({"entityId": "bafkE", "skipped": "lods-no-supported-platform"});
+        assert_eq!(
+            follow_up_summary(Ok(skipped)),
+            serde_json::json!({"skipped": "lods-no-supported-platform"})
+        );
+        let err = follow_up_summary(Err(anyhow::anyhow!("gate failed")));
+        assert_eq!(err["error"], "gate failed");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cfg() -> Config {
+    pub(super) fn cfg() -> Config {
         Config {
             platforms: vec!["windows".to_string(), "mac".to_string()],
             version: "v49".to_string(),

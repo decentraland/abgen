@@ -418,6 +418,17 @@ ENABLE_LODS=1 OUT_ROOT=/tmp/ab-out ./target/release/abgen-lambda \
   --once lambda/examples/event-lods.json
 ```
 
+With `ENABLE_LODS=1` a *conversion* job for a scene also runs the LOD lane
+once its asset bundles are published and notified, so one deployment's
+bundles and LODs land in one go. The LOD result is nested under the
+conversion summary's `lods` key (`reusedBy`, `levels`, `objects`, …, or a
+single `skipped` / `error` field). It is best effort: a LOD failure never
+fails the conversion, whose bundles are already out; the separate LOD event
+upstream remains the retry path, and thanks to the reuse index that retry is
+a cheap `by=inputs` hit when the follow-up already succeeded. Wearables and
+emotes never trigger it, and an already-converted scene still gets the LOD
+pass (again cheap when nothing changed).
+
 Without `ENABLE_LODS` (the default) LOD jobs are acked and
 skipped with `{"skipped": "lods-disabled"}`, i.e. LOD generation stays on the
 Unity pipeline. Turn it on per environment: a LOD build is a whole-scene bake

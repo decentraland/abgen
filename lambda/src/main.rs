@@ -275,11 +275,29 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
         return lod::convert(cfg, &proxy, &job.entity_id, content_server);
     }
 
+    let mut summary = convert_asset_bundles(cfg, &proxy, job, content_server)?;
+    // A scene's LODs follow its asset bundles in the same job, once those are published
+    // and notified. Best effort: the conversion's result stands whatever the LOD lane
+    // says, and the separate LOD event upstream remains the retry path for it.
+    if let Some(lods) = lod::follow_up(cfg, &proxy, &job.entity_id, content_server) {
+        summary["lods"] = lods;
+    }
+    Ok(summary)
+}
+
+/// The asset-bundle half of a conversion job: skip platforms already converted at this
+/// version, convert the rest, publish, notify. Returns the job summary.
+fn convert_asset_bundles(
+    cfg: &config::Config,
+    proxy: &std::sync::Arc<abgen::live::Proxy>,
+    job: &event::Job,
+    content_server: &str,
+) -> Result<serde_json::Value> {
     let mut pending: Vec<String> = cfg.platforms.clone();
     let mut already: Vec<String> = Vec::new();
     if !job.force {
         pending.retain(|platform| {
-            let done = output::platform_converted(&proxy, cfg, &job.entity_id, platform);
+            let done = output::platform_converted(proxy, cfg, &job.entity_id, platform);
             if done {
                 eprintln!(
                     "skip: {} {platform} already converted at {}",
@@ -305,7 +323,7 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
         }
     } else {
         for platform in &cfg.platforms {
-            if let Some(key) = output::converted_marker_key(&proxy, cfg, &job.entity_id, platform) {
+            if let Some(key) = output::converted_marker_key(proxy, cfg, &job.entity_id, platform) {
                 abgen::rediscache::forget(&key);
             }
         }
@@ -314,7 +332,7 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
     let agent = catalyst::agent();
     let entity_doc = catalyst::fetch_entity(&agent, content_server, &job.entity_id)?;
 
-    let outcome = convert::convert_entity(cfg, &proxy, &job.entity_id, content_server, &pending)?;
+    let outcome = convert::convert_entity(cfg, proxy, &job.entity_id, content_server, &pending)?;
 
     metrics::counter!("abgen_lambda_texencode_cache_total", "outcome" => "hit")
         .increment(outcome.cache_hits);
@@ -326,12 +344,12 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
     }
 
     let published = publish_forget_notify(
-        || output::publish(cfg, &agent, &proxy, &entity_doc, &outcome),
+        || output::publish(cfg, &agent, proxy, &entity_doc, &outcome),
         || {
             if job.force {
                 for platform in &cfg.platforms {
                     if let Some(key) =
-                        output::converted_marker_key(&proxy, cfg, &job.entity_id, platform)
+                        output::converted_marker_key(proxy, cfg, &job.entity_id, platform)
                     {
                         abgen::rediscache::forget(&key);
                     }
