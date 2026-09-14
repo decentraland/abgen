@@ -4,7 +4,6 @@ use serde_json::Value;
 pub struct Job {
     pub entity_id: String,
     pub content_server_url: Option<String>,
-    pub is_lods: bool,
     pub force: bool,
     /// SQS `ApproximateReceiveCount`; 1 for direct/HTTP invokes. Approximate
     /// overcounts but never undercounts, so `>=` last-attempt checks are safe.
@@ -68,26 +67,23 @@ fn job_from_value(v: &Value) -> Result<Job> {
                 .get("contentServerUrl")
                 .and_then(Value::as_str)
                 .map(normalize_content_server),
-            is_lods: false,
             force,
             receive_count: 1,
         });
     }
     if let Some(id) = v.pointer("/entity/entityId").and_then(Value::as_str) {
-        let is_lods = v.get("lods").map(|l| !l.is_null()).unwrap_or(false);
         let content_server_url = v
             .get("contentServerUrls")
             .and_then(Value::as_array)
             .and_then(|a| a.first())
             .and_then(Value::as_str)
             .map(normalize_content_server);
-        if !is_lods && content_server_url.is_none() {
+        if content_server_url.is_none() {
             bail!("deployment for {id} has no contentServerUrls — not a conversion job");
         }
         return Ok(Job {
             entity_id: validated_entity_id(id)?,
             content_server_url,
-            is_lods,
             force,
             receive_count: 1,
         });
@@ -166,7 +162,6 @@ mod tests {
             jobs[0].content_server_url.as_deref(),
             Some("https://peer.decentraland.org/content")
         );
-        assert!(!jobs[0].is_lods);
     }
 
     #[test]
@@ -180,7 +175,6 @@ mod tests {
         let jobs = jobs_from_event(&e).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].entity_id, "bafkdef456");
-        assert!(!jobs[0].is_lods);
     }
 
     #[test]
@@ -228,13 +222,14 @@ mod tests {
     }
 
     #[test]
-    fn flags_lods_jobs() {
+    fn a_deployment_without_content_server_urls_is_not_a_job() {
+        // The legacy LOD-generator messages carried a `lods` array and no content server;
+        // that producer is gone, and nothing else is allowed to omit the server.
         let e = serde_json::json!({
             "entity": {"entityId": "bafklod789"},
             "lods": ["https://x/lod0.glb"]
         });
-        let jobs = jobs_from_event(&e).unwrap();
-        assert!(jobs[0].is_lods);
+        assert!(jobs_from_event(&e).is_err());
     }
 
     #[test]

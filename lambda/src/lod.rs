@@ -5,11 +5,10 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// LOD jobs carry the legacy Unity generator's FBX source URLs; abgen has no FBX
-/// importer and regenerates the LOD geometry from the scene entity instead
-/// (the same lodgen chain the abcdn serves JIT), so those URLs are unused.
-///
-pub fn convert(
+/// Build a scene's LODs from its entity and publish them under its scene id, or republish
+/// a previous build's when the reuse index says a build would produce the same bytes.
+/// The same lodgen chain the abcdn serves JIT.
+fn convert(
     cfg: &Config,
     proxy: &Arc<Proxy>,
     entity_id: &str,
@@ -148,12 +147,13 @@ pub fn convert(
 }
 
 /// Run the LOD lane for a scene whose asset bundles a conversion job just finished with,
-/// so one deployment's bundles and LODs land in one go.
+/// so one deployment's bundles and LODs land in one go. This is the only way LODs are
+/// built: nothing else asks for them.
 ///
 /// `None` when there is nothing to do: LODs are off, or the entity is not a scene. Otherwise
 /// the LOD summary, flattened for nesting under the conversion summary's `lods` key. A LOD
-/// failure is reported there and never fails the conversion, whose bundles are already
-/// published and notified; the LOD event upstream stays the retry path.
+/// failure is logged and reported there and never fails the job, whose bundles are already
+/// published and notified; the scene's next deployment is the next attempt.
 pub fn follow_up(
     cfg: &Config,
     proxy: &Arc<Proxy>,
@@ -176,7 +176,7 @@ pub fn follow_up(
     }
     let result = convert(cfg, proxy, entity_id, content_server);
     if let Err(e) = &result {
-        eprintln!("lods: {entity_id}: follow-up failed ({e:#}); the conversion stands");
+        eprintln!("lods: {entity_id}: LOD generation failed ({e:#}); the conversion stands");
     }
     let summary = follow_up_summary(result);
     let outcome = if summary.get("error").is_some() {

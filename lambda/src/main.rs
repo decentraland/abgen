@@ -181,7 +181,7 @@ fn instrumented_job(cfg: &config::Config, job: Result<event::Job>) -> Result<ser
     let summary = job.and_then(|job| {
         let summary = catch_job_panic(|| handle_job(cfg, &job));
         match summary {
-            Err(err) if !job.is_lods && job.receive_count >= cfg.max_receive_count => {
+            Err(err) if job.receive_count >= cfg.max_receive_count => {
                 tombstone_final_failure(cfg, &job, err)
             }
             other => other,
@@ -254,16 +254,6 @@ pub(crate) fn job_outcome(summary: &Result<serde_json::Value>) -> &'static str {
 }
 
 fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Value> {
-    if job.is_lods && !cfg.lods_enabled {
-        eprintln!(
-            "skip: LOD job for {} (LOD generation is off; set ENABLE_LODS=1)",
-            job.entity_id
-        );
-        return Ok(serde_json::json!({
-            "entityId": job.entity_id, "skipped": "lods-disabled"
-        }));
-    }
-
     let content_server = job
         .content_server_url
         .as_deref()
@@ -271,14 +261,10 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
     event::validate_content_server(content_server, cfg.allowed_content_server_hosts.as_deref())?;
     let proxy = convert::make_proxy(cfg, content_server);
 
-    if job.is_lods {
-        return lod::convert(cfg, &proxy, &job.entity_id, content_server);
-    }
-
     let mut summary = convert_asset_bundles(cfg, &proxy, job, content_server)?;
     // A scene's LODs follow its asset bundles in the same job, once those are published
-    // and notified. Best effort: the conversion's result stands whatever the LOD lane
-    // says, and the separate LOD event upstream remains the retry path for it.
+    // and notified. The conversion's result stands whatever the LOD lane says: a LOD
+    // failure is logged and reported in the summary, never redelivered.
     if let Some(lods) = lod::follow_up(cfg, &proxy, &job.entity_id, content_server) {
         summary["lods"] = lods;
     }
@@ -528,7 +514,6 @@ mod tests {
             job: Ok(event::Job {
                 entity_id: entity_id.to_string(),
                 content_server_url: None,
-                is_lods: false,
                 force: false,
                 receive_count: 1,
             }),
@@ -590,21 +575,16 @@ mod tests {
     }
 
     #[test]
-    fn direct_invokes_keep_the_job_summary_shape() {
-        let cfg = test_cfg();
-        let e = json!({"entity": {"entityId": "bafklod789"}, "lods": ["https://x/lod0.glb"]});
-        assert_eq!(
-            handle(&cfg, &e).unwrap(),
-            json!({"jobs": [{"entityId": "bafklod789", "skipped": "lods-disabled"}]})
-        );
-    }
-
-    #[test]
-    fn lod_records_are_acknowledged_not_reported_as_failures() {
+    fn legacy_lod_records_are_reported_as_failures_not_converted() {
+        // A `lods` message names no content server, so it is a parse failure like any
+        // other malformed record: reported by message id, never handled as a job.
         let cfg = test_cfg();
         let body = json!({"entity": {"entityId": "bafklod789"}, "lods": ["https://x/lod0.glb"]});
         let e = json!({"Records": [{"messageId": "m-1", "body": body.to_string()}]});
-        assert_eq!(handle(&cfg, &e).unwrap(), json!({"batchItemFailures": []}));
+        assert_eq!(
+            handle(&cfg, &e).unwrap(),
+            json!({"batchItemFailures": [{"itemIdentifier": "m-1"}]})
+        );
     }
 
     #[test]
@@ -691,16 +671,6 @@ mod tests {
     }
 
     #[test]
-    fn http_records_body_with_only_skips_is_a_200() {
-        let mut cfg = test_cfg();
-        cfg.http_secret = Some("s3cret".to_string());
-        let record = json!({"entity": {"entityId": "bafklod789"}, "lods": ["https://x/lod0.glb"]});
-        let body = json!({"Records": [{"messageId": "m-1", "body": record.to_string()}]});
-        let resp = handle(&cfg, &http_post(&body, "s3cret")).unwrap();
-        assert_eq!(resp["statusCode"], 200);
-    }
-
-    #[test]
     fn http_500_body_is_generic_not_the_error_chain() {
         let mut cfg = test_cfg();
         cfg.http_secret = Some("s3cret".to_string());
@@ -736,7 +706,6 @@ mod tests {
         let job = |receive_count| event::Job {
             entity_id: "bafktomb01".to_string(),
             content_server_url: Some("http://10.0.3.7:8500".to_string()),
-            is_lods: false,
             force: false,
             receive_count,
         };
@@ -790,7 +759,7 @@ mod tests {
     fn job_outcome_classification() {
         assert_eq!(job_outcome(&Err(anyhow::anyhow!("x"))), "error");
         assert_eq!(
-            job_outcome(&Ok(json!({"skipped": "lods-disabled"}))),
+            job_outcome(&Ok(json!({"skipped": "already-converted"}))),
             "skipped"
         );
         assert_eq!(job_outcome(&Ok(json!({"exitCode": 1}))), "failed");
@@ -821,7 +790,6 @@ mod tests {
         let job = |url: Option<&str>| event::Job {
             entity_id: "bafkurl001".to_string(),
             content_server_url: url.map(str::to_string),
-            is_lods: false,
             force: false,
             receive_count: 3,
         };
