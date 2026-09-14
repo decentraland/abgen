@@ -323,12 +323,14 @@ paying for one.
 1. The job asks the registry, at `POST /entities/active`, which entity the new
    deployment's pointers currently serve. That is still the previous deployment, because
    this job is what replaces it. Worlds pass `?world_name=`.
-2. If the registry reports every target platform's LOD as `complete`, the job compares the
-   two deployments' **content listings**. The registry returns the previous one with the
-   entity and the new one arrives with the job, so this costs nothing. Identical listings
-   mean identical files — the scene's code and the `main.crdt` its runtime starts from
-   included — so nothing is left for a build to do differently. The previous descriptor is
-   renamed to this entity and the scene is never executed.
+2. If the registry reports every target platform's LOD as `complete`, the job checks whether
+   anything that decides the geometry changed. Placements are a function of three things:
+   the `main.crdt` the runtime starts from, the scene code that mutates it, and `scene.json`,
+   which fixes the parcels the result is cropped to. Hold those equal, and check that every
+   asset the previous descriptor placed is still served under the same name, and executing
+   the scene cannot produce a different answer. Both listings are already in hand — the
+   registry returns the previous one with the entity — so this costs nothing, and the scene
+   is never executed. A new thumbnail or an added asset nothing places does not block it.
 3. Otherwise the job derives the new deployment's descriptor and primitives and stops
    there: no asset download, no assemble, no atlas, no simplify, no bundling. Those two are
    the **LOD state** — everything a build is a function of — and they are compared against
@@ -338,12 +340,16 @@ paying for one.
    what it placed is.
 4. On a match the previous bundles are copied to this entity's names and the job finishes.
    Otherwise it builds normally. The job summary records which check decided it, under
-   `lods.reusedBy`: `content` for the free path, `geometry` for the derived one.
+   `lods.reusedBy`: `inputs` for the free path, `geometry` for the derived one.
 
-The scene's own `main.crdt` is deliberately not compared directly. It is the editor's
-frame-zero snapshot, and scene code adds, moves and removes entities after it, so two
-scenes can share a `main.crdt` and still render differently. Comparing the whole content
-listing sidesteps that: if the code is identical too, the frames it simulates are identical.
+`main.crdt` is never read as scene truth — it is the editor's frame-zero snapshot, and scene
+code adds, moves and removes entities after it. It is only compared as an *input*: identical
+snapshot plus identical code means the frames the runtime simulates are identical too, which
+is a claim about the inputs rather than about the snapshot's contents.
+
+Deriving placements is around 80% of a LOD build (median 436 ms of 514 ms across the 26k
+corpus run), so the difference between deciding at step 2 and deciding at step 3 is most of
+the saving, and step 3 still avoids the remaining 20%.
 
 The state document carries the glTF placements **and** the SDK primitives. The descriptor
 alone would not: it lists glTF assets only, so a scene whose only change is a primitive

@@ -1,6 +1,7 @@
 use crate::config::Config;
 use abgen::live::Proxy;
 use anyhow::{bail, Context, Result};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -142,6 +143,71 @@ fn publish_state(proxy: &Arc<Proxy>, scene_id: &str, state: &serde_json::Value) 
     }
 }
 
+/// True when nothing that decides the LOD geometry changed between two deployments.
+///
+/// Placements are a function of three things: the `main.crdt` the runtime starts from, the
+/// scene code that mutates it, and `scene.json`, which fixes the parcels the result is
+/// cropped to. Hold those equal and executing the scene cannot produce a different answer,
+/// so the previous run's geometry stands without running it again.
+///
+/// Everything else in a deployment is free to change. A new thumbnail, an added asset no
+/// entity places, a re-uploaded texture the scene stopped using — none of them can move a
+/// placement, because only code and `main.crdt` place anything. The assets that *are*
+/// placed are checked separately: every hash the previous descriptor named must still be
+/// served under the same name, or the bundles would be built from different bytes.
+///
+/// This matters because deriving placements is the expensive part of a LOD build — around
+/// 80% of it — so the difference between deciding here and deciding by execution is most
+/// of the saving.
+fn lod_inputs_unchanged(
+    new_content: &BTreeMap<String, String>,
+    previous_content: &BTreeMap<String, String>,
+    previous_state: &serde_json::Value,
+) -> bool {
+    if new_content.is_empty() || previous_content.is_empty() {
+        return false;
+    }
+    // Anything that can place an entity, or decide where the parcels are.
+    let decides_geometry = |file: &str| {
+        let lower = file.to_ascii_lowercase();
+        lower == "main.crdt" || lower == "scene.json" || lower.ends_with(".js")
+    };
+    let mut seen_code = false;
+    for (file, hash) in new_content {
+        if !decides_geometry(file) {
+            continue;
+        }
+        seen_code = true;
+        if previous_content.get(file) != Some(hash) {
+            return false;
+        }
+    }
+    // A file that decided geometry before and is gone now is a change too.
+    for file in previous_content.keys() {
+        if decides_geometry(file) && !new_content.contains_key(file) {
+            return false;
+        }
+    }
+    if !seen_code {
+        // No code and no crdt: nothing to reason about, so do not guess.
+        return false;
+    }
+    // Every asset the previous build placed must still be served under the same name.
+    let Some(assets) = previous_state
+        .pointer("/descriptor/assets")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    let placed: std::collections::HashSet<&str> = assets
+        .iter()
+        .filter_map(|a| a.get("hash").and_then(serde_json::Value::as_str))
+        .collect();
+    let served: std::collections::HashSet<&str> =
+        new_content.values().map(String::as_str).collect();
+    placed.iter().all(|h| served.contains(h))
+}
+
 /// Publish the previous deployment's LOD bundles for this entity instead of building them,
 /// when the two deployments would produce the same geometry.
 ///
@@ -209,14 +275,12 @@ fn try_reuse(
         .with_context(|| format!("parse {}", state_key(&previous)))?;
     let scene_id = entity_id.to_lowercase();
 
-    // Identical content listings mean identical files, including the scene's code and the
-    // `main.crdt` its runtime starts from, so there is nothing left for a build to do
-    // differently. Both listings are already in hand — the registry returned the previous
-    // one alongside the entity — which makes this the one check that costs nothing.
-    let content_digest = crate::bundle_registry::content_digest(entity.get("content"));
-    let same_content = !content_digest.is_empty() && content_digest == active.content_digest;
+    // Both listings are already in hand — the registry returned the previous one alongside
+    // the entity — so this check costs nothing and skips the part of a build that costs most.
+    let new_content = crate::bundle_registry::content_map(entity.get("content"));
+    let same_inputs = lod_inputs_unchanged(&new_content, &active.content, &published);
 
-    let (doc, state) = if same_content {
+    let (doc, state) = if same_inputs {
         // Same files, so the same descriptor apart from the entity it names. Rename the
         // previous one rather than executing the scene to derive a document already known.
         let Some(bytes) = proxy.space_get_key(&descriptor_key(&previous)) else {
@@ -306,7 +370,7 @@ fn try_reuse(
     eprintln!(
         "reused: {entity_id} lods scene={scene_id} from={previous} by={} levels={} platforms={} \
          bytes={} objects={} in {:.1}s",
-        if same_content { "content" } else { "geometry" },
+        if same_inputs { "inputs" } else { "geometry" },
         levels
             .iter()
             .map(|(l, _)| l.to_string())
@@ -328,8 +392,8 @@ fn try_reuse(
         notified,
     );
     summary["lods"]["reusedFrom"] = serde_json::json!(previous);
-    summary["lods"]["reusedBy"] = serde_json::json!(if same_content {
-        "content"
+    summary["lods"]["reusedBy"] = serde_json::json!(if same_inputs {
+        "inputs"
     } else {
         "geometry"
     });
@@ -448,6 +512,102 @@ impl Drop for StagingGuard {
         if !self.keep {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod reuse_input_tests {
+    use super::*;
+
+    fn listing(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(f, h)| (f.to_string(), h.to_string()))
+            .collect()
+    }
+
+    fn state(assets: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "generation": "1",
+            "descriptor": {
+                "assets": assets.iter().map(|h| serde_json::json!({"hash": h})).collect::<Vec<_>>()
+            },
+            "primitives": [],
+        })
+    }
+
+    const BASE: &[(&str, &str)] = &[
+        ("main.crdt", "bafkcrdt"),
+        ("bin/index.js", "bafkcode"),
+        ("scene.json", "bafkscene"),
+        ("models/tree.glb", "bafktree"),
+    ];
+
+    #[test]
+    fn unchanged_inputs_reuse_even_when_other_files_moved() {
+        let prev = listing(BASE);
+        let st = state(&["bafktree"]);
+        assert!(lod_inputs_unchanged(&listing(BASE), &prev, &st));
+
+        // A new thumbnail and an asset nothing places cannot move a placement.
+        let mut noisy = listing(BASE);
+        noisy.insert("thumbnail.png".into(), "bafkthumb".into());
+        noisy.insert("models/unused.glb".into(), "bafkunused".into());
+        assert!(lod_inputs_unchanged(&noisy, &prev, &st));
+    }
+
+    #[test]
+    fn anything_that_places_an_entity_forces_the_geometry_path() {
+        let prev = listing(BASE);
+        let st = state(&["bafktree"]);
+        for (file, hash) in [
+            ("bin/index.js", "bafkcode2"),
+            ("main.crdt", "bafkcrdt2"),
+            ("scene.json", "bafkscene2"),
+        ] {
+            let mut changed = listing(BASE);
+            changed.insert(file.to_string(), hash.to_string());
+            assert!(
+                !lod_inputs_unchanged(&changed, &prev, &st),
+                "{file} must not be waved through"
+            );
+        }
+        // A second code file appearing is a change, and one disappearing is too.
+        let mut added = listing(BASE);
+        added.insert("bin/extra.js".into(), "bafkextra".into());
+        assert!(!lod_inputs_unchanged(&added, &prev, &st));
+        let mut dropped = listing(BASE);
+        dropped.remove("main.crdt");
+        assert!(!lod_inputs_unchanged(&dropped, &prev, &st));
+    }
+
+    #[test]
+    fn a_placed_asset_must_still_be_served() {
+        let prev = listing(BASE);
+        let st = state(&["bafktree"]);
+        // The tree was re-uploaded under a new hash: same code, different bytes on screen.
+        let mut retextured = listing(BASE);
+        retextured.insert("models/tree.glb".into(), "bafktree2".into());
+        assert!(!lod_inputs_unchanged(&retextured, &prev, &st));
+
+        // A descriptor we cannot read is never taken on trust.
+        assert!(!lod_inputs_unchanged(
+            &listing(BASE),
+            &prev,
+            &serde_json::json!({"generation": "1"})
+        ));
+    }
+
+    #[test]
+    fn empty_or_codeless_listings_never_shortcut() {
+        let st = state(&[]);
+        assert!(!lod_inputs_unchanged(
+            &BTreeMap::new(),
+            &listing(BASE),
+            &st
+        ));
+        let assets_only = listing(&[("models/tree.glb", "bafktree")]);
+        assert!(!lod_inputs_unchanged(&assets_only, &assets_only, &st));
     }
 }
 
