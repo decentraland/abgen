@@ -326,6 +326,9 @@ pub struct ManifestPlacements {
     /// Primitives dropped because their material can never draw a pixel
     /// (`PrimitiveMaterial::draws_nothing`): invisible collision and trigger volumes.
     pub invisible_volume_skipped: usize,
+    /// Deployment files the scene read through the runtime while it executed, as
+    /// lower-cased `file -> hash`. Empty when placements did not come from execution.
+    pub files_read: std::collections::BTreeMap<String, String>,
 }
 
 /// `StaticSceneDescriptorBuilder.Build` over the LWW-folded components of

@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::catalyst::{CatalystClient, Scene};
@@ -234,18 +234,34 @@ pub fn state_digest(state: &serde_json::Value) -> String {
 pub fn descriptor_only(
     params: &GenerateParams,
 ) -> Result<(String, serde_json::Value, Vec<primitives::PrimitivePlacement>)> {
+    let (client, ent) = resolve_scene(params)?;
+    let (doc, primitives) = descriptor_for(&client, &ent, &params.iss)?;
+    Ok((ent.entity_id.to_lowercase(), doc, primitives))
+}
+
+/// Resolve the scene `params` name, with the client the rest of the pipeline would use.
+pub fn resolve_scene(params: &GenerateParams) -> Result<(CatalystClient, Scene)> {
     if params.scene.is_empty() {
-        bail!("descriptor_only needs a scene pointer or entity id");
+        bail!("generate needs a scene pointer or entity id");
     }
     let client =
         CatalystClient::from_args(&params.catalyst, None).with_content_cache(params.cache.clone());
     let ent = client
         .resolve_scene(&params.scene)
         .with_context(|| format!("resolve scene {:?}", params.scene))?;
+    Ok((client, ent))
+}
+
+/// Execute an already resolved scene for its descriptor and primitives, and stop there.
+pub fn descriptor_for(
+    client: &CatalystClient,
+    ent: &Scene,
+    iss: &str,
+) -> Result<(serde_json::Value, Vec<primitives::PrimitivePlacement>)> {
     let sid = ent.entity_id.to_lowercase();
-    let acquired = acquire_placements(&client, &ent, &params.iss)?;
+    let acquired = acquire_placements(client, ent, iss)?;
     let (doc, _, _) = iss_document(&sid, &acquired.placements, &ent.content_by_file());
-    Ok((sid, doc, acquired.primitives))
+    Ok((doc, acquired.primitives))
 }
 
 pub fn write_iss_descriptor(
@@ -396,10 +412,15 @@ pub struct GenerateOutcome {
     pub levels: Vec<LevelBuild>,
     pub gate: Vec<GateCheck>,
     pub log: Vec<String>,
-    /// Everything that decided this scene's LOD geometry, from [`lod_state`]. Published
-    /// beside the descriptor so the next deployment can tell whether it would build the
-    /// same bundles, and so a human can read what changed when it would not.
+    /// Everything that decided this scene's LOD geometry, from [`lod_state`]. Recorded in
+    /// the reuse index so the next deployment can tell whether it would build the same
+    /// bundles, and so a human can read what changed when it would not.
     pub lod_state: serde_json::Value,
+    /// Every deployment file this build read, as lower-cased `file -> hash`: what the
+    /// runtime read while executing the scene, the scene's code and `main.crdt`, and every
+    /// glTF, buffer and texture the assembly fetched. A later deployment that serves each of
+    /// these under the same hash, with the same code and snapshot, builds the same bundles.
+    pub dependencies: BTreeMap<String, String>,
 }
 
 pub fn normalize_levels(levels: &[u32]) -> Result<Vec<u32>> {
@@ -735,6 +756,19 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     let placements = acquired.placements;
     let primitives = acquired.primitives;
     let unresolved_srcs = acquired.unresolved_srcs;
+    let mut dependencies = acquired.files_read;
+    // The code the runtime executed and the snapshot it started from are inputs too; the
+    // runtime fetches them directly rather than through the recorded read path.
+    let by_file = ent.content_by_file();
+    for file in ["main.crdt"]
+        .into_iter()
+        .chain(ent.metadata.get("main").and_then(|v| v.as_str()))
+    {
+        let lower = file.to_lowercase();
+        if let Some(hash) = by_file.get(&lower) {
+            dependencies.insert(lower, hash.clone());
+        }
+    }
     // Taken here, while both halves of the scene's geometry are still owned by this
     // function: `assemble` consumes them below.
     let lod_state = {
@@ -787,7 +821,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     let mut staged: Vec<(u32, PathBuf, simplify::SimplifyReport, Option<u32>)> = Vec::new();
     {
         let t = std::time::Instant::now();
-        let mut model = assemble::assemble(
+        let (mut model, fetched) = assemble::assemble_recording(
             &client,
             &ent,
             &placements,
@@ -800,6 +834,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
                 ..Default::default()
             },
         )?;
+        dependencies.extend(fetched);
         assemble_ms = t.elapsed().as_millis();
         if params.crop {
             let rects = crop::crop_rects_rh(base, &parcels);
@@ -1143,6 +1178,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         gate,
         log,
         lod_state,
+        dependencies,
     })
 }
 

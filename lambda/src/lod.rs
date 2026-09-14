@@ -1,7 +1,7 @@
 use crate::config::Config;
 use abgen::live::Proxy;
+use abgen::lodgen::reuse::{self, Inputs, ReuseRecord};
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -42,14 +42,35 @@ pub fn convert(
     let params = generate_params(cfg, entity_id, content_server, &platforms, &staging);
     let started = std::time::Instant::now();
 
-    match try_reuse(cfg, proxy, entity_id, content_server, &platforms, &params) {
+    // Resolved once here and again inside `generate`; the second resolution is a content
+    // cache hit. The inputs are needed on both paths: to look a previous build up, and to
+    // file this one under when it builds.
+    let (client, ent) = abgen::lodgen::resolve_scene(&params)?;
+    let inputs = match reuse::inputs(&ent) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            eprintln!("lods: {entity_id}: no reusable inputs ({e}); the state alone decides");
+            None
+        }
+    };
+
+    match try_reuse(
+        cfg,
+        proxy,
+        &client,
+        &ent,
+        content_server,
+        &platforms,
+        &params,
+        inputs.as_ref(),
+    ) {
         Ok(Some(summary)) => {
             drop(guard);
             return Ok(summary);
         }
         Ok(None) => {}
-        // Reuse is an optimization: a registry that is down, a descriptor that will not
-        // parse or an object that has gone missing must cost a rebuild, never a job.
+        // Reuse is an optimization: a record that will not parse, an object that has gone
+        // missing or a scene that will not execute must cost a rebuild, never a job.
         Err(e) => eprintln!("lods: {entity_id}: reuse check failed ({e}); building"),
     }
 
@@ -71,7 +92,14 @@ pub fn convert(
     let objects = abgen::lods::published_objects(&scene_dir, &cfg.lod_levels);
     let published = publish(cfg, proxy, &objects)?;
     if published.uploaded {
-        publish_state(proxy, &outcome.scene_id, &outcome.lod_state);
+        let record = record_for_build(
+            &outcome,
+            &published.keys,
+            &cfg.lod_levels,
+            &platforms,
+            inputs,
+        );
+        publish_record(proxy, &record);
     }
 
     // Notify only after every generated object has been published.
@@ -119,14 +147,6 @@ pub fn convert(
     Ok(summary)
 }
 
-/// Key the LOD state document is published under, beside the scene's descriptor.
-///
-/// This is the record a later deployment compares itself against, and the one to read when
-/// two deployments disagree about whether they would build the same thing.
-fn state_key(scene_id: &str) -> String {
-    format!("lods-unity/manifests/{scene_id}_LODState.json")
-}
-
 /// Key the scene's descriptor is published under.
 fn descriptor_key(scene_id: &str) -> String {
     format!(
@@ -135,224 +155,236 @@ fn descriptor_key(scene_id: &str) -> String {
     )
 }
 
-fn publish_state(proxy: &Arc<Proxy>, scene_id: &str, state: &serde_json::Value) {
-    match serde_json::to_string_pretty(state) {
-        Ok(text) => proxy.space_put_key(&state_key(scene_id), text.as_bytes()),
-        // Only costs the next deployment its reuse; never the job.
-        Err(e) => eprintln!("lods: {scene_id}: could not serialize the LOD state ({e})"),
-    }
-}
-
-/// True when nothing that decides the LOD geometry changed between two deployments.
+/// Publish a previous build's LOD bundles under this entity's names instead of building
+/// them, when a build would produce the same bytes.
 ///
-/// Placements are a function of three things: the `main.crdt` the runtime starts from, the
-/// scene code that mutates it, and `scene.json`, which fixes the parcels the result is
-/// cropped to. Hold those equal and executing the scene cannot produce a different answer,
-/// so the previous run's geometry stands without running it again.
+/// Two content-addressed lookups, cheapest first:
 ///
-/// Everything else in a deployment is free to change. A new thumbnail, an added asset no
-/// entity places, a re-uploaded texture the scene stopped using — none of them can move a
-/// placement, because only code and `main.crdt` place anything. The assets that *are*
-/// placed are checked separately: every hash the previous descriptor named must still be
-/// served under the same name, or the bundles would be built from different bytes.
-///
-/// This matters because deriving placements is the expensive part of a LOD build — around
-/// 80% of it — so the difference between deciding here and deciding by execution is most
-/// of the saving.
-fn lod_inputs_unchanged(
-    new_content: &BTreeMap<String, String>,
-    previous_content: &BTreeMap<String, String>,
-    previous_state: &serde_json::Value,
-) -> bool {
-    if new_content.is_empty() || previous_content.is_empty() {
-        return false;
-    }
-    // Anything that can place an entity, or decide where the parcels are.
-    let decides_geometry = |file: &str| {
-        let lower = file.to_ascii_lowercase();
-        lower == "main.crdt" || lower == "scene.json" || lower.ends_with(".js")
-    };
-    let mut seen_code = false;
-    for (file, hash) in new_content {
-        if !decides_geometry(file) {
-            continue;
-        }
-        seen_code = true;
-        if previous_content.get(file) != Some(hash) {
-            return false;
-        }
-    }
-    // A file that decided geometry before and is gone now is a change too.
-    for file in previous_content.keys() {
-        if decides_geometry(file) && !new_content.contains_key(file) {
-            return false;
-        }
-    }
-    if !seen_code {
-        // No code and no crdt: nothing to reason about, so do not guess.
-        return false;
-    }
-    // Every asset the previous build placed must still be served under the same name.
-    let Some(assets) = previous_state
-        .pointer("/descriptor/assets")
-        .and_then(serde_json::Value::as_array)
-    else {
-        return false;
-    };
-    let placed: std::collections::HashSet<&str> = assets
-        .iter()
-        .filter_map(|a| a.get("hash").and_then(serde_json::Value::as_str))
-        .collect();
-    let served: std::collections::HashSet<&str> =
-        new_content.values().map(String::as_str).collect();
-    placed.iter().all(|h| served.contains(h))
-}
-
-/// Publish the previous deployment's LOD bundles for this entity instead of building them,
-/// when the two deployments would produce the same geometry.
-///
-/// The expensive half of a LOD build is everything after placements: downloading every
-/// asset, assembling, atlasing, simplifying and bundling per platform. Deriving the
-/// descriptor stops before all of it, so this check costs one scene execution and a few
-/// small reads, against a full build that costs minutes.
-///
-/// Equality is decided by the LOD state document, not by the descriptor alone: the
-/// descriptor lists glTF placements but not the scene's SDK primitives, and a scene whose
-/// only change is a primitive would otherwise reuse bundles that no longer match it.
+/// 1. By inputs. The runtime's output is a function of the code, the `main.crdt` snapshot
+///    and the parcels; a record filed under this deployment's inputs digest means the same
+///    placements without executing anything. What those placements resolve to is checked
+///    against the record's dependency list, so a texture re-uploaded under the same name
+///    still misses.
+/// 2. By state. Execute the scene, derive the LOD state — placements, their content hashes
+///    and the SDK primitives — and look that up. A code change that moved nothing lands
+///    here and still reuses. This costs the scene execution and nothing downstream of it:
+///    no asset download, no assemble, no atlas, no simplify, no bundling.
 ///
 /// Returns `None` whenever anything is missing or unequal, which always means "build".
+#[allow(clippy::too_many_arguments)]
 fn try_reuse(
     cfg: &Config,
     proxy: &Arc<Proxy>,
-    entity_id: &str,
+    client: &abgen::catalyst::CatalystClient,
+    ent: &abgen::catalyst::Scene,
     content_server: &str,
     platforms: &[String],
     params: &abgen::lodgen::GenerateParams,
+    inputs: Option<&Inputs>,
 ) -> Result<Option<serde_json::Value>> {
     let started = std::time::Instant::now();
-    let Some(registry) = cfg.ab_registry_url.as_deref() else {
-        return Ok(None);
-    };
     if !proxy.space_configured() {
         return Ok(None);
     }
-    let agent = crate::catalyst::agent();
-    let entity = crate::catalyst::fetch_entity(&agent, content_server, entity_id)?;
-    let pointers: Vec<String> = entity
-        .get("pointers")
-        .and_then(serde_json::Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    let world_name = entity
-        .pointer("/metadata/worldConfiguration/name")
-        .and_then(serde_json::Value::as_str);
+    let entity_id = ent.entity_id.as_str();
+    let scene_id = ent.entity_id.to_lowercase();
+    let content = ent.content_by_file();
+    let levels = cfg.lod_levels.as_slice();
 
-    let Some(active) =
-        crate::bundle_registry::active_entity(&agent, registry, &pointers, world_name)?
-    else {
-        return Ok(None);
-    };
-    // The registry still answers with the deployment this job supersedes. If it has already
-    // moved on to this entity there is no earlier build to copy from.
-    if active.entity_id.eq_ignore_ascii_case(entity_id) {
-        return Ok(None);
-    }
-    if !active.lods_complete_for(platforms) {
-        return Ok(None);
-    }
-
-    let previous = active.entity_id.to_lowercase();
-    let Some(bytes) = proxy.space_get_key(&state_key(&previous)) else {
-        // Built before the state document was published.
-        return Ok(None);
-    };
-    let published: serde_json::Value = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse {}", state_key(&previous)))?;
-    let scene_id = entity_id.to_lowercase();
-
-    // Both listings are already in hand — the registry returned the previous one alongside
-    // the entity — so this check costs nothing and skips the part of a build that costs most.
-    let new_content = crate::bundle_registry::content_map(entity.get("content"));
-    let same_inputs = lod_inputs_unchanged(&new_content, &active.content, &published);
-
-    let (doc, state) = if same_inputs {
-        // Same files, so the same descriptor apart from the entity it names. Rename the
-        // previous one rather than executing the scene to derive a document already known.
-        let Some(bytes) = proxy.space_get_key(&descriptor_key(&previous)) else {
-            return Ok(None);
-        };
-        let mut doc: serde_json::Value = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse {}", descriptor_key(&previous)))?;
-        let Some(obj) = doc.as_object_mut() else {
-            return Ok(None);
-        };
-        obj.insert("sceneId".to_string(), serde_json::json!(scene_id));
-        (doc, published)
-    } else {
-        // Files differ, so derive this deployment's state and compare it with what the
-        // previous one recorded. Still far short of a build: placements only, with nothing
-        // downstream of them. A code change that leaves the geometry alone lands here and
-        // still reuses; only a real difference in the state falls through to a build.
-        let (_, doc, primitives) = abgen::lodgen::descriptor_only(params)?;
-        let state = abgen::lodgen::lod_state(&doc, &primitives);
-        if state != published {
-            return Ok(None);
+    if let Some(inputs) = inputs {
+        let digest = reuse::inputs_digest(inputs);
+        if let Some(record) = read_record(proxy, &reuse::inputs_index_key(&digest)) {
+            match record.accepts_inputs(inputs, &content, levels, platforms) {
+                // Same inputs, so the same descriptor apart from the entity it names: rename
+                // the previous one rather than executing the scene to derive it again.
+                Ok(()) => match renamed_descriptor(proxy, &record.built_by, &scene_id) {
+                    Some(doc) => {
+                        return republish(
+                            cfg,
+                            proxy,
+                            content_server,
+                            ent,
+                            platforms,
+                            record,
+                            doc,
+                            Some(inputs),
+                            "inputs",
+                            started,
+                        )
+                    }
+                    None => eprintln!(
+                        "lods: {entity_id}: {} published no descriptor to rename; deriving one",
+                        record.built_by
+                    ),
+                },
+                Err(why) => {
+                    eprintln!("lods: {entity_id}: inputs record {digest} does not apply: {why}")
+                }
+            }
         }
-        (doc, state)
-    };
+    }
 
-    // Same geometry: copy the bundles across under this entity's names. The bundle's own
-    // metadata still names the previous scene's prefab as its main asset, which is what the
-    // explorer loads by — it reads the name out of the bundle, never off the file name.
-    let mut keys: Vec<String> = Vec::new();
-    let mut levels: Vec<(u32, usize)> = Vec::new();
-    for &level in &cfg.lod_levels {
-        let mut level_bytes = 0usize;
+    let (doc, primitives) = abgen::lodgen::descriptor_for(client, ent, &params.iss)?;
+    let state = abgen::lodgen::lod_state(&doc, &primitives);
+    let digest = abgen::lodgen::state_digest(&state);
+    let Some(record) = read_record(proxy, &reuse::state_index_key(&digest)) else {
+        return Ok(None);
+    };
+    match record.accepts_state(&state, &content, levels, platforms) {
+        Ok(()) => republish(
+            cfg,
+            proxy,
+            content_server,
+            ent,
+            platforms,
+            record,
+            doc,
+            inputs,
+            "state",
+            started,
+        ),
+        Err(why) => {
+            eprintln!("lods: {entity_id}: state record {digest} does not apply: {why}");
+            Ok(None)
+        }
+    }
+}
+
+fn read_record(proxy: &Arc<Proxy>, key: &str) -> Option<ReuseRecord> {
+    let bytes = proxy.space_get_key(key)?;
+    match serde_json::from_slice(&bytes) {
+        Ok(record) => Some(record),
+        Err(e) => {
+            eprintln!("lods: {key} does not parse ({e}); ignoring it");
+            None
+        }
+    }
+}
+
+/// The descriptor `built_by` published, renamed to `scene_id`. Same placements, so the same
+/// document apart from the entity it names.
+fn renamed_descriptor(
+    proxy: &Arc<Proxy>,
+    built_by: &str,
+    scene_id: &str,
+) -> Option<serde_json::Value> {
+    let bytes = proxy.space_get_key(&descriptor_key(&built_by.to_lowercase()))?;
+    let mut doc: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    doc.as_object_mut()?
+        .insert("sceneId".to_string(), serde_json::json!(scene_id));
+    Some(doc)
+}
+
+/// One object to carry from a previous build's scene to this one.
+#[derive(Debug, PartialEq)]
+pub struct CopyItem {
+    pub level: u32,
+    pub from: String,
+    pub to: String,
+    /// Bundles must exist or the reuse is off; the published glb is carried when present.
+    pub required: bool,
+}
+
+/// Every per-scene object a build publishes, as `(from, to)` keys between two scene ids.
+pub fn copy_items(
+    from_scene: &str,
+    to_scene: &str,
+    levels: &[u32],
+    platforms: &[String],
+) -> Vec<CopyItem> {
+    let mut out = Vec::new();
+    for &level in levels {
         for platform in platforms {
-            let from = format!(
-                "LOD/{level}/{}",
-                abgen::lods::lod_bundle_name(&previous, level, platform)
-            );
-            let to = format!(
-                "LOD/{level}/{}",
-                abgen::lods::lod_bundle_name(&scene_id, level, platform)
-            );
-            let Some(bytes) = proxy.space_get_key(&from) else {
-                eprintln!("lods: {entity_id}: {from} is missing; building instead");
-                return Ok(None);
-            };
-            level_bytes += bytes.len();
-            proxy.space_put_key(&to, &bytes);
-            keys.push(to);
+            out.push(CopyItem {
+                level,
+                from: format!(
+                    "LOD/{level}/{}",
+                    abgen::lods::lod_bundle_name(from_scene, level, platform)
+                ),
+                to: format!(
+                    "LOD/{level}/{}",
+                    abgen::lods::lod_bundle_name(to_scene, level, platform)
+                ),
+                required: true,
+            });
         }
-        levels.push((level, level_bytes));
-        let glb_from = format!(
-            "{}/{}",
-            abgen::lods::PUBLISHED_GLB_DIR,
-            abgen::lods::published_glb_name(&previous, level)
-        );
-        if let Some(bytes) = proxy.space_get_key(&glb_from) {
-            let glb_to = format!(
+        out.push(CopyItem {
+            level,
+            from: format!(
                 "{}/{}",
                 abgen::lods::PUBLISHED_GLB_DIR,
-                abgen::lods::published_glb_name(&scene_id, level)
-            );
-            proxy.space_put_key(&glb_to, &bytes);
-            keys.push(glb_to);
+                abgen::lods::published_glb_name(from_scene, level)
+            ),
+            to: format!(
+                "{}/{}",
+                abgen::lods::PUBLISHED_GLB_DIR,
+                abgen::lods::published_glb_name(to_scene, level)
+            ),
+            required: false,
+        });
+    }
+    out
+}
+
+/// Copy `record`'s bundles under this entity's names, publish its descriptor, point both
+/// indexes at it and notify. `None` when a bundle the record promised is not there.
+///
+/// The copied bundle keeps the previous scene's prefab name in its own metadata, which is
+/// what the explorer loads by: it reads the main asset's name out of the bundle, never off
+/// the file name.
+#[allow(clippy::too_many_arguments)]
+fn republish(
+    cfg: &Config,
+    proxy: &Arc<Proxy>,
+    content_server: &str,
+    ent: &abgen::catalyst::Scene,
+    platforms: &[String],
+    mut record: ReuseRecord,
+    doc: serde_json::Value,
+    inputs: Option<&Inputs>,
+    by: &str,
+    started: std::time::Instant,
+) -> Result<Option<serde_json::Value>> {
+    let entity_id = ent.entity_id.as_str();
+    let scene_id = ent.entity_id.to_lowercase();
+    let from_scene = record.built_by.to_lowercase();
+    let mut keys: Vec<String> = Vec::new();
+    let mut levels: Vec<(u32, usize)> = cfg.lod_levels.iter().map(|&l| (l, 0)).collect();
+    for item in copy_items(&from_scene, &scene_id, &cfg.lod_levels, platforms) {
+        let Some(bytes) = proxy.space_get_key(&item.from) else {
+            if item.required {
+                eprintln!(
+                    "lods: {entity_id}: {} is missing; building instead",
+                    item.from
+                );
+                return Ok(None);
+            }
+            continue;
+        };
+        if item.required {
+            if let Some(slot) = levels.iter_mut().find(|(l, _)| *l == item.level) {
+                slot.1 += bytes.len();
+            }
         }
+        // A re-run of the same entity finds its own objects; verified, not rewritten.
+        if item.from != item.to {
+            proxy.space_put_key(&item.to, &bytes);
+        }
+        keys.push(item.to);
     }
 
-    // The descriptor is the one thing that is not copied: it names its own scene, so the
-    // freshly derived document is published rather than the previous entity's.
+    // The descriptor is the one object not copied: it names its own scene.
     let iss_key = descriptor_key(&scene_id);
     proxy.space_put_key(&iss_key, serde_json::to_string_pretty(&doc)?.as_bytes());
     keys.push(iss_key);
-    publish_state(proxy, &scene_id, &state);
+
+    // This deployment now holds the bytes too, and it is the newest to; point both indexes
+    // at it so a cleanup of older deployments does not turn the next job into a build.
+    record.built_by = scene_id.clone();
+    record.keys = keys.clone();
+    record.inputs = inputs.cloned();
+    record.inputs_digest = inputs.map(reuse::inputs_digest);
+    publish_record(proxy, &record);
 
     let notified = crate::notify::send_finished(
         cfg,
@@ -368,9 +400,8 @@ fn try_reuse(
             .collect::<Vec<_>>(),
     )?;
     eprintln!(
-        "reused: {entity_id} lods scene={scene_id} from={previous} by={} levels={} platforms={} \
-         bytes={} objects={} in {:.1}s",
-        if same_inputs { "inputs" } else { "geometry" },
+        "reused: {entity_id} lods scene={scene_id} from={from_scene} by={by} levels={} \
+         platforms={} bytes={} objects={} in {:.1}s",
         levels
             .iter()
             .map(|(l, _)| l.to_string())
@@ -391,14 +422,55 @@ fn try_reuse(
         true,
         notified,
     );
-    summary["lods"]["reusedFrom"] = serde_json::json!(previous);
-    summary["lods"]["reusedBy"] = serde_json::json!(if same_inputs {
-        "inputs"
-    } else {
-        "geometry"
-    });
+    summary["lods"]["reusedFrom"] = serde_json::json!(from_scene);
+    summary["lods"]["reusedBy"] = serde_json::json!(by);
     summary["lods"]["keys"] = serde_json::json!(keys);
     Ok(Some(summary))
+}
+
+/// The record a fresh build files itself under.
+pub fn record_for_build(
+    outcome: &abgen::lodgen::GenerateOutcome,
+    keys: &[String],
+    levels: &[u32],
+    platforms: &[String],
+    inputs: Option<Inputs>,
+) -> ReuseRecord {
+    ReuseRecord {
+        built_by: outcome.scene_id.clone(),
+        generation: abgen::lodgen::LOD_GENERATION.to_string(),
+        levels: levels.to_vec(),
+        platforms: platforms.to_vec(),
+        keys: keys.to_vec(),
+        dependencies: outcome.dependencies.clone(),
+        unresolved: outcome.unresolved_srcs.clone(),
+        inputs_digest: inputs.as_ref().map(reuse::inputs_digest),
+        inputs,
+        state_digest: abgen::lodgen::state_digest(&outcome.lod_state),
+        state: outcome.lod_state.clone(),
+    }
+}
+
+/// File `record` under both of its content addresses. A failure here only costs a later
+/// deployment its reuse, never this job.
+fn publish_record(proxy: &Arc<Proxy>, record: &ReuseRecord) {
+    let text = match serde_json::to_string_pretty(record) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!(
+                "lods: {}: could not serialize the reuse record ({e})",
+                record.built_by
+            );
+            return;
+        }
+    };
+    proxy.space_put_key(
+        &reuse::state_index_key(&record.state_digest),
+        text.as_bytes(),
+    );
+    if let Some(digest) = &record.inputs_digest {
+        proxy.space_put_key(&reuse::inputs_index_key(digest), text.as_bytes());
+    }
 }
 
 /// The success summary a converted LOD job returns. Carries a top-level
@@ -516,98 +588,101 @@ impl Drop for StagingGuard {
 }
 
 #[cfg(test)]
-mod reuse_input_tests {
+mod reuse_tests {
     use super::*;
 
-    fn listing(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs
-            .iter()
-            .map(|(f, h)| (f.to_string(), h.to_string()))
-            .collect()
-    }
-
-    fn state(assets: &[&str]) -> serde_json::Value {
-        serde_json::json!({
-            "generation": "1",
-            "descriptor": {
-                "assets": assets.iter().map(|h| serde_json::json!({"hash": h})).collect::<Vec<_>>()
-            },
-            "primitives": [],
-        })
-    }
-
-    const BASE: &[(&str, &str)] = &[
-        ("main.crdt", "bafkcrdt"),
-        ("bin/index.js", "bafkcode"),
-        ("scene.json", "bafkscene"),
-        ("models/tree.glb", "bafktree"),
-    ];
-
     #[test]
-    fn unchanged_inputs_reuse_even_when_other_files_moved() {
-        let prev = listing(BASE);
-        let st = state(&["bafktree"]);
-        assert!(lod_inputs_unchanged(&listing(BASE), &prev, &st));
-
-        // A new thumbnail and an asset nothing places cannot move a placement.
-        let mut noisy = listing(BASE);
-        noisy.insert("thumbnail.png".into(), "bafkthumb".into());
-        noisy.insert("models/unused.glb".into(), "bafkunused".into());
-        assert!(lod_inputs_unchanged(&noisy, &prev, &st));
+    fn copy_items_name_every_per_scene_object_between_two_scenes() {
+        let plats = vec!["windows".to_string(), "mac".to_string()];
+        let items = copy_items("bafkPrev", "bafkNext", &[1], &plats);
+        assert_eq!(
+            items,
+            vec![
+                CopyItem {
+                    level: 1,
+                    from: "LOD/1/bafkprev_1_windows".into(),
+                    to: "LOD/1/bafknext_1_windows".into(),
+                    required: true,
+                },
+                CopyItem {
+                    level: 1,
+                    from: "LOD/1/bafkprev_1_mac".into(),
+                    to: "LOD/1/bafknext_1_mac".into(),
+                    required: true,
+                },
+                CopyItem {
+                    level: 1,
+                    from: "lods-unity/lods/bafkprev_1.glb".into(),
+                    to: "lods-unity/lods/bafknext_1.glb".into(),
+                    required: false,
+                },
+            ]
+        );
+        // Two levels, one platform: bundles are required, glbs are carried when present.
+        let both = copy_items("a", "b", &[0, 1], &plats[..1]);
+        assert_eq!(both.iter().filter(|i| i.required).count(), 2);
+        assert_eq!(both.iter().filter(|i| !i.required).count(), 2);
+        assert!(both.iter().all(|i| i.from.contains("/a") && i.to.contains("/b")));
     }
 
     #[test]
-    fn anything_that_places_an_entity_forces_the_geometry_path() {
-        let prev = listing(BASE);
-        let st = state(&["bafktree"]);
-        for (file, hash) in [
-            ("bin/index.js", "bafkcode2"),
-            ("main.crdt", "bafkcrdt2"),
-            ("scene.json", "bafkscene2"),
-        ] {
-            let mut changed = listing(BASE);
-            changed.insert(file.to_string(), hash.to_string());
-            assert!(
-                !lod_inputs_unchanged(&changed, &prev, &st),
-                "{file} must not be waved through"
-            );
-        }
-        // A second code file appearing is a change, and one disappearing is too.
-        let mut added = listing(BASE);
-        added.insert("bin/extra.js".into(), "bafkextra".into());
-        assert!(!lod_inputs_unchanged(&added, &prev, &st));
-        let mut dropped = listing(BASE);
-        dropped.remove("main.crdt");
-        assert!(!lod_inputs_unchanged(&dropped, &prev, &st));
-    }
+    fn a_build_files_itself_under_both_digests() {
+        let state =
+            serde_json::json!({"generation": "1", "descriptor": {"assets": []}, "primitives": []});
+        let outcome = abgen::lodgen::GenerateOutcome {
+            entity_id: "bafkScene".into(),
+            scene_id: "bafkscene".into(),
+            source_tris: 0,
+            placement_stats: Default::default(),
+            unresolved_srcs: vec!["models/gone.glb".into()],
+            levels: Vec::new(),
+            gate: Vec::new(),
+            log: Vec::new(),
+            lod_state: state.clone(),
+            dependencies: [("models/tree.glb", "bafktree")]
+                .into_iter()
+                .map(|(f, h)| (f.to_string(), h.to_string()))
+                .collect(),
+        };
+        let keys = vec!["LOD/1/bafkscene_1_windows".to_string()];
+        let inputs = Inputs {
+            generation: abgen::lodgen::LOD_GENERATION.to_string(),
+            runtime_version: "7".into(),
+            base: "0,0".into(),
+            parcels: vec!["0,0".into()],
+            main_crdt: None,
+            code: [("bin/index.js".to_string(), "bafkcode".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let record = record_for_build(
+            &outcome,
+            &keys,
+            &[1],
+            &["windows".to_string()],
+            Some(inputs.clone()),
+        );
+        assert_eq!(record.built_by, "bafkscene");
+        assert_eq!(record.keys, keys);
+        assert_eq!(record.state, state);
+        assert_eq!(record.state_digest, abgen::lodgen::state_digest(&state));
+        assert_eq!(
+            record.inputs_digest.as_deref(),
+            Some(reuse::inputs_digest(&inputs).as_str())
+        );
+        assert_eq!(record.unresolved, vec!["models/gone.glb".to_string()]);
+        assert_eq!(record.dependencies["models/tree.glb"], "bafktree");
+        // The state key is what a later job derives; the inputs key what it hashes for free.
+        assert_eq!(
+            reuse::state_index_key(&record.state_digest),
+            format!("lod-reuse/by-state/{}.json", record.state_digest)
+        );
 
-    #[test]
-    fn a_placed_asset_must_still_be_served() {
-        let prev = listing(BASE);
-        let st = state(&["bafktree"]);
-        // The tree was re-uploaded under a new hash: same code, different bytes on screen.
-        let mut retextured = listing(BASE);
-        retextured.insert("models/tree.glb".into(), "bafktree2".into());
-        assert!(!lod_inputs_unchanged(&retextured, &prev, &st));
-
-        // A descriptor we cannot read is never taken on trust.
-        assert!(!lod_inputs_unchanged(
-            &listing(BASE),
-            &prev,
-            &serde_json::json!({"generation": "1"})
-        ));
-    }
-
-    #[test]
-    fn empty_or_codeless_listings_never_shortcut() {
-        let st = state(&[]);
-        assert!(!lod_inputs_unchanged(
-            &BTreeMap::new(),
-            &listing(BASE),
-            &st
-        ));
-        let assets_only = listing(&[("models/tree.glb", "bafktree")]);
-        assert!(!lod_inputs_unchanged(&assets_only, &assets_only, &st));
+        // An SDK6 build has no inputs and is filed by state only.
+        let by_state_only =
+            record_for_build(&outcome, &keys, &[1], &["windows".to_string()], None);
+        assert!(by_state_only.inputs.is_none());
+        assert!(by_state_only.inputs_digest.is_none());
     }
 }
 
@@ -628,7 +703,6 @@ mod tests {
             lods_enabled: true,
             max_receive_count: 3,
             lod_levels: crate::config::default_levels(),
-            ab_registry_url: None,
         }
     }
 
@@ -678,7 +752,6 @@ mod tests {
         let staging = PathBuf::from("/tmp/out/lod/bafkscene");
         let both = Config {
             lod_levels: vec![0, 1],
-            ab_registry_url: None,
             ..cfg()
         };
         let p = generate_params(&both, "bafkscene", "https://c/content", &[], &staging);

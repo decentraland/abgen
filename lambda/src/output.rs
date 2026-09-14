@@ -229,7 +229,6 @@ mod tests {
             lods_enabled: false,
             max_receive_count: 3,
             lod_levels: vec![1],
-            ab_registry_url: None,
         }
     }
 

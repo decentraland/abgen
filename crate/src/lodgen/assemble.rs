@@ -1,6 +1,9 @@
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::BTreeMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Mutex;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 #[cfg(not(target_arch = "wasm32"))]
@@ -394,6 +397,30 @@ pub fn assemble(
     cache_dir: Option<&Path>,
     lane: model::MatLane,
 ) -> Result<LodModel> {
+    assemble_recording(client, scene, placements, primitives, level, cache_dir, lane)
+        .map(|(model, _)| model)
+}
+
+/// [`assemble`], also returning every deployment file the assembly read, as
+/// `file -> hash` with the file name lower-cased.
+///
+/// This is the set of files a rebuild would be a function of beyond the placements
+/// themselves: the glTFs, their `.bin` buffers and their textures. The descriptor names
+/// only the glTF hashes, so a texture re-uploaded under the same name changes the bundle
+/// without changing the descriptor; a reuse check needs this list to see that.
+///
+/// When several deployment files share one hash, every name is recorded, so the check
+/// stays conservative whichever name the glTF resolved through.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn assemble_recording(
+    client: &crate::catalyst::CatalystClient,
+    scene: &crate::catalyst::Scene,
+    placements: &[Placement],
+    primitives: &[PrimitivePlacement],
+    level: u32,
+    cache_dir: Option<&Path>,
+    lane: model::MatLane,
+) -> Result<(LodModel, BTreeMap<String, String>)> {
     let by_file = scene.content_by_file();
     let mut file_by_hash: HashMap<&str, &str> = HashMap::new();
     for c in &scene.content {
@@ -403,7 +430,7 @@ pub fn assemble(
     }
     let fetch = |hash: &str| fetch_cached(client, cache_dir, hash);
     let fetch_texture = |source: &TextureSource| fetch_texture_cached(client, cache_dir, source);
-    assemble_from(
+    let (model, fetched) = assemble_from_recording(
         &format!("{}_{}", scene.entity_id.to_lowercase(), level),
         &by_file,
         &file_by_hash,
@@ -412,7 +439,23 @@ pub fn assemble(
         &fetch,
         &fetch_texture,
         lane,
-    )
+    )?;
+    Ok((model, dependencies_from_hashes(scene, &fetched)))
+}
+
+/// Every `file -> hash` pair of the deployment whose hash is in `fetched`, file names
+/// lower-cased like [`crate::catalyst::Scene::content_by_file`] spells them.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn dependencies_from_hashes(
+    scene: &crate::catalyst::Scene,
+    fetched: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    scene
+        .content
+        .iter()
+        .filter(|c| fetched.contains(&c.hash))
+        .map(|c| (c.file.to_lowercase(), c.hash.clone()))
+        .collect()
 }
 
 /// Assembles the GLB `placements` and the SDK `primitives` into one Unity-space model.
@@ -430,6 +473,51 @@ pub fn assemble_from(
     fetch_texture: &(dyn Fn(&TextureSource) -> Result<Vec<u8>> + Sync),
     lane: model::MatLane,
 ) -> Result<LodModel> {
+    assemble_from_recording(
+        root_name,
+        by_file,
+        file_by_hash,
+        placements,
+        primitives,
+        fetch,
+        fetch_texture,
+        lane,
+    )
+    .map(|(model, _)| model)
+}
+
+/// [`assemble_from`], also returning every content hash it asked `fetch` (or a hash-sourced
+/// `fetch_texture`) for, whether or not the fetch succeeded. URL textures are not content
+/// and are not recorded.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_from_recording(
+    root_name: &str,
+    by_file: &HashMap<String, String>,
+    file_by_hash: &HashMap<&str, &str>,
+    placements: &[Placement],
+    primitives: &[PrimitivePlacement],
+    fetch: &(dyn Fn(&str) -> Result<Vec<u8>> + Sync),
+    fetch_texture: &(dyn Fn(&TextureSource) -> Result<Vec<u8>> + Sync),
+    lane: model::MatLane,
+) -> Result<(LodModel, BTreeSet<String>)> {
+    let fetched: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    let record = |hash: &str| {
+        if let Ok(mut set) = fetched.lock() {
+            set.insert(hash.to_string());
+        }
+    };
+    let recording_fetch = |hash: &str| -> Result<Vec<u8>> {
+        record(hash);
+        fetch(hash)
+    };
+    let recording_fetch_texture = |source: &TextureSource| -> Result<Vec<u8>> {
+        if let TextureSource::Hash(hash) = source {
+            record(hash);
+        }
+        fetch_texture(source)
+    };
+    let fetch = &recording_fetch;
+    let fetch_texture = &recording_fetch_texture;
     if placements.is_empty() && primitives.is_empty() {
         bail!("assemble: no placements");
     }
@@ -667,7 +755,8 @@ pub fn assemble_from(
         counters.primitives_zero_scale,
         counters.primitive_textures_failed
     ));
-    Ok(model)
+    let fetched = fetched.into_inner().unwrap_or_default();
+    Ok((model, fetched))
 }
 
 /// Appends the SDK primitives to `model`. Each one is the explorer's Unity-space mesh
@@ -1802,6 +1891,40 @@ mod tests {
     }
 
     #[test]
+    fn assembly_records_every_deployment_file_it_read() {
+        let glb = tri_glb();
+        let cache = temp_cache("deps");
+        stage(&cache, "htri", &glb);
+        // Two deployment names share the placed hash: both are recorded, so the reuse check
+        // stays conservative whichever name the scene resolved through.
+        let ent = entity(&[
+            ("models/Tree.glb", "htri"),
+            ("models/copy-of-tree.glb", "htri"),
+            ("models/unused.glb", "hunused"),
+            ("scene-thumbnail.png", "hthumb"),
+        ]);
+        let (model, deps) = assemble_recording(
+            &dummy_client(),
+            &ent,
+            &[place("htri")],
+            &[],
+            1,
+            Some(&cache),
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(model.total_tris(), 1);
+        let want: BTreeMap<String, String> = [
+            ("models/tree.glb", "htri"),
+            ("models/copy-of-tree.glb", "htri"),
+        ]
+        .into_iter()
+        .map(|(f, h)| (f.to_string(), h.to_string()))
+        .collect();
+        assert_eq!(deps, want, "lower-cased names of what was fetched, nothing else");
+    }
+
+    #[test]
     fn nul_padded_json_chunk_is_tolerated() {
         let glb = tri_glb();
         let (json, bin) = chunks(&glb);
@@ -1909,7 +2032,7 @@ mod tests {
                 [1.0; 3],
             ),
         ];
-        let model = assemble_from(
+        let (model, fetched) = assemble_from_recording(
             "prims_1",
             &by_file,
             &file_by_hash,
@@ -1920,6 +2043,8 @@ mod tests {
             Default::default(),
         )
         .unwrap();
+        // The content texture is a dependency of the build; the URL one is not content.
+        assert_eq!(fetched, BTreeSet::from(["hpng".to_string()]));
 
         // zero-scale sphere skipped; the two textured boxes share one material + image
         assert_eq!(model.primitives.len(), 3);

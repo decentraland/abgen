@@ -9,6 +9,8 @@ pub mod primitives;
 pub mod quantize;
 pub mod reclamp;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod reuse;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod scenerun;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod simplify;
@@ -25,10 +27,11 @@ pub use gate::{gate_failures, self_gate_bundle, self_gate_bundle_with, GateCheck
 pub use inventory::{inventory, reference_url, BundleInventory, InventoryDelta};
 #[cfg(not(target_arch = "wasm32"))]
 pub use pipeline::{
-    acquire_placements, choose_lane, descriptor_only, effective_tri_cap, expected_rel_path,
-    generate, iss_document, lod_state, normalize_levels, parse_parcel, scene_geometry,
-    staged_glb_name, state_digest, write_iss_descriptor, GenerateOutcome, GenerateParams,
-    LevelBuild, PlacementStats, SimplifyLane, LOD_GENERATION, TRIS_PER_PARCEL,
+    acquire_placements, choose_lane, descriptor_for, descriptor_only, effective_tri_cap,
+    expected_rel_path, generate, iss_document, lod_state, normalize_levels, parse_parcel,
+    resolve_scene, scene_geometry, staged_glb_name, state_digest, write_iss_descriptor,
+    GenerateOutcome, GenerateParams, LevelBuild, PlacementStats, SimplifyLane, LOD_GENERATION,
+    TRIS_PER_PARCEL,
 };
 
 #[cfg(test)]

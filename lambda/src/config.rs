@@ -15,10 +15,6 @@ pub struct Config {
     pub max_receive_count: u32,
     /// LOD levels the LOD lane builds and publishes (`LOD_LEVELS`).
     pub lod_levels: Vec<u32>,
-    /// Asset-bundle registry base URL (`AB_REGISTRY_URL`). When set, a LOD job asks the
-    /// registry what the pointers currently serve and reuses that deployment's bundles if
-    /// the new one would build the same geometry. Unset disables reuse entirely.
-    pub ab_registry_url: Option<String>,
 }
 
 impl Config {
@@ -36,12 +32,7 @@ impl Config {
                 default_levels()
             }
         };
-        let ab_registry_url = std::env::var("AB_REGISTRY_URL")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
         Config {
-            ab_registry_url,
             platforms,
             version: std::env::var("AB_VERSION").unwrap_or_else(|_| "v49".to_string()),
             cache_dir: std::env::var("ABGEN_CACHE_DIR").unwrap_or_else(|_| {

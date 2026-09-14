@@ -163,7 +163,9 @@ pub fn object_headers(key: &str) -> ObjectHeaders {
         "application/wasm"
     };
     let uploader_lane = matches!(content_type, "application/wasm" | "text/cache-manifest");
-    let cache_control = if key.starts_with("manifest/") {
+    let cache_control = if key.starts_with("manifest/") || key.starts_with("lod-reuse/") {
+        // Both families are rewritten in place: consumer-server manifests on every
+        // rebuild, LOD reuse records whenever a later deployment republishes a build.
         NO_CACHE
     } else if key.starts_with("lods-unity/") {
         PUBLIC_ONE_YEAR
@@ -704,6 +706,18 @@ mod tests {
                 "v41/bafkScene/Qmhash_windows.manifest",
                 "text/cache-manifest",
                 IMMUTABLE_BUNDLE,
+            ),
+            // LOD reuse records are rewritten in place whenever a later deployment
+            // republishes a build, so the origin must never let them be cached.
+            (
+                "lod-reuse/by-inputs/0123abcd.json",
+                "application/json",
+                NO_CACHE,
+            ),
+            (
+                "lod-reuse/by-state/0123abcd.json",
+                "application/json",
+                NO_CACHE,
             ),
         ] {
             let h = object_headers(key);

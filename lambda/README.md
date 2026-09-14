@@ -66,7 +66,6 @@ all hits.
 | `ABGEN_HTTP_SECRET` | — (**fail-closed**) | shared secret the Function URL POST path requires in `x-abgen-secret`; unset means every HTTP invocation is refused with `503` |
 | `ENABLE_LODS` | off | generate `LOD_LEVELS` for `lods` jobs instead of acking and skipping them (see [LOD jobs](#lod-jobs)) |
 | `LOD_LEVELS` | `1` | comma-separated LOD levels the LOD lane builds and publishes (`0,1` for both); level 2 is refused |
-| `AB_REGISTRY_URL` | — (off) | asset-bundle registry base, e.g. `https://asset-bundle-registry-abgen.decentraland.org`. With it set, a LOD job first asks the registry which deployment the scene's pointers currently serve and, if the new deployment would build the same geometry, republishes that build's bundles instead of rebuilding (see [Reusing an unchanged build](#reusing-an-unchanged-build)). Unset disables the check. |
 | `ALLOWED_CONTENT_SERVER_HOSTS` | — (**fail-open**) | comma-separated allowlist of hosts an event's `contentServerUrl` may name; **unset means any https host is accepted**, so every deployment should set it. Scheme/shape validation (https only, no userinfo) applies regardless — allowlist or not, a plaintext or internal-IP URL is rejected. The `lambdaImage` bakes in `peer.decentraland.org`; a function env var overrides it. |
 | `ABGEN_EMF_NAMESPACE` | — (off) | CloudWatch namespace for EMF metrics (e.g. `abgen/lambda`); unset means no recorder is installed and every `metrics::` call stays a no-op |
 | `ABGEN_LOG_FORMAT` | plain text | `json` for JSON log lines |
@@ -233,6 +232,7 @@ extra dimensions.
 | LOD bundles, `ENABLE_LODS=1` | `LOD/{level}/{sceneId}_{level}_{platform}` |
 | ISS descriptor, `ENABLE_LODS=1` | `lods-unity/manifests/{sceneId}_InitialSceneState.json` |
 | published LOD GLB (gltfpack layout, level 1 only), `ENABLE_LODS=1` | `lods-unity/lods/{sceneId}_1.glb` |
+| LOD reuse index, `ENABLE_LODS=1` | `lod-reuse/by-inputs/{digest}.json`, `lod-reuse/by-state/{digest}.json` (see [Reusing an unchanged build](#reusing-an-unchanged-build)) |
 
 The three LOD families are the production key set (consumer-server keys plus
 the converter's `LOD/1` bundles); `lods::published_objects` lists them for
@@ -288,7 +288,9 @@ scene sources (`.js`/`.json`/`.crdt`) the direct-upload spelling
 (`lods-unity/manifests/…`) are `public, max-age=31536000` — the
 lod-generator-unity storage adapter's `CACHE_CONTROL_ONE_YEAR`, whose keys
 these are (they embed the content-addressed entity id; they are *not*
-rewritten-in-place consumer-server manifests).
+rewritten-in-place consumer-server manifests). LOD reuse records
+(`lod-reuse/…`) *are* rewritten in place, by every deployment that reuses
+the build they describe, so they carry the manifests' no-cache policy.
 That is origin-level defense in depth — **cache policy still must
 live on the CDN distribution**: long/immutable TTLs for `{AB_VERSION}/…`
 (keys are content-addressed) and TTL 0 for `manifest/…`. No `.br` siblings of native AssetBundles or LOD artifacts (see step 3 note above). Two remaining divergences from
@@ -317,62 +319,81 @@ shape bypasses the already-converted skip.
 ## Reusing an unchanged build
 
 A scene redeployed with no change to its geometry produces byte-equal LOD bundles, so the
-second build is pure waste. With `AB_REGISTRY_URL` set, a LOD job checks for that before
-paying for one.
+second build is pure waste. A LOD job checks for that before paying for one, by content
+address: it never asks a registry who deployed before it, and it trusts nothing but the
+catalyst's listing and objects abgen itself wrote.
 
-1. The job asks the registry, at `POST /entities/active`, which entity the new
-   deployment's pointers currently serve. That is still the previous deployment, because
-   this job is what replaces it. Worlds pass `?world_name=`.
-2. If the registry reports every target platform's LOD as `complete`, the job checks whether
-   anything that decides the geometry changed. Placements are a function of three things:
-   the `main.crdt` the runtime starts from, the scene code that mutates it, and `scene.json`,
-   which fixes the parcels the result is cropped to. Hold those equal, and check that every
-   asset the previous descriptor placed is still served under the same name, and executing
-   the scene cannot produce a different answer. Both listings are already in hand — the
-   registry returns the previous one with the entity — so this costs nothing, and the scene
-   is never executed. A new thumbnail or an added asset nothing places does not block it.
-3. Otherwise the job derives the new deployment's descriptor and primitives and stops
-   there: no asset download, no assemble, no atlas, no simplify, no bundling. Those two are
-   the **LOD state** — everything a build is a function of — and they are compared against
-   the state the previous deployment published, at
-   `lods-unity/manifests/{sceneId}_LODState.json`. A scene that changed its code without
-   moving anything lands here and still reuses: the code is not part of the state, only
-   what it placed is.
-4. On a match the previous bundles are copied to this entity's names and the job finishes.
-   Otherwise it builds normally. The job summary records which check decided it, under
-   `lods.reusedBy`: `inputs` for the free path, `geometry` for the derived one.
+Every build files a **reuse record** under two keys, both sha256 digests of what the build
+was a function of (`abgen::lodgen::reuse`):
+
+- `lod-reuse/by-inputs/{digest}.json` — the digest of the scene runtime's **inputs**: the
+  pipeline generation, the `main.crdt` hash, the base and parcels from `scene.json`, and
+  the hash of every `.js` file plus the scene's `main`. The runtime gives the scene no real
+  network and a fixed virtual clock, so equal inputs execute to equal placements. Only
+  SDK7 scenes have inputs; an SDK6 scene runs through an adaption layer fetched from the
+  network at build time, which nothing here can pin.
+- `lod-reuse/by-state/{digest}.json` — the digest of the **LOD state**: the descriptor
+  minus its `sceneId`, the SDK primitives the descriptor omits, and the generation. This
+  is everything a build is a function of once placements are known.
+
+The record names the scene whose per-scene keys hold the bundles (`builtBy`), what it
+built (`levels`, `platforms`, `keys`), every deployment file it read as `file -> hash`
+(`dependencies`: the code and snapshot, every file the runtime read, every glTF, buffer
+and texture the assembly fetched), the glTF sources it could not resolve (`unresolved`),
+and both documents in full.
+
+A job then decides in two tiers, cheapest first:
+
+1. **By inputs, no execution.** Hash this deployment's inputs, `GET` the record. On a hit,
+   check it covers the configured levels and platforms, that every recorded dependency is
+   still served under the same name with the same hash, and that no unresolved source is
+   now shipped. A thumbnail, an added asset nothing places or a scene description edit
+   pass; a texture re-uploaded under the same name does not, even though the descriptor
+   would never show it. Pass means copy.
+2. **By state, one execution.** Otherwise run the embedded scene runtime, derive the state
+   document, hash it, `GET` the record. Check coverage, full document equality (not just
+   the digest) and the same dependency rule. A code change that moved nothing lands here
+   and still reuses. This costs the execution and nothing downstream of it: no asset
+   download, no assemble, no atlas, no simplify, no bundling.
+3. Otherwise build, and file the result under both keys.
+
+On a copy, every bundle and the published glb are read from `builtBy`'s keys and written
+under this scene's names; a bundle the record promised but the bucket lacks falls through
+to a build. The descriptor is the one object not copied, since it names its own scene: tier
+1 republishes the previous one with `sceneId` replaced, tier 2 the freshly derived one.
+Both records are then rewritten with this scene as `builtBy`, so the pointer always follows
+the newest deployment holding the bytes and a cleanup of older ones does not turn the next
+job into a build. The job summary records which tier decided, under `lods.reusedBy`:
+`inputs` or `state`.
+
+Because the lookup is by content rather than by predecessor, a rollback, a scene cloned to
+other parcels with the same content, and a redelivered job for the same entity all hit.
+Bundles are still duplicated per scene id — the explorer loads
+`LOD/{level}/{sceneId}_{level}_{platform}` — but the index costs one small object per
+distinct build, not a second copy of anything.
 
 `main.crdt` is never read as scene truth — it is the editor's frame-zero snapshot, and scene
 code adds, moves and removes entities after it. It is only compared as an *input*: identical
-snapshot plus identical code means the frames the runtime simulates are identical too, which
-is a claim about the inputs rather than about the snapshot's contents.
+snapshot plus identical code means the frames the runtime simulates are identical too.
 
-Deriving placements is around 80% of a LOD build (median 436 ms of 514 ms across the 26k
-corpus run), so the difference between deciding at step 2 and deciding at step 3 is most of
-the saving, and step 3 still avoids the remaining 20%.
+Deriving placements is most of a build's *median* cost (436 ms of 514 ms across the 26k
+corpus run, warm cache), which is why tier 1 exists; but the median is dominated by tiny
+scenes. For a scene whose LOD matters, on a Lambda with no warm content cache, the asset
+downloads and encoding are where the minutes go, and tier 2 avoids all of them for half a
+second of execution. A job that misses both tiers executes the scene twice — once to derive
+the state, once inside the build.
 
-The state document carries the glTF placements **and** the SDK primitives. The descriptor
-alone would not: it lists glTF assets only, so a scene whose only change is a primitive
-would look unchanged and reuse bundles that no longer match it. It is written out rather
-than hashed so that when two deployments disagree, the disagreement can be read. It also
-carries a generation constant, `abgen::lodgen::LOD_GENERATION` — bump that when a pipeline
-change makes already published bundles wrong to reuse, and every scene rebuilds once before
-reuse resumes.
-
-The scene's own deployment carries no such document. `main.crdt` is the editor's frame-zero
-snapshot, not the state the LOD is built from, and the `<sceneId>-lod-manifest.json` the
-`parse-manifest` command reads is an input to the old Unity pipeline that deployments do not
-ship. `LOD.manifest.json`, which a build does write, is a receipt: version, scene id, levels,
-file list, exit code. None of the three describes the geometry, which is why the state
-document exists.
+`abgen::lodgen::LOD_GENERATION` is inside both digests. Bump it when a pipeline change makes
+already published bundles wrong to reuse, and no stored record is ever looked up again:
+every scene rebuilds once and files itself under the new generation.
 
 The copied bundle keeps the previous scene's prefab name in its own `metadata.json`. That
 is what the explorer loads by: it reads the main asset's name out of the bundle rather than
-off the file name. The descriptor is the one object not copied, since it names its own
-scene; the freshly derived one is published instead.
+off the file name.
 
-Reuse is an optimization and never a failure mode. A registry that is unreachable, a
-descriptor that will not parse or a missing object all fall through to a normal build.
+Reuse is an optimization and never a failure mode. A record that will not parse, a missing
+object, a scene that will not execute or a catalyst that will not answer all fall through
+to a normal build.
 
 ## LOD jobs
 

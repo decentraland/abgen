@@ -574,6 +574,7 @@ mod tests {
             gate: Vec::new(),
             log: Vec::new(),
             lod_state: serde_json::Value::Null,
+            dependencies: Default::default(),
         }
     }
 
