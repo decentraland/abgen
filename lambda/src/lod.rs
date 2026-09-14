@@ -70,7 +70,7 @@ pub fn convert(
     let objects = abgen::lods::published_objects(&scene_dir, &cfg.lod_levels);
     let published = publish(cfg, proxy, &objects)?;
     if published.uploaded {
-        publish_signature(proxy, &outcome.scene_id, &outcome.build_signature);
+        publish_state(proxy, &outcome.scene_id, &outcome.lod_state);
     }
 
     // Notify only after every generated object has been published.
@@ -118,9 +118,12 @@ pub fn convert(
     Ok(summary)
 }
 
-/// Key the build signature is published under, beside the scene's descriptor.
-fn signature_key(scene_id: &str) -> String {
-    format!("lods-unity/manifests/{scene_id}_lodsig")
+/// Key the LOD state document is published under, beside the scene's descriptor.
+///
+/// This is the record a later deployment compares itself against, and the one to read when
+/// two deployments disagree about whether they would build the same thing.
+fn state_key(scene_id: &str) -> String {
+    format!("lods-unity/manifests/{scene_id}_LODState.json")
 }
 
 /// Key the scene's descriptor is published under.
@@ -131,8 +134,12 @@ fn descriptor_key(scene_id: &str) -> String {
     )
 }
 
-fn publish_signature(proxy: &Arc<Proxy>, scene_id: &str, signature: &str) {
-    proxy.space_put_key(&signature_key(scene_id), signature.as_bytes());
+fn publish_state(proxy: &Arc<Proxy>, scene_id: &str, state: &serde_json::Value) {
+    match serde_json::to_string_pretty(state) {
+        Ok(text) => proxy.space_put_key(&state_key(scene_id), text.as_bytes()),
+        // Only costs the next deployment its reuse; never the job.
+        Err(e) => eprintln!("lods: {scene_id}: could not serialize the LOD state ({e})"),
+    }
 }
 
 /// Publish the previous deployment's LOD bundles for this entity instead of building them,
@@ -143,9 +150,9 @@ fn publish_signature(proxy: &Arc<Proxy>, scene_id: &str, signature: &str) {
 /// descriptor stops before all of it, so this check costs one scene execution and a few
 /// small reads, against a full build that costs minutes.
 ///
-/// Equality is decided by [`abgen::lodgen::build_signature`], not by the descriptor alone:
-/// the descriptor lists glTF placements but not the scene's SDK primitives, and a scene
-/// whose only change is a primitive would otherwise reuse bundles that no longer match it.
+/// Equality is decided by the LOD state document, not by the descriptor alone: the
+/// descriptor lists glTF placements but not the scene's SDK primitives, and a scene whose
+/// only change is a primitive would otherwise reuse bundles that no longer match it.
 ///
 /// Returns `None` whenever anything is missing or unequal, which always means "build".
 fn try_reuse(
@@ -194,11 +201,12 @@ fn try_reuse(
     }
 
     let previous = active.entity_id.to_lowercase();
-    let Some(published) = proxy.space_get_key(&signature_key(&previous)) else {
-        // Built before signatures were published, or by a different generation.
+    let Some(bytes) = proxy.space_get_key(&state_key(&previous)) else {
+        // Built before the state document was published.
         return Ok(None);
     };
-    let published = String::from_utf8_lossy(&published).trim().to_string();
+    let published: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse {}", state_key(&previous)))?;
     let scene_id = entity_id.to_lowercase();
 
     // Identical content listings mean identical files, including the scene's code and the
@@ -208,7 +216,7 @@ fn try_reuse(
     let content_digest = crate::bundle_registry::content_digest(entity.get("content"));
     let same_content = !content_digest.is_empty() && content_digest == active.content_digest;
 
-    let (doc, signature) = if same_content {
+    let (doc, state) = if same_content {
         // Same files, so the same descriptor apart from the entity it names. Rename the
         // previous one rather than executing the scene to derive a document already known.
         let Some(bytes) = proxy.space_get_key(&descriptor_key(&previous)) else {
@@ -222,14 +230,16 @@ fn try_reuse(
         obj.insert("sceneId".to_string(), serde_json::json!(scene_id));
         (doc, published)
     } else {
-        // Files differ, so derive this deployment's geometry and compare digests. Still far
-        // short of a build: placements only, with nothing downstream of them.
+        // Files differ, so derive this deployment's state and compare it with what the
+        // previous one recorded. Still far short of a build: placements only, with nothing
+        // downstream of them. A code change that leaves the geometry alone lands here and
+        // still reuses; only a real difference in the state falls through to a build.
         let (_, doc, primitives) = abgen::lodgen::descriptor_only(params)?;
-        let signature = abgen::lodgen::build_signature(&doc, &primitives);
-        if signature != published {
+        let state = abgen::lodgen::lod_state(&doc, &primitives);
+        if state != published {
             return Ok(None);
         }
-        (doc, signature)
+        (doc, state)
     };
 
     // Same geometry: copy the bundles across under this entity's names. The bundle's own
@@ -278,7 +288,7 @@ fn try_reuse(
     let iss_key = descriptor_key(&scene_id);
     proxy.space_put_key(&iss_key, serde_json::to_string_pretty(&doc)?.as_bytes());
     keys.push(iss_key);
-    publish_signature(proxy, &scene_id, &signature);
+    publish_state(proxy, &scene_id, &state);
 
     let notified = crate::notify::send_finished(
         cfg,

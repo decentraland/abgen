@@ -169,20 +169,27 @@ pub fn iss_document(
     )
 }
 
-/// Everything about a scene that decides what its LOD bundles contain, as one digest.
+/// Everything about a scene that decides what its LOD bundles contain, as a document.
 ///
-/// The descriptor carries the resolved glTF placements but **not** the SDK primitives,
-/// which `assemble` turns into geometry just like a glTF instance — two deployments can
-/// therefore share a descriptor and still differ in what a player sees. The signature
-/// covers both, plus the generation, so an equal signature means equal LOD geometry and
-/// the second deployment can publish the first's bundles instead of building them.
+/// This is the state a build is a function of. Two deployments with equal state produce
+/// equal bundles, so the second can publish the first's instead of building them. It is
+/// written out next to the descriptor rather than kept as a digest so that when two
+/// deployments disagree, the disagreement can be read.
 ///
-/// `sceneId` is excluded on purpose: it is the one field guaranteed to differ between two
+/// It carries both halves of the geometry. The descriptor alone would not: it lists the
+/// resolved glTF placements but **not** the SDK primitives, which `assemble` turns into
+/// geometry just the same, so two scenes can share a descriptor and still differ in what a
+/// player sees.
+///
+/// `sceneId` is excluded on purpose. It is the one field guaranteed to differ between two
 /// deployments of the same scene, and it names the entity rather than describing it.
-pub fn build_signature(
+///
+/// `generation` invalidates everything already published when a pipeline change makes old
+/// bundles wrong to reuse: bump [`LOD_GENERATION`] and no stored state matches again.
+pub fn lod_state(
     doc: &serde_json::Value,
     primitives: &[primitives::PrimitivePlacement],
-) -> String {
+) -> serde_json::Value {
     let mut descriptor = doc.clone();
     if let Some(obj) = descriptor.as_object_mut() {
         obj.remove("sceneId");
@@ -205,13 +212,17 @@ pub fn build_signature(
             })
         })
         .collect();
-    let payload = serde_json::json!({
+    serde_json::json!({
         "generation": LOD_GENERATION,
         "descriptor": descriptor,
         "primitives": prims,
-    });
-    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
-    crate::hashes::sha256_hex(&bytes)
+    })
+}
+
+/// A short digest of [`lod_state`], for logs and metrics. Equality of the state documents
+/// is what decides reuse; this is only a handle to name one in a line of output.
+pub fn state_digest(state: &serde_json::Value) -> String {
+    crate::hashes::sha256_hex(&serde_json::to_vec(state).unwrap_or_default())
 }
 
 /// Resolve a scene and derive its descriptor and primitives, and stop there.
@@ -385,10 +396,10 @@ pub struct GenerateOutcome {
     pub levels: Vec<LevelBuild>,
     pub gate: Vec<GateCheck>,
     pub log: Vec<String>,
-    /// Digest of everything that decides this scene's LOD geometry, from
-    /// [`build_signature`]. Published beside the descriptor so the next deployment can
-    /// tell whether it would build the same bundles.
-    pub build_signature: String,
+    /// Everything that decided this scene's LOD geometry, from [`lod_state`]. Published
+    /// beside the descriptor so the next deployment can tell whether it would build the
+    /// same bundles, and so a human can read what changed when it would not.
+    pub lod_state: serde_json::Value,
 }
 
 pub fn normalize_levels(levels: &[u32]) -> Result<Vec<u32>> {
@@ -726,9 +737,9 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     let unresolved_srcs = acquired.unresolved_srcs;
     // Taken here, while both halves of the scene's geometry are still owned by this
     // function: `assemble` consumes them below.
-    let build_signature = {
+    let lod_state = {
         let (doc, _, _) = iss_document(&sid, &placements, &ent.content_by_file());
-        self::build_signature(&doc, &primitives)
+        self::lod_state(&doc, &primitives)
     };
     log.push(format!("placement-source: {placement_source}"));
     log.push(format!("placements: {}", placements.len()));
@@ -1131,12 +1142,12 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         levels: level_builds,
         gate,
         log,
-        build_signature,
+        lod_state,
     })
 }
 
 #[cfg(test)]
-mod signature_tests {
+mod lod_state_tests {
     use super::*;
 
     fn doc(scene_id: &str, hash: &str) -> serde_json::Value {
@@ -1157,13 +1168,13 @@ mod signature_tests {
         let a = doc("bafkone", "bafkasset");
         let b = doc("bafktwo", "bafkasset");
         assert_eq!(
-            build_signature(&a, &[]),
-            build_signature(&b, &[]),
+            state_digest(&lod_state(&a, &[])),
+            state_digest(&lod_state(&b, &[])),
             "two deployments of the same geometry must sign the same"
         );
 
         let moved = doc("bafkone", "bafkother");
-        assert_ne!(build_signature(&a, &[]), build_signature(&moved, &[]));
+        assert_ne!(state_digest(&lod_state(&a, &[])), state_digest(&lod_state(&moved, &[])));
     }
 
     #[test]
@@ -1178,15 +1189,15 @@ mod signature_tests {
             rotation: [0.0, 0.0, 0.0, 1.0],
             scale: [1.0; 3],
         };
-        let one = build_signature(&d, std::slice::from_ref(&prim));
-        assert_ne!(one, build_signature(&d, &[]), "primitives must count");
+        let one = state_digest(&lod_state(&d, std::slice::from_ref(&prim)));
+        assert_ne!(one, state_digest(&lod_state(&d, &[])), "primitives must count");
 
         prim.scale = [2.0, 1.0, 1.0];
-        assert_ne!(one, build_signature(&d, std::slice::from_ref(&prim)));
+        assert_ne!(one, state_digest(&lod_state(&d, std::slice::from_ref(&prim))));
 
         prim.scale = [1.0; 3];
         prim.material.color = [1.0, 0.0, 0.0, 1.0];
-        assert_ne!(one, build_signature(&d, std::slice::from_ref(&prim)));
+        assert_ne!(one, state_digest(&lod_state(&d, std::slice::from_ref(&prim))));
     }
 }
 

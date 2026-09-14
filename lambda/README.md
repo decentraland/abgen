@@ -330,9 +330,12 @@ paying for one.
    included — so nothing is left for a build to do differently. The previous descriptor is
    renamed to this entity and the scene is never executed.
 3. Otherwise the job derives the new deployment's descriptor and primitives and stops
-   there: no asset download, no assemble, no atlas, no simplify, no bundling. That geometry
-   is reduced to one digest and compared against the digest published beside the previous
-   deployment's descriptor, at `lods-unity/manifests/{sceneId}_lodsig`.
+   there: no asset download, no assemble, no atlas, no simplify, no bundling. Those two are
+   the **LOD state** — everything a build is a function of — and they are compared against
+   the state the previous deployment published, at
+   `lods-unity/manifests/{sceneId}_LODState.json`. A scene that changed its code without
+   moving anything lands here and still reuses: the code is not part of the state, only
+   what it placed is.
 4. On a match the previous bundles are copied to this entity's names and the job finishes.
    Otherwise it builds normally. The job summary records which check decided it, under
    `lods.reusedBy`: `content` for the free path, `geometry` for the derived one.
@@ -342,11 +345,20 @@ frame-zero snapshot, and scene code adds, moves and removes entities after it, s
 scenes can share a `main.crdt` and still render differently. Comparing the whole content
 listing sidesteps that: if the code is identical too, the frames it simulates are identical.
 
-The digest covers the glTF placements **and** the SDK primitives. The descriptor alone
-would not: it lists glTF assets only, so a scene whose only change is a primitive would
-look unchanged and reuse bundles that no longer match it. It also carries a generation
-constant, `abgen::lodgen::LOD_GENERATION` — bump that when a pipeline change makes already
-published bundles wrong to reuse, and every scene rebuilds once before reuse resumes.
+The state document carries the glTF placements **and** the SDK primitives. The descriptor
+alone would not: it lists glTF assets only, so a scene whose only change is a primitive
+would look unchanged and reuse bundles that no longer match it. It is written out rather
+than hashed so that when two deployments disagree, the disagreement can be read. It also
+carries a generation constant, `abgen::lodgen::LOD_GENERATION` — bump that when a pipeline
+change makes already published bundles wrong to reuse, and every scene rebuilds once before
+reuse resumes.
+
+The scene's own deployment carries no such document. `main.crdt` is the editor's frame-zero
+snapshot, not the state the LOD is built from, and the `<sceneId>-lod-manifest.json` the
+`parse-manifest` command reads is an input to the old Unity pipeline that deployments do not
+ship. `LOD.manifest.json`, which a build does write, is a receipt: version, scene id, levels,
+file list, exit code. None of the three describes the geometry, which is why the state
+document exists.
 
 The copied bundle keeps the previous scene's prefab name in its own `metadata.json`. That
 is what the explorer loads by: it reads the main asset's name out of the bundle rather than

@@ -573,7 +573,7 @@ mod tests {
             levels: Vec::new(),
             gate: Vec::new(),
             log: Vec::new(),
-            build_signature: String::new(),
+            lod_state: serde_json::Value::Null,
         }
     }
 
