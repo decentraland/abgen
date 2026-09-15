@@ -89,11 +89,11 @@ with `rawMessageDelivery: true` receives byte-compatible bodies:
 - already-converted skips publish `statusCode: 13`, matching prod's
   triage fast path — one event per processed job, and a redelivered SQS
   message re-notifies if an earlier publish failed after upload
-- with `ENABLE_LODS=1`, the LOD step of a scene conversion publishes one
-  event per supported platform with `isLods: true` and `statusCode: 0`,
-  after the conversion's own events, matching the shape the registry
-  already consumes; a configuration whose platforms have no LOD lane
-  (`lods-no-supported-platform`) publishes no LOD events
+- the LOD step of a scene conversion (`ENABLE_LODS=1`) publishes nothing:
+  `isLods` is always `false`. The registry's per-platform `lods` status is
+  not maintained by this pipeline and must not be read as one; the
+  `lod-reuse/` records and the per-scene `LOD/…` keys are the record of
+  which LODs exist
 
 Publish failures fail the invocation (SQS redelivers); with the ARN unset
 nothing is published and the run reports `"notified": false`.
@@ -412,8 +412,8 @@ publishing LOD/0 with the lod-generator-unity pipeline — level 0 is the
 client-side ISS assembly) and every configured platform that has a LOD lane
 (`windows|mac|linux`; `webgl` is dropped with a log line). The result passes
 the same structural self-gate as the JIT lane, is uploaded under the
-unversioned `LOD/…` and `lods-unity/…` keys above, filed in the reuse index,
-and followed by one finished event per platform with `isLods: true` (see
+unversioned `LOD/…` and `lods-unity/…` keys above and filed in the reuse
+index. No finished event is published for LODs (see
 [Finished events](#finished-events-sns)). Before any of that, the job checks
 whether a build already exists — see
 [Reusing an unchanged build](#reusing-an-unchanged-build).

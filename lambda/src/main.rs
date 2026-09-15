@@ -302,7 +302,7 @@ fn convert_asset_bundles(
                 })
                 .collect();
             let notified =
-                notify::send_finished(cfg, &job.entity_id, content_server, false, &finished)?;
+                notify::send_finished(cfg, &job.entity_id, content_server, &finished)?;
             return Ok(serde_json::json!({
                 "entityId": job.entity_id, "skipped": "already-converted", "notified": notified
             }));
@@ -355,7 +355,7 @@ fn convert_asset_bundles(
                 platform: p,
                 status_code: notify::STATUS_ALREADY_CONVERTED,
             }));
-            notify::send_finished(cfg, &job.entity_id, content_server, false, &finished)
+            notify::send_finished(cfg, &job.entity_id, content_server, &finished)
         },
     );
     if !cfg.keep_output {
@@ -448,7 +448,7 @@ fn tombstone_final_failure(
         };
     let finished = tombstone_statuses(&cfg.platforms, &tombstoned);
     let notified =
-        match notify::send_finished(cfg, &job.entity_id, content_server, false, &finished) {
+        match notify::send_finished(cfg, &job.entity_id, content_server, &finished) {
             Ok(n) => n,
             Err(e) => return Err(err.context(format!("{e:#}"))),
         };

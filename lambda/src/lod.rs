@@ -58,7 +58,6 @@ fn convert(
         proxy,
         &client,
         &ent,
-        content_server,
         &platforms,
         &params,
         inputs.as_ref(),
@@ -101,15 +100,6 @@ fn convert(
         publish_record(proxy, &record);
     }
 
-    // Notify only after every generated object has been published.
-    let finished: Vec<crate::notify::Finished> = platforms
-        .iter()
-        .map(|p| crate::notify::Finished {
-            platform: p,
-            status_code: 0,
-        })
-        .collect();
-    let notified = crate::notify::send_finished(cfg, entity_id, content_server, true, &finished)?;
     let bundle_bytes: usize = outcome.levels.iter().map(|l| l.bundle_bytes).sum();
     eprintln!(
         "done: {entity_id} lods scene={} levels={} platforms={} bytes={bundle_bytes} \
@@ -140,7 +130,6 @@ fn convert(
         &levels,
         objects.len(),
         published.uploaded,
-        notified,
     );
     summary["lods"]["keys"] = serde_json::json!(published.keys);
     Ok(summary)
@@ -197,7 +186,7 @@ pub fn is_scene(entity: &serde_json::Value) -> bool {
 }
 
 /// A LOD job's result as one object: the `lods` block with `exitCode`, `sceneId` and
-/// `notified` folded in; a skip or an error as a single field.
+/// folded in; a skip or an error as a single field.
 pub fn follow_up_summary(result: Result<serde_json::Value>) -> serde_json::Value {
     match result {
         Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
@@ -209,7 +198,7 @@ pub fn follow_up_summary(result: Result<serde_json::Value>) -> serde_json::Value
                 .get_mut("lods")
                 .map(serde_json::Value::take)
                 .unwrap_or_else(|| serde_json::json!({}));
-            for field in ["exitCode", "sceneId", "notified"] {
+            for field in ["exitCode", "sceneId"] {
                 if let Some(v) = lod.get(field) {
                     flat[field] = v.clone();
                 }
@@ -249,7 +238,6 @@ fn try_reuse(
     proxy: &Arc<Proxy>,
     client: &abgen::catalyst::CatalystClient,
     ent: &abgen::catalyst::Scene,
-    content_server: &str,
     platforms: &[String],
     params: &abgen::lodgen::GenerateParams,
     inputs: Option<&Inputs>,
@@ -274,7 +262,6 @@ fn try_reuse(
                         return republish(
                             cfg,
                             proxy,
-                            content_server,
                             ent,
                             platforms,
                             record,
@@ -306,7 +293,6 @@ fn try_reuse(
         Ok(()) => republish(
             cfg,
             proxy,
-            content_server,
             ent,
             platforms,
             record,
@@ -398,8 +384,8 @@ pub fn copy_items(
     out
 }
 
-/// Copy `record`'s bundles under this entity's names, publish its descriptor, point both
-/// indexes at it and notify. `None` when a bundle the record promised is not there.
+/// Copy `record`'s bundles under this entity's names, publish its descriptor and point both
+/// indexes at it. `None` when a bundle the record promised is not there.
 ///
 /// The copied bundle keeps the previous scene's prefab name in its own metadata, which is
 /// what the explorer loads by: it reads the main asset's name out of the bundle, never off
@@ -408,7 +394,6 @@ pub fn copy_items(
 fn republish(
     cfg: &Config,
     proxy: &Arc<Proxy>,
-    content_server: &str,
     ent: &abgen::catalyst::Scene,
     platforms: &[String],
     mut record: ReuseRecord,
@@ -458,19 +443,6 @@ fn republish(
     record.inputs_digest = inputs.map(reuse::inputs_digest);
     publish_record(proxy, &record);
 
-    let notified = crate::notify::send_finished(
-        cfg,
-        entity_id,
-        content_server,
-        true,
-        &platforms
-            .iter()
-            .map(|p| crate::notify::Finished {
-                platform: p,
-                status_code: 0,
-            })
-            .collect::<Vec<_>>(),
-    )?;
     eprintln!(
         "reused: {entity_id} lods scene={scene_id} from={from_scene} by={by} levels={} \
          platforms={} bytes={} objects={} in {:.1}s",
@@ -492,7 +464,6 @@ fn republish(
         &levels,
         keys.len(),
         true,
-        notified,
     );
     summary["lods"]["reusedFrom"] = serde_json::json!(from_scene);
     summary["lods"]["reusedBy"] = serde_json::json!(by);
@@ -555,7 +526,6 @@ fn success_summary(
     levels: &[(u32, usize)],
     objects: usize,
     uploaded: bool,
-    notified: bool,
 ) -> serde_json::Value {
     serde_json::json!({
         "entityId": entity_id,
@@ -570,7 +540,6 @@ fn success_summary(
             "objects": objects,
             "uploaded": uploaded,
         },
-        "notified": notified,
     })
 }
 
@@ -782,17 +751,17 @@ mod follow_up_tests {
     #[test]
     fn follow_up_summary_flattens_the_lod_block_and_keeps_skips_and_errors_small() {
         let converted =
-            success_summary("bafkE", "bafke", &["windows".to_string()], &[(1, 9)], 4, true, true);
+            success_summary("bafkE", "bafke", &["windows".to_string()], &[(1, 9)], 4, true);
         let flat = follow_up_summary(Ok(converted));
         assert_eq!(flat["exitCode"], 0);
         assert_eq!(flat["sceneId"], "bafke");
-        assert_eq!(flat["notified"], true);
+        assert!(flat.get("notified").is_none(), "LODs notify nobody: {flat}");
         assert_eq!(flat["objects"], 4);
         assert_eq!(flat["levels"][0]["bundleBytes"], 9);
         assert!(flat.get("lods").is_none(), "no double nesting: {flat}");
 
         let mut reused =
-            success_summary("bafkE", "bafke", &["mac".to_string()], &[(1, 9)], 4, true, false);
+            success_summary("bafkE", "bafke", &["mac".to_string()], &[(1, 9)], 4, true);
         reused["lods"]["reusedBy"] = serde_json::json!("inputs");
         assert_eq!(follow_up_summary(Ok(reused))["reusedBy"], "inputs");
 
@@ -888,10 +857,8 @@ mod tests {
             &[(0, 1024), (1, 512)],
             7,
             true,
-            true,
         );
         assert_eq!(s["exitCode"], 0);
-        assert_eq!(s["notified"], true);
         assert_eq!(s["lods"]["levels"][1]["bundleBytes"], 512);
         // The regression this guards: a success summary without a top-level
         // exitCode is classified "failed" by the job metrics.
