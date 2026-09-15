@@ -163,7 +163,7 @@ generate/placements/assemble run without node: scenes lacking an ISS
   descriptor are executed by the embedded scene runtime.
 generate: the full sync chain: resolve scene -> placements (iss|embedded
   scene runtime) -> assemble -> crop -> atlas -> simplify -> bundle via the LOD build mode
-  into {out}/{sceneId}/LOD/{level}/{sceneId}_{level}_{platform} (+.br,
+  into {out}/{sceneId}/LOD/{level}/{sceneId}_{level}_{platform} (plus
   LOD.manifest.json). --level takes a comma-separated list (default 0,1;
   level 2 is refused; production stopped emitting it): every level shares
   ONE assemble/crop/atlas bake and gets its own simplify pass, staged
