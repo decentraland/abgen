@@ -199,11 +199,11 @@ generate: the full sync chain: resolve scene -> placements (iss|embedded
   rect and adds a crop-bounds self-gate check. --platform takes a
   comma-separated list (windows|mac|linux; webgl is refused — upstream webgl
   LOD bundles use an empty suffix and are unsupported here): every platform
-  bundle is built from the same bake and simplify pass, written with its own
-  .br sidecar, listed in ONE union LOD.manifest.json, and self-gated
+  bundle is built from the same bake and simplify pass, listed in ONE union
+  LOD.manifest.json, and self-gated
   separately (one gate table per platform, including a target-platform
   check: windows=19 mac=2 linux=24). Every run also writes the ISS
-  descriptor {out}/{sceneId}/{sceneId}_InitialSceneState.json (+.br)
+  descriptor {out}/{sceneId}/{sceneId}_InitialSceneState.json
   next to LOD.manifest.json — the production InitialSceneState shape
   ({version, sceneId, assets:[{hash, position, rotation, scale}]}) with the
   acquired placements serialized verbatim in the pinned base-relative

@@ -442,9 +442,6 @@ fn empty_scene_bundle_passes_empty_gate_and_fails_content_gate() {
     assert_eq!(doc["sceneId"], serde_json::json!(sid));
     assert_eq!(doc["version"], serde_json::json!(1));
     assert!(placements::parse_iss(&bytes).unwrap().is_empty());
-    let mut br = iss_path.as_os_str().to_owned();
-    br.push(".br");
-    assert!(PathBuf::from(br).is_file());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -512,9 +509,6 @@ fn multi_platform_bundles_union_manifest_and_target_platform_gate() {
         let path = out.join(sid).join(&rel);
         let data = std::fs::read(&path).unwrap();
         assert_eq!(first_target_platform(&data), want_tp, "{plat}");
-        let mut br = path.as_os_str().to_owned();
-        br.push(".br");
-        assert!(PathBuf::from(br).is_file(), "{plat} .br sidecar missing");
         let checks = self_gate_bundle(&data, sid, 1, plat).unwrap();
         for c in &checks {
             assert!(c.ok, "{plat} unexpected FAIL {}: {}", c.label, c.detail);
@@ -655,9 +649,6 @@ fn multi_level_sources_build_both_levels_from_one_bake() {
         for c in &checks {
             assert!(c.ok, "L{level} unexpected FAIL {}: {}", c.label, c.detail);
         }
-        let mut br = path.as_os_str().to_owned();
-        br.push(".br");
-        assert!(PathBuf::from(br).is_file(), "L{level} .br sidecar missing");
     }
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(out.join(sid).join("LOD.manifest.json")).unwrap())

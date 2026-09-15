@@ -746,17 +746,6 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
                 conv.results.iter().any(|r| r.rel_path == rel),
                 rel.clone(),
             );
-            let br = {
-                let mut s = path.as_os_str().to_owned();
-                s.push(".br");
-                PathBuf::from(s)
-            };
-            push_check(
-                &mut gate,
-                format!("L{level}:{plat}:brotli-sidecar"),
-                br.is_file(),
-                br.display().to_string(),
-            );
             if plat == &primary {
                 primary_bytes = data.len();
                 primary_path = path;

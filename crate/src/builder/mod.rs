@@ -16,6 +16,7 @@ pub use templates::templates_missing;
 pub use templates::templates_missing_in;
 pub use templates::REQUIRED_TEMPLATES;
 pub use texture::source_image_decodes;
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 pub(crate) use texture::{detect_container, pack_normal_map};
 
 use material::shader_pptr;
