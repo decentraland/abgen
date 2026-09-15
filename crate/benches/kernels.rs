@@ -280,5 +280,77 @@ fn jpeg(c: &mut Criterion) {
     group.finish()
 }
 
-criterion_group!(kernels, bc7, bc5, dxt1, resize, lz4, crn, jpeg);
+fn cache_contention(c: &mut Criterion) {
+    const THREADS: usize = 12;
+    let pixels = std::sync::Arc::new(texture_rgba(256, 256, 0xD1B54A32));
+    abgen::texencode_cache::enable_memory_only_with_profile(
+        abgen::texencode_cache::CacheProfile::Batch,
+    );
+
+    let contend = |params: [i64; 2], miss: bool| {
+        if miss {
+            abgen::texencode_cache::clear();
+        }
+        let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(THREADS);
+            for _ in 0..THREADS {
+                let pixels = std::sync::Arc::clone(&pixels);
+                let start = std::sync::Arc::clone(&start);
+                handles.push(scope.spawn(move || {
+                    start.wait();
+                    abgen::texencode_cache::get_or_encode_shared(
+                        abgen::texencode_cache::Kind::Bc7,
+                        &pixels,
+                        256,
+                        256,
+                        &params,
+                        || {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            Some((vec![0x5a; 64 * 1024], 9))
+                        },
+                    )
+                    .unwrap()
+                }));
+            }
+            for handle in handles {
+                black_box(handle.join().unwrap());
+            }
+        });
+    };
+
+    abgen::texencode_cache::clear();
+    let _ = abgen::texencode_cache::get_or_encode_shared(
+        abgen::texencode_cache::Kind::Bc7,
+        &pixels,
+        256,
+        256,
+        &[1, 0],
+        || Some((vec![0x5a; 64 * 1024], 9)),
+    );
+
+    let mut group = c.benchmark_group("cache_contention");
+    group.sample_size(20);
+    group.bench_function("12_threads_hit", |b| b.iter(|| contend([1, 0], false)));
+    let iteration = std::sync::atomic::AtomicI64::new(1);
+    group.bench_function("12_threads_coalesced_miss", |b| {
+        b.iter(|| {
+            let n = iteration.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            contend([2, n], true)
+        })
+    });
+    group.finish();
+}
+
+criterion_group!(
+    kernels,
+    bc7,
+    bc5,
+    dxt1,
+    resize,
+    lz4,
+    crn,
+    jpeg,
+    cache_contention
+);
 criterion_main!(kernels);

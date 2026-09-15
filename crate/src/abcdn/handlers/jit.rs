@@ -382,11 +382,13 @@ async fn lod_space_read_through(
     resp
 }
 
-/// Server-lane write-back. Upload metadata is deliberately shared with the
-/// lambda lane: `space::object_headers` derives Content-Type / Cache-Control /
-/// Content-Encoding from the key (#60), replacing the per-call-site
-/// `application/octet-stream` this path used to send, so origin objects match
-/// their production writers no matter which lane wrote them.
+/// Server-lane write-back. The key set and the upload metadata are shared with
+/// the lambda lane: `lods::published_objects` lists the production families
+/// (`LOD/{level}/…` bundles, the `lods-unity/manifests/…` ISS descriptor and
+/// the `lods-unity/lods/{sid}_1.glb` published GLB). Native artifacts are
+/// never transport-wrapped; `space::object_headers` derives Content-Type, Cache-Control and
+/// Content-Encoding from the key, so origin objects match their production
+/// writers no matter which lane wrote them.
 pub(super) fn spawn_lod_writeback(state: &AppState, sid: &str) {
     let Some(proxy) = state.live_proxy.clone() else {
         return;
@@ -398,30 +400,9 @@ pub(super) fn spawn_lod_writeback(state: &AppState, sid: &str) {
     let sid = sid.to_string();
     tokio::task::spawn_blocking(move || {
         let mut puts = 0usize;
-        for level in lodjit::LOD_LEVELS {
-            let dir = scene_dir.join("LOD").join(level.to_string());
-            let Ok(rd) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for ent in rd.flatten() {
-                if !ent.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                    continue;
-                }
-                let name = ent.file_name();
-                let Some(name) = name.to_str() else { continue };
-                if name.contains(".tmp.") {
-                    continue;
-                }
-                if let Ok(bytes) = std::fs::read(ent.path()) {
-                    proxy.space_put_key(&format!("LOD/{level}/{name}"), &bytes);
-                    puts += 1;
-                }
-            }
-        }
-        let iss = format!("{sid}{}", crate::lodgen::placements::ISS_SUFFIX);
-        for cand in [iss.clone(), format!("{iss}.br")] {
-            if let Ok(bytes) = std::fs::read(scene_dir.join(&cand)) {
-                proxy.space_put_key(&format!("lods-unity/manifests/{cand}"), &bytes);
+        for obj in crate::lods::published_objects(&scene_dir, &lodjit::LOD_LEVELS) {
+            if let Ok(bytes) = std::fs::read(&obj.path) {
+                proxy.space_put_key(&obj.key, &bytes);
                 puts += 1;
             }
         }
@@ -596,10 +577,6 @@ pub(super) fn jit_target(path: &str) -> Option<JitTarget> {
     None
 }
 
-pub(super) fn br_bundle_target(path: &str) -> bool {
-    path.split('/').count() == 3 && path.strip_suffix(".br").and_then(jit_target).is_some()
-}
-
 pub(super) fn flat_target(path: &str) -> Option<(String, String)> {
     let segs: Vec<&str> = path.split('/').collect();
     if segs.len() != 2 {
@@ -608,11 +585,13 @@ pub(super) fn flat_target(path: &str) -> Option<(String, String)> {
     if matches!(segs[0], "manifest" | "LOD" | "lods-unity" | "dcl") {
         return None;
     }
-    if !resolver::is_safe_component(segs[0]) || !resolver::is_safe_component(segs[1]) {
+    if !resolver::is_safe_component(segs[0])
+        || !resolver::is_safe_component(segs[1])
+        || segs[1].ends_with(".br")
+    {
         return None;
     }
-    let raw = segs[1].strip_suffix(".br").unwrap_or(segs[1]);
-    let (stem, platform) = raw.rsplit_once('_')?;
+    let (stem, platform) = segs[1].rsplit_once('_')?;
     if stem.is_empty() || !resolver::is_platform(platform) {
         return None;
     }
@@ -660,13 +639,12 @@ async fn serve_flat_rewrite(
     cid: &str,
     filename: &str,
     raw: &str,
-    is_br: bool,
     method: &Method,
     headers: &HeaderMap,
 ) -> Option<Response> {
     let (exact, from_jit) = state.serve_lookup(|r| resolver::binary_path(r, cid, filename))?;
     state.touch_if_jit(&exact, from_jit);
-    let resp = serve::serve_binary(state, path, &exact, raw, is_br, method, headers).await;
+    let resp = serve::serve_binary(state, path, &exact, raw, method, headers).await;
     if resp.status() != StatusCode::NOT_FOUND {
         Some(resp)
     } else {
@@ -689,11 +667,7 @@ pub(super) async fn flat_fallback(
     };
     let segs: Vec<&str> = path.split('/').collect();
     let (url_ver, filename) = (segs[0].to_string(), segs[1].to_string());
-    let raw = filename
-        .strip_suffix(".br")
-        .unwrap_or(&filename)
-        .to_string();
-    let is_br = filename.ends_with(".br");
+    let raw = filename.clone();
     if proxy.space_configured() {
         let dst = state.jit_root.join(&filename);
         let _pin = state.jit_cache.pin(&filename);
@@ -714,9 +688,6 @@ pub(super) async fn flat_fallback(
             return resp;
         }
     }
-    if is_br {
-        return with_reason(local, "br-not-built");
-    }
     let neg_key = bare.to_string();
     if state.hash_neg_cache.get(&neg_key).await.is_some() {
         return with_reason(local, "hash-unresolved");
@@ -729,7 +700,7 @@ pub(super) async fn flat_fallback(
         }
         Err(()) => return with_reason(local, "hash-unresolved"),
     };
-    if proxy.space_configured() && !is_br {
+    if proxy.space_configured() {
         let (p2, c2, r2) = (proxy.clone(), cid.clone(), raw.clone());
         let dst = state.jit_root.join(&cid).join(platform).join(&raw);
         let _pin = state.jit_cache.pin(&cid);
@@ -741,7 +712,7 @@ pub(super) async fn flat_fallback(
             state.jit_record(&cid);
             state.resolve_cache.invalidate(path).await;
             if let Some(resp) =
-                serve_flat_rewrite(state, path, &cid, &filename, &raw, is_br, method, headers).await
+                serve_flat_rewrite(state, path, &cid, &filename, &raw, method, headers).await
             {
                 return resp;
             }
@@ -764,7 +735,7 @@ pub(super) async fn flat_fallback(
         });
     }
     if let Some(resp) =
-        serve_flat_rewrite(state, path, &cid, &filename, &raw, is_br, method, headers).await
+        serve_flat_rewrite(state, path, &cid, &filename, &raw, method, headers).await
     {
         return resp;
     }
@@ -811,8 +782,7 @@ pub(super) async fn shader_fallback(
         .unwrap_or(&target.canonical)
         .to_string();
     let cache_key = format!("shader:{}", target.canonical);
-    let first =
-        serve::serve_binary(state, &cache_key, &exact, &basename, false, method, headers).await;
+    let first = serve::serve_binary(state, &cache_key, &exact, &basename, method, headers).await;
     if first.status() != StatusCode::NOT_FOUND {
         return first;
     }
@@ -874,8 +844,7 @@ pub(super) async fn shader_fallback(
     if materialized {
         state.resolve_cache.invalidate(&cache_key).await;
         state.resolve_cache.invalidate(path).await;
-        let resp =
-            serve::serve_binary(state, &cache_key, &exact, &basename, false, method, headers).await;
+        let resp = serve::serve_binary(state, &cache_key, &exact, &basename, method, headers).await;
         if resp.status() != StatusCode::NOT_FOUND {
             return resp;
         }

@@ -334,7 +334,35 @@ impl<'a> Builder<'a> {
         self.set_obj(self.ab_pid, "AssetBundle", ab, Role::Bundle);
     }
 
+    /// An LOD bundle ships exactly the textures its materials sample. The
+    /// builder emits a Texture2D for every texture reference in the GLB
+    /// before it knows which materials survive (a material no primitive
+    /// references never enters `material_entries`), so a texture bound
+    /// only by such a material would otherwise become a container entry
+    /// nothing samples. Drop those objects before path ids resolve.
+    fn prune_orphan_lod_textures(&mut self) {
+        let live: HashSet<i64> = self
+            .material_entries
+            .iter()
+            .flat_map(|(_, _, deps)| deps.iter().copied())
+            .collect();
+        let (keep, orphans): (Vec<(String, i64)>, Vec<(String, i64)>) =
+            std::mem::take(&mut self.texture_entries)
+                .into_iter()
+                .partition(|(_, pid)| live.contains(pid));
+        self.texture_entries = keep;
+        for (_, pid) in orphans {
+            self.objects.remove(&pid);
+            self.order.retain(|p| *p != pid);
+            self.roles.remove(&pid);
+            self.force_inline_tex.remove(&pid);
+        }
+    }
+
     pub(super) fn finalize_pathids(&mut self) -> Result<()> {
+        if self.lod.is_some() {
+            self.prune_orphan_lod_textures();
+        }
         let mut old2new: HashMap<i64, i64> = HashMap::new();
         for (&old_pid, role) in self.roles.iter() {
             old2new.insert(old_pid, self.resolve_pathid(role));

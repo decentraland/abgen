@@ -1,13 +1,18 @@
 use anyhow::{anyhow, bail, Context, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::catalyst::{CatalystClient, Scene};
 use crate::lods;
 
-use super::gate::{push_check, self_gate_bundle_with, tri_cap_check, GateCheck};
+use super::gate::{
+    push_check, self_gate_bundle_with, tri_cap_check, GateCheck, BUNDLE_TEXTURE_MAX,
+};
 use super::model::LodModel;
-use super::{assemble, atlas, crop, emit, model, placements, reclamp, simplify, simplify_meshopt};
+use super::simplify_meshopt::SimplifyPolicy;
+use super::{
+    assemble, atlas, crop, emit, model, placements, primitives, reclamp, simplify, simplify_meshopt,
+};
 
 pub fn parse_parcel(s: &str) -> Result<(i32, i32)> {
     let parts: Vec<&str> = s.trim().split(',').collect();
@@ -49,60 +54,105 @@ pub fn scene_geometry(ent: &Scene) -> Result<((i32, i32), Vec<(i32, i32)>)> {
     Ok((parse_parcel(base)?, parcels))
 }
 
+/// Everything the scene places: GLB `placements` plus SDK `primitives`.
 pub fn acquire_placements(
     client: &CatalystClient,
     ent: &Scene,
     iss: &str,
-) -> Result<Vec<placements::Placement>> {
-    let iss_bytes: Option<Vec<u8>> = match iss {
-        "off" => None,
-        "auto" => {
-            let got = placements::fetch_iss(&ent.entity_id)?;
-            if got.is_none() {
-                eprintln!(
-                    "iss: no descriptor for {} (404), falling through",
-                    ent.entity_id
-                );
-            }
-            got
-        }
-        path => Some(std::fs::read(path).with_context(|| format!("read ISS file {path}"))?),
-    };
-
-    match iss_bytes {
-        Some(bytes) => {
-            let list = placements::parse_iss(&bytes)?;
-            eprintln!("source: iss ({} placements)", list.len());
-            Ok(list)
-        }
-        None => match crate::lodgen::scenerun::run_scene_placements(client, ent)? {
-            None => {
-                eprintln!(
-                    "scene-runtime: scene ran to completion but emitted no renderer state; \
-                     treating {} as an empty scene",
-                    ent.entity_id
-                );
-                Ok(Vec::new())
-            }
-            Some(full) => {
-                eprintln!(
-                    "source: embedded-scene-runtime ({} placements, {} mesh-renderer-only skipped, {} unresolved src)",
-                    full.placements.len(),
-                    full.skipped_mesh_renderer,
-                    full.unresolved_src
-                );
-                Ok(full.placements)
-            }
-        },
-    }
+) -> Result<placements::ManifestPlacements> {
+    acquire_placements_independently(client, ent, iss).map(|(full, _)| full)
 }
 
-pub fn write_iss_descriptor(
-    out_dir: &Path,
+/// Placements come from executing the scene in the embedded SDK runtime, never from
+/// reading its `main.crdt` as data. That file is the editor's frame-zero snapshot and
+/// is handed to the runtime as initial state; scene code then adds, moves and removes
+/// entities, so the LOD wants the state after the runtime's simulated frames
+/// (`scenerun::driver`: start + 90 timed updates), which only execution produces.
+/// A GltfContainer naming a file the deployment does not ship is not fatal:
+/// the parser has already dropped those entities (production's
+/// `StaticSceneDescriptorBuilder` does the same via `missingHashes`, and the
+/// Explorer renders nothing for them), so the LOD is built from what
+/// resolves, the names are logged and recorded, and the ISS descriptor never
+/// carries them downstream. Only a scene with nothing renderable left fails.
+fn finish_sdk_placements(
+    ent: &Scene,
+    executed: Result<Option<placements::ManifestPlacements>>,
+) -> Result<placements::ManifestPlacements> {
+    let full = executed?.ok_or_else(|| {
+        anyhow!(
+            "scene {} emitted no renderer state; refusing to publish an empty LOD",
+            ent.entity_id
+        )
+    })?;
+    if full.placements.is_empty() && full.primitives.is_empty() {
+        bail!(
+            "scene {} produced zero placements after SDK execution; refusing to publish an empty LOD",
+            ent.entity_id
+        );
+    }
+    if full.unresolved_src > 0 {
+        eprintln!(
+            "WARN: scene {} references {} glTF source(s) its deployment does not ship; \
+             building without them {}",
+            ent.entity_id,
+            full.unresolved_src,
+            unresolved_summary(&full.unresolved_srcs)
+        );
+    }
+    eprintln!(
+        "source: embedded-scene-runtime ({} placements, {} primitives, {} mesh-renderer skipped, {} unresolved src{})",
+        full.placements.len(),
+        full.primitives.len(),
+        full.skipped_mesh_renderer,
+        full.unresolved_src,
+        if full.unresolved_srcs.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", unresolved_summary(&full.unresolved_srcs))
+        }
+    );
+    Ok(full)
+}
+
+/// Up to the first ten unresolved srcs, bracketed, for error/log lines.
+fn unresolved_summary(srcs: &[String]) -> String {
+    const SHOWN: usize = 10;
+    let mut shown: Vec<String> = srcs.iter().take(SHOWN).map(|s| format!("{s:?}")).collect();
+    if srcs.len() > SHOWN {
+        shown.push(format!("… +{}", srcs.len() - SHOWN));
+    }
+    format!("[{}]", shown.join(", "))
+}
+
+fn acquire_placements_independently(
+    client: &CatalystClient,
+    ent: &Scene,
+    iss: &str,
+) -> Result<(placements::ManifestPlacements, &'static str)> {
+    if iss != "auto" && iss != "off" {
+        bail!(
+            "--iss FILE cannot supply generated placements; derive independently and use --diff-iss FILE for comparison"
+        );
+    }
+    let full = finish_sdk_placements(
+        ent,
+        crate::lodgen::scenerun::run_scene_placements(client, ent),
+    )?;
+    Ok((full, "embedded-sdk"))
+}
+
+/// Bump when a pipeline change makes an already published LOD bundle wrong to reuse.
+/// A signature carrying a different generation never matches, so the next deployment of
+/// every scene rebuilds once and republishes under the new generation.
+pub const LOD_GENERATION: &str = "1";
+
+/// The descriptor document a build publishes, with how many placements resolved to a
+/// content hash and how many were dropped because the deployment does not ship one.
+pub fn iss_document(
     scene_id: &str,
     list: &[placements::Placement],
     content_by_file: &HashMap<String, String>,
-) -> Result<(PathBuf, usize, usize)> {
+) -> (serde_json::Value, usize, usize) {
     let mut assets: Vec<(String, &placements::Placement)> = Vec::new();
     let mut skipped = 0usize;
     for p in list {
@@ -111,13 +161,126 @@ pub fn write_iss_descriptor(
             Err(_) => skipped += 1,
         }
     }
-    let doc = placements::iss_descriptor(scene_id, &assets);
+    let resolved = assets.len();
+    (
+        placements::iss_descriptor(scene_id, &assets),
+        resolved,
+        skipped,
+    )
+}
+
+/// Everything about a scene that decides what its LOD bundles contain, as a document.
+///
+/// This is the state a build is a function of. Two deployments with equal state produce
+/// equal bundles, so the second can publish the first's instead of building them. It is
+/// written out next to the descriptor rather than kept as a digest so that when two
+/// deployments disagree, the disagreement can be read.
+///
+/// It carries both halves of the geometry. The descriptor alone would not: it lists the
+/// resolved glTF placements but **not** the SDK primitives, which `assemble` turns into
+/// geometry just the same, so two scenes can share a descriptor and still differ in what a
+/// player sees.
+///
+/// `sceneId` is excluded on purpose. It is the one field guaranteed to differ between two
+/// deployments of the same scene, and it names the entity rather than describing it.
+///
+/// `generation` invalidates everything already published when a pipeline change makes old
+/// bundles wrong to reuse: bump [`LOD_GENERATION`] and no stored state matches again.
+pub fn lod_state(
+    doc: &serde_json::Value,
+    primitives: &[primitives::PrimitivePlacement],
+) -> serde_json::Value {
+    let mut descriptor = doc.clone();
+    if let Some(obj) = descriptor.as_object_mut() {
+        obj.remove("sceneId");
+    }
+    let prims: Vec<serde_json::Value> = primitives
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "shape": p.spec.shape.name(),
+                "uvs": p.spec.uvs,
+                "radiusTop": p.spec.radius_top,
+                "radiusBottom": p.spec.radius_bottom,
+                "color": p.material.color,
+                "class": format!("{:?}", p.material.class),
+                "cutoff": p.material.cutoff,
+                "texture": p.material.texture.as_ref().map(|t| format!("{:?}", t.source)),
+                "position": p.position,
+                "rotation": p.rotation,
+                "scale": p.scale,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "generation": LOD_GENERATION,
+        "descriptor": descriptor,
+        "primitives": prims,
+    })
+}
+
+/// A short digest of [`lod_state`], for logs and metrics. Equality of the state documents
+/// is what decides reuse; this is only a handle to name one in a line of output.
+pub fn state_digest(state: &serde_json::Value) -> String {
+    crate::hashes::sha256_hex(&serde_json::to_vec(state).unwrap_or_default())
+}
+
+/// Resolve a scene and derive its descriptor and primitives, and stop there.
+///
+/// This is the front of `generate` — resolve the entity, execute its SDK7 runtime for
+/// placements — without any of the work that follows: no asset download, no assemble, no
+/// atlas, no simplify, no bundling. It exists so a caller can decide whether a rebuild is
+/// needed at all before paying for one.
+pub fn descriptor_only(
+    params: &GenerateParams,
+) -> Result<(
+    String,
+    serde_json::Value,
+    Vec<primitives::PrimitivePlacement>,
+)> {
+    let (client, ent) = resolve_scene(params)?;
+    let (doc, primitives) = descriptor_for(&client, &ent, &params.iss)?;
+    Ok((ent.entity_id.to_lowercase(), doc, primitives))
+}
+
+/// Resolve the scene `params` name, with the client the rest of the pipeline would use.
+pub fn resolve_scene(params: &GenerateParams) -> Result<(CatalystClient, Scene)> {
+    if params.scene.is_empty() {
+        bail!("generate needs a scene pointer or entity id");
+    }
+    let client =
+        CatalystClient::from_args(&params.catalyst, None).with_content_cache(params.cache.clone());
+    let ent = client
+        .resolve_scene(&params.scene)
+        .with_context(|| format!("resolve scene {:?}", params.scene))?;
+    Ok((client, ent))
+}
+
+/// Execute an already resolved scene for its descriptor and primitives, and stop there.
+pub fn descriptor_for(
+    client: &CatalystClient,
+    ent: &Scene,
+    iss: &str,
+) -> Result<(serde_json::Value, Vec<primitives::PrimitivePlacement>)> {
+    let sid = ent.entity_id.to_lowercase();
+    let acquired = acquire_placements(client, ent, iss)?;
+    let (doc, _, _) = iss_document(&sid, &acquired.placements, &ent.content_by_file());
+    Ok((doc, acquired.primitives))
+}
+
+pub fn write_iss_descriptor(
+    out_dir: &Path,
+    scene_id: &str,
+    list: &[placements::Placement],
+    content_by_file: &HashMap<String, String>,
+) -> Result<(PathBuf, usize, usize)> {
+    let (doc, resolved, skipped) = iss_document(scene_id, list, content_by_file);
     let text = serde_json::to_string_pretty(&doc)?;
     let dir = out_dir.join(scene_id);
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
     let path = dir.join(format!("{scene_id}{}", placements::ISS_SUFFIX));
     lods::write_atomic(&path, text.as_bytes())?;
-    Ok((path, assets.len(), skipped))
+    Ok((path, resolved, skipped))
 }
 
 pub fn staged_glb_name(scene_id: &str, level: u32) -> String {
@@ -139,13 +302,18 @@ pub struct GenerateParams {
     pub platform: String,
     pub platforms: Vec<String>,
     pub levels: Vec<u32>,
+    /// `-si` ratio for the budget lanes; `simplify_policy` carries its own.
     pub ratio: f64,
+    /// Level-1 decimation policy (default production `gltfpack -si 0.1 -se 0.01`).
+    pub simplify_policy: SimplifyPolicy,
+    /// Budget-policy cap; consulted only under `SimplifyPolicy::Budget`.
     pub tri_cap: Option<u64>,
+    /// Budget policy: cap at 500 x parcels when no explicit `tri_cap`.
     pub tri_cap_auto: bool,
+    /// Atlas canvas ceiling (MeshBaker's AutoSizeAtlas tops out at 2048).
     pub atlas_max: u32,
     pub atlas_padding: u32,
-    pub atlas_fixed: bool,
-    pub atlas_adaptive: bool,
+    pub atlas_mode: atlas::AtlasMode,
     pub crop: bool,
     pub catalyst: String,
     pub iss: String,
@@ -168,14 +336,14 @@ impl Default for GenerateParams {
             out_dir: "lodgen-out".to_string(),
             platform: "windows".to_string(),
             platforms: Vec::new(),
-            levels: vec![0, 1],
+            levels: vec![1],
             ratio: 0.1,
+            simplify_policy: SimplifyPolicy::default(),
             tri_cap: None,
             tri_cap_auto: true,
-            atlas_max: 256,
+            atlas_max: 2048,
             atlas_padding: 2,
-            atlas_fixed: false,
-            atlas_adaptive: false,
+            atlas_mode: atlas::AtlasMode::MeshBaker,
             crop: true,
             catalyst: "https://peer.decentraland.org/content".to_string(),
             iss: "auto".to_string(),
@@ -203,14 +371,60 @@ pub struct LevelBuild {
     pub glb_path: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlacementStats {
+    pub count: usize,
+    pub rotated: usize,
+    pub non_uniform_scale: usize,
+    pub mirrored: usize,
+    pub extreme_scale: usize,
+}
+
+fn placement_stats(placements: &[placements::Placement]) -> PlacementStats {
+    let mut stats = PlacementStats {
+        count: placements.len(),
+        ..Default::default()
+    };
+    for placement in placements {
+        let [x, y, z, w] = placement.rotation;
+        if x.abs() > 1e-6 || y.abs() > 1e-6 || z.abs() > 1e-6 || (w.abs() - 1.0).abs() > 1e-6 {
+            stats.rotated += 1;
+        }
+        let [x, y, z] = placement.scale;
+        if (x.abs() - y.abs()).abs() > 1e-6 || (y.abs() - z.abs()).abs() > 1e-6 {
+            stats.non_uniform_scale += 1;
+        }
+        if x * y * z < 0.0 {
+            stats.mirrored += 1;
+        }
+        if [x, y, z].iter().any(|v| v.abs() < 0.01 || v.abs() > 100.0) {
+            stats.extreme_scale += 1;
+        }
+    }
+    stats
+}
+
 #[derive(Debug)]
 pub struct GenerateOutcome {
     pub entity_id: String,
     pub scene_id: String,
     pub source_tris: usize,
+    pub placement_stats: PlacementStats,
+    /// glTF srcs the scene named that its deployment lacks; their entities
+    /// were dropped before assembly and never reach the ISS descriptor.
+    pub unresolved_srcs: Vec<String>,
     pub levels: Vec<LevelBuild>,
     pub gate: Vec<GateCheck>,
     pub log: Vec<String>,
+    /// Everything that decided this scene's LOD geometry, from [`lod_state`]. Recorded in
+    /// the reuse index so the next deployment can tell whether it would build the same
+    /// bundles, and so a human can read what changed when it would not.
+    pub lod_state: serde_json::Value,
+    /// Every deployment file this build read, as lower-cased `file -> hash`: what the
+    /// runtime read while executing the scene, the scene's code and `main.crdt`, and every
+    /// glTF, buffer and texture the assembly fetched. A later deployment that serves each of
+    /// these under the same hash, with the same code and snapshot, builds the same bundles.
+    pub dependencies: BTreeMap<String, String>,
 }
 
 pub fn normalize_levels(levels: &[u32]) -> Result<Vec<u32>> {
@@ -237,17 +451,31 @@ pub const TRIS_PER_PARCEL: u64 = 500;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SimplifyLane {
     Passthrough,
-    Uncapped { ratio: f64 },
-    Capped { ratio: f64, cap: u64 },
+    /// Production policy: one `-si ratio -se target_error` pass, no cap.
+    GltfpackSi {
+        ratio: f32,
+        target_error: f32,
+    },
+    Uncapped {
+        ratio: f64,
+    },
+    Capped {
+        ratio: f64,
+        cap: u64,
+    },
 }
 
+/// The tri cap in force at `level`: `None` at level 0 and under the
+/// gltfpack-si policy (which never caps); under the budget policy the
+/// parcel threshold when `tri_cap_auto`, else the explicit cap.
 pub fn effective_tri_cap(
     level: u32,
+    policy: SimplifyPolicy,
     tri_cap: Option<u64>,
     tri_cap_auto: bool,
     threshold: u64,
 ) -> Option<u64> {
-    if level == 0 {
+    if level == 0 || policy != SimplifyPolicy::Budget {
         return None;
     }
     if tri_cap_auto {
@@ -259,6 +487,7 @@ pub fn effective_tri_cap(
 
 pub fn choose_lane(
     level: u32,
+    policy: SimplifyPolicy,
     tri_cap: Option<u64>,
     tri_cap_auto: bool,
     ratio: f64,
@@ -268,7 +497,21 @@ pub fn choose_lane(
     if level == 0 {
         return SimplifyLane::Passthrough;
     }
-    match effective_tri_cap(level, tri_cap, tri_cap_auto, threshold) {
+    if let SimplifyPolicy::GltfpackSi {
+        ratio,
+        target_error,
+    } = policy
+    {
+        return if source_tris == 0 {
+            SimplifyLane::Passthrough
+        } else {
+            SimplifyLane::GltfpackSi {
+                ratio,
+                target_error,
+            }
+        };
+    }
+    match effective_tri_cap(level, policy, tri_cap, tri_cap_auto, threshold) {
         Some(cap) if source_tris as u64 <= cap => SimplifyLane::Passthrough,
         Some(cap) => SimplifyLane::Capped { ratio, cap },
         None if source_tris as u64 <= threshold => SimplifyLane::Passthrough,
@@ -299,6 +542,54 @@ fn run_gltfpack_lane(
         },
         Err(e) if params.allow_unsimplified => {
             eprintln!("WARNING: {e:#}; --allow-unsimplified passthrough");
+            simplify::copy_unsimplified(pre, out)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn run_gltfpack_si_lane(
+    pre: &Path,
+    out: &Path,
+    params: &GenerateParams,
+    ratio: f32,
+    target_error: f32,
+) -> Result<simplify::SimplifyReport> {
+    match simplify::resolve_gltfpack(params.gltfpack.as_deref()) {
+        Ok(bin) => match simplify::simplify_si(pre, out, ratio, target_error, &bin) {
+            Ok(r) => Ok(r),
+            Err(e) if params.allow_unsimplified => {
+                eprintln!("WARNING: gltfpack failed ({e:#}); --allow-unsimplified passthrough");
+                simplify::copy_unsimplified(pre, out)
+            }
+            Err(e) => Err(e),
+        },
+        Err(e) if params.allow_unsimplified => {
+            eprintln!("WARNING: {e:#}; --allow-unsimplified passthrough");
+            simplify::copy_unsimplified(pre, out)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn run_meshopt_si_lane(
+    model: &LodModel,
+    pre: &Path,
+    out: &Path,
+    params: &GenerateParams,
+    ratio: f32,
+    target_error: f32,
+) -> Result<simplify::SimplifyReport> {
+    let attempt = || -> Result<simplify::SimplifyReport> {
+        let (m, report) = simplify_meshopt::simplify_model_si(model, ratio, target_error)?;
+        let glb = emit::emit_glb(&m)?;
+        std::fs::write(out, &glb).with_context(|| format!("write {}", out.display()))?;
+        Ok(report)
+    };
+    match attempt() {
+        Ok(r) => Ok(r),
+        Err(e) if params.allow_unsimplified => {
+            eprintln!("WARNING: meshopt simplify failed ({e:#}); --allow-unsimplified passthrough");
             simplify::copy_unsimplified(pre, out)
         }
         Err(e) => Err(e),
@@ -343,6 +634,7 @@ fn run_simplify(
     let threshold = TRIS_PER_PARCEL * parcel_count as u64;
     let lane = choose_lane(
         level,
+        params.simplify_policy,
         params.tri_cap,
         params.tri_cap_auto,
         params.ratio,
@@ -362,9 +654,19 @@ fn run_simplify(
                     "simplify-lane[0]: level-0 pass-through ({source_tris} tris, ratio 1.0, no gltfpack)"
                 ));
             } else {
-                match effective_tri_cap(level, params.tri_cap, params.tri_cap_auto, threshold) {
+                match effective_tri_cap(
+                    level,
+                    params.simplify_policy,
+                    params.tri_cap,
+                    params.tri_cap_auto,
+                    threshold,
+                ) {
                     Some(cap) => log.push(format!(
                         "simplify-lane[{level}]: pass-through under cap ({source_tris} tris <= cap {cap})"
+                    )),
+                    None if params.simplify_policy != SimplifyPolicy::Budget => log.push(format!(
+                        "simplify-lane[{level}]: pass-through (empty source, {})",
+                        params.simplify_policy.name()
                     )),
                     None => log.push(format!(
                         "simplify-lane[{level}]: pass-through ({source_tris} tris <= {threshold} = {TRIS_PER_PARCEL} x {parcel_count} parcels)"
@@ -372,6 +674,23 @@ fn run_simplify(
                 }
             }
             simplify::passthrough(pre, out)
+        }
+        SimplifyLane::GltfpackSi {
+            ratio,
+            target_error,
+        } => {
+            log.push(format!(
+                "simplify-lane[{level}]: gltfpack-si ratio {ratio} -se {target_error} uncapped ({source_tris} tris, {})",
+                params.simplifier.name()
+            ));
+            match params.simplifier {
+                simplify::SimplifierBackend::Gltfpack => {
+                    run_gltfpack_si_lane(pre, out, params, ratio, target_error)
+                }
+                simplify::SimplifierBackend::Meshopt => {
+                    run_meshopt_si_lane(model, pre, out, params, ratio, target_error)
+                }
+            }
         }
         SimplifyLane::Uncapped { ratio } => {
             log.push(format!(
@@ -421,7 +740,8 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         lods::validate_lod_platform(p)?;
     }
     let primary = platforms[0].clone();
-    let client = CatalystClient::from_args(&params.catalyst, None);
+    let client =
+        CatalystClient::from_args(&params.catalyst, None).with_content_cache(params.cache.clone());
     let ent = client
         .resolve_scene(&params.scene)
         .with_context(|| format!("resolve scene {:?}", params.scene))?;
@@ -434,21 +754,61 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
 
     let t_total = std::time::Instant::now();
     let t = std::time::Instant::now();
-    let placements = acquire_placements(&client, &ent, &params.iss)?;
+    let (acquired, placement_source) =
+        acquire_placements_independently(&client, &ent, &params.iss)?;
     let placements_ms = t.elapsed().as_millis();
+    let placements = acquired.placements;
+    let primitives = acquired.primitives;
+    let unresolved_srcs = acquired.unresolved_srcs;
+    let mut dependencies = acquired.files_read;
+    // The code the runtime executed and the snapshot it started from are inputs too; the
+    // runtime fetches them directly rather than through the recorded read path.
+    let by_file = ent.content_by_file();
+    for file in ["main.crdt"]
+        .into_iter()
+        .chain(ent.metadata.get("main").and_then(|v| v.as_str()))
+    {
+        let lower = file.to_lowercase();
+        if let Some(hash) = by_file.get(&lower) {
+            dependencies.insert(lower, hash.clone());
+        }
+    }
+    // Taken here, while both halves of the scene's geometry are still owned by this
+    // function: `assemble` consumes them below.
+    let lod_state = {
+        let (doc, _, _) = iss_document(&sid, &placements, &ent.content_by_file());
+        self::lod_state(&doc, &primitives)
+    };
+    log.push(format!("placement-source: {placement_source}"));
     log.push(format!("placements: {}", placements.len()));
-    if !placements.is_empty() && placements.iter().all(|p| p.scale.iter().all(|s| *s == 0.0)) {
+    log.push(format!(
+        "primitives: {} (mesh-renderers={} skipped={} missing-textures={} invisible-volumes={})",
+        primitives.len(),
+        acquired.mesh_renderers,
+        acquired.skipped_mesh_renderer,
+        acquired.missing_textures,
+        acquired.invisible_volume_skipped
+    ));
+    if placements.is_empty() && primitives.is_empty() {
         bail!(
-            "scene {} produced {} placements, all scaled to zero; refusing to emit an invisible bundle",
-            ent.entity_id,
-            placements.len()
+            "scene {} produced zero placements; refusing to publish an empty LOD",
+            ent.entity_id
         );
     }
+    let zero = |scale: &[f64; 3]| scale.iter().all(|s| *s == 0.0);
+    if placements.iter().all(|p| zero(&p.scale)) && primitives.iter().all(|p| zero(&p.scale)) {
+        bail!(
+            "scene {} produced {} placements and {} primitives, all scaled to zero; refusing to emit an invisible bundle",
+            ent.entity_id,
+            placements.len(),
+            primitives.len()
+        );
+    }
+    let placement_stats = placement_stats(&placements);
 
     if let Some(dir) = params.cache.as_deref() {
         std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
     }
-    let expect_content = !placements.is_empty();
     let staging = params
         .workdir
         .clone()
@@ -456,19 +816,20 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     std::fs::create_dir_all(&staging).with_context(|| format!("mkdir {}", staging.display()))?;
     let pre = staging.join(format!("{sid}_pre.glb"));
 
-    let mut assemble_ms = 0;
+    let assemble_ms;
     let mut atlas_ms = 0;
-    let mut emit_ms = 0;
+    let mut emit_ms;
     let mut simplify_ms = 0;
     let mut crop_stats: Option<crop::UnionStats> = None;
-    let mut source_tris = 0usize;
-    let mut staged: Vec<(u32, PathBuf, simplify::SimplifyReport)> = Vec::new();
-    if expect_content {
+    let source_tris;
+    let mut staged: Vec<(u32, PathBuf, simplify::SimplifyReport, Option<u32>)> = Vec::new();
+    {
         let t = std::time::Instant::now();
-        let mut model = assemble::assemble(
+        let (mut model, fetched) = assemble::assemble_recording(
             &client,
             &ent,
             &placements,
+            &primitives,
             levels[0],
             params.cache.as_deref(),
             model::MatLane {
@@ -477,6 +838,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
                 ..Default::default()
             },
         )?;
+        dependencies.extend(fetched);
         assemble_ms = t.elapsed().as_millis();
         if params.crop {
             let rects = crop::crop_rects_rh(base, &parcels);
@@ -487,13 +849,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
             }
         }
         let t = std::time::Instant::now();
-        let mode = if params.atlas_fixed {
-            atlas::AtlasMode::FullBleed
-        } else if params.atlas_adaptive {
-            atlas::AtlasMode::Adaptive
-        } else {
-            atlas::AtlasMode::Native
-        };
+        let mode = params.atlas_mode;
         if params.bake_after_simplify {
             log.extend(model.log.iter().cloned());
             let root_name = model.root_name.clone();
@@ -542,7 +898,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
                 if !params.keep_glb {
                     let _ = std::fs::remove_file(&dec);
                 }
-                staged.push((level, out, sim));
+                staged.push((level, out, sim, atlas::max_image_side(&atlased)));
             }
         } else {
             let (model, atlas_rects) = atlas::atlas_with_rects(
@@ -555,6 +911,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
             atlas_ms = t.elapsed().as_millis();
             log.extend(model.log.iter().cloned());
             source_tris = model.total_tris();
+            let atlas_side = atlas::max_image_side(&model);
 
             let t = std::time::Instant::now();
             let glb = emit::emit_glb(&model)?;
@@ -591,27 +948,42 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
                         rep.reclamped, rep.scanned
                     ));
                 }
-                staged.push((level, out, sim));
+                staged.push((level, out, sim, atlas_side));
             }
         }
-    } else {
-        log.push("empty scene: no placements; emitting content-free LOD bundles".to_string());
-        for &level in &levels {
-            let out = staging.join(staged_glb_name(&sid, level));
-            let t = std::time::Instant::now();
-            let glb = emit::emit_empty_glb(&format!("{}_{}", sid, level))?;
-            std::fs::write(&out, &glb).with_context(|| format!("write {}", out.display()))?;
-            emit_ms += t.elapsed().as_millis();
-            staged.push((
-                level,
-                out,
-                simplify::SimplifyReport {
-                    passthrough: true,
-                    ..Default::default()
-                },
-            ));
-        }
     }
+
+    // The published GLB (gltfpack layout: KHR_mesh_quantization u16 positions
+    // dequantized by the mesh node's translation/scale, i8 normals, u16
+    // texcoords dequantized by KHR_texture_transform) is what production's
+    // Unity converter imported, so it is also what the bundles are built
+    // from: the Unity mesh carries the quantized integers and the transform
+    // carries the dequantization, exactly like the CDN's bundles, and LZ4
+    // packs the low-entropy vertex data the same way (Genesis Plaza: 2.42 MB
+    // from the float GLB vs 1.95 MB from this one, production 1.82 MB).
+    // Level 0 has no published GLB and stays on its float bake.
+    let scene_dir = PathBuf::from(&params.out_dir).join(&sid);
+    let t = std::time::Instant::now();
+    let mut published: HashMap<u32, (PathBuf, u64, usize)> = HashMap::new();
+    let mut sources: Vec<String> = Vec::with_capacity(staged.len());
+    for (level, staged_glb, _, _) in &staged {
+        if *level == 0 {
+            sources.push(staged_glb.to_string_lossy().into_owned());
+            continue;
+        }
+        let float_glb = std::fs::read(staged_glb)
+            .with_context(|| format!("read staged glb {}", staged_glb.display()))?;
+        let path = lods::write_published_glb(&scene_dir, &sid, *level, &float_glb)?;
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        log.push(format!(
+            "publish[{level}]: {} ({bytes} bytes, from {} float bytes) is the bundle input",
+            path.display(),
+            float_glb.len()
+        ));
+        sources.push(path.to_string_lossy().into_owned());
+        published.insert(*level, (path, bytes, float_glb.len()));
+    }
+    let publish_ms = t.elapsed().as_millis();
 
     let opts = lods::LodOptions {
         platform: primary.clone(),
@@ -624,17 +996,12 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         }),
         ..Default::default()
     };
-    let sources: Vec<String> = staged
-        .iter()
-        .map(|(_, p, _)| p.to_string_lossy().into_owned())
-        .collect();
-    let t = std::time::Instant::now();
+    let t_package = std::time::Instant::now();
+    let t_bundle = std::time::Instant::now();
     let conv = lods::convert_lods_platforms(&client, &sources, &params.out_dir, &opts, &platforms)?;
-    let bundle_ms = t.elapsed().as_millis();
-    log.push(format!(
-        "timing: placements_ms={placements_ms} assemble_ms={assemble_ms} atlas_ms={atlas_ms} emit_ms={emit_ms} simplify_ms={simplify_ms} bundle_ms={bundle_ms} total_ms={}",
-        t_total.elapsed().as_millis()
-    ));
+    let bundle_ms = t_bundle.elapsed().as_millis();
+    let package_ms = t_package.elapsed().as_millis();
+    let t_finalize = std::time::Instant::now();
     if !conv.skipped.is_empty() {
         bail!("convert_lods skipped sources: {:?}", conv.skipped);
     }
@@ -707,22 +1074,20 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         );
     }
     let mut level_builds: Vec<LevelBuild> = Vec::new();
-    for (level, staged_glb, sim) in staged {
-        if expect_content {
-            if let Some(cap) = effective_tri_cap(
-                level,
-                params.tri_cap,
-                params.tri_cap_auto,
-                TRIS_PER_PARCEL * parcel_count as u64,
-            ) {
-                let c = tri_cap_check(cap, sim.tris_after, sim.unsimplified);
-                push_check(&mut gate, format!("L{level}:{}", c.label), c.ok, c.detail);
-            }
+    for (level, staged_glb, sim, atlas_side) in staged {
+        if let Some(cap) = effective_tri_cap(
+            level,
+            params.simplify_policy,
+            params.tri_cap,
+            params.tri_cap_auto,
+            TRIS_PER_PARCEL * parcel_count as u64,
+        ) {
+            let c = tri_cap_check(cap, sim.tris_after, sim.unsimplified);
+            push_check(&mut gate, format!("L{level}:{}", c.label), c.ok, c.detail);
         }
         let mut primary_path = PathBuf::new();
         let mut primary_bytes = 0usize;
-        let gate_budget = (expect_content && !params.atlas_fixed && !params.atlas_adaptive)
-            .then(|| atlas::budget_pot(params.atlas_max));
+        let gate_budget = atlas_side.map(|s| s.next_power_of_two().min(BUNDLE_TEXTURE_MAX));
         for plat in &platforms {
             let rel = expected_rel_path(&sid, level, plat);
             let path = PathBuf::from(&params.out_dir)
@@ -730,8 +1095,15 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
                 .join(&rel);
             let data = std::fs::read(&path)
                 .with_context(|| format!("read built bundle {}", path.display()))?;
-            let checks =
-                self_gate_bundle_with(&data, &sid, level, plat, expect_content, gate_budget)?;
+            let checks = self_gate_bundle_with(
+                &data,
+                &sid,
+                level,
+                plat,
+                true,
+                gate_budget,
+                params.fidelity,
+            )?;
             for c in checks {
                 push_check(
                     &mut gate,
@@ -751,6 +1123,26 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
                 primary_path = path;
             }
         }
+        let published = published.remove(&level);
+        if level >= 1 && published.is_none() {
+            bail!(
+                "published GLB worker returned no result for scene {} level {level}",
+                conv.scene_id
+            );
+        }
+        if let Some((published, published_bytes, float_len)) = published {
+            push_check(
+                &mut gate,
+                format!("L{level}:published-glb"),
+                published_bytes > 0,
+                format!("{} ({published_bytes} bytes)", published.display()),
+            );
+            log.push(format!(
+                "published-glb[{level}]: {} ({published_bytes} bytes; float glb {} bytes)",
+                published.display(),
+                float_len
+            ));
+        }
         let glb_path = if params.keep_glb {
             Some(staged_glb)
         } else {
@@ -769,13 +1161,227 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     if !params.keep_glb {
         let _ = std::fs::remove_file(&pre);
     }
+    let finalize_ms = t_finalize.elapsed().as_millis();
+    let io = client.io_stats();
+    log.push(format!(
+        "io: network_requests={} network_bytes={} cache_hits={} cache_bytes={}",
+        io.network_requests, io.network_bytes, io.cache_hits, io.cache_bytes
+    ));
+    log.push(format!(
+        "timing: placements_ms={placements_ms} assemble_ms={assemble_ms} atlas_ms={atlas_ms} emit_ms={emit_ms} simplify_ms={simplify_ms} publish_ms={publish_ms} bundle_ms={bundle_ms} package_ms={package_ms} finalize_ms={finalize_ms} total_ms={}",
+        t_total.elapsed().as_millis()
+    ));
 
     Ok(GenerateOutcome {
         entity_id: ent.entity_id.clone(),
         scene_id: conv.scene_id.clone(),
         source_tris,
+        placement_stats,
+        unresolved_srcs,
         levels: level_builds,
         gate,
         log,
+        lod_state,
+        dependencies,
     })
+}
+
+#[cfg(test)]
+mod lod_state_tests {
+    use super::*;
+
+    fn doc(scene_id: &str, hash: &str) -> serde_json::Value {
+        placements::iss_descriptor(
+            scene_id,
+            &[(
+                hash.to_string(),
+                &placements::Placement {
+                    glb_hash: Some(hash.to_string()),
+                    ..Default::default()
+                },
+            )],
+        )
+    }
+
+    #[test]
+    fn signature_ignores_the_scene_id_but_not_the_placements() {
+        let a = doc("bafkone", "bafkasset");
+        let b = doc("bafktwo", "bafkasset");
+        assert_eq!(
+            state_digest(&lod_state(&a, &[])),
+            state_digest(&lod_state(&b, &[])),
+            "two deployments of the same geometry must sign the same"
+        );
+
+        let moved = doc("bafkone", "bafkother");
+        assert_ne!(
+            state_digest(&lod_state(&a, &[])),
+            state_digest(&lod_state(&moved, &[]))
+        );
+    }
+
+    #[test]
+    fn signature_covers_primitives_which_the_descriptor_omits() {
+        // A scene whose only change is an SDK primitive has an identical descriptor, so
+        // descriptor equality alone would wrongly reuse the previous bundles.
+        let d = doc("bafkone", "bafkasset");
+        let mut prim = primitives::PrimitivePlacement {
+            spec: primitives::PrimitiveSpec::simple(primitives::PrimitiveShape::Box),
+            material: primitives::PrimitiveMaterial::default(),
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+        };
+        let one = state_digest(&lod_state(&d, std::slice::from_ref(&prim)));
+        assert_ne!(
+            one,
+            state_digest(&lod_state(&d, &[])),
+            "primitives must count"
+        );
+
+        prim.scale = [2.0, 1.0, 1.0];
+        assert_ne!(
+            one,
+            state_digest(&lod_state(&d, std::slice::from_ref(&prim)))
+        );
+
+        prim.scale = [1.0; 3];
+        prim.material.color = [1.0, 0.0, 0.0, 1.0];
+        assert_ne!(
+            one,
+            state_digest(&lod_state(&d, std::slice::from_ref(&prim)))
+        );
+    }
+}
+
+#[cfg(test)]
+mod placement_policy_tests {
+    use super::*;
+
+    fn manifest(count: usize) -> placements::ManifestPlacements {
+        placements::ManifestPlacements {
+            placements: vec![placements::Placement::default(); count],
+            ..Default::default()
+        }
+    }
+
+    fn primitive() -> super::super::primitives::PrimitivePlacement {
+        super::super::primitives::PrimitivePlacement {
+            spec: super::super::primitives::PrimitiveSpec::simple(
+                super::super::primitives::PrimitiveShape::Box,
+            ),
+            material: Default::default(),
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+        }
+    }
+
+    fn scene(runtime: &str, main: Option<&str>) -> Scene {
+        let mut metadata = serde_json::json!({"runtimeVersion": runtime});
+        if let Some(main) = main {
+            metadata["main"] = serde_json::Value::String(main.to_string());
+        }
+        Scene {
+            entity_id: "scene".into(),
+            entity_type: "scene".into(),
+            pointers: Vec::new(),
+            content: Vec::new(),
+            metadata,
+        }
+    }
+
+    #[test]
+    fn sdk_output_is_the_only_placement_source() {
+        // a declarative Creator Hub scene is executed like any other
+        let full = finish_sdk_placements(&scene("7", Some("bin/index.js")), Ok(Some(manifest(2))))
+            .unwrap();
+        assert_eq!(full.placements.len(), 2);
+        let full = finish_sdk_placements(&scene("7", None), Ok(Some(manifest(1)))).unwrap();
+        assert_eq!(full.placements.len(), 1);
+    }
+
+    #[test]
+    fn sdk_failure_and_empty_results_are_rejected_unresolved_srcs_are_not() {
+        let executable = scene("7", Some("bin/index.js"));
+        assert!(
+            finish_sdk_placements(&executable, Err(anyhow!("runtime failed")))
+                .unwrap_err()
+                .to_string()
+                .contains("runtime failed")
+        );
+        assert!(finish_sdk_placements(&executable, Ok(None))
+            .unwrap_err()
+            .to_string()
+            .contains("no renderer state"));
+        assert!(finish_sdk_placements(&executable, Ok(Some(manifest(0))))
+            .unwrap_err()
+            .to_string()
+            .contains("zero placements"));
+
+        // A model the deployment lacks: its entities were already dropped by
+        // the parser; the rest is built and the names travel with the result.
+        let mut incomplete = manifest(1);
+        incomplete.unresolved_src = 1;
+        incomplete.unresolved_srcs = vec!["models/gone.glb".to_string()];
+        let built = finish_sdk_placements(&executable, Ok(Some(incomplete))).unwrap();
+        assert_eq!(built.placements.len(), 1);
+        assert_eq!(built.unresolved_srcs, vec!["models/gone.glb".to_string()]);
+        // ...unless nothing renderable is left.
+        let mut only_missing = manifest(0);
+        only_missing.unresolved_src = 2;
+        assert!(finish_sdk_placements(&executable, Ok(Some(only_missing)))
+            .unwrap_err()
+            .to_string()
+            .contains("zero placements"));
+
+        // MeshRenderers that named no shape are counted, not fatal
+        let mut skipped = manifest(1);
+        skipped.mesh_renderers = 3;
+        skipped.skipped_mesh_renderer = 3;
+        assert_eq!(
+            finish_sdk_placements(&executable, Ok(Some(skipped)))
+                .unwrap()
+                .placements
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn primitives_only_sdk_output_is_a_valid_scene() {
+        let mut prims_only = manifest(0);
+        prims_only.primitives.push(primitive());
+        prims_only.mesh_renderers = 1;
+        let got = finish_sdk_placements(&scene("7", None), Ok(Some(prims_only))).unwrap();
+        assert!(got.placements.is_empty());
+        assert_eq!(got.primitives.len(), 1);
+    }
+
+    #[test]
+    fn descriptor_input_cannot_authorize_generated_placements() {
+        let client = CatalystClient::new("http://unused");
+        let error = acquire_placements_independently(&client, &scene("7", None), "upstream.json")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot supply generated placements"));
+    }
+
+    #[test]
+    fn placement_metrics_identify_explorer_transform_outliers() {
+        let placements = vec![
+            placements::Placement::default(),
+            placements::Placement {
+                rotation: [0.0, 0.707, 0.0, 0.707],
+                scale: [-2.0, 3.0, 200.0],
+                ..Default::default()
+            },
+        ];
+        let stats = placement_stats(&placements);
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.rotated, 1);
+        assert_eq!(stats.non_uniform_scale, 1);
+        assert_eq!(stats.mirrored, 1);
+        assert_eq!(stats.extreme_scale, 1);
+    }
 }

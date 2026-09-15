@@ -32,8 +32,9 @@ and compare against the ids above before trusting a mismatch.
 
 ## Files
 
-- `golden_*_.placements.json` — stdout of `abgen-lod placements` (sorted
-  Placement array, byte-stable across runs).
+- `golden_*_.placements.json` — stdout of `abgen-lod placements` (Placement
+  array in descriptor order: first-seen gltf src, then entity insertion
+  order; byte-stable across runs).
 - `golden_*_.manifest.json` — the raw `<entityId>-lod-manifest.json` the npm
   tool wrote in output-manifests/, for parse_lod_manifest_full cross-checks and
   the parity oracle.
@@ -55,3 +56,21 @@ REPRESENTATION models the scene never places. It anchors the empty-placements
 lane and the synthetic-initial-state plumbing; the SDK6 scene at 100,100
 anchors the GltfContainer lane (one placement, models/SCENE.glb, resolved
 hash, non-trivial rotation and scale).
+
+## Descriptor semantics the goldens pin
+
+Both placement files are reproduced offline from the committed manifests by
+the descriptor lane (`golden_manifests_cross_check_the_compose_seam`, or
+`abgen-lod parse-manifest crate/src/lodgen/testdata/golden_<C>.manifest.json
+--scene <entity> --catalyst https://peer.decentraland.org/content`), which applies
+the production `StaticSceneDescriptorBuilder` rules: 4x4 TRS composition along the parent chain, Unity's
+decomposition (`scale.x` negative under `det < 0`, `MatrixToQuaternion` sign
+convention, NaN rotation -> identity), the entity's own VisibilityComponent,
+the live-events exclusions, unresolved srcs dropped, descriptor order. Under
+those rules the two files are byte-identical to the npm-tool captures: the
+SDK7 scene places nothing, and the SDK6 placement is a root entity with a
+resolved src and no visibility row whose rotation `(1, 0, 0, 6.123234262925839e-17)`
+is a half turn about x, which the largest-diagonal branch returns with x
+positive and w unchanged. A regeneration that differs means the descriptor
+semantics moved, not the scene; the network goldens above then say whether the
+embedded runtime still agrees.

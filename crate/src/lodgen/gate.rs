@@ -51,15 +51,23 @@ fn lod_target_platform(platform: &str) -> Option<i32> {
     }
 }
 
+/// Largest texture edge the LOD bundle lane emits (the LOD converter's
+/// maxTextureSize): every bundle texture must be a square power of two at or
+/// under it, with a full mip chain.
+pub const BUNDLE_TEXTURE_MAX: u32 = 512;
+
 pub fn self_gate_bundle(
     data: &[u8],
     scene_id: &str,
     level: u32,
     platform: &str,
 ) -> Result<Vec<GateCheck>> {
-    self_gate_bundle_with(data, scene_id, level, platform, true, None)
+    self_gate_bundle_with(data, scene_id, level, platform, true, None, false)
 }
 
+/// `atlas_budget` is an inclusive ceiling on every texture edge (the client
+/// texture arrays accept mixed sizes); `fidelity` admits the fourth metal
+/// bucket name in the `material-buckets` check.
 pub fn self_gate_bundle_with(
     data: &[u8],
     scene_id: &str,
@@ -67,6 +75,7 @@ pub fn self_gate_bundle_with(
     platform: &str,
     expect_content: bool,
     atlas_budget: Option<u32>,
+    fidelity: bool,
 ) -> Result<Vec<GateCheck>> {
     let bundle = Bundle::load_bytes(data).context("parse built bundle")?;
     let sid = scene_id.to_lowercase();
@@ -337,23 +346,41 @@ pub fn self_gate_bundle_with(
         ),
     );
     for (name, fmt, w, h, mips) in &textures {
-        let square_pot = *w > 0 && w == h && (*w as u64).is_power_of_two() && *w <= 512;
+        let square_pot =
+            *w > 0 && w == h && (*w as u64).is_power_of_two() && *w <= BUNDLE_TEXTURE_MAX as i64;
         let full_mips = square_pot && *mips == (*w as u64).trailing_zeros() as i64 + 1;
-        let on_budget = atlas_budget.is_none_or(|b| *w == b as i64);
+        let on_budget = atlas_budget.is_none_or(|b| *w <= b as i64);
         push_check(
             &mut checks,
             format!("texture[{name}]"),
             *fmt == 25 && square_pot && full_mips && on_budget,
-            format!("fmt={fmt} {w}x{h} mips={mips} budget={atlas_budget:?}"),
+            format!(
+                "fmt={fmt} {w}x{h} mips={mips} (want BC7 square POT <= {}, max {atlas_budget:?})",
+                BUNDLE_TEXTURE_MAX
+            ),
         );
     }
-    let tex_sizes: std::collections::BTreeSet<(i64, i64)> =
-        textures.iter().map(|(_, _, w, h, _)| (*w, *h)).collect();
+    let mut allowed: Vec<&str> = vec![
+        super::atlas::class_material_name(super::model::AlphaClass::Opaque),
+        super::atlas::class_material_name(super::model::AlphaClass::Mask),
+        super::atlas::class_material_name(super::model::AlphaClass::Blend),
+    ];
+    if fidelity {
+        allowed.push(super::atlas::metal_material_name());
+    }
+    let stray_mats: Vec<&String> = materials
+        .iter()
+        .map(|(n, _, _, _)| n)
+        .filter(|n| !allowed.contains(&n.as_str()))
+        .collect();
     push_check(
         &mut checks,
-        "texture-uniform-size",
-        tex_sizes.len() <= 1,
-        format!("{} distinct size(s): {tex_sizes:?}", tex_sizes.len()),
+        "material-buckets",
+        stray_mats.is_empty(),
+        format!(
+            "{} material(s) outside the production bucket names {allowed:?}: {stray_mats:?}",
+            stray_mats.len()
+        ),
     );
     for (name, mgm, keywords, met, smooth, stc) in &mat_metal {
         if *mgm == 0 {

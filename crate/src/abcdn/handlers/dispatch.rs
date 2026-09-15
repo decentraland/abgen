@@ -47,9 +47,6 @@ async fn dispatch_with_fallbacks(
         if let Some(target) = jit_target(path) {
             return bundle_fallback(state, proxy, path, &target, method, headers, local).await;
         }
-        if br_bundle_target(path) {
-            return with_reason(local, "br-not-built");
-        }
     }
     if path.split('/').next() == Some("LOD") {
         return lod_fallback(state, path, method, headers, local).await;
@@ -101,9 +98,7 @@ pub(super) async fn dispatch_local(
             return serve::not_found();
         };
         state.touch_if_jit(&exact, from_jit);
-        let etag = filename.strip_suffix(".br").unwrap_or(filename);
-        let is_br = filename.ends_with(".br");
-        return serve::serve_binary(state, path, &exact, etag, is_br, method, headers).await;
+        return serve::serve_binary(state, path, &exact, filename, method, headers).await;
     }
 
     if segments.len() == 3 && segments[0] == "lods-unity" && segments[1] == "manifests" {
@@ -120,16 +115,14 @@ pub(super) async fn dispatch_local(
     if segments.len() == 3 && segments[0] != "manifest" {
         let entity = segments[1];
         let filename = segments[2];
-        let raw = filename.strip_suffix(".br").unwrap_or(filename);
-        if is_bundle_name(raw) {
-            let is_br = filename.ends_with(".br");
+        if is_bundle_name(filename) {
             let Some((exact, from_jit)) =
                 state.serve_lookup(|r| resolver::binary_path(r, entity, filename))
             else {
                 return serve::not_found();
             };
             state.touch_if_jit(&exact, from_jit);
-            return serve::serve_binary(state, path, &exact, raw, is_br, method, headers).await;
+            return serve::serve_binary(state, path, &exact, filename, method, headers).await;
         }
 
         if let Some(resp) = serve_content_native(state, entity, filename, method).await {
@@ -140,9 +133,7 @@ pub(super) async fn dispatch_local(
 
     if segments.len() == 2 && segments[0] != "manifest" {
         let filename = segments[1];
-        let raw = filename.strip_suffix(".br").unwrap_or(filename);
-        let is_br = filename.ends_with(".br");
-        let (_, bare) = resolver::split_platform(raw);
+        let (_, bare) = resolver::split_platform(filename);
         let exact = state
             .bundle_index
             .get(&filename.to_ascii_lowercase())
@@ -153,7 +144,7 @@ pub(super) async fn dispatch_local(
             return serve::not_found();
         };
         state.touch_if_jit(&exact, from_jit);
-        return serve::serve_binary(state, path, &exact, raw, is_br, method, headers).await;
+        return serve::serve_binary(state, path, &exact, filename, method, headers).await;
     }
 
     if segments.len() >= 4 && segments[0] != "manifest" && segments[0] != "LOD" {

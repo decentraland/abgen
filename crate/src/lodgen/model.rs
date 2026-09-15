@@ -26,9 +26,21 @@ pub fn scaled_emissive(m: &crate::scene::Material) -> [f64; 3] {
 }
 
 impl AlphaClass {
+    /// Bucket class of a source material as production's glTFast import sees
+    /// it: the glTF alphaMode, except that `KHR_materials_transmission`
+    /// materials import as a blended (transparent) surface whatever their
+    /// alphaMode says.
+    pub fn for_material(mode: &str, transmission: bool) -> AlphaClass {
+        if transmission {
+            AlphaClass::Blend
+        } else {
+            AlphaClass::from_alpha_mode(mode)
+        }
+    }
+
     pub fn from_alpha_mode(mode: &str) -> AlphaClass {
         match mode {
-            "MASK" => AlphaClass::Blend,
+            "MASK" => AlphaClass::Mask,
             "BLEND" => AlphaClass::Blend,
             _ => AlphaClass::Opaque,
         }
@@ -344,6 +356,35 @@ pub(crate) fn intern_image(
     Some(i)
 }
 
+/// Interns an image from raw bytes (a scene texture fetched outside any GLB). PNG/JPEG
+/// pass through; anything else decodes and re-encodes as PNG. `None` if undecodable.
+pub(crate) fn intern_image_bytes(
+    raw: Vec<u8>,
+    by_hash: &mut HashMap<String, usize>,
+    model: &mut LodModel,
+) -> Option<usize> {
+    let (bytes, mime) = match sniff_mime(&raw) {
+        Some(m) => (raw, m.to_string()),
+        None => {
+            let img = image::load_from_memory(&raw).ok()?;
+            let mut cur = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut cur, image::ImageFormat::Png).ok()?;
+            model
+                .log
+                .push("primitive texture: reencoded to png".to_string());
+            (cur.into_inner(), "image/png".to_string())
+        }
+    };
+    let key = crate::hashes::sha256_hex(&bytes);
+    if let Some(&i) = by_hash.get(&key) {
+        return Some(i);
+    }
+    let i = model.images.len();
+    model.images.push(LodImage { bytes, mime });
+    by_hash.insert(key, i);
+    Some(i)
+}
+
 fn walk(
     scene: &crate::scene::Scene,
     idx: usize,
@@ -479,7 +520,7 @@ pub fn from_glb_bytes_with(
         let mr_image = intern(m.metallic_roughness_image);
         model.materials.push(LodMaterial {
             name: m.name.clone(),
-            class: AlphaClass::from_alpha_mode(&m.alpha_mode),
+            class: AlphaClass::for_material(&m.alpha_mode, m.uses_transmission),
             base_color,
             cutoff: m.alpha_cutoff,
             image,
@@ -515,10 +556,17 @@ mod tests {
     #[test]
     fn alpha_mode_mapping() {
         assert_eq!(AlphaClass::from_alpha_mode("OPAQUE"), AlphaClass::Opaque);
-        assert_eq!(AlphaClass::from_alpha_mode("MASK"), AlphaClass::Blend);
+        assert_eq!(AlphaClass::from_alpha_mode("MASK"), AlphaClass::Mask);
         assert_eq!(AlphaClass::from_alpha_mode("BLEND"), AlphaClass::Blend);
         assert_eq!(AlphaClass::from_alpha_mode(""), AlphaClass::Opaque);
         assert_eq!(AlphaClass::from_alpha_mode("mask"), AlphaClass::Opaque);
+        assert_eq!(AlphaClass::for_material("OPAQUE", true), AlphaClass::Blend);
+        assert_eq!(AlphaClass::for_material("MASK", true), AlphaClass::Blend);
+        assert_eq!(AlphaClass::for_material("MASK", false), AlphaClass::Mask);
+        assert_eq!(
+            AlphaClass::for_material("OPAQUE", false),
+            AlphaClass::Opaque
+        );
     }
 
     #[test]

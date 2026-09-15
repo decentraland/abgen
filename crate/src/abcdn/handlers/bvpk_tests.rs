@@ -156,9 +156,9 @@ async fn preflight_and_error_reasons() {
     assert_eq!(not_pack.status(), StatusCode::NOT_FOUND);
     assert_eq!(reason_of(&not_pack), None);
 
-    let br_cold = get(&state, "bvwebgpu/bv4/bafkx.pack.br").await;
-    assert_eq!(br_cold.status(), StatusCode::NOT_FOUND);
-    assert_eq!(reason_of(&br_cold).as_deref(), Some("br-not-built"));
+    let compressed_sidecar = get(&state, "bvwebgpu/bv4/bafkx.pack.br").await;
+    assert_eq!(compressed_sidecar.status(), StatusCode::NOT_FOUND);
+    assert_eq!(reason_of(&compressed_sidecar), None);
 
     std::env::set_var("ABGEN_BVWEBGPU", "0");
     let disabled = get(&state, "bvwebgpu/bv4/bafkx.pack").await;

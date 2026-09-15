@@ -55,6 +55,7 @@ pub mod gpu_dispatch {
 #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 pub mod gpuhost;
 pub mod scene;
+mod singleflight;
 
 pub mod alpha_bleed;
 pub mod animation;

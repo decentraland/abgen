@@ -110,10 +110,10 @@ fn jit_target_skips_iss_manifest_route() {
 }
 
 #[test]
-fn materialize_tmp_paths_are_distinct_for_br_sidecars() {
+fn materialize_tmp_paths_are_distinct() {
     use std::path::Path;
     let a = super::materialize_tmp_path(Path::new("/out/LOD/1/a_windows"));
-    let b = super::materialize_tmp_path(Path::new("/out/LOD/1/a_windows.br"));
+    let b = super::materialize_tmp_path(Path::new("/out/LOD/1/b_windows"));
     assert_ne!(a, b);
     let pid = std::process::id();
     let a = a.to_str().unwrap();
@@ -123,7 +123,7 @@ fn materialize_tmp_paths_are_distinct_for_br_sidecars() {
         "{a}"
     );
     assert!(
-        b.starts_with(&format!("/out/LOD/1/a_windows.br.tmp.{pid}.")),
+        b.starts_with(&format!("/out/LOD/1/b_windows.tmp.{pid}.")),
         "{b}"
     );
     assert_ne!(
@@ -194,12 +194,6 @@ fn jit_target_bundle_route() {
     assert_eq!(t.platform(), "mac");
 
     assert!(jit_target("v41/bafkEntity/Qmhash_linux.br").is_none());
-    assert!(super::br_bundle_target("v41/bafkEntity/Qmhash_linux.br"));
-    assert!(!super::br_bundle_target("v41/bafkEntity/Qmhash_linux"));
-    assert!(!super::br_bundle_target("v41/Qmhash_windows.br"));
-    assert!(!super::br_bundle_target(
-        "manifest/bafkEntity_windows.json.br"
-    ));
 }
 
 #[test]
@@ -218,10 +212,7 @@ fn flat_target_table() {
         super::flat_target("v41/Qmhash_windows"),
         Some(("Qmhash".to_string(), "windows".to_string()))
     );
-    assert_eq!(
-        super::flat_target("v41/Qmhash_mac.br"),
-        Some(("Qmhash".to_string(), "mac".to_string()))
-    );
+    assert_eq!(super::flat_target("v41/Qmhash_mac.br"), None);
     assert_eq!(
         super::flat_target("v41/Qmhash_webgl"),
         Some(("Qmhash".to_string(), "webgl".to_string()))
@@ -230,10 +221,7 @@ fn flat_target_table() {
         super::flat_target("v41/Qmhash_0123abcd_windows"),
         Some(("Qmhash".to_string(), "windows".to_string()))
     );
-    assert_eq!(
-        super::flat_target("v41/Qmhash_0123abcd_mac.br"),
-        Some(("Qmhash".to_string(), "mac".to_string()))
-    );
+    assert_eq!(super::flat_target("v41/Qmhash_0123abcd_mac.br"), None);
     assert_eq!(super::flat_target("v41/Qmhash"), None);
     assert_eq!(super::flat_target("v41/_windows"), None);
     assert_eq!(super::flat_target("manifest/Qmhash_windows"), None);
@@ -502,6 +490,9 @@ async fn lod_jit_success_writes_back_to_space() {
         b"{}",
     )
     .unwrap();
+    let gdir = dir.join(sid).join("lods-unity").join("lods");
+    std::fs::create_dir_all(&gdir).unwrap();
+    std::fs::write(gdir.join(format!("{sid}_1.glb")), b"glb").unwrap();
 
     super::spawn_lod_writeback(&state, sid);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -516,7 +507,11 @@ async fn lod_jit_success_writes_back_to_space() {
                 );
             }
             assert!(
-                log.contains(&format!("PUT /LOD/0/{sid}_0_windows")),
+                !log.contains(&format!("PUT /LOD/0/{sid}_0_windows")),
+                "level 0 is not a JIT level: {log:?}"
+            );
+            assert!(
+                log.contains(&format!("PUT /lods-unity/lods/{sid}_1.glb")),
                 "{log:?}"
             );
             assert!(
@@ -708,22 +703,6 @@ async fn jit_single_flight_coalesces_and_negcaches_failures() {
     assert!(matches!(again, super::JitBuild::Failed));
     assert_eq!(cseen.lock().unwrap().len(), calls_before);
     assert!(state.jit_inflight.lock().await.is_empty());
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn br_bundle_requests_skip_the_jit_build() {
-    use axum::http::StatusCode;
-    let dir = lane_temp_dir("brskip");
-    let (host, _seen) = crate::live::stub::serve(vec![]);
-    let (chost, cseen) = crate::live::stub::serve(vec![]);
-    let proxy = mk_stub_proxy_catalyst(&host, &format!("http://{chost}"), false, "brskip");
-    let state = mk_lane_state_content(&dir, Some(proxy), None, &format!("http://{chost}"));
-
-    let resp = lane_get(&state, "v41/bafkEnt/Qmhash_windows.br").await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    assert_eq!(reason_of(&resp).as_deref(), Some("br-not-built"));
-    assert!(cseen.lock().unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1153,7 +1132,7 @@ fn upstream_eligibility_covers_only_delivery_paths() {
 
     assert!(f("manifest/bafkup_windows.json"));
     assert!(f("v41/bafkup/Qmx_windows"));
-    assert!(f("v41/bafkup/Qmx_mac.br"));
+    assert!(!f("v41/bafkup/Qmx_mac.br"));
     assert!(f("LOD/1/bafkscene_1_mac"));
     assert!(f("lods-unity/manifests/bafkscene_InitialSceneState.json"));
     assert!(f("v41/Qmflat_windows"));

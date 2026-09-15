@@ -57,7 +57,8 @@ pub trait SceneEngine {
     fn run_capture(&self, job: SceneJob) -> anyhow::Result<CaptureOutcome>;
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "scene-runtime")]
 pub(crate) fn initial_state_parts(main_crdt: Option<&[u8]>) -> Vec<Vec<u8>> {
     let stream = crdt::synthetic_initial_state(None);
     let mut parts = Vec::new();
@@ -155,10 +156,21 @@ fn run_scene_with(
     };
     let read_content = content.clone();
     let read_client = client.clone();
+    // Every deployment file the scene reads at run time is an input to its placements,
+    // so a reuse check must see it change; record what was served under which hash.
+    let files_read = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
+        String,
+        String,
+    >::new()));
+    let recorder = files_read.clone();
     let read_file: ReadFileFn = Box::new(move |name| {
+        let lower = name.to_lowercase();
         let hash = read_content
-            .get(&name.to_lowercase())
+            .get(&lower)
             .ok_or_else(|| anyhow!("scene content does not list file {name}"))?;
+        if let Ok(mut map) = recorder.lock() {
+            map.insert(lower, hash.clone());
+        }
         Ok((read_client.fetch_content(hash)?, hash.clone()))
     });
     let job = SceneJob {
@@ -171,7 +183,9 @@ fn run_scene_with(
     if outcome.stream.is_empty() {
         return Ok(None);
     }
-    Ok(Some(crdt::placements_from_crdt(&outcome.stream, &content)))
+    let mut placements = crdt::placements_from_crdt(&outcome.stream, &content);
+    placements.files_read = files_read.lock().map(|m| m.clone()).unwrap_or_default();
+    Ok(Some(placements))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32"), feature = "scene-runtime"))]
