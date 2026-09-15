@@ -8,10 +8,6 @@ use abgen::lods;
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::PathBuf;
 
-mod compare;
-
-use compare::cmd_compare;
-
 const BIN_NAME: &str = "abgen-lod";
 const CATALYST: &str = "https://peer.decentraland.org/content";
 
@@ -67,13 +63,12 @@ fn ensure_parent(path: &std::path::Path) -> Result<()> {
 }
 
 fn usage_text() -> &'static str {
-    "abgen-lod — LOD asset-bundle builder + structural comparator
+    "abgen-lod — LOD asset-bundle builder
 
 USAGE:
   abgen-lod bundle <src.glb> --entity <entityId> [--level 1]
             [--platform windows|mac|linux] [--out DIR] [--catalyst URL]
             [--base X,Y --parcels 'x,y;x,y;...'] [--timestamp N] [--vertical-clip H]
-  abgen-lod compare <ours> <prod> [--prod-ab vNN] [--allow-legacy]
   abgen-lod placements (--coords X,Y | --scene <entityId>) [--iss FILE|auto|off]
             [--catalyst URL]
   abgen-lod parse-manifest <manifest.json> --scene <pointer|entityId>
@@ -98,18 +93,13 @@ USAGE:
             [--fidelity] [--gpu]
 
 bundle: stages <src.glb> as {entityIdLower}_{level}.glb and builds
-  {out}/{entityIdLower}/LOD/{level}/{entityIdLower}_{level}_{platform} (+.br).
+  {out}/{entityIdLower}/LOD/{level}/{entityIdLower}_{level}_{platform}.
   Scene base/parcels are resolved the way the upstream converter does, unless
   --base/--parcels override: POST /entities/active on catalyst-style hosts
   (a stale/redeployed entity id does NOT resolve), GET /contents/{id} when
   the host is a worlds-content-server. An unresolvable entity is a warning,
   not an error: the bundle is built with zeroed plane/vertical clipping and
   a zero root position, matching the upstream Unity LOD converter.
-compare: parses both bundles and prints PASS/FAIL per structural check; exits 1 on FAIL.
-  --prod-ab passes the reference build's asset-bundle version (from the
-  asset-bundle-registry — it is NOT recorded inside the bundle): versions
-  before v49 predate the current LOD lane and are skipped with exit 2
-  instead of compared (--allow-legacy forces the comparison anyway).
 placements: resolves the scene, then prints its GLB placement list as JSON.
   --iss auto (default) tries the production InitialSceneState descriptor first
   (404 falls through); --iss FILE reads a local descriptor; --iss off skips ISS.
@@ -173,7 +163,7 @@ generate/placements/assemble run without node: scenes lacking an ISS
   descriptor are executed by the embedded scene runtime.
 generate: the full sync chain: resolve scene -> placements (iss|embedded
   scene runtime) -> assemble -> crop -> atlas -> simplify -> bundle via the LOD build mode
-  into {out}/{sceneId}/LOD/{level}/{sceneId}_{level}_{platform} (+.br,
+  into {out}/{sceneId}/LOD/{level}/{sceneId}_{level}_{platform} (plus
   LOD.manifest.json). --level takes a comma-separated list (default 0,1;
   level 2 is refused; production stopped emitting it): every level shares
   ONE assemble/crop/atlas bake and gets its own simplify pass, staged
@@ -209,11 +199,11 @@ generate: the full sync chain: resolve scene -> placements (iss|embedded
   rect and adds a crop-bounds self-gate check. --platform takes a
   comma-separated list (windows|mac|linux; webgl is refused — upstream webgl
   LOD bundles use an empty suffix and are unsupported here): every platform
-  bundle is built from the same bake and simplify pass, written with its own
-  .br sidecar, listed in ONE union LOD.manifest.json, and self-gated
+  bundle is built from the same bake and simplify pass, listed in ONE union
+  LOD.manifest.json, and self-gated
   separately (one gate table per platform, including a target-platform
   check: windows=19 mac=2 linux=24). Every run also writes the ISS
-  descriptor {out}/{sceneId}/{sceneId}_InitialSceneState.json (+.br)
+  descriptor {out}/{sceneId}/{sceneId}_InitialSceneState.json
   next to LOD.manifest.json — the production InitialSceneState shape
   ({version, sceneId, assets:[{hash, position, rotation, scale}]}) with the
   acquired placements serialized verbatim in the pinned base-relative
@@ -265,7 +255,6 @@ fn main() {
     let Some(cmd) = argv.first() else { usage() };
     let rc = match cmd.as_str() {
         "bundle" => cmd_bundle(&argv[1..]),
-        "compare" => cmd_compare(&argv[1..]),
         "placements" => cmd_placements(&argv[1..]),
         "parse-manifest" => cmd_parse_manifest(&argv[1..]),
         "assemble" => cmd_assemble(&argv[1..]),

@@ -155,7 +155,7 @@ pub(super) fn looks_like_normal_map(rgba: &[u8]) -> bool {
     (hits as f64 / n as f64) >= 0.95
 }
 
-pub(super) fn pack_normal_map(rgba: &[u8]) -> Vec<u8> {
+pub(crate) fn pack_normal_map(rgba: &[u8]) -> Vec<u8> {
     let n = rgba.len() / 4;
     let mut out = vec![0u8; n * 4];
     for i in 0..n {
@@ -351,7 +351,7 @@ pub(super) fn standalone_texture_readable(model_referenced: bool, compressed: bo
     !(model_referenced && compressed)
 }
 
-pub(super) fn detect_container(raw: &[u8]) -> String {
+pub(crate) fn detect_container(raw: &[u8]) -> String {
     if raw.len() >= 8 && &raw[0..8] == b"\x89PNG\r\n\x1a\n" {
         "PNG".to_string()
     } else if raw.len() >= 2 && raw[0] == 0xFF && raw[1] == 0xD8 {

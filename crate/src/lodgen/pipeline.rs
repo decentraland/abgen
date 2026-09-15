@@ -117,7 +117,6 @@ pub fn write_iss_descriptor(
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
     let path = dir.join(format!("{scene_id}{}", placements::ISS_SUFFIX));
     lods::write_atomic(&path, text.as_bytes())?;
-    lods::write_brotli_sidecar(&path, text.as_bytes())?;
     Ok((path, assets.len(), skipped))
 }
 
@@ -746,17 +745,6 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
                 format!("L{level}:{plat}:rel-path"),
                 conv.results.iter().any(|r| r.rel_path == rel),
                 rel.clone(),
-            );
-            let br = {
-                let mut s = path.as_os_str().to_owned();
-                s.push(".br");
-                PathBuf::from(s)
-            };
-            push_check(
-                &mut gate,
-                format!("L{level}:{plat}:brotli-sidecar"),
-                br.is_file(),
-                br.display().to_string(),
             );
             if plat == &primary {
                 primary_bytes = data.len();

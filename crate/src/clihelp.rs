@@ -1,57 +1,13 @@
-//! Small CLI-side helpers shared by every abgen binary.
+//! Shared cache and concurrency defaults.
 //!
-//! In-process texture caches ([`crate::texencode_cache`], [`crate::decode_cache`])
-//! are enabled on every host that drives `export::convert` for more than a
-//! single throwaway texture. Both are content-hash-keyed, bounded by bytes
-//! with LRU eviction, and default on. Each entry point declares the context
-//! it runs in ([`crate::texencode_cache::CacheProfile`]), which sets the
-//! encode cache's *default* bounds; the env vars below always win when set:
-//!   - `Lambda` (the lambda entrypoint): in-memory encode cache at the full
-//!     4096 MiB default, disk cache off — lambda storage is ephemeral
-//!     scratch that never survives a cold start.
-//!   - `Client` (the `abgen` JIT server sidecar / `live::Proxy`, the node
-//!     addon, the UPM native lib and its `abgen-host` helper, the
-//!     `abgen-build` CLI): in-memory encode cache capped at 256 MiB, disk
-//!     cache on and bounded to 2048 MiB — desktop-polite budgets for
-//!     processes sharing a developer's or player's machine.
-//!   - `Batch` (`abgen-bench`; also the fallback when no profile is
-//!     declared): the historical defaults — 4096 MiB in memory, disk cache
-//!     on at 8192 MiB.
-//!
-//! The env vars are escape hatches over those per-context defaults:
-//!   - `ABGEN_TEX_ENCODE_CACHE_MAX_MB` (profile default above) bounds the
-//!     encoded BC7/DXT1/DXT5/BC3 chain cache.
-//!   - `ABGEN_DECODE_CACHE_MB` (default 512) bounds the decoded source-image
-//!     (RGBA) cache; set to 0 to disable it outright.
-//!
-//! The encode cache also has an on-disk backing ([`crate::texencode_cache`]'s
-//! `disk` submodule) that survives across process runs, keyed by the same
-//! content hash plus the encoder's crate version + `ABGEN_BUILD_ID` so a
-//! stale build can never serve a hit:
-//!   - `ABGEN_DISK_CACHE` is the escape hatch over the profile default
-//!     above. Regardless of profile it defaults off for dev builds, whose
-//!     fixed `devbuild0000` stamp (instead of the real content-addressed
-//!     `ABGEN_BUILD_ID` everything `flake.nix`/`release.yml` produces) would
-//!     let two different source trees share one key space; `0`/`false`
-//!     disables it, `1`/`true` forces it on.
-//!   - `ABGEN_DISK_CACHE_DIR` overrides the cache directory (default
-//!     `$XDG_CACHE_HOME/abgen/texencode`, else the platform cache dir —
-//!     `~/Library/Caches/abgen/texencode` on macOS, `~/.cache/abgen/texencode`
-//!     elsewhere).
-//!   - `ABGEN_DISK_CACHE_MAX_MB` (profile default above) bounds total bytes
-//!     on disk, LRU-evicted by file mtime.
-//!
-//! Caching never changes output bytes — only which calls skip real work —
-//! so it is safe to leave on everywhere it is enabled.
-//!
-//! File-level conversion concurrency ([`default_file_concurrency`]) is
-//! likewise on by default, scaled to the host: `min(cores, max(4, ram_gib
-//! / 4))`, budgeting ~4 GiB of peak per-file working set and never
-//! dropping below the old flat default of 4. `ABGEN_FILE_CONCURRENCY`
-//! overrides the computed value outright — a debug/escape hatch, never
-//! required to reach the fast default. Shared by `live::corpus_file_jobs`
-//! (JIT path; `ABGEN_JIT_FILE_CONCURRENCY` wins over it there) and
-//! `export::convert::file_concurrency` (export path).
+//! Encode profiles are Lambda (4096 MiB memory, no disk), Client (256 MiB,
+//! 2048 MiB disk), and Batch (4096 MiB, 8192 MiB disk).
+//! `ABGEN_TEX_ENCODE_CACHE_MAX_MB`, `ABGEN_DISK_CACHE`,
+//! `ABGEN_DISK_CACHE_DIR`, and `ABGEN_DISK_CACHE_MAX_MB` override them;
+//! `ABGEN_DECODE_CACHE_MB` controls the 512 MiB decoded-image cache. Disk keys
+//! include the crate version and `ABGEN_BUILD_ID`, and default off for dev builds.
+//! File jobs use `min(cores, max(4, ram_gib / 4))`, overridden by
+//! `ABGEN_FILE_CONCURRENCY`; network jobs use `(4 * cores).clamp(8, 32)`.
 
 /// Free-to-use system memory in GiB, or `None` if it can't be determined
 /// (unsupported platform, or the read failed). Cheap and dependency-free:

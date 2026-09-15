@@ -859,9 +859,6 @@ async fn map_read(
     MapFuture(shared).await
 }
 
-#[cfg(target_arch = "wasm32")]
-pub mod bisect;
-
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
