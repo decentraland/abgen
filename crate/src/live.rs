@@ -357,6 +357,7 @@ impl Proxy {
         }
     }
 
+    #[cfg(feature = "web-pack")]
     pub(crate) fn content_store(&self) -> &LocalContentStore {
         &self.content
     }
@@ -448,6 +449,7 @@ impl Proxy {
             .collect()
     }
 
+    #[cfg(feature = "web-pack")]
     pub(crate) fn content_bytes_allow_empty(&self, hash: &str) -> Result<Vec<u8>> {
         match self.ensure_content(hash) {
             Ok(()) => self.content_store().fetch(hash),
@@ -1056,8 +1058,13 @@ impl Proxy {
         content_server_url: &str,
     ) -> Result<Vec<String>> {
         if platform == crate::bvwebgpu::BVW_PLATFORM {
-            self.build_bvwebgpu_pack(out_root, cid)?;
-            return Ok(vec![crate::bvwebgpu::pack_file_name(cid)]);
+            #[cfg(feature = "web-pack")]
+            {
+                self.build_bvwebgpu_pack(out_root, cid)?;
+                return Ok(vec![crate::bvwebgpu::pack_file_name(cid)]);
+            }
+            #[cfg(not(feature = "web-pack"))]
+            bail!("bvwebgpu generation requires the web-pack feature");
         }
         let ctx = self.entity_ctx(cid)?;
         let pdir = out_root

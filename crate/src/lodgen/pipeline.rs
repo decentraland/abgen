@@ -117,7 +117,6 @@ pub fn write_iss_descriptor(
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
     let path = dir.join(format!("{scene_id}{}", placements::ISS_SUFFIX));
     lods::write_atomic(&path, text.as_bytes())?;
-    lods::write_brotli_sidecar(&path, text.as_bytes())?;
     Ok((path, assets.len(), skipped))
 }
 

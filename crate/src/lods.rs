@@ -1,8 +1,6 @@
 use crate::builder::{build_bundle, BuildOpts, LodBuildParams};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::catalyst::CatalystClient;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::compress;
 use crate::naming;
 use anyhow::{anyhow, bail, Context, Result};
 #[cfg(not(target_arch = "wasm32"))]
@@ -411,7 +409,6 @@ pub fn convert_lods_platforms(
             std::fs::create_dir_all(parent)?;
         }
         write_atomic(&path, data)?;
-        write_brotli_sidecar(&path, data)?;
     }
 
     write_lod_manifest(&entity_dir, &conv, &opts.ab_version)?;
@@ -498,14 +495,6 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn write_brotli_sidecar(path: &Path, data: &[u8]) -> Result<()> {
-    let mut br = path.as_os_str().to_owned();
-    br.push(".br");
-    write_atomic(&PathBuf::from(br), &compress::brotli(data)?)?;
-    Ok(())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 fn write_lod_manifest(entity_dir: &Path, conv: &LodConversion, ab_version: &str) -> Result<()> {
     std::fs::create_dir_all(entity_dir)?;
     let mut files: Vec<serde_json::Value> = conv
@@ -530,7 +519,6 @@ fn write_lod_manifest(entity_dir: &Path, conv: &LodConversion, ab_version: &str)
     let text = serde_json::to_string_pretty(&manifest)?;
     let mpath = entity_dir.join("LOD.manifest.json");
     write_atomic(&mpath, text.as_bytes())?;
-    write_brotli_sidecar(&mpath, text.as_bytes())?;
     Ok(())
 }
 
