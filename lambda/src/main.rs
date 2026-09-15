@@ -301,8 +301,7 @@ fn convert_asset_bundles(
                     status_code: notify::STATUS_ALREADY_CONVERTED,
                 })
                 .collect();
-            let notified =
-                notify::send_finished(cfg, &job.entity_id, content_server, &finished)?;
+            let notified = notify::send_finished(cfg, &job.entity_id, content_server, &finished)?;
             return Ok(serde_json::json!({
                 "entityId": job.entity_id, "skipped": "already-converted", "notified": notified
             }));
@@ -447,11 +446,10 @@ fn tombstone_final_failure(
             Err(e) => return Err(err.context(format!("{e:#}"))),
         };
     let finished = tombstone_statuses(&cfg.platforms, &tombstoned);
-    let notified =
-        match notify::send_finished(cfg, &job.entity_id, content_server, &finished) {
-            Ok(n) => n,
-            Err(e) => return Err(err.context(format!("{e:#}"))),
-        };
+    let notified = match notify::send_finished(cfg, &job.entity_id, content_server, &finished) {
+        Ok(n) => n,
+        Err(e) => return Err(err.context(format!("{e:#}"))),
+    };
     Ok(serde_json::json!({
         "entityId": job.entity_id,
         "exitCode": notify::STATUS_UNEXPECTED_ERROR,

@@ -291,15 +291,7 @@ fn try_reuse(
     };
     match record.accepts_state(&state, &content, levels, platforms) {
         Ok(()) => republish(
-            cfg,
-            proxy,
-            ent,
-            platforms,
-            record,
-            doc,
-            inputs,
-            "state",
-            started,
+            cfg, proxy, ent, platforms, record, doc, inputs, "state", started,
         ),
         Err(why) => {
             eprintln!("lods: {entity_id}: state record {digest} does not apply: {why}");
@@ -457,14 +449,7 @@ fn republish(
         started.elapsed().as_secs_f64(),
     );
 
-    let mut summary = success_summary(
-        entity_id,
-        &scene_id,
-        platforms,
-        &levels,
-        keys.len(),
-        true,
-    );
+    let mut summary = success_summary(entity_id, &scene_id, platforms, &levels, keys.len(), true);
     summary["lods"]["reusedFrom"] = serde_json::json!(from_scene);
     summary["lods"]["reusedBy"] = serde_json::json!(by);
     summary["lods"]["keys"] = serde_json::json!(keys);
@@ -663,7 +648,9 @@ mod reuse_tests {
         let both = copy_items("a", "b", &[0, 1], &plats[..1]);
         assert_eq!(both.iter().filter(|i| i.required).count(), 2);
         assert_eq!(both.iter().filter(|i| !i.required).count(), 2);
-        assert!(both.iter().all(|i| i.from.contains("/a") && i.to.contains("/b")));
+        assert!(both
+            .iter()
+            .all(|i| i.from.contains("/a") && i.to.contains("/b")));
     }
 
     #[test]
@@ -720,8 +707,7 @@ mod reuse_tests {
         );
 
         // An SDK6 build has no inputs and is filed by state only.
-        let by_state_only =
-            record_for_build(&outcome, &keys, &[1], &["windows".to_string()], None);
+        let by_state_only = record_for_build(&outcome, &keys, &[1], &["windows".to_string()], None);
         assert!(by_state_only.inputs.is_none());
         assert!(by_state_only.inputs_digest.is_none());
     }
@@ -733,7 +719,9 @@ mod follow_up_tests {
 
     #[test]
     fn only_scenes_get_a_lod_follow_up() {
-        assert!(is_scene(&serde_json::json!({"type": "scene", "id": "bafk"})));
+        assert!(is_scene(
+            &serde_json::json!({"type": "scene", "id": "bafk"})
+        ));
         assert!(!is_scene(&serde_json::json!({"type": "wearable"})));
         assert!(!is_scene(&serde_json::json!({"id": "bafk"})));
     }
@@ -750,8 +738,14 @@ mod follow_up_tests {
 
     #[test]
     fn follow_up_summary_flattens_the_lod_block_and_keeps_skips_and_errors_small() {
-        let converted =
-            success_summary("bafkE", "bafke", &["windows".to_string()], &[(1, 9)], 4, true);
+        let converted = success_summary(
+            "bafkE",
+            "bafke",
+            &["windows".to_string()],
+            &[(1, 9)],
+            4,
+            true,
+        );
         let flat = follow_up_summary(Ok(converted));
         assert_eq!(flat["exitCode"], 0);
         assert_eq!(flat["sceneId"], "bafke");
