@@ -283,7 +283,11 @@ mod tests {
     #[test]
     fn inputs_ignore_what_cannot_move_a_placement() {
         let base = base_digest();
-        let thumb = digest_of("7", &["0,0", "1,0"], &with("scene-thumbnail.png", "bafknew"));
+        let thumb = digest_of(
+            "7",
+            &["0,0", "1,0"],
+            &with("scene-thumbnail.png", "bafknew"),
+        );
         assert_eq!(thumb.as_deref(), Some(base.as_str()), "thumbnail");
         let retextured = digest_of("7", &["0,0", "1,0"], &with("models/tree.png", "bafknew"));
         assert_eq!(
@@ -294,7 +298,11 @@ mod tests {
         let added = digest_of("7", &["0,0", "1,0"], &with("models/extra.glb", "bafkextra"));
         assert_eq!(added.as_deref(), Some(base.as_str()), "unplaced asset");
         let other_base = digest_of("7", &["1,0", "0,0"], &owned(BASE));
-        assert_ne!(other_base.as_deref(), Some(base.as_str()), "base moved: the crop moves");
+        assert_ne!(
+            other_base.as_deref(),
+            Some(base.as_str()),
+            "base moved: the crop moves"
+        );
         let same_parcels_other_order = {
             let mut s = scene("7", &["0,0", "1,0"], &owned(BASE));
             s.metadata["scene"]["parcels"] = serde_json::json!(["1,0", "0,0"]);
@@ -330,7 +338,9 @@ mod tests {
 
     #[test]
     fn only_sdk7_scenes_with_code_have_inputs() {
-        assert!(inputs(&scene("6", &["0,0"], &owned(BASE))).unwrap().is_none());
+        assert!(inputs(&scene("6", &["0,0"], &owned(BASE)))
+            .unwrap()
+            .is_none());
         let mut no_runtime = scene("7", &["0,0"], &owned(BASE));
         no_runtime
             .metadata
@@ -389,13 +399,25 @@ mod tests {
         let ins = r.inputs.clone().unwrap();
         let plats = vec!["windows".to_string(), "mac".to_string()];
         let same = owned(BASE);
-        assert_eq!(r.accepts_inputs(&ins, &listing(&same), &[1], &plats), Ok(()));
+        assert_eq!(
+            r.accepts_inputs(&ins, &listing(&same), &[1], &plats),
+            Ok(())
+        );
         let thumb = with("scene-thumbnail.png", "bafknew");
-        assert_eq!(r.accepts_inputs(&ins, &listing(&thumb), &[1], &plats), Ok(()));
+        assert_eq!(
+            r.accepts_inputs(&ins, &listing(&thumb), &[1], &plats),
+            Ok(())
+        );
         let extra = with("models/unused.glb", "bafkunused");
-        assert_eq!(r.accepts_inputs(&ins, &listing(&extra), &[1], &plats), Ok(()));
+        assert_eq!(
+            r.accepts_inputs(&ins, &listing(&extra), &[1], &plats),
+            Ok(())
+        );
         // One platform of two is covered.
-        assert_eq!(r.accepts_inputs(&ins, &listing(&same), &[1], &plats[..1]), Ok(()));
+        assert_eq!(
+            r.accepts_inputs(&ins, &listing(&same), &[1], &plats[..1]),
+            Ok(())
+        );
     }
 
     #[test]
@@ -432,7 +454,8 @@ mod tests {
             "level 0 was not built"
         );
         assert!(
-            r.accepts_inputs(&ins, &same, &[1], &["linux".to_string()]).is_err(),
+            r.accepts_inputs(&ins, &same, &[1], &["linux".to_string()])
+                .is_err(),
             "linux was not built"
         );
         let mut other = ins.clone();
@@ -471,7 +494,10 @@ mod tests {
     fn records_round_trip_and_tolerate_older_shapes() {
         let r = record();
         let text = serde_json::to_string_pretty(&r).unwrap();
-        assert!(text.contains("\"builtBy\""), "camelCase on the wire: {text}");
+        assert!(
+            text.contains("\"builtBy\""),
+            "camelCase on the wire: {text}"
+        );
         let back: ReuseRecord = serde_json::from_str(&text).unwrap();
         assert_eq!(back, r);
 

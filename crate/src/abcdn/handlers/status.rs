@@ -88,6 +88,9 @@ fn registry_mode(state: &AppState) -> &'static str {
     }
 }
 
+/// `version` is this binary's crate version and `pid` its OS process id: the two fields a
+/// loopback supervisor needs to tell one server build from another and to signal this process.
+/// Both describe the running binary, not the corpus it serves.
 pub async fn health(State(state): State<AppState>) -> Response {
     let root_present = state.out_root.is_dir();
     let jit = state.live_proxy.is_some();
@@ -113,7 +116,9 @@ pub async fn health(State(state): State<AppState>) -> Response {
         "catalyst_url": state.catalyst_url,
         "ab_version": state.ab_version,
         "ab_date": state.ab_date,
+        "version": env!("CARGO_PKG_VERSION"),
         "build_id": option_env!("ABGEN_BUILD_ID").unwrap_or("unknown"),
+        "pid": std::process::id(),
         "lod_jit": {
             "enabled": state.lod_jit.enabled,
             "simplifier": state.lod_jit.simplifier.name(),

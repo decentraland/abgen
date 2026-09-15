@@ -1344,7 +1344,9 @@ mod tests {
             }),
             ..volume.clone()
         };
-        assert!(!resolve_material(Some(&textured), &lowered).0.draws_nothing());
+        assert!(!resolve_material(Some(&textured), &lowered)
+            .0
+            .draws_nothing());
 
         // A texture the deployment does not ship falls back to colour only, which is what
         // the explorer draws too — still nothing.
@@ -1364,7 +1366,9 @@ mod tests {
             transparency_mode: Some(TRANSPARENCY_OPAQUE),
             ..volume.clone()
         };
-        assert!(!resolve_material(Some(&opaque_zero), &lowered).0.draws_nothing());
+        assert!(!resolve_material(Some(&opaque_zero), &lowered)
+            .0
+            .draws_nothing());
         let faint = MaterialFields {
             color: Some([1.0, 1.0, 1.0, 0.02]),
             ..volume

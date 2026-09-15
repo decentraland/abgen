@@ -233,7 +233,11 @@ pub fn state_digest(state: &serde_json::Value) -> String {
 /// needed at all before paying for one.
 pub fn descriptor_only(
     params: &GenerateParams,
-) -> Result<(String, serde_json::Value, Vec<primitives::PrimitivePlacement>)> {
+) -> Result<(
+    String,
+    serde_json::Value,
+    Vec<primitives::PrimitivePlacement>,
+)> {
     let (client, ent) = resolve_scene(params)?;
     let (doc, primitives) = descriptor_for(&client, &ent, &params.iss)?;
     Ok((ent.entity_id.to_lowercase(), doc, primitives))
@@ -1210,7 +1214,10 @@ mod lod_state_tests {
         );
 
         let moved = doc("bafkone", "bafkother");
-        assert_ne!(state_digest(&lod_state(&a, &[])), state_digest(&lod_state(&moved, &[])));
+        assert_ne!(
+            state_digest(&lod_state(&a, &[])),
+            state_digest(&lod_state(&moved, &[]))
+        );
     }
 
     #[test]
@@ -1226,14 +1233,24 @@ mod lod_state_tests {
             scale: [1.0; 3],
         };
         let one = state_digest(&lod_state(&d, std::slice::from_ref(&prim)));
-        assert_ne!(one, state_digest(&lod_state(&d, &[])), "primitives must count");
+        assert_ne!(
+            one,
+            state_digest(&lod_state(&d, &[])),
+            "primitives must count"
+        );
 
         prim.scale = [2.0, 1.0, 1.0];
-        assert_ne!(one, state_digest(&lod_state(&d, std::slice::from_ref(&prim))));
+        assert_ne!(
+            one,
+            state_digest(&lod_state(&d, std::slice::from_ref(&prim)))
+        );
 
         prim.scale = [1.0; 3];
         prim.material.color = [1.0, 0.0, 0.0, 1.0];
-        assert_ne!(one, state_digest(&lod_state(&d, std::slice::from_ref(&prim))));
+        assert_ne!(
+            one,
+            state_digest(&lod_state(&d, std::slice::from_ref(&prim)))
+        );
     }
 }
 

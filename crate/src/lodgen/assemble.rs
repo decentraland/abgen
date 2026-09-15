@@ -3,11 +3,11 @@ use rayon::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
 use std::collections::BTreeMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Mutex;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use super::model::{self, AlphaClass, LodMaterial, LodModel, LodPrimitive};
 use super::placements::Placement;
@@ -397,8 +397,10 @@ pub fn assemble(
     cache_dir: Option<&Path>,
     lane: model::MatLane,
 ) -> Result<LodModel> {
-    assemble_recording(client, scene, placements, primitives, level, cache_dir, lane)
-        .map(|(model, _)| model)
+    assemble_recording(
+        client, scene, placements, primitives, level, cache_dir, lane,
+    )
+    .map(|(model, _)| model)
 }
 
 /// [`assemble`], also returning every deployment file the assembly read, as
@@ -1921,7 +1923,10 @@ mod tests {
         .into_iter()
         .map(|(f, h)| (f.to_string(), h.to_string()))
         .collect();
-        assert_eq!(deps, want, "lower-cased names of what was fetched, nothing else");
+        assert_eq!(
+            deps, want,
+            "lower-cased names of what was fetched, nothing else"
+        );
     }
 
     #[test]

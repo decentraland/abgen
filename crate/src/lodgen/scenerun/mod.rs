@@ -158,9 +158,10 @@ fn run_scene_with(
     let read_client = client.clone();
     // Every deployment file the scene reads at run time is an input to its placements,
     // so a reuse check must see it change; record what was served under which hash.
-    let files_read = std::sync::Arc::new(std::sync::Mutex::new(
-        std::collections::BTreeMap::<String, String>::new(),
-    ));
+    let files_read = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
+        String,
+        String,
+    >::new()));
     let recorder = files_read.clone();
     let read_file: ReadFileFn = Box::new(move |name| {
         let lower = name.to_lowercase();
@@ -183,10 +184,7 @@ fn run_scene_with(
         return Ok(None);
     }
     let mut placements = crdt::placements_from_crdt(&outcome.stream, &content);
-    placements.files_read = files_read
-        .lock()
-        .map(|m| m.clone())
-        .unwrap_or_default();
+    placements.files_read = files_read.lock().map(|m| m.clone()).unwrap_or_default();
     Ok(Some(placements))
 }
 
