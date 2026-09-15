@@ -53,6 +53,11 @@ The not-served rows are the registry's signed/write/ops surface - they belong to
 dedicated registry deployment, not this converter. Ops routes abgen adds instead: `/ping`,
 `/health`, `/livez`, `/readyz`, `/metrics` (bearer-gated when `ABGEN_METRICS_BEARER_TOKEN` is set).
 
+`GET /health` carries two fields describing the running binary rather than its corpus: `version`
+(the crate version, matching the `abgen-v{version}-{target}` release artifact) and `pid` (this
+process's OS id). They exist for loopback supervision - a client that finds a server already bound
+to the port it wants can tell whether that server is the release it pins, and can signal it if not.
+
 On the index routes (`POST /entities/active|versions`), a connected content DB supplies real
 timestamps and deployer identity; without one, the built-in fallback serves the same shapes with
 `timestamp: 0` and an empty deployer.
