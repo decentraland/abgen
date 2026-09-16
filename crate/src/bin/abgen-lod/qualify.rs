@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use std::collections::{HashSet, VecDeque};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -47,6 +47,10 @@ struct Options {
     out: PathBuf,
     report: PathBuf,
     cache: PathBuf,
+    /// Root of the second, published-layout copy of everything this run builds. Its tree is
+    /// the S3 key layout `lambda/src/lod.rs` writes, so it uploads with a plain `s3 sync` and
+    /// no flattening step. See [`publish_build`].
+    publish: PathBuf,
     jobs: usize,
     max_attempts: u32,
     snapshot_passes: usize,
@@ -221,6 +225,7 @@ fn parse(argv: &[String]) -> Result<Options> {
     let mut out = PathBuf::from("lod-qualification");
     let mut report = None;
     let mut cache = None;
+    let mut publish = None;
     let mut jobs = abgen::clihelp::default_lod_concurrency();
     let mut max_attempts = DEFAULT_ATTEMPTS;
     let mut snapshot_passes = DEFAULT_SNAPSHOT_PASSES;
@@ -251,6 +256,7 @@ fn parse(argv: &[String]) -> Result<Options> {
             "--out" => out = PathBuf::from(value(argv, &mut i)?),
             "--report" => report = Some(PathBuf::from(value(argv, &mut i)?)),
             "--cache" => cache = Some(PathBuf::from(value(argv, &mut i)?)),
+            "--publish-dir" => publish = Some(PathBuf::from(value(argv, &mut i)?)),
             "-j" | "--jobs" => jobs = value(argv, &mut i)?.parse().context("--jobs")?,
             "--attempts" => max_attempts = value(argv, &mut i)?.parse().context("--attempts")?,
             "--snapshot-passes" => {
@@ -335,12 +341,14 @@ fn parse(argv: &[String]) -> Result<Options> {
     }
     let report = report.unwrap_or_else(|| out.join("qualification.json"));
     let cache = cache.unwrap_or_else(|| out.join(".cache"));
+    let publish = publish.unwrap_or_else(|| out.join("publish"));
     Ok(Options {
         catalyst,
         worlds_url,
         out,
         report,
         cache,
+        publish,
         jobs,
         max_attempts,
         snapshot_passes,
@@ -746,6 +754,136 @@ fn discovery_failure(stage: &str, error: anyhow::Error) -> SceneRecord {
     )
 }
 
+/// Write `bytes` at `path` through a uniquely named temporary, so a reader (or a publishing
+/// sync) never observes a half-written record. Workers race on the same digest whenever two
+/// scenes really are equal, which is the case the record exists to describe.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Mirror one finished build into the published key layout and file its reuse record there.
+///
+/// `opts.publish` ends up holding the keys `lambda/src/lod.rs` puts in the space, nested under
+/// the single `LOD/` prefix [`publish_key`] applies, so a finished run uploads with a plain
+/// `s3 sync` and no flattening step:
+///
+/// ```text
+/// <publish>/LOD/{level}/{sid}_{level}_{platform}
+/// <publish>/LOD/lods-unity/manifests/{sid}_InitialSceneState.json
+/// <publish>/LOD/lods-unity/lods/{sid}_{level}.glb
+/// <publish>/LOD/lod-reuse/by-state/{digest}.json
+/// <publish>/LOD/lod-reuse/by-inputs/{digest}.json  (only when the scene has pinnable inputs)
+/// ```
+///
+/// The per-scene tree under `<out>/{source}/{sid}/` stays where it is and every entry here is
+/// a hard link into it, so the second layout costs an inode per object and no bytes. A link
+/// that cannot be made (a `--publish-dir` on another filesystem) falls back to a copy.
+///
+/// Called only for a build that passed every gate, matching the lambda: it bails before
+/// publishing anything when its self-gate fails, so a known-bad bundle never reaches S3 and
+/// never stands in for a later scene. A failure here costs a later deployment its reuse, never
+/// this run, so it is reported and swallowed.
+fn publish_build(job: &Job, opts: &Options, outcome: &abgen::lodgen::GenerateOutcome) {
+    let scene_dir = opts
+        .out
+        .join(component(&job.source))
+        .join(&outcome.scene_id);
+    let objects = abgen::lods::published_objects(&scene_dir, &opts.levels);
+    if objects.is_empty() {
+        eprintln!(
+            "publish: {}: published nothing; no record filed",
+            outcome.scene_id
+        );
+        return;
+    }
+    let mut keys = Vec::with_capacity(objects.len());
+    for object in &objects {
+        let key = publish_key(&object.key);
+        if let Err(e) = link_into(&object.path, &opts.publish.join(&key)) {
+            eprintln!("publish: {}: could not place {key} ({e})", outcome.scene_id);
+        }
+        keys.push(key);
+    }
+    let record = abgen::lodgen::reuse::record_for_build(
+        outcome,
+        &keys,
+        &opts.levels,
+        &opts.platforms,
+        outcome.inputs.clone(),
+    );
+    let text = match serde_json::to_string_pretty(&record) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!(
+                "reuse: {}: could not serialize the record ({e})",
+                outcome.scene_id
+            );
+            return;
+        }
+    };
+    let mut targets = vec![abgen::lodgen::reuse::state_index_key(&record.state_digest)];
+    if let Some(digest) = &record.inputs_digest {
+        targets.push(abgen::lodgen::reuse::inputs_index_key(digest));
+    }
+    for key in targets {
+        let path = opts.publish.join(publish_key(&key));
+        if let Err(e) = write_atomic(&path, text.as_bytes()) {
+            eprintln!(
+                "reuse: {}: could not write {} ({e})",
+                outcome.scene_id,
+                path.display()
+            );
+        }
+    }
+}
+
+/// Nest one published key under the run's single `LOD/` prefix, so the whole upload is one
+/// top-level folder in the destination bucket rather than three siblings:
+///
+/// ```text
+/// LOD/{level}/…            (bundles already carry the prefix and are left alone)
+/// LOD/lods-unity/…         (ISS descriptors, published GLBs)
+/// LOD/lod-reuse/…          (the reuse records)
+/// ```
+///
+/// This deliberately diverges from the flat key space `lambda/src/lod.rs` writes: the lambda
+/// puts `lods-unity/…` and `lod-reuse/…` beside `LOD/`, and `crate::space::object_headers`
+/// keys its Cache-Control off those un-nested prefixes. A consumer of this tree therefore
+/// resolves the ISS descriptor under `LOD/lods-unity/manifests/`, not `lods-unity/manifests/`.
+fn publish_key(key: &str) -> String {
+    if key.starts_with("LOD/") {
+        key.to_string()
+    } else {
+        format!("LOD/{key}")
+    }
+}
+
+/// Hard-link `src` to `dst`, replacing whatever is there. Two scenes never share a published
+/// key, but a retried attempt re-links its own, so an existing `dst` is expected and replaced
+/// rather than treated as an error. Falls back to a copy when the two paths are not on the
+/// same filesystem.
+fn link_into(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if let Some(dir) = dst.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let _ = std::fs::remove_file(dst);
+    match std::fs::hard_link(src, dst) {
+        Ok(()) => Ok(()),
+        Err(_) => std::fs::copy(src, dst).map(|_| ()),
+    }
+}
+
 fn run_one_attempt(job: &Job, opts: &Options) -> Result<SceneRecord> {
     let params = GenerateParams {
         scene: job.entity_id.clone(),
@@ -790,6 +928,11 @@ fn run_one_attempt(job: &Job, opts: &Options) -> Result<SceneRecord> {
         ok: identity_ok,
         detail: format!("resolved {} expected {}", outcome.entity_id, job.entity_id),
     });
+    // Only a build that passed every gate may stand in for a later one.
+    if failed == 0 && identity_ok {
+        publish_build(job, opts, &outcome);
+    }
+
     Ok(SceneRecord {
         entity_id: job.entity_id.clone(),
         source: job.source.clone(),
@@ -1307,6 +1450,7 @@ mod tests {
             out: root.join("out"),
             report: root.join("qualification.json"),
             cache: root.join("cache"),
+            publish: root.join("publish"),
             jobs: 3,
             max_attempts: 1,
             snapshot_passes: 3,

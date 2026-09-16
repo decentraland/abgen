@@ -425,6 +425,10 @@ pub struct GenerateOutcome {
     /// glTF, buffer and texture the assembly fetched. A later deployment that serves each of
     /// these under the same hash, with the same code and snapshot, builds the same bundles.
     pub dependencies: BTreeMap<String, String>,
+    /// The scene's pinnable reuse inputs, or `None` when it has none (see
+    /// [`super::reuse::inputs`]). Carried out of the build so a caller can file the reuse
+    /// record without resolving the entity a second time.
+    pub inputs: Option<super::reuse::Inputs>,
 }
 
 pub fn normalize_levels(levels: &[u32]) -> Result<Vec<u32>> {
@@ -748,6 +752,16 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     let sid = ent.entity_id.to_lowercase();
     let mut log: Vec<String> = Vec::new();
     log.push(format!("entity: {}", ent.entity_id));
+    // Derived here, where the resolved entity is in hand, so the reuse record a caller files
+    // needs no second resolution. A scene without pinnable inputs is the normal case (SDK6,
+    // or SDK7 with no code): its state alone decides reuse.
+    let reuse_inputs = match super::reuse::inputs(&ent) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            log.push(format!("reuse: no pinnable inputs ({e})"));
+            None
+        }
+    };
     let (base, parcels) = scene_geometry(&ent)?;
     let parcel_count = parcels.len();
     log.push(format!("base={},{} parcels={parcel_count}", base.0, base.1));
@@ -1183,6 +1197,7 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         log,
         lod_state,
         dependencies,
+        inputs: reuse_inputs,
     })
 }
 

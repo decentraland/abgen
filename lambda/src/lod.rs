@@ -1,6 +1,6 @@
 use crate::config::Config;
 use abgen::live::Proxy;
-use abgen::lodgen::reuse::{self, Inputs, ReuseRecord};
+use abgen::lodgen::reuse::{self, record_for_build, Inputs, ReuseRecord};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -456,29 +456,6 @@ fn republish(
     Ok(Some(summary))
 }
 
-/// The record a fresh build files itself under.
-pub fn record_for_build(
-    outcome: &abgen::lodgen::GenerateOutcome,
-    keys: &[String],
-    levels: &[u32],
-    platforms: &[String],
-    inputs: Option<Inputs>,
-) -> ReuseRecord {
-    ReuseRecord {
-        built_by: outcome.scene_id.clone(),
-        generation: abgen::lodgen::LOD_GENERATION.to_string(),
-        levels: levels.to_vec(),
-        platforms: platforms.to_vec(),
-        keys: keys.to_vec(),
-        dependencies: outcome.dependencies.clone(),
-        unresolved: outcome.unresolved_srcs.clone(),
-        inputs_digest: inputs.as_ref().map(reuse::inputs_digest),
-        inputs,
-        state_digest: abgen::lodgen::state_digest(&outcome.lod_state),
-        state: outcome.lod_state.clone(),
-    }
-}
-
 /// File `record` under both of its content addresses. A failure here only costs a later
 /// deployment its reuse, never this job.
 fn publish_record(proxy: &Arc<Proxy>, record: &ReuseRecord) {
@@ -671,6 +648,7 @@ mod reuse_tests {
                 .into_iter()
                 .map(|(f, h)| (f.to_string(), h.to_string()))
                 .collect(),
+            inputs: None,
         };
         let keys = vec!["LOD/1/bafkscene_1_windows".to_string()];
         let inputs = Inputs {

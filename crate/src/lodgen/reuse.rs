@@ -107,6 +107,34 @@ pub fn inputs_digest(inputs: &Inputs) -> String {
     crate::hashes::sha256_hex(&serde_json::to_vec(inputs).unwrap_or_default())
 }
 
+/// The record a fresh build files itself under.
+///
+/// `keys` are the space keys the build published, in the shape
+/// [`crate::lods::published_objects`] returns. `inputs` is the build's pinnable inputs when
+/// it had any; [`super::GenerateOutcome::inputs`] carries them out of an offline build, and
+/// a caller that resolved the entity itself may pass its own.
+pub fn record_for_build(
+    outcome: &super::GenerateOutcome,
+    keys: &[String],
+    levels: &[u32],
+    platforms: &[String],
+    inputs: Option<Inputs>,
+) -> ReuseRecord {
+    ReuseRecord {
+        built_by: outcome.scene_id.clone(),
+        generation: super::LOD_GENERATION.to_string(),
+        levels: levels.to_vec(),
+        platforms: platforms.to_vec(),
+        keys: keys.to_vec(),
+        dependencies: outcome.dependencies.clone(),
+        unresolved: outcome.unresolved_srcs.clone(),
+        inputs_digest: inputs.as_ref().map(inputs_digest),
+        inputs,
+        state_digest: super::state_digest(&outcome.lod_state),
+        state: outcome.lod_state.clone(),
+    }
+}
+
 /// What one build published and what it was a function of.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]

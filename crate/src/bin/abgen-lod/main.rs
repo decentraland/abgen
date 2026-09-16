@@ -98,8 +98,8 @@ USAGE:
             [--fidelity] [--gpu]
   abgen-lod compare <ours> <reference> [--json]
   abgen-lod qualify-corpus --out DIR [--report FILE] [--cache DIR] [-j JOBS]
-            [--catalyst URL] [--worlds-url URL] [--platform windows,mac]
-            [--level 0,1]
+            [--publish-dir DIR] [--catalyst URL] [--worlds-url URL]
+            [--platform windows,mac] [--level 0,1]
             [--city-min -150] [--city-max 150] [--no-city] [--no-worlds]
             [--world NAME[,NAME...]] [--entity-ids FILE]
             [--attempts 3] [--snapshot-passes 8]
@@ -122,8 +122,15 @@ qualify-corpus: snapshots active Genesis City deployments from the configured
   Catalyst and all deployed scenes from the paginated Worlds API, converts
   immutable entity hashes into scratch output with bounded workers, rechecks
   the snapshot, and writes a versioned JSON report plus Explorer risk
-  candidates. It never publishes. Any discovery, generation, self-gate, or
-  snapshot-stability failure produces exit status 1. --reference-cdn BASE
+  candidates. It uploads nothing. Any discovery, generation, self-gate, or
+  snapshot-stability failure produces exit status 1. Alongside the per-scene
+  trees it mirrors every scene that passed its gates into --publish-dir
+  (default {out}/publish) as hard links, in the S3 key layout the lambda
+  publishes nested under one top-level LOD/ folder: LOD/{level}/ for the
+  bundles, LOD/lods-unity/manifests/ for the ISS descriptors,
+  LOD/lods-unity/lods/ for the GLBs and LOD/lod-reuse/ for the reuse records.
+  A finished run therefore uploads with a plain `aws s3 sync` and no
+  flattening step. --reference-cdn BASE
   additionally fetches the production bundle at
   BASE/LOD/{level}/{sid}_{level}_{platform} for every built level/platform
   and records a `compare`-style inventory of both sides, the delta and the
