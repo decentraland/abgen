@@ -57,8 +57,7 @@ pub trait SceneEngine {
     fn run_capture(&self, job: SceneJob) -> anyhow::Result<CaptureOutcome>;
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(feature = "scene-runtime")]
+#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
 pub(crate) fn initial_state_parts(main_crdt: Option<&[u8]>) -> Vec<Vec<u8>> {
     let stream = crdt::synthetic_initial_state(None);
     let mut parts = Vec::new();
