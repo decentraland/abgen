@@ -97,6 +97,7 @@ pub mod resolver;
 pub mod ress;
 pub mod sbp_order;
 pub mod skeleton;
+pub mod skinbounds;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod sns;
 #[cfg(not(target_arch = "wasm32"))]
