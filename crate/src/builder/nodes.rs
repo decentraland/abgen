@@ -310,7 +310,7 @@ impl<'a> Builder<'a> {
             scene.nodes.iter().map(|n| n.children.clone()).collect()
         };
         for (smr_pid, go_pid, mesh_pid, mat_pid, skin_idx, blend_shape_weights) in pending {
-            let (bones, root_bone) = match skin_idx {
+            let (bones, root_bone, root_joint) = match skin_idx {
                 Some(si) => {
                     let skin = &scene.skins[si];
                     let bs: Vec<Value> = skin
@@ -323,22 +323,22 @@ impl<'a> Builder<'a> {
                         joints: &skin.joints,
                         skeleton: skin.skeleton,
                     };
-                    let rb = match skeleton::resolve_root_joint(&view) {
-                        Some(rj) if self.node_tr.contains_key(&rj) => {
-                            crate::value::pptr(0, self.node_tr[&rj])
-                        }
-                        _ => crate::value::pptr(0, 0),
+                    let root_joint = skeleton::resolve_root_joint(&view)
+                        .filter(|rj| self.node_tr.contains_key(rj));
+                    let rb = match root_joint {
+                        Some(rj) => crate::value::pptr(0, self.node_tr[&rj]),
+                        None => crate::value::pptr(0, 0),
                     };
-                    (bs, rb)
+                    (bs, rb, root_joint)
                 }
-                None => (Vec::new(), crate::value::pptr(0, 0)),
+                None => (Vec::new(), crate::value::pptr(0, 0), None),
             };
             let base = self.base_clone("SkinnedMeshRenderer");
             let mats: Vec<Value> = mat_pid
                 .into_iter()
                 .map(|p| crate::value::pptr(0, p))
                 .collect();
-            let smr = mesh_layout::skinned_mesh_renderer_tree(
+            let mut smr = mesh_layout::skinned_mesh_renderer_tree(
                 &base,
                 go_pid,
                 mesh_pid,
@@ -347,6 +347,35 @@ impl<'a> Builder<'a> {
                 root_bone,
                 &blend_shape_weights,
             );
+            // Animated skins ship a baked m_AABB covering every clip instead of
+            // relying on Unity's one-shot dirty recompute, which only ever sees
+            // the bind pose (see skinbounds.rs).
+            if let (Some(si), Some(rj)) = (skin_idx, root_joint) {
+                if self.has_gltf_animations() {
+                    let bone_boxes = self
+                        .objects
+                        .get(&mesh_pid)
+                        .map(|(_, mesh)| skinbounds::bone_boxes_from_mesh(mesh))
+                        .unwrap_or_default();
+                    let input = skinbounds::SkinBoundsInput {
+                        gltf: &self.gltf_json,
+                        buffers: &self.gltf_buffers,
+                        joints: &scene.skins[si].joints,
+                        root: rj,
+                        bone_boxes: &bone_boxes,
+                    };
+                    if let Some((c, e)) = skinbounds::bake_skinned_aabb(&input) {
+                        smr.insert(
+                            "m_AABB",
+                            map! {
+                                "m_Center" => map!{"x" => c[0], "y" => c[1], "z" => c[2]},
+                                "m_Extent" => map!{"x" => e[0], "y" => e[1], "z" => e[2]},
+                            },
+                        );
+                        smr.insert("m_DirtyAABB", false);
+                    }
+                }
+            }
 
             if let Some(slot) = self.objects.get_mut(&smr_pid) {
                 slot.1 = smr;
