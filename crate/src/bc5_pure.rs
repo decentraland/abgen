@@ -1,15 +1,10 @@
+#[cfg(target_arch = "aarch64")]
+use crate::gpu::corelib::bc5::write_alpha_block;
+use crate::gpu::corelib::bc5::{fix_range, write_alpha_block5, write_alpha_block7};
+use crate::gpu::corelib::mips::pad_to_block_size;
 use std::sync::OnceLock;
 
 const BC5_BLOCK_SIZE: usize = 16;
-
-fn fix_range(min: &mut u8, max: &mut u8, steps: u8) {
-    if (*max - *min) < steps {
-        *max = (i32::from(*min) + i32::from(steps)).min(i32::from(u8::MAX)) as u8;
-    }
-    if (*max - *min) < steps {
-        *min = (i32::from(*max) - i32::from(steps)).max(0) as u8;
-    }
-}
 
 /// Builds both codebooks from the (already clamped) channel ranges.
 fn build_codebooks(min5: u8, max5: u8, min7: u8, max7: u8) -> ([u8; 8], [u8; 8]) {
@@ -29,55 +24,6 @@ fn build_codebooks(min5: u8, max5: u8, min7: u8, max7: u8) -> ([u8; 8], [u8; 8])
         codes7[1 + i as usize] = (((7 - i) * i32::from(min7) + i * i32::from(max7)) / 7) as u8;
     }
     (codes5, codes7)
-}
-
-fn write_alpha_block(alpha0: u8, alpha1: u8, indices: &[u8; 16], block: &mut [u8]) {
-    let mut buf = [0u8; 8];
-    buf[0] = alpha0;
-    buf[1] = alpha1;
-    for i in 0..2 {
-        let mut value = 0u32;
-        for j in 0..8 {
-            value |= u32::from(indices[8 * i + j]) << (3 * j);
-        }
-        for j in 0..3 {
-            buf[2 + i * 3 + j] = ((value >> (8 * j)) & 0xFF) as u8;
-        }
-    }
-    block.copy_from_slice(&buf);
-}
-
-fn write_alpha_block5(alpha0: u8, alpha1: u8, indices: &[u8; 16], block: &mut [u8]) {
-    if alpha0 > alpha1 {
-        let mut swapped = *indices;
-        for index in &mut swapped[..] {
-            *index = match *index {
-                0 => 1,
-                1 => 0,
-                x @ 2..=5 => 7 - x,
-                x => x,
-            }
-        }
-        write_alpha_block(alpha1, alpha0, &swapped, block);
-    } else {
-        write_alpha_block(alpha0, alpha1, indices, block);
-    }
-}
-
-fn write_alpha_block7(alpha0: u8, alpha1: u8, indices: &[u8; 16], block: &mut [u8]) {
-    if alpha0 < alpha1 {
-        let mut swapped = *indices;
-        for index in &mut swapped[..] {
-            *index = match *index {
-                0 => 1,
-                1 => 0,
-                x => 9 - x,
-            }
-        }
-        write_alpha_block(alpha1, alpha0, &swapped, block);
-    } else {
-        write_alpha_block(alpha0, alpha1, indices, block);
-    }
 }
 
 fn fit_codes_scalar(vals: &[u8; 16], codes: &[u8; 8], indices: &mut [u8; 16]) -> u32 {
@@ -126,7 +72,6 @@ pub(crate) fn encode_bc4_channel_scalar(vals: &[u8; 16], block: &mut [u8]) {
     fix_range(&mut min7, &mut max7, 7);
 
     let (codes5, codes7) = build_codebooks(min5, max5, min7, max7);
-
     let mut indices5 = [0u8; 16];
     let mut indices7 = [0u8; 16];
     let err5 = fit_codes_scalar(vals, &codes5, &mut indices5);
@@ -341,26 +286,6 @@ pub(crate) fn repack_for_bc5(rgba: &[u8]) -> Vec<u8> {
         out[i * 4 + 3] = 255;
     }
     out
-}
-
-fn pad_to_block_size(rgba: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize) {
-    let pw = (w + 3) & !3;
-    let ph = (h + 3) & !3;
-    if pw == w && ph == h {
-        return (rgba.to_vec(), w, h);
-    }
-
-    let mut out = vec![0u8; pw * ph * 4];
-    for y in 0..ph {
-        let sy = y % h;
-        for x in 0..pw {
-            let sx = x % w;
-            let s = (sy * w + sx) * 4;
-            let d = (y * pw + x) * 4;
-            out[d..d + 4].copy_from_slice(&rgba[s..s + 4]);
-        }
-    }
-    (out, pw, ph)
 }
 
 /// 2x2 rounding average for even dimensions: `(a+b+c+d+2)>>2` per channel,

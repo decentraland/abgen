@@ -121,6 +121,8 @@ pub struct Material {
     pub tex_uv_channels: std::collections::BTreeMap<String, i64>,
     pub uses_uv_channel_select: bool,
     pub uses_spec_gloss: bool,
+    /// `KHR_materials_transmission` present (glTFast imports it as a blended surface).
+    pub uses_transmission: bool,
     pub spec_gloss_image: Option<TexRef>,
     pub specular_factor: [f64; 3],
     pub glossiness_factor: f64,

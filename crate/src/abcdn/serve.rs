@@ -14,27 +14,21 @@ use crate::resolver::resolve_with_casing;
 fn binary_content_type(etag_source: &str) -> &'static str {
     if etag_source.ends_with(".manifest") {
         "text/cache-manifest"
-    } else if etag_source.ends_with(".pack") || etag_source.ends_with(".pack.br") {
+    } else if etag_source.ends_with(".pack") {
         "application/octet-stream"
     } else {
         "application/wasm"
     }
 }
 
-fn immutable_cache_control(is_brotli: bool) -> &'static str {
-    if is_brotli {
-        "public,no-transform,max-age=31536000,immutable"
-    } else {
-        "public,max-age=31536000,immutable"
-    }
-}
+const IMMUTABLE_CACHE_CONTROL: &str = "public,max-age=31536000,immutable";
 
 fn apply_cors(resp: &mut Response) {
     let h = resp.headers_mut();
     h.insert("Access-Control-Allow-Origin", "*".parse().unwrap());
     h.insert(
         "Access-Control-Expose-Headers",
-        "ETag, Content-Range, Accept-Ranges, Content-Length, Content-Encoding"
+        "ETag, Content-Range, Accept-Ranges, Content-Length"
             .parse()
             .unwrap(),
     );
@@ -131,7 +125,6 @@ pub async fn serve_binary(
     key: &str,
     exact: &Path,
     etag_source: &str,
-    is_brotli: bool,
     method: &Method,
     headers: &HeaderMap,
 ) -> Response {
@@ -151,10 +144,7 @@ pub async fn serve_binary(
             let mut resp = StatusCode::NOT_MODIFIED.into_response();
             let h = resp.headers_mut();
             h.insert("ETag", etag.parse().unwrap());
-            h.insert(
-                "Cache-Control",
-                immutable_cache_control(is_brotli).parse().unwrap(),
-            );
+            h.insert("Cache-Control", IMMUTABLE_CACHE_CONTROL.parse().unwrap());
             apply_cors(&mut resp);
             return resp;
         }
@@ -165,18 +155,11 @@ pub async fn serve_binary(
         let h = resp.headers_mut();
         h.insert("Content-Type", content_type.parse().unwrap());
         h.insert("ETag", etag.parse().unwrap());
-        h.insert(
-            "Cache-Control",
-            immutable_cache_control(is_brotli).parse().unwrap(),
-        );
-        if is_brotli {
-            h.insert("Content-Encoding", "br".parse().unwrap());
-        } else {
-            h.insert("Accept-Ranges", "bytes".parse().unwrap());
-        }
+        h.insert("Cache-Control", IMMUTABLE_CACHE_CONTROL.parse().unwrap());
+        h.insert("Accept-Ranges", "bytes".parse().unwrap());
     };
 
-    if !is_brotli {
+    {
         let range_header = headers.get("range").and_then(|v| v.to_str().ok());
         match parse_range_header(range_header, Some(size)) {
             Some(ParsedRange::Unsatisfiable) => {

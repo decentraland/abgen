@@ -101,11 +101,19 @@ pub(super) fn build_lod_material_tree(
         lod_tex_env("_SpecGlossMap", (0, 0), (1.0, 1.0), (0.0, 0.0)),
     ];
 
+    // Blend state per class as the production converter ships it
+    // (LODConversion.cs:513-551, serialized under the URP property names
+    // DCL/Scene_TexArray declares): transparent = alpha blend, no depth
+    // write, both colour and alpha blending One / OneMinusSrcAlpha;
+    // cutout = opaque blend with depth write and shader-side alpha test;
+    // opaque = the shader defaults.
     let fid_blend = transparent && lod.fidelity;
     let alpha_clip = if masked { 1.0 } else { 0.0 };
     let alpha_to_mask = if masked { 1.0 } else { 0.0 };
     let cutoff = 0.5;
     let dst_blend = if transparent { 10.0 } else { 0.0 };
+    let dst_blend_alpha = if transparent { 10.0 } else { 0.0 };
+    let z_write = if transparent { 0.0 } else { 1.0 };
     let surface = if masked || transparent { 1.0 } else { 0.0 };
     let floats: Vec<(&str, f64)> = vec![
         ("_AddPrecomputedVelocity", 0.0),
@@ -121,7 +129,7 @@ pub(super) fn build_lod_material_tree(
         ("_DetailAlbedoMapScale", 1.0),
         ("_DetailNormalMapScale", 1.0),
         ("_DstBlend", dst_blend),
-        ("_DstBlendAlpha", 0.0),
+        ("_DstBlendAlpha", dst_blend_alpha),
         ("_EnvironmentReflections", if fid_blend { 0.0 } else { 1.0 }),
         ("_GlossMapScale", 1.0),
         ("_Glossiness", 0.0),
@@ -132,12 +140,14 @@ pub(super) fn build_lod_material_tree(
         ("_Parallax", 0.02),
         ("_QueueOffset", 0.0),
         ("_ReceiveShadows", 1.0),
+        // Production never writes _Smoothness, so the DCL/Scene_TexArray
+        // default (0.5) ships on every merged LOD material.
         (
             "_Smoothness",
             if lod.fidelity {
                 (1.0 - m.roughness).clamp(0.0, 1.0)
             } else {
-                0.0
+                0.5
             },
         ),
         ("_SmoothnessTextureChannel", 0.0),
@@ -148,14 +158,27 @@ pub(super) fn build_lod_material_tree(
         ("_UVSec", 0.0),
         ("_WorkflowMode", 1.0),
         ("_XRMotionVectorsPass", 1.0),
-        ("_ZWrite", if fid_blend { 0.0 } else { 1.0 }),
+        ("_ZWrite", z_write),
     ];
     let floats_v: Vec<Value> = floats.into_iter().map(|(n, v)| arr![n, v]).collect();
 
-    let mut lod_base_color = materials::base_color_gamma_encoded(m.base_color);
-    if transparent && !lod.fidelity {
-        lod_base_color[3] = 0.8_f32 as f64;
-    }
+    // The converter re-parents the imported material onto DCL/Scene_TexArray
+    // (LODConversion.cs:500-501); glTFast keeps baseColorFactor under its
+    // own property name, so `_BaseColor` is the shader default, white, and
+    // only the transparent class overrides its alpha (LODConversion.cs:527).
+    // The bake has already folded the factor into the atlas texels. Fidelity
+    // keeps the per-texel alpha instead of the constant 0.8. The regular
+    // material lane gamma-encodes the factor instead (materials.rs).
+    let lod_base_color = [
+        1.0,
+        1.0,
+        1.0,
+        if transparent && !lod.fidelity {
+            0.8_f32 as f64
+        } else {
+            1.0
+        },
+    ];
     let emission_color = if emis_pid != (0, 0) {
         [1.0, 1.0, 1.0, 1.0]
     } else {

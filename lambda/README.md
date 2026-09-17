@@ -30,7 +30,7 @@ entities. The Lambda handler enables it once and clears it after each entity.
 | 4 | registry SQS notification | deferred (registry duplicate is a follow-up) |
 | 5 | already-converted skip (entity-level manifest check) **and** per-file asset reuse (space probe per digest-named glb) | done |
 | 6 | container image (`nix build .#lambdaImage`) | done |
-| 7 | LOD jobs — regenerated from the scene via `lodgen`, opt-in with `ENABLE_LODS` | done (FBX sources still not transcoded) |
+| 7 | LOD generation — a scene conversion continues into the `lodgen` LOD lane once its bundles are notified, opt-in with `ENABLE_LODS` | done |
 
 ## Local run (no AWS)
 
@@ -64,7 +64,8 @@ all hits.
 | `ABGEN_REDIS_URL` | — (off) | `redis://host[:port]` (or `rediss://…` for TLS) — enables the shared hit-cache in front of S3 existence probes (see below) |
 | `ABGEN_REDIS_TTL_SECONDS` | `86400` | TTL on cached positive probes |
 | `ABGEN_HTTP_SECRET` | — (**fail-closed**) | shared secret the Function URL POST path requires in `x-abgen-secret`; unset means every HTTP invocation is refused with `503` |
-| `ENABLE_LODS` | off | generate LOD levels 0+1 for `lods` jobs instead of acking and skipping them (see [LOD jobs](#lod-jobs)) |
+| `ENABLE_LODS` | off | after a scene's asset bundles are published and notified, build (or reuse) its `LOD_LEVELS` in the same job (see [LOD generation](#lod-generation)) |
+| `LOD_LEVELS` | `1` | comma-separated LOD levels the LOD lane builds and publishes (`0,1` for both); level 2 is refused |
 | `ALLOWED_CONTENT_SERVER_HOSTS` | — (**fail-open**) | comma-separated allowlist of hosts an event's `contentServerUrl` may name; **unset means any https host is accepted**, so every deployment should set it. Scheme/shape validation (https only, no userinfo) applies regardless — allowlist or not, a plaintext or internal-IP URL is rejected. The `lambdaImage` bakes in `peer.decentraland.org`; a function env var overrides it. |
 | `ABGEN_EMF_NAMESPACE` | — (off) | CloudWatch namespace for EMF metrics (e.g. `abgen/lambda`); unset means no recorder is installed and every `metrics::` call stays a no-op |
 | `ABGEN_LOG_FORMAT` | plain text | `json` for JSON log lines |
@@ -88,12 +89,11 @@ with `rawMessageDelivery: true` receives byte-compatible bodies:
 - already-converted skips publish `statusCode: 13`, matching prod's
   triage fast path — one event per processed job, and a redelivered SQS
   message re-notifies if an earlier publish failed after upload
-- a successful `ENABLE_LODS=1` LOD job publishes one event per supported
-  platform with `isLods: true` and `statusCode: 0`, mirroring upstream's
-  `publishFinishedEvent(…, isLods: !!job.lods)`; the two LOD *skip* branches
-  (`lods-disabled`, `lods-no-supported-platform`) ack the message and
-  deliberately publish nothing — with LODs off, generation (and its events)
-  stays on the Unity pipeline
+- the LOD step of a scene conversion (`ENABLE_LODS=1`) publishes nothing:
+  `isLods` is always `false`. The registry's per-platform `lods` status is
+  not maintained by this pipeline and must not be read as one; the
+  `lod-reuse/` records and the per-scene `LOD/…` keys are the record of
+  which LODs exist
 
 Publish failures fail the invocation (SQS redelivers); with the ARN unset
 nothing is published and the run reports `"notified": false`.
@@ -228,8 +228,17 @@ extra dimensions.
 | wearable & emote bundles (entity-scoped) | `{AB_VERSION}/{entityId}/{bundleName}` |
 | manifests | `manifest/{entityId}_{platform}.json` |
 | scene sources (`main.crdt`, `scene.json`, main script; clean scene builds) | `{AB_VERSION}/{entityId}/{file}` |
-| LOD bundles (+ `.br`), `ENABLE_LODS=1` only | `LOD/{level}/{sceneId}_{level}_{platform}` |
-| ISS descriptor (+ `.br`), `ENABLE_LODS=1` only | `lods-unity/manifests/{sceneId}_InitialSceneState.json` |
+| LOD bundles, `ENABLE_LODS=1` | `LOD/{level}/{sceneId}_{level}_{platform}` |
+| ISS descriptor, `ENABLE_LODS=1` | `lods-unity/manifests/{sceneId}_InitialSceneState.json` |
+| published LOD GLB (gltfpack layout, level 1 only), `ENABLE_LODS=1` | `lods-unity/lods/{sceneId}_1.glb` |
+| LOD reuse index, `ENABLE_LODS=1` | `lod-reuse/by-inputs/{digest}.json`, `lod-reuse/by-state/{digest}.json` (see [Reusing an unchanged build](#reusing-an-unchanged-build)) |
+
+The three LOD families are the production key set (consumer-server keys plus
+the converter's `LOD/1` bundles); `lods::published_objects` lists them for
+the live lane. Production publishes level 1 only — level 0
+is the client-side ISS assembly — so `LOD/0` is opt-in: the abcdn JIT lane
+builds `LOD_LEVELS = [1]`, `abgen-lod generate` takes `--level 0,1`, and the
+lambda's level set is the `LOD_LEVELS` env var (default `1`).
 
 ## Container image & Lambda settings
 
@@ -278,12 +287,12 @@ scene sources (`.js`/`.json`/`.crdt`) the direct-upload spelling
 (`lods-unity/manifests/…`) are `public, max-age=31536000` — the
 lod-generator-unity storage adapter's `CACHE_CONTROL_ONE_YEAR`, whose keys
 these are (they embed the content-addressed entity id; they are *not*
-rewritten-in-place consumer-server manifests). `.br` objects additionally
-carry `Content-Encoding: br`, like every brotli variant cdn-uploader
-writes. That is origin-level defense in depth — **cache policy still must
+rewritten-in-place consumer-server manifests). LOD reuse records
+(`lod-reuse/…`) *are* rewritten in place, by every deployment that reuses
+the build they describe, so they carry the manifests' no-cache policy.
+That is origin-level defense in depth — **cache policy still must
 live on the CDN distribution**: long/immutable TTLs for `{AB_VERSION}/…`
-(keys are content-addressed) and TTL 0 for `manifest/…`. No `.br` siblings
-of asset bundles (see step 3 note above). Two remaining divergences from
+(keys are content-addressed) and TTL 0 for `manifest/…`. No `.br` siblings of native AssetBundles or LOD artifacts (see step 3 note above). Two remaining divergences from
 cdn-uploader, both deliberate: no `decompressed-content-length` object
 metadata, and no `ACL: public-read` (grant reads via bucket policy /
 CloudFront OAC, not object ACLs).
@@ -302,41 +311,137 @@ are content-addressed, so a differing bundle gets a different name).
 
 SQS record batches whose bodies are catalyst `DeploymentToSqs` payloads
 (`{"entity":{"entityId":…},"contentServerUrls":[…]}`), or a plain
-`{"entityId":…, "contentServerUrl":…}` for manual invokes. LOD jobs
-(`lods` present) take the [LOD lane](#lod-jobs). `"force": true` in either
-shape bypasses the already-converted skip.
+`{"entityId":…, "contentServerUrl":…}` for manual invokes. A deployment
+without `contentServerUrls` is a parse failure, which retires the legacy
+LOD-generator messages (`lods` array, no server) that used to reach this
+queue. `"force": true` in either shape bypasses the already-converted skip.
 
-## LOD jobs
+## Reusing an unchanged build
 
-A deployment event with a `lods` array is a LOD job. Those URLs point at the
-legacy Unity generator's **FBX** sources; abgen has no FBX importer, so it
-does not transcode them. With `ENABLE_LODS=1` the handler instead
-*regenerates* the LODs from the scene entity through the same `lodgen` chain
-the abcdn server runs JIT (`abgen-lod generate`): resolve placements (ISS
-descriptor, else the embedded scene runtime) → assemble → crop → atlas →
-simplify → bundle, levels 0 and 1, for every configured platform that has a
-LOD lane (`windows|mac|linux`; `webgl` is dropped with a log line). The
-result passes the same structural self-gate as the JIT lane — a gate failure
-fails the job and publishes nothing — and is then uploaded under the
-unversioned `LOD/…` and `lods-unity/manifests/…` keys above, followed by one
-finished event per platform with `isLods: true` (see
-[Finished events](#finished-events-sns)).
+A scene redeployed with no change to its geometry produces byte-equal LOD bundles, so the
+second build is pure waste. A LOD job checks for that before paying for one, by content
+address: it never asks a registry who deployed before it, and it trusts nothing but the
+catalyst's listing and objects abgen itself wrote.
+
+Every build files a **reuse record** under two keys, both sha256 digests of what the build
+was a function of (`abgen::lodgen::reuse`):
+
+- `lod-reuse/by-inputs/{digest}.json` — the digest of the scene runtime's **inputs**: the
+  pipeline generation, the `main.crdt` hash, the base and parcels from `scene.json`, and
+  the hash of every `.js` file plus the scene's `main`. The runtime gives the scene no real
+  network and a fixed virtual clock, so equal inputs execute to equal placements. Only
+  SDK7 scenes have inputs; an SDK6 scene runs through an adaption layer fetched from the
+  network at build time, which nothing here can pin.
+- `lod-reuse/by-state/{digest}.json` — the digest of the **LOD state**: the descriptor
+  minus its `sceneId`, the SDK primitives the descriptor omits, and the generation. This
+  is everything a build is a function of once placements are known.
+
+The record names the scene whose per-scene keys hold the bundles (`builtBy`), what it
+built (`levels`, `platforms`, `keys`), every deployment file it read as `file -> hash`
+(`dependencies`: the code and snapshot, every file the runtime read, every glTF, buffer
+and texture the assembly fetched), the glTF sources it could not resolve (`unresolved`),
+and both documents in full.
+
+A job then decides in two tiers, cheapest first:
+
+1. **By inputs, no execution.** Hash this deployment's inputs, `GET` the record. On a hit,
+   check it covers the configured levels and platforms, that every recorded dependency is
+   still served under the same name with the same hash, and that no unresolved source is
+   now shipped. A thumbnail, an added asset nothing places or a scene description edit
+   pass; a texture re-uploaded under the same name does not, even though the descriptor
+   would never show it. Pass means copy.
+2. **By state, one execution.** Otherwise run the embedded scene runtime, derive the state
+   document, hash it, `GET` the record. Check coverage, full document equality (not just
+   the digest) and the same dependency rule. A code change that moved nothing lands here
+   and still reuses. This costs the execution and nothing downstream of it: no asset
+   download, no assemble, no atlas, no simplify, no bundling.
+3. Otherwise build, and file the result under both keys.
+
+On a copy, every bundle and the published glb are read from `builtBy`'s keys and written
+under this scene's names; a bundle the record promised but the bucket lacks falls through
+to a build. The descriptor is the one object not copied, since it names its own scene: tier
+1 republishes the previous one with `sceneId` replaced, tier 2 the freshly derived one.
+Both records are then rewritten with this scene as `builtBy`, so the pointer always follows
+the newest deployment holding the bytes and a cleanup of older ones does not turn the next
+job into a build. The job summary records which tier decided, under `lods.reusedBy`:
+`inputs` or `state`.
+
+Because the lookup is by content rather than by predecessor, a rollback, a scene cloned to
+other parcels with the same content, and a redelivered job for the same entity all hit.
+Bundles are still duplicated per scene id — the explorer loads
+`LOD/{level}/{sceneId}_{level}_{platform}` — but the index costs one small object per
+distinct build, not a second copy of anything.
+
+`main.crdt` is never read as scene truth — it is the editor's frame-zero snapshot, and scene
+code adds, moves and removes entities after it. It is only compared as an *input*: identical
+snapshot plus identical code means the frames the runtime simulates are identical too.
+
+Deriving placements is most of a build's *median* cost (436 ms of 514 ms across the 26k
+corpus run, warm cache), which is why tier 1 exists; but the median is dominated by tiny
+scenes. For a scene whose LOD matters, on a Lambda with no warm content cache, the asset
+downloads and encoding are where the minutes go, and tier 2 avoids all of them for half a
+second of execution. A job that misses both tiers executes the scene twice — once to derive
+the state, once inside the build.
+
+`abgen::lodgen::LOD_GENERATION` is inside both digests. Bump it when a pipeline change makes
+already published bundles wrong to reuse, and no stored record is ever looked up again:
+every scene rebuilds once and files itself under the new generation.
+
+The copied bundle keeps the previous scene's prefab name in its own `metadata.json`. That
+is what the explorer loads by: it reads the main asset's name out of the bundle rather than
+off the file name.
+
+Reuse is an optimization and never a failure mode. A record that will not parse, a missing
+object, a scene that will not execute or a catalyst that will not answer all fall through
+to a normal build.
+
+## LOD generation
+
+There is no separate LOD job. With `ENABLE_LODS=1` every conversion job for a
+**scene** continues into the LOD lane once its asset bundles are published and
+their finished events sent, so one deployment's bundles and LODs land in one
+go. Wearables and emotes never reach it. An already-converted scene still
+gets the LOD step, which the reuse index makes a cheap `by=inputs` hit when
+nothing changed.
+
+The LODs are regenerated from the scene entity through the same `lodgen`
+chain the abcdn server runs JIT (`abgen-lod generate`): resolve placements
+with the embedded scene runtime → assemble → crop → atlas → simplify →
+bundle, for every level in `LOD_LEVELS` (default `1`; production stopped
+publishing LOD/0 with the lod-generator-unity pipeline — level 0 is the
+client-side ISS assembly) and every configured platform that has a LOD lane
+(`windows|mac|linux`; `webgl` is dropped with a log line). The result passes
+the same structural self-gate as the JIT lane, is uploaded under the
+unversioned `LOD/…` and `lods-unity/…` keys above and filed in the reuse
+index. No finished event is published for LODs (see
+[Finished events](#finished-events-sns)). Before any of that, the job checks
+whether a build already exists — see
+[Reusing an unchanged build](#reusing-an-unchanged-build).
+
+The LOD result is nested under the conversion summary's `lods` key
+(`reusedBy`, `reusedFrom`, `levels`, `objects`, `keys`, `exitCode`, …, or a
+single `skipped` / `error` field). **A LOD failure never fails the job**: the
+bundles are already out and notified, so the error is logged with the entity
+id, counted in `abgen_lambda_lod_followup_total{outcome="error"}`, reported
+in the summary, and the message is acked. The scene's next deployment is the
+next attempt. This is deliberate — a redelivery would only re-notify the
+already-converted bundles to retry a step that is not theirs.
 
 ```bash
 ENABLE_LODS=1 OUT_ROOT=/tmp/ab-out ./target/release/abgen-lambda \
-  --once lambda/examples/event-lods.json
+  --once lambda/examples/event-manual.json
 ```
 
-Without `ENABLE_LODS` (the default) LOD jobs are acked and skipped with
-`{"skipped": "lods-disabled"}`, i.e. LOD generation stays on the Unity
-pipeline. Turn it on per environment: a LOD build is a whole-scene bake and
-costs far more CPU/RAM/time than a single-entity conversion, so size the
-function (memory, timeout, SQS visibility) for it first.
+Without `ENABLE_LODS` (the default) a conversion job ends with its bundles
+and no LOD is produced anywhere. Turn it on per environment: a LOD build is a
+whole-scene bake and costs far more CPU/RAM/time than a single-entity
+conversion, so size the function (memory, timeout, SQS visibility) for it
+first.
 
 Known boundaries: level 2 is never emitted (production stopped emitting it),
-the deployment's FBX source URLs are ignored rather than converted, and level
-0 is the ISS-era pass-through bake rather than the retired legacy LOD0 shape
-(same divergence `abgen-lod generate` documents).
+and level 0 (when requested) is the ISS-era pass-through bake rather than the
+retired legacy LOD0 shape (same divergence `abgen-lod generate` documents).
+
 
 ## Partial batch responses
 

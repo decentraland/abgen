@@ -153,6 +153,10 @@ impl Gpu {
     pub fn backend_debug(&self) -> String {
         format!("{:?}", self.info.backend)
     }
+
+    pub fn is_cpu_adapter(&self) -> bool {
+        self.info.device_type == ::wgpu::DeviceType::Cpu
+    }
 }
 
 #[cfg(test)]

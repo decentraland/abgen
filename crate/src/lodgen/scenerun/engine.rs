@@ -8,21 +8,52 @@ use rquickjs::{
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 pub struct QuickJsEngine;
 
+struct EngineRequest {
+    job: SceneJob,
+    reply: mpsc::SyncSender<Result<CaptureOutcome>>,
+}
+
+struct EnginePool {
+    jobs: mpsc::SyncSender<EngineRequest>,
+}
+
+impl EnginePool {
+    fn start() -> Self {
+        let workers = crate::clihelp::default_file_concurrency().max(1);
+        let (jobs, receiver) = mpsc::sync_channel::<EngineRequest>(workers);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..workers {
+            let receiver = Arc::clone(&receiver);
+            std::thread::Builder::new()
+                .name(format!("abgen-scenerun-{index}"))
+                .stack_size(SCENE_THREAD_STACK)
+                .spawn(move || loop {
+                    let request = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                    let Ok(request) = request else { break };
+                    let _ = request.reply.send(run_on_thread(request.job));
+                })
+                .expect("spawn reusable scene runtime worker");
+        }
+        Self { jobs }
+    }
+}
+
 impl SceneEngine for QuickJsEngine {
     fn run_capture(&self, job: SceneJob) -> Result<CaptureOutcome> {
-        let worker = std::thread::Builder::new()
-            .name("abgen-scenerun".into())
-            .stack_size(SCENE_THREAD_STACK)
-            .spawn(move || run_on_thread(job))
-            .map_err(|e| anyhow!("spawn scene runtime thread: {e}"))?;
-        worker
-            .join()
-            .map_err(|_| anyhow!("scene runtime thread panicked"))?
+        static POOL: OnceLock<EnginePool> = OnceLock::new();
+        let pool = POOL.get_or_init(EnginePool::start);
+        let (reply, result) = mpsc::sync_channel(1);
+        pool.jobs
+            .send(EngineRequest { job, reply })
+            .map_err(|_| anyhow!("scene runtime worker pool stopped"))?;
+        result
+            .recv()
+            .map_err(|_| anyhow!("scene runtime worker stopped without a result"))?
     }
 }
 
@@ -288,7 +319,7 @@ module.exports.onStart = async function () {{
   if (state.hasEntities) failures.push('hasEntities');
   if (state.data.length !== 4) failures.push('stateParts=' + state.data.length);
   const server = await engineApi.isServer();
-  if (!server.isServer) failures.push('isServer');
+  if (server.isServer !== false) failures.push('isServer');
   const rf = await require('~system/Runtime').readFile({{ fileName: 'blob.bin' }});
   if (new Uint8Array(rf.content).length !== 3) failures.push('readFile');
   if (rf.hash !== 'hblob') failures.push('readFileHash=' + rf.hash);
@@ -366,10 +397,9 @@ module.exports.onUpdate = async function (_dt) {{
         assert!(outcome.sent);
         assert_eq!(outcome.stream.len(), 2 * main.len());
         assert_eq!(&outcome.stream[..main.len()], &main[..]);
-        let content = HashMap::new();
-        let got = crdt::placements_from_crdt(&outcome.stream, &content);
-        assert_eq!(got.placements.len(), 1);
-        assert_eq!(got.placements[0].glb_file.as_deref(), Some("main.glb"));
+        let got = crdt::gltf_srcs_from_crdt(&outcome.stream);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, "main.glb");
     }
 
     #[test]
@@ -414,12 +444,9 @@ module.exports = {{
         for engine in engines {
             let outcome = engine.run_capture(job(code.clone(), None)).unwrap();
             assert!(outcome.sent);
-            let got = crdt::placements_from_crdt(&outcome.stream, &HashMap::new());
-            assert_eq!(got.placements.len(), 1);
-            assert_eq!(
-                got.placements[0].glb_file.as_deref(),
-                Some("models/clean.glb")
-            );
+            let got = crdt::gltf_srcs_from_crdt(&outcome.stream);
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].1.as_str(), "models/clean.glb");
         }
     }
 
@@ -526,9 +553,9 @@ module.exports.onUpdate = async function (_dt) {{
         );
         let outcome = QuickJsEngine.run_capture(job(code, None)).unwrap();
         assert!(outcome.sent);
-        let got = crdt::placements_from_crdt(&outcome.stream, &HashMap::new());
-        assert_eq!(got.placements.len(), 1);
-        assert_eq!(got.placements[0].glb_file.as_deref(), Some("start.glb"));
+        let got = crdt::gltf_srcs_from_crdt(&outcome.stream);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, "start.glb");
     }
 
     #[test]
@@ -567,9 +594,9 @@ module.exports.onUpdate = async function (_dt) {{}};
         j.limits.memory_bytes = 32 << 20;
         let outcome = QuickJsEngine.run_capture(j).unwrap();
         assert!(outcome.sent);
-        let got = crdt::placements_from_crdt(&outcome.stream, &HashMap::new());
-        assert_eq!(got.placements.len(), 1);
-        assert_eq!(got.placements[0].glb_file.as_deref(), Some("before.glb"));
+        let got = crdt::gltf_srcs_from_crdt(&outcome.stream);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, "before.glb");
     }
 
     #[test]
@@ -590,9 +617,9 @@ module.exports.onUpdate = async function (_dt) {{
 "
         );
         let outcome = QuickJsEngine.run_capture(job(code, None)).unwrap();
-        let got = crdt::placements_from_crdt(&outcome.stream, &HashMap::new());
-        assert_eq!(got.placements.len(), 1);
-        let file = got.placements[0].glb_file.clone().unwrap();
+        let got = crdt::gltf_srcs_from_crdt(&outcome.stream);
+        assert_eq!(got.len(), 1);
+        let file = got[0].1.clone();
         let ms: i64 = file
             .trim_start_matches("delta-")
             .trim_end_matches(".glb")
