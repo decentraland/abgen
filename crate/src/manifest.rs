@@ -27,6 +27,30 @@ pub struct CorpusManifestSpec<'a> {
     pub content_server_url: &'a str,
     pub exit_code: i32,
     pub date: &'a str,
+    /// Generations of the recipes that named the bundles in `built` — the union
+    /// [`crate::recipes::generations`] produced across them — or `None` from a writer that
+    /// cannot vouch for the whole set. See [`recipes_block`].
+    pub recipes: Option<&'a std::collections::BTreeMap<&'static str, u32>>,
+}
+
+/// The `recipes` the manifest carries, or `None` to leave the key out entirely.
+///
+/// While no recipe has been bumped the block says nothing anyone can act on, and omitting it
+/// keeps the manifest byte-identical to the one this converter has always written.
+///
+/// Once something *has* been bumped, the block's presence is itself the signal, so a writer
+/// that knows the full set writes it even when it is empty: empty is then a positive claim
+/// that this entity uses no bumped recipe and its bundles are still good, where absent means
+/// "written before the bump, reconvert once". A writer passing `None` declines to make that
+/// claim and gets the reconversion. [`crate::recipes::recorded_is_current`] reads it back.
+#[cfg(not(target_arch = "wasm32"))]
+fn recipes_block(
+    recipes: Option<&std::collections::BTreeMap<&'static str, u32>>,
+) -> Option<serde_json::Value> {
+    match recipes {
+        Some(r) if crate::recipes::any_bumped() => Some(serde_json::json!(r)),
+        _ => None,
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -35,13 +59,16 @@ pub fn write_corpus_manifest(m: &CorpusManifestSpec) -> Result<PathBuf> {
     files.sort();
     files.dedup();
     files.push("dcl".to_string());
-    let manifest = serde_json::json!({
+    let mut manifest = serde_json::json!({
         "version": m.ab_version,
         "files": files,
         "exitCode": m.exit_code,
         "contentServerUrl": m.content_server_url,
         "date": m.date,
     });
+    if let Some(block) = recipes_block(m.recipes) {
+        manifest["recipes"] = block;
+    }
     let dir = m
         .out_root
         .join(&*crate::naming::fs_safe_component(m.entity_id));
@@ -131,6 +158,7 @@ mod tests {
             content_server_url: "http://cs",
             exit_code: 0,
             date: TEST_DATE,
+            recipes: None,
         })
         .unwrap();
         assert_eq!(p, tmp.join("entityZ").join("windows.manifest.json"));
@@ -155,11 +183,48 @@ mod tests {
                 content_server_url: "http://cs",
                 exit_code: 0,
                 date: TEST_DATE,
+                recipes: None,
             })
             .unwrap(),
         )
         .unwrap();
         assert_eq!(first, second);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn recipes_block_appears_only_once_something_is_bumped() {
+        // While the table is at baseline the manifest must be byte-identical to the one
+        // this converter has always written — no empty block, no new key.
+        let empty = BTreeMap::new();
+        assert_eq!(
+            recipes_block(Some(&empty)).is_some(),
+            crate::recipes::any_bumped()
+        );
+        // A writer that cannot vouch for the set never writes the block, so its manifests
+        // always reconvert once after a bump rather than claiming a currency they don't know.
+        assert!(recipes_block(None).is_none());
+
+        let tmp = std::env::temp_dir().join(format!("abgen_corpus_recipes_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let built = vec!["QmA_deadbeef_windows".to_string()];
+        let p = write_corpus_manifest(&CorpusManifestSpec {
+            out_root: &tmp,
+            entity_id: "entityZ",
+            platform: "windows",
+            built: &built,
+            ab_version: "v41",
+            content_server_url: "http://cs",
+            exit_code: 0,
+            date: TEST_DATE,
+            recipes: Some(&empty),
+        })
+        .unwrap();
+        let m: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(m.get("recipes").is_some(), crate::recipes::any_bumped());
+        // Whatever the table says, a conversion's own record of it reads back as current.
+        assert!(crate::recipes::recorded_is_current(m.get("recipes")));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -178,6 +243,7 @@ mod tests {
             content_server_url: "http://cs",
             exit_code: exit_code_for_failures(3),
             date: TEST_DATE,
+            recipes: None,
         })
         .unwrap();
         let m: serde_json::Value =
@@ -208,6 +274,7 @@ mod tests {
             content_server_url: "http://cs",
             exit_code: 0,
             date: TEST_DATE,
+            recipes: None,
         })
         .unwrap();
         let m: serde_json::Value =

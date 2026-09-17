@@ -5,7 +5,7 @@ use crate::local_store::LocalContentStore;
 use crate::naming;
 use crate::space::Space;
 use anyhow::{anyhow, bail, Context, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -137,7 +137,7 @@ fn compute_deps_digests(
     tolerant: bool,
     jobs: usize,
 ) -> (
-    HashMap<String, String>,
+    HashMap<String, naming::GlbDigest>,
     std::collections::HashSet<String>,
     Vec<(String, String, String)>,
 ) {
@@ -149,8 +149,8 @@ fn compute_deps_digests(
         .filter(|(hash, file)| is_convertible(file).0 && seen.insert(hash.clone()))
         .collect();
 
-    let slots: Vec<Mutex<Option<Result<String, (bool, String)>>>> =
-        work.iter().map(|_| Mutex::new(None)).collect();
+    type Slot = Mutex<Option<Result<naming::GlbDigest, (bool, String)>>>;
+    let slots: Vec<Slot> = work.iter().map(|_| Mutex::new(None)).collect();
     let workers = jobs.clamp(1, work.len().max(1));
     let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
@@ -171,7 +171,7 @@ fn compute_deps_digests(
         }
     });
 
-    let mut digests: HashMap<String, String> = HashMap::new();
+    let mut digests: HashMap<String, naming::GlbDigest> = HashMap::new();
     let mut undeployed: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut warns: Vec<(String, String, String)> = Vec::new();
     for ((hash, file), slot) in work.iter().map(|w| (&w.0, &w.1)).zip(slots) {
@@ -223,7 +223,7 @@ pub(crate) struct EntityCtx {
     pub(crate) content_by_file: HashMap<String, String>,
     pub(crate) scan: EntityScan,
 
-    deps_digests: HashMap<String, String>,
+    deps_digests: HashMap<String, naming::GlbDigest>,
     /// GLBs whose referenced textures are not deployed in the entity: prod
     /// skips these (no manifest entry, exit 0), so they must not count as
     /// conversion failures (#59).
@@ -252,6 +252,14 @@ impl EntityCtx {
             self.scan.normal_refs.contains(hash),
             &naming::image_key_extension(file),
         )
+    }
+
+    /// The recipe generations already folded into this image's class digest, for the union
+    /// a manifest records.
+    fn image_recipes(&self, hash: &str) -> BTreeMap<&'static str, u32> {
+        crate::recipes::generations(&crate::recipes::image_recipes(
+            self.scan.normal_refs.contains(hash),
+        ))
     }
 }
 
@@ -717,9 +725,10 @@ impl Proxy {
         if let Some(req_digest) = req_digest {
             if is_glb {
                 match ctx.deps_digests.get(hash) {
-                    Some(d) if d == req_digest => {}
+                    Some(d) if d.digest == req_digest => {}
                     Some(d) => bail!(
-                        "deps digest mismatch for {file} (hash {hash}): requested {req_digest}, computed {d}"
+                        "deps digest mismatch for {file} (hash {hash}): requested {req_digest}, computed {}",
+                        d.digest
                     ),
                     None => bail!(
                         "deps digest unavailable for {file} (hash {hash}): dependency resolution failed at entity scan"
@@ -1108,6 +1117,15 @@ impl Proxy {
         let mut work: Vec<WorkItem> = Vec::new();
         let mut candidates: Vec<ProbeCandidate> = Vec::new();
         let mut done_pre: usize = 0;
+        // Union over every bundle this manifest will list, reused or rebuilt: the
+        // generations that decided their names. Recorded so the next job can tell a
+        // manifest a recipe bump invalidated from one that is merely old.
+        //
+        // Stays empty for an entity under bare naming (wearables, emotes, or
+        // `ABGEN_DEPS_DIGEST=0`), and that empty union is the honest answer there: a name
+        // with no digest carries no generation, so no recipe bump governs those bundles and
+        // `AB_VERSION` remains the only thing that can invalidate them.
+        let mut used_recipes: BTreeMap<&'static str, u32> = BTreeMap::new();
         for (idx, c) in convertible.iter().enumerate() {
             let order = idx + 1;
             let (is_glb, is_image) = is_convertible(&c.file);
@@ -1119,13 +1137,17 @@ impl Proxy {
             let bare_name = format!("{case_hash}_{platform}");
             let digest_naming = self.deps_digest && ctx.scene.entity_type == "scene";
             let bundle_name = if digest_naming && is_image {
+                crate::recipes::merge_into(&mut used_recipes, &ctx.image_recipes(&c.hash));
                 format!(
                     "{case_hash}_{}_{platform}",
                     ctx.image_digest(&c.hash, &c.file)
                 )
             } else if digest_naming && is_glb {
                 match ctx.deps_digests.get(&c.hash) {
-                    Some(d) => format!("{case_hash}_{d}_{platform}"),
+                    Some(d) => {
+                        crate::recipes::merge_into(&mut used_recipes, &d.recipes);
+                        format!("{case_hash}_{}_{platform}", d.digest)
+                    }
                     None if ctx.undeployed_dep_glbs.contains(&c.hash) => {
                         tracing::warn!(
                             entity = %cid,
@@ -1367,6 +1389,7 @@ impl Proxy {
                 content_server_url,
                 exit_code: crate::manifest::exit_code_for_failures(failed.len() + tolerated),
                 date: &self.date,
+                recipes: Some(&used_recipes),
             })?;
         if self.space_configured() {
             match std::fs::read(&manifest_path) {

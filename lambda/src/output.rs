@@ -5,8 +5,9 @@ use abgen::live::Proxy;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
-/// Bucket+version-scoped so an `AB_VERSION` bump can't suppress reconversion;
-/// only verdicts read back from S3 are cached — never our own fail-soft uploads.
+/// Bucket+version-scoped so an `AB_VERSION` bump can't suppress reconversion; and
+/// recipe-scoped for the same reason, since a recipe bump leaves `AB_VERSION` alone.
+/// Only verdicts read back from S3 are cached — never our own fail-soft uploads.
 pub fn converted_marker_key(
     proxy: &Arc<Proxy>,
     cfg: &Config,
@@ -18,9 +19,40 @@ pub fn converted_marker_key(
     }
     let bucket = proxy.space_bucket()?;
     Some(format!(
-        "abgen:converted:{bucket}:{}:{entity_id}_{platform}",
-        cfg.version
+        "abgen:converted:{bucket}:{}{}:{entity_id}_{platform}",
+        cfg.version,
+        recipe_marker_scope()
     ))
+}
+
+/// Appended to the converted marker so a recipe bump cannot be answered out of a cache
+/// filled before it. Empty while nothing is bumped, which keeps the keys already in Redis
+/// exactly where they are.
+fn recipe_marker_scope() -> String {
+    use abgen::recipes::Recipe;
+    if !abgen::recipes::any_bumped() {
+        return String::new();
+    }
+    let table: Vec<String> = Recipe::ALL
+        .iter()
+        .filter(|r| r.generation() != abgen::recipes::BASELINE)
+        .map(|r| format!("{}{}", r.name(), r.generation()))
+        .collect();
+    format!("+{}", table.join("."))
+}
+
+/// Whether a manifest read back from S3 says this platform is already built the way this
+/// build would build it.
+///
+/// Three questions, all of which must answer yes: the conversion succeeded, it ran at the
+/// `AB_VERSION` in force, and the per-asset-type recipes it recorded are the ones in force
+/// ([`abgen::recipes::recorded_is_current`]). The third is what lets a fix ship without an
+/// `AB_VERSION` bump: the entity is reconverted, but every bundle whose recipes did not move
+/// keeps its name and is reused off the CDN rather than rebuilt.
+fn manifest_is_current(json: &serde_json::Value, version: &str) -> bool {
+    json.get("exitCode").and_then(serde_json::Value::as_i64) == Some(0)
+        && json.get("version").and_then(serde_json::Value::as_str) == Some(version)
+        && abgen::recipes::recorded_is_current(json.get("recipes"))
 }
 
 pub fn platform_converted(
@@ -41,8 +73,7 @@ pub fn platform_converted(
     let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return false;
     };
-    let converted = json.get("exitCode").and_then(serde_json::Value::as_i64) == Some(0)
-        && json.get("version").and_then(serde_json::Value::as_str) == Some(cfg.version.as_str());
+    let converted = manifest_is_current(&json, &cfg.version);
     if converted {
         if let Some(key) = &marker {
             abgen::rediscache::mark(key);
@@ -343,6 +374,46 @@ mod tests {
             !log.iter()
                 .any(|l| l == "PUT /manifest/bafkpart_windows.json"),
             "{log:?}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_is_current_only_at_this_version_and_these_recipes() {
+        let good = serde_json::json!({"version": "v49", "files": ["x"], "exitCode": 0});
+        assert!(super::manifest_is_current(&good, "v49"));
+        assert!(!super::manifest_is_current(&good, "v50"));
+
+        let failed = serde_json::json!({"version": "v49", "files": [], "exitCode": 12});
+        assert!(!super::manifest_is_current(&failed, "v49"));
+
+        let skin = abgen::recipes::Recipe::Skin;
+        let with_recipes = |gen: u64| {
+            let mut m = good.clone();
+            let mut block = serde_json::Map::new();
+            block.insert(skin.name().to_string(), serde_json::Value::from(gen));
+            m["recipes"] = serde_json::Value::Object(block);
+            m
+        };
+
+        // A block naming a generation this build does not have is stale, whatever the
+        // version says — that is the whole point of shipping a fix without bumping it.
+        assert!(!super::manifest_is_current(
+            &with_recipes(u64::from(skin.generation()) + 1),
+            "v49"
+        ));
+        // A block recording exactly what is in force is current.
+        assert!(super::manifest_is_current(
+            &with_recipes(u64::from(skin.generation())),
+            "v49"
+        ));
+    }
+
+    #[test]
+    fn the_converted_marker_is_scoped_to_the_recipe_table() {
+        // Empty while nothing is bumped, so no key already in Redis moves on adoption.
+        assert_eq!(
+            super::recipe_marker_scope().is_empty(),
+            !abgen::recipes::any_bumped()
         );
     }
 

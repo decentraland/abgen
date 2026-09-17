@@ -139,6 +139,11 @@ pub(crate) fn write_cdn_manifest(
         content_server_url,
         exit_code: abgen::manifest::exit_code_for_failures(missing.len()),
         date,
+        // This writer names standalone images bare (`digest_naming` covers glbs only), so
+        // no image recipe can be carried in a name here and the union would be a claim it
+        // cannot make. Declining it costs these manifests one reconversion after a bump —
+        // and an offline corpus run republishes everything anyway.
+        recipes: None,
     })?;
     Ok(missing.len())
 }
@@ -392,7 +397,7 @@ pub(crate) fn derive_one_entity(
                 .ok()
             });
             match digest {
-                Some(d) => format!("{case_hash}_{d}_{platform}"),
+                Some(d) => format!("{case_hash}_{}_{platform}", d.digest),
                 None => continue,
             }
         } else {
@@ -665,6 +670,21 @@ mod tests {
     const GLTF_JSON: &str = r#"{"asset":{"version":"2.0"},
         "images":[{"uri":"t.png"}],"buffers":[{"uri":"a.bin"}]}"#;
 
+    /// The digest the planner mints for [`GLTF_JSON`]: the same fold the planner does,
+    /// recipes included, so a bump moves the expectation with the code instead of failing
+    /// these tests for the wrong reason.
+    fn gltf_json_digest(deps: &[(&str, &str)]) -> String {
+        let doc: serde_json::Value = serde_json::from_str(GLTF_JSON).unwrap();
+        let deps: Vec<(String, String)> = deps
+            .iter()
+            .map(|(f, h)| (f.to_string(), h.to_string()))
+            .collect();
+        abgen::naming::compute_deps_digest_for(
+            &deps,
+            &abgen::recipes::generations(&abgen::recipes::gltf_recipes(&doc)),
+        )
+    }
+
     #[test]
     fn derive_names_glbs_canonically_in_deps_digest_mode() {
         let store = store_with_entity(
@@ -698,10 +718,7 @@ mod tests {
             toggles(true, false),
         )
         .unwrap();
-        let digest = abgen::naming::compute_deps_digest(&[
-            ("a.bin".to_string(), "Qmbin".to_string()),
-            ("t.png".to_string(), "Qmtex".to_string()),
-        ]);
+        let digest = gltf_json_digest(&[("a.bin", "Qmbin"), ("t.png", "Qmtex")]);
         assert_eq!(glb_names(&reuse), vec![format!("Qmglb_{digest}_windows")]);
         assert!(reuse
             .bundles
@@ -739,8 +756,7 @@ mod tests {
         let tolerant =
             derive_one_entity(&store, "bafyentity", "windows", &cache, toggles(true, true))
                 .unwrap();
-        let digest =
-            abgen::naming::compute_deps_digest(&[("t.png".to_string(), "Qmtex".to_string())]);
+        let digest = gltf_json_digest(&[("t.png", "Qmtex")]);
         assert_eq!(
             glb_names(&tolerant),
             vec![format!("Qmglb_{digest}_windows")]
