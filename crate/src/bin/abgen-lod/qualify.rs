@@ -774,9 +774,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Mirror one finished build into the published key layout and file its reuse record there.
 ///
-/// `opts.publish` ends up holding the keys `lambda/src/lod.rs` puts in the space, nested under
-/// the single `LOD/` prefix [`publish_key`] applies, so a finished run uploads with a plain
-/// `s3 sync` and no flattening step:
+/// `opts.publish` ends up holding exactly the keys `lambda/src/lod.rs` puts in the space —
+/// `abgen::lods::published_objects` and `abgen::lodgen::reuse` are the one spelling of the
+/// layout, shared with the lambda — so a finished run uploads with a plain `s3 sync` and no
+/// flattening step:
 ///
 /// ```text
 /// <publish>/LOD/{level}/{sid}_{level}_{platform}
@@ -809,11 +810,13 @@ fn publish_build(job: &Job, opts: &Options, outcome: &abgen::lodgen::GenerateOut
     }
     let mut keys = Vec::with_capacity(objects.len());
     for object in &objects {
-        let key = publish_key(&object.key);
-        if let Err(e) = link_into(&object.path, &opts.publish.join(&key)) {
-            eprintln!("publish: {}: could not place {key} ({e})", outcome.scene_id);
+        if let Err(e) = link_into(&object.path, &opts.publish.join(&object.key)) {
+            eprintln!(
+                "publish: {}: could not place {} ({e})",
+                outcome.scene_id, object.key
+            );
         }
-        keys.push(key);
+        keys.push(object.key.clone());
     }
     let record = abgen::lodgen::reuse::record_for_build(
         outcome,
@@ -837,7 +840,7 @@ fn publish_build(job: &Job, opts: &Options, outcome: &abgen::lodgen::GenerateOut
         targets.push(abgen::lodgen::reuse::inputs_index_key(digest));
     }
     for key in targets {
-        let path = opts.publish.join(publish_key(&key));
+        let path = opts.publish.join(&key);
         if let Err(e) = write_atomic(&path, text.as_bytes()) {
             eprintln!(
                 "reuse: {}: could not write {} ({e})",
@@ -845,27 +848,6 @@ fn publish_build(job: &Job, opts: &Options, outcome: &abgen::lodgen::GenerateOut
                 path.display()
             );
         }
-    }
-}
-
-/// Nest one published key under the run's single `LOD/` prefix, so the whole upload is one
-/// top-level folder in the destination bucket rather than three siblings:
-///
-/// ```text
-/// LOD/{level}/…            (bundles already carry the prefix and are left alone)
-/// LOD/lods-unity/…         (ISS descriptors, published GLBs)
-/// LOD/lod-reuse/…          (the reuse records)
-/// ```
-///
-/// This deliberately diverges from the flat key space `lambda/src/lod.rs` writes: the lambda
-/// puts `lods-unity/…` and `lod-reuse/…` beside `LOD/`, and `crate::space::object_headers`
-/// keys its Cache-Control off those un-nested prefixes. A consumer of this tree therefore
-/// resolves the ISS descriptor under `LOD/lods-unity/manifests/`, not `lods-unity/manifests/`.
-fn publish_key(key: &str) -> String {
-    if key.starts_with("LOD/") {
-        key.to_string()
-    } else {
-        format!("LOD/{key}")
     }
 }
 

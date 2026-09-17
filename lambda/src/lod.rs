@@ -211,7 +211,8 @@ pub fn follow_up_summary(result: Result<serde_json::Value>) -> serde_json::Value
 /// Key the scene's descriptor is published under.
 fn descriptor_key(scene_id: &str) -> String {
     format!(
-        "lods-unity/manifests/{scene_id}{}",
+        "{}/{scene_id}{}",
+        abgen::lods::MANIFEST_KEY_DIR,
         abgen::lodgen::placements::ISS_SUFFIX
     )
 }
@@ -362,12 +363,12 @@ pub fn copy_items(
             level,
             from: format!(
                 "{}/{}",
-                abgen::lods::PUBLISHED_GLB_DIR,
+                abgen::lods::GLB_KEY_DIR,
                 abgen::lods::published_glb_name(from_scene, level)
             ),
             to: format!(
                 "{}/{}",
-                abgen::lods::PUBLISHED_GLB_DIR,
+                abgen::lods::GLB_KEY_DIR,
                 abgen::lods::published_glb_name(to_scene, level)
             ),
             required: false,
@@ -594,6 +595,116 @@ impl Drop for StagingGuard {
 mod reuse_tests {
     use super::*;
 
+    /// Every key the lambda publishes lives under the one `LOD/` root, and the two
+    /// independent code paths that name the same object agree on its key.
+    ///
+    /// This is the property the offline generator depends on. `abgen-lod qualify-corpus`
+    /// builds its publish tree from `published_objects` alone, then a run's output is synced
+    /// to the same bucket a lambda writes to; if the lambda named any object differently, a
+    /// scene built offline and a scene built by the lambda would land in different places and
+    /// neither reuse nor the client would find both.
+    ///
+    /// The cross-check that matters is `descriptor_key` against `published_objects`: a fresh
+    /// build publishes the ISS descriptor by walking the scene directory, while the reuse
+    /// path publishes it by formatting a key from the scene id. Those are separate spellings
+    /// of one layout and nothing but this test holds them together.
+    #[test]
+    fn every_published_key_lives_under_one_lod_root() {
+        let sid = "bafkscene";
+        let levels = [1u32];
+        let plats = vec!["windows".to_string(), "mac".to_string()];
+
+        // A finished scene directory, in the shape a build leaves behind.
+        let base = std::env::temp_dir().join(format!("abgen-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let scene = base.join(sid);
+        std::fs::create_dir_all(scene.join("LOD/1")).unwrap();
+        std::fs::create_dir_all(scene.join(abgen::lods::PUBLISHED_GLB_DIR)).unwrap();
+        std::fs::write(scene.join("LOD/1/bafkscene_1_windows"), b"w").unwrap();
+        std::fs::write(scene.join("LOD/1/bafkscene_1_mac"), b"m").unwrap();
+        std::fs::write(scene.join("bafkscene_InitialSceneState.json"), b"{}").unwrap();
+        std::fs::write(
+            scene
+                .join(abgen::lods::PUBLISHED_GLB_DIR)
+                .join("bafkscene_1.glb"),
+            b"g",
+        )
+        .unwrap();
+
+        let objects = abgen::lods::published_objects(&scene, &levels);
+        let keys: Vec<&str> = objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "LOD/1/bafkscene_1_mac",
+                "LOD/1/bafkscene_1_windows",
+                "LOD/lods-unity/manifests/bafkscene_InitialSceneState.json",
+                "LOD/lods-unity/lods/bafkscene_1.glb",
+            ],
+            "the fresh-build key set is the published layout"
+        );
+
+        // The reuse path names the descriptor itself rather than walking the directory.
+        // It must agree with the key the fresh path produced for the same file.
+        let from_walk = keys
+            .iter()
+            .find(|k| k.contains("/manifests/"))
+            .expect("a descriptor key");
+        assert_eq!(
+            &descriptor_key(sid),
+            from_walk,
+            "descriptor_key and published_objects disagree on the ISS key"
+        );
+
+        // Same for the reuse path's copy targets.
+        let items = copy_items("bafkprev", sid, &levels, &plats);
+        for item in &items {
+            assert!(
+                keys.contains(&item.to.as_str()),
+                "copy target {} is not a key a fresh build would publish",
+                item.to
+            );
+            assert!(
+                item.from.starts_with("LOD/") && item.to.starts_with("LOD/"),
+                "copy item escapes the LOD root: {} -> {}",
+                item.from,
+                item.to
+            );
+        }
+
+        // The reuse records themselves.
+        let index_keys = [
+            reuse::inputs_index_key("abcd"),
+            reuse::state_index_key("abcd"),
+        ];
+        assert_eq!(
+            index_keys,
+            [
+                "LOD/lod-reuse/by-inputs/abcd.json".to_string(),
+                "LOD/lod-reuse/by-state/abcd.json".to_string(),
+            ]
+        );
+
+        // Nothing the lambda writes for a LOD build sits outside the single root, and the
+        // metadata still resolves per family now that the prefixes are nested.
+        for key in keys.iter().map(|k| k.to_string()).chain(index_keys) {
+            assert!(key.starts_with("LOD/"), "key outside the LOD root: {key}");
+            let h = abgen::space::object_headers(&key);
+            let want = if key.starts_with("LOD/lod-reuse/") {
+                ("application/json", "private, max-age=0, no-cache")
+            } else if key.ends_with(".glb") {
+                ("model/gltf-binary", "public, max-age=31536000")
+            } else if key.ends_with(".json") {
+                ("application/json", "public, max-age=31536000")
+            } else {
+                ("application/wasm", "public,max-age=31536000,immutable")
+            };
+            assert_eq!((h.content_type, h.cache_control), want, "headers for {key}");
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn copy_items_name_every_per_scene_object_between_two_scenes() {
         let plats = vec!["windows".to_string(), "mac".to_string()];
@@ -615,8 +726,8 @@ mod reuse_tests {
                 },
                 CopyItem {
                     level: 1,
-                    from: "lods-unity/lods/bafkprev_1.glb".into(),
-                    to: "lods-unity/lods/bafknext_1.glb".into(),
+                    from: "LOD/lods-unity/lods/bafkprev_1.glb".into(),
+                    to: "LOD/lods-unity/lods/bafknext_1.glb".into(),
                     required: false,
                 },
             ]
@@ -681,7 +792,7 @@ mod reuse_tests {
         // The state key is what a later job derives; the inputs key what it hashes for free.
         assert_eq!(
             reuse::state_index_key(&record.state_digest),
-            format!("lod-reuse/by-state/{}.json", record.state_digest)
+            format!("LOD/lod-reuse/by-state/{}.json", record.state_digest)
         );
 
         // An SDK6 build has no inputs and is filed by state only.

@@ -133,7 +133,7 @@ pub struct ObjectHeaders {
 /// through `@dcl/cdn-uploader`, whose `cacheHeader()` joins directives with a
 /// bare comma, while scene source files are uploaded directly by
 ///
-/// `lods-unity/…` (the ISS descriptor under `manifests/`, the published GLB
+/// `LOD/lods-unity/…` (the ISS descriptor under `manifests/`, the published GLB
 /// under `lods/`) is NOT a consumer-server manifest family: its production
 /// writer is lod-generator-unity's storage adapter, which uploads every file
 /// with `CACHE_CONTROL_ONE_YEAR = 'public, max-age=31536000'` and a
@@ -163,11 +163,11 @@ pub fn object_headers(key: &str) -> ObjectHeaders {
         "application/wasm"
     };
     let uploader_lane = matches!(content_type, "application/wasm" | "text/cache-manifest");
-    let cache_control = if key.starts_with("manifest/") || key.starts_with("lod-reuse/") {
+    let cache_control = if key.starts_with("manifest/") || key.starts_with("LOD/lod-reuse/") {
         // Both families are rewritten in place: consumer-server manifests on every
         // rebuild, LOD reuse records whenever a later deployment republishes a build.
         NO_CACHE
-    } else if key.starts_with("lods-unity/") {
+    } else if key.starts_with("LOD/lods-unity/") {
         PUBLIC_ONE_YEAR
     } else if uploader_lane {
         IMMUTABLE_BUNDLE
@@ -673,12 +673,12 @@ mod tests {
             // Production writer of this family is lod-generator-unity's
             // storage adapter: CACHE_CONTROL_ONE_YEAR = 'public, max-age=31536000'.
             (
-                "lods-unity/manifests/bafkscene_InitialSceneState.json",
+                "LOD/lods-unity/manifests/bafkscene_InitialSceneState.json",
                 "application/json",
                 PUBLIC_ONE_YEAR,
             ),
             (
-                "lods-unity/lods/bafkscene_1.glb",
+                "LOD/lods-unity/lods/bafkscene_1.glb",
                 "model/gltf-binary",
                 PUBLIC_ONE_YEAR,
             ),
@@ -710,12 +710,12 @@ mod tests {
             // LOD reuse records are rewritten in place whenever a later deployment
             // republishes a build, so the origin must never let them be cached.
             (
-                "lod-reuse/by-inputs/0123abcd.json",
+                "LOD/lod-reuse/by-inputs/0123abcd.json",
                 "application/json",
                 NO_CACHE,
             ),
             (
-                "lod-reuse/by-state/0123abcd.json",
+                "LOD/lod-reuse/by-state/0123abcd.json",
                 "application/json",
                 NO_CACHE,
             ),
@@ -763,7 +763,7 @@ mod tests {
         for key in [
             "manifest/bafkEntity_windows.json",
             "LOD/1/bafkscene_1_windows",
-            "lods-unity/manifests/bafkscene_InitialSceneState.json",
+            "LOD/lods-unity/manifests/bafkscene_InitialSceneState.json",
             "v41/dcl/scene_ignore_windows",
         ] {
             assert_eq!(uri_encode_key(key), key);

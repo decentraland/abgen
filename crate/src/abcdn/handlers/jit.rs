@@ -425,7 +425,11 @@ pub(super) async fn iss_fallback(
     if let Some(proxy) = state.live_proxy.clone().filter(|p| p.space_configured()) {
         let sid = state.jit_key_of(&dst);
         let _pin = sid.as_deref().and_then(|s| state.jit_cache.pin(s));
-        let key = path.to_string();
+        // The request path is the client-facing URL; the space key is what
+        // `crate::lods::published_objects` wrote, which nests the descriptor under the
+        // single `LOD/` root. They are not the same string, so derive the key rather than
+        // reusing the path — otherwise this lane reads a key nothing ever writes.
+        let key = format!("{}/{filename}", crate::lods::MANIFEST_KEY_DIR);
         if let Some(resp) = space_lane_serve(
             state,
             Some("iss"),

@@ -186,8 +186,25 @@ pub fn lod_bundle_name(scene_id: &str, level: u32, platform: &str) -> String {
     format!("{}_{}_{}", scene_id.to_lowercase(), level, platform)
 }
 
-/// Scene-relative directory of the published GLB family (`lods-unity/lods/{file}`).
+/// Scene-relative directory of the published GLB family on disk
+/// (`<scene_dir>/lods-unity/lods/{file}`). This is a filesystem path, not a key: the key it
+/// publishes under is [`GLB_KEY_DIR`].
 pub const PUBLISHED_GLB_DIR: &str = "lods-unity/lods";
+
+/// The single top-level folder every published LOD object lives under.
+///
+/// Bundles were always keyed `LOD/{level}/…`; the descriptor, GLB and reuse families are
+/// nested beneath the same root so one prefix holds a whole generation and an upload is one
+/// `s3 sync` of one directory. [`crate::space::object_headers`] classifies on these
+/// spellings, and `crate::abcdn` serves bundles from the unchanged `LOD/{level}/…` shape.
+pub const PUBLISH_ROOT: &str = "LOD";
+
+/// Key prefix of the ISS descriptor family. Note this is *not* the descriptor's on-disk
+/// location: it is written at the scene-directory root and published under here.
+pub const MANIFEST_KEY_DIR: &str = "LOD/lods-unity/manifests";
+
+/// Key prefix of the published GLB family (on disk: [`PUBLISHED_GLB_DIR`]).
+pub const GLB_KEY_DIR: &str = "LOD/lods-unity/lods";
 
 /// File name of the published GLB: abgen lower-cases every LOD key, production
 /// names it with the verbatim entity id (identical for `bafk…` ids).
@@ -523,9 +540,9 @@ pub struct PublishedObject {
 }
 
 /// Space objects a generated LOD scene directory publishes, keyed the way
-/// production lays them out: bundles at `LOD/{level}/{file}`, the ISS
-/// descriptor at `lods-unity/manifests/{file}` and the published GLB at
-/// `lods-unity/lods/{file}` — all unversioned, unlike asset bundles. Upload
+/// production lays them out, all under the single [`PUBLISH_ROOT`] folder: bundles at
+/// `LOD/{level}/{file}`, the ISS descriptor at `LOD/lods-unity/manifests/{file}` and the
+/// published GLB at `LOD/lods-unity/lods/{file}` — all unversioned, unlike asset bundles. Upload
 /// metadata (Content-Type/Cache-Control/Content-Encoding) is derived from the
 /// key by `space::object_headers`, not carried here.
 #[cfg(not(target_arch = "wasm32"))]
@@ -545,14 +562,14 @@ pub fn published_objects(scene_dir: &Path, levels: &[u32]) -> Vec<PublishedObjec
             continue;
         }
         out.push(PublishedObject {
-            key: format!("lods-unity/manifests/{name}"),
+            key: format!("{MANIFEST_KEY_DIR}/{name}"),
             path: scene_dir.join(&name),
         });
     }
     let glb_dir = scene_dir.join(PUBLISHED_GLB_DIR);
     for name in dir_file_names(&glb_dir) {
         out.push(PublishedObject {
-            key: format!("{PUBLISHED_GLB_DIR}/{name}"),
+            key: format!("{GLB_KEY_DIR}/{name}"),
             path: glb_dir.join(&name),
         });
     }
@@ -809,8 +826,8 @@ mod tests {
             vec![
                 "LOD/0/bafkscene_0_windows",
                 "LOD/1/bafkscene_1_mac",
-                "lods-unity/manifests/bafkscene_InitialSceneState.json",
-                "lods-unity/lods/bafkscene_1.glb",
+                "LOD/lods-unity/manifests/bafkscene_InitialSceneState.json",
+                "LOD/lods-unity/lods/bafkscene_1.glb",
             ]
         );
         assert_eq!(objs[1].path, scene.join("LOD/1/bafkscene_1_mac"));
@@ -856,7 +873,7 @@ mod tests {
             .into_iter()
             .map(|o| o.key)
             .collect();
-        assert_eq!(keys, vec!["lods-unity/lods/bafkscene_1.glb"]);
+        assert_eq!(keys, vec!["LOD/lods-unity/lods/bafkscene_1.glb"]);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

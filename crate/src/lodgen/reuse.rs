@@ -22,8 +22,8 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
-pub const INPUTS_INDEX_PREFIX: &str = "lod-reuse/by-inputs/";
-pub const STATE_INDEX_PREFIX: &str = "lod-reuse/by-state/";
+pub const INPUTS_INDEX_PREFIX: &str = "LOD/lod-reuse/by-inputs/";
+pub const STATE_INDEX_PREFIX: &str = "LOD/lod-reuse/by-state/";
 
 pub fn inputs_index_key(digest: &str) -> String {
     format!("{INPUTS_INDEX_PREFIX}{digest}.json")
@@ -545,8 +545,8 @@ mod tests {
 
     #[test]
     fn index_keys_live_under_the_no_cache_prefix() {
-        assert_eq!(inputs_index_key("abc"), "lod-reuse/by-inputs/abc.json");
-        assert_eq!(state_index_key("abc"), "lod-reuse/by-state/abc.json");
+        assert_eq!(inputs_index_key("abc"), "LOD/lod-reuse/by-inputs/abc.json");
+        assert_eq!(state_index_key("abc"), "LOD/lod-reuse/by-state/abc.json");
         assert_eq!(
             crate::space::object_headers(&inputs_index_key("abc")).cache_control,
             "private, max-age=0, no-cache"

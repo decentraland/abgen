@@ -444,8 +444,10 @@ async fn iss_lane_reads_through_space_and_reports_reason() {
     let dir = lane_temp_dir("issrt");
     let sid = "bafkissrt";
     let body = br#"{"version":1,"sceneId":"bafkissrt","assets":[]}"#.to_vec();
+    // The space holds the published key, which nests the descriptor under the single `LOD/`
+    // root; the request path below stays the client-facing one. They differ on purpose.
     let (host, _seen) = crate::live::stub::serve(vec![(
-        format!("/lods-unity/manifests/{sid}_InitialSceneState.json"),
+        format!("/LOD/lods-unity/manifests/{sid}_InitialSceneState.json"),
         200,
         body.clone(),
     )]);
@@ -511,12 +513,12 @@ async fn lod_jit_success_writes_back_to_space() {
                 "level 0 is not a JIT level: {log:?}"
             );
             assert!(
-                log.contains(&format!("PUT /lods-unity/lods/{sid}_1.glb")),
+                log.contains(&format!("PUT /LOD/lods-unity/lods/{sid}_1.glb")),
                 "{log:?}"
             );
             assert!(
                 log.contains(&format!(
-                    "PUT /lods-unity/manifests/{sid}_InitialSceneState.json"
+                    "PUT /LOD/lods-unity/manifests/{sid}_InitialSceneState.json"
                 )),
                 "{log:?}"
             );
