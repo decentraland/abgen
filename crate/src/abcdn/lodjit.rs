@@ -575,7 +575,6 @@ mod tests {
             log: Vec::new(),
             lod_state: serde_json::Value::Null,
             dependencies: Default::default(),
-            inputs: None,
         }
     }
 

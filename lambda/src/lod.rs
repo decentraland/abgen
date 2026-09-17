@@ -759,7 +759,6 @@ mod reuse_tests {
                 .into_iter()
                 .map(|(f, h)| (f.to_string(), h.to_string()))
                 .collect(),
-            inputs: None,
         };
         let keys = vec!["LOD/1/bafkscene_1_windows".to_string()];
         let inputs = Inputs {
