@@ -406,6 +406,14 @@ mod tests {
             &with_recipes(u64::from(skin.generation())),
             "v49"
         ));
+
+        // AB_VERSION stays total. Recipes are a conjunct, never a substitute: a manifest
+        // whose recipes are perfectly current is still stale at a bumped AB_VERSION, so a
+        // version bump reconverts everything exactly as it did before recipes existed.
+        assert!(!super::manifest_is_current(
+            &with_recipes(u64::from(skin.generation())),
+            "v50"
+        ));
     }
 
     #[test]
