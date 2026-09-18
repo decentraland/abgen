@@ -2361,7 +2361,9 @@ mod tests {
 
         let (host2, seen2) = super::stub::serve(vec![]);
         let digests_off = stub_proxy(&host2, false, "digests-off-probe");
-        assert!(!digests_off.space_probe_asset("v41", "Qmhit_0123456789abcdef0123456789abcdef_windows"));
+        assert!(
+            !digests_off.space_probe_asset("v41", "Qmhit_0123456789abcdef0123456789abcdef_windows")
+        );
         assert_eq!(
             seen2.lock().unwrap().clone(),
             vec!["HEAD /v41/assets/Qmhit_0123456789abcdef0123456789abcdef_windows".to_string()]

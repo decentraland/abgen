@@ -105,18 +105,17 @@ impl Recipe {
     /// The current generation. Bump by one, in the commit that changes the output.
     ///
     /// History, newest first — a bump is only legible next to the change it names:
-    /// - `Texture` 1: GLB-embedded images past the old 8192 `LoadImage` bound are capped
-    ///   instead of dropped, and standalone images between 8192 and 16384 cap at the
-    ///   platform size (#121).
-    /// - `Skin` 1: skinned renderer bounds are baked over every animation clip instead of
-    ///   the bind pose; gated on a glTF with skins *and* clips, `Skin` being the narrower
-    ///   superset (#119).
+    /// - `Animation` 1: skinned renderer bounds are baked over every animation clip
+    ///   instead of the bind pose (#119). The fix is gated on a glTF that declares a skin
+    ///   *and* carries clips, so either trait's recipe is a safe superset of it;
+    ///   `Animation` carries it because a rig with no clips is exactly the case the fix
+    ///   leaves serializing byte for byte as before.
     pub const fn generation(self) -> u32 {
         match self {
             Recipe::Glb => 0,
-            Recipe::Texture => 1,
-            Recipe::Skin => 1,
-            Recipe::Animation => 0,
+            Recipe::Texture => 0,
+            Recipe::Skin => 0,
+            Recipe::Animation => 1,
         }
     }
 
@@ -275,7 +274,9 @@ mod tests {
         for r in Recipe::ALL {
             assert_eq!(recorded.get(r.name()), Some(&r.generation()));
         }
-        assert!(recorded_is_current(Some(&serde_json::to_value(&recorded).unwrap())));
+        assert!(recorded_is_current(Some(
+            &serde_json::to_value(&recorded).unwrap()
+        )));
 
         // And the detection itself: whatever generation a recipe stands at now, the block
         // written before a bump of it stops reading as current.
@@ -295,8 +296,9 @@ mod tests {
 
     #[test]
     fn an_entity_is_only_governed_by_the_recipes_it_records() {
-        // A scene of static props records glb+texture and nothing else, so bumping `skin`
-        // leaves it current — that is the saving — while bumping `glb` does not.
+        // A scene of static props records glb+texture and nothing else, so the live
+        // `animation` bump leaves it current — that is the saving — while a `glb` bump
+        // would not.
         let props = recorded_generations(&[Recipe::Glb, Recipe::Texture]);
         assert_eq!(props.len(), 2);
         assert!(!props.contains_key(Recipe::Skin.name()));
@@ -398,7 +400,9 @@ mod tests {
             Recipe::Glb.name().to_string(),
             serde_json::Value::from(u64::from(Recipe::Glb.generation()) + 1),
         );
-        assert!(!recorded_is_current(Some(&serde_json::Value::Object(ahead))));
+        assert!(!recorded_is_current(Some(&serde_json::Value::Object(
+            ahead
+        ))));
 
         // Names this build does not know, and values that are not generations.
         assert!(!recorded_is_current(Some(&json!({"nosuchrecipe": 0}))));

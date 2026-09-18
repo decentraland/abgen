@@ -335,9 +335,12 @@ mod tests {
 
     #[test]
     fn tombstones_only_unconverted_platforms() {
+        // Recorded at this build's own generations, so the recipe question answers yes and
+        // this test stays about which platforms get tombstoned.
         let good = serde_json::json!({
             "version": "v49", "files": ["x", "dcl"], "exitCode": 0,
-            "contentServerUrl": "cs", "date": "d"
+            "contentServerUrl": "cs", "date": "d",
+            "recipes": abgen::recipes::recorded_generations(&abgen::recipes::Recipe::ALL),
         })
         .to_string()
         .into_bytes();
@@ -438,8 +441,16 @@ mod tests {
     fn the_two_version_lanes_invalidate_independently() {
         // The point of the split: a scene manifest survives a wearable-lane bump, and a
         // wearable manifest survives a scene-lane bump. Neither drags the other.
-        let scene = serde_json::json!({"version": "v49", "files": ["x"], "exitCode": 0});
-        let wearable = serde_json::json!({"version": "v49w", "files": ["x"], "exitCode": 0});
+        // Both carry this build's generations: the recipe question is settled, so what is
+        // left under test is purely the two version lanes.
+        let scene = serde_json::json!({
+            "version": "v49", "files": ["x"], "exitCode": 0,
+            "recipes": abgen::recipes::recorded_generations(&abgen::recipes::Recipe::ALL),
+        });
+        let wearable = serde_json::json!({
+            "version": "v49w", "files": ["x"], "exitCode": 0,
+            "recipes": abgen::recipes::recorded_generations(&abgen::recipes::Recipe::ALL),
+        });
 
         assert!(super::manifest_is_current(&scene, ["v49", "v49w"]));
         assert!(super::manifest_is_current(&wearable, ["v49", "v49w"]));

@@ -597,10 +597,13 @@ mod tests {
         // Generations supplied directly, so this holds whatever the live table says.
         let deps = [("a/b.bin".to_string(), "hashX".to_string())];
         let base = compute_deps_digest_for(&deps, &BTreeMap::new());
-        let gen1: BTreeMap<&'static str, u32> = [(recipes::Recipe::Skin.name(), 1u32)].into_iter().collect();
-        let gen2: BTreeMap<&'static str, u32> = [(recipes::Recipe::Skin.name(), 2u32)].into_iter().collect();
-        let other: BTreeMap<&'static str, u32> =
-            [(recipes::Recipe::Texture.name(), 1u32)].into_iter().collect();
+        let gen1: BTreeMap<&'static str, u32> =
+            [(recipes::Recipe::Skin.name(), 1u32)].into_iter().collect();
+        let gen2: BTreeMap<&'static str, u32> =
+            [(recipes::Recipe::Skin.name(), 2u32)].into_iter().collect();
+        let other: BTreeMap<&'static str, u32> = [(recipes::Recipe::Texture.name(), 1u32)]
+            .into_iter()
+            .collect();
 
         for d in [&gen1, &gen2, &other] {
             assert_ne!(compute_deps_digest_for(&deps, d), base);
@@ -625,7 +628,8 @@ mod tests {
         // map can ever hash to the digest some other dependency list already owns.
         let recipes: BTreeMap<&'static str, u32> =
             [(recipes::Recipe::Glb.name(), 1u32)].into_iter().collect();
-        let with = compute_deps_digest_for(&[("a/b.bin".to_string(), "hashX".to_string())], &recipes);
+        let with =
+            compute_deps_digest_for(&[("a/b.bin".to_string(), "hashX".to_string())], &recipes);
         for deps in [
             vec![],
             vec![("a/b.bin".to_string(), "hashX".to_string())],

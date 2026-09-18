@@ -221,7 +221,11 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         // Appended after `date`, so nothing about the existing field order moves.
         assert_eq!(
-            m.as_object().unwrap().keys().next_back().map(String::as_str),
+            m.as_object()
+                .unwrap()
+                .keys()
+                .next_back()
+                .map(String::as_str),
             Some("recipes")
         );
         // Whatever the table says, a conversion's own record of it reads back as current.

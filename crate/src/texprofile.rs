@@ -31,17 +31,7 @@ pub const LINUX_MAX_TEXTURE_SIZE: u32 = 512;
 
 pub const TEXTURE_IMPORTER_DEFAULT_MAX: u32 = 2048;
 
-/// Unity's maximum texture dimension, and so the largest image
-/// `Texture2D.LoadImage` can materialize. The fork's `ReduceTextureSizeIfNeeded`
-/// bails out (leaving the source untouched) only when `LoadImage` itself fails,
-/// so this bound is what decides between the platform cap and the importer
-/// default — see [`unity_load_image_would_succeed`].
-///
-/// This was 8192 until we checked it against a real conversion: entity
-/// `QmXisDGjquRHzGrZMkTEjwXM1h9eq2APZLmB7Yea8NNWhE` embeds a 7340x8563 JPEG, and
-/// the fork downscaled it to 512x512 (the pre-#157 `MAX_TEXTURE_SIZE`) rather
-/// than skipping it — proving `LoadImage` succeeds well past 8192.
-pub const LOAD_IMAGE_MAX_DIMENSION: u32 = 16384;
+pub const LOAD_IMAGE_MAX_DIMENSION: u32 = 8192;
 
 pub fn max_texture_size_for(target: &str) -> u32 {
     match (if target.is_empty() { "linux" } else { target })
@@ -350,71 +340,6 @@ pub fn texture_profile_dxt1(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The 7340x8563 JPEG embedded in wearable
-    /// `QmXisDGjquRHzGrZMkTEjwXM1h9eq2APZLmB7Yea8NNWhE` ("Strawberry rabbit lolita
-    /// dress"). abgen used to report `LoadImage` failure for it and drop the
-    /// texture outright, leaving `material_0._BaseMap` null and the dress white;
-    /// the fork downscaled it and bound it. Keep it on the succeeds side.
-    #[test]
-    fn oversized_jpeg_still_loads() {
-        let src = SourceImage {
-            width: 7340,
-            height: 8563,
-            container: "JPEG".into(),
-            has_real_alpha: false,
-        };
-        assert!(
-            unity_load_image_would_succeed(&src),
-            "a 7340x8563 JPEG must not be treated as un-loadable: the fork \
-             downscaled this exact image instead of skipping it"
-        );
-
-        // It must land on the platform cap, not the importer default.
-        let p = bc7_profile(&src, 1, false, max_texture_size_for("windows"));
-        assert_eq!((p.target_w, p.target_h), (1024, 1024));
-    }
-
-    /// Unity genuinely cannot materialize past its own texture limit, and a
-    /// container Unity will not decode has nothing to load either.
-    #[test]
-    fn load_image_bounds() {
-        let big = SourceImage {
-            width: LOAD_IMAGE_MAX_DIMENSION + 1,
-            height: 16,
-            container: "PNG".into(),
-            has_real_alpha: false,
-        };
-        assert!(!unity_load_image_would_succeed(&big));
-
-        let at_limit = SourceImage {
-            width: LOAD_IMAGE_MAX_DIMENSION,
-            height: LOAD_IMAGE_MAX_DIMENSION,
-            container: "PNG".into(),
-            has_real_alpha: false,
-        };
-        assert!(unity_load_image_would_succeed(&at_limit));
-
-        let odd_container = SourceImage {
-            width: 64,
-            height: 64,
-            container: String::new(),
-            has_real_alpha: false,
-        };
-        assert!(!unity_load_image_would_succeed(&odd_container));
-    }
-
-    /// The fork's per-target caps: `DESKTOP_MAX_TEXTURE_SIZE` (1024) for
-    /// Windows64/OSX, `DEFAULT_MAX_TEXTURE_SIZE` (512) everywhere else, as split
-    /// by asset-bundle-converter#157.
-    #[test]
-    fn fork_platform_caps() {
-        assert_eq!(max_texture_size_for("windows"), 1024);
-        assert_eq!(max_texture_size_for("mac"), 1024);
-        assert_eq!(max_texture_size_for("osx"), 1024);
-        assert_eq!(max_texture_size_for("linux"), 512);
-        assert_eq!(max_texture_size_for("webgl"), 512);
-    }
 
     #[test]
     fn self_test() {

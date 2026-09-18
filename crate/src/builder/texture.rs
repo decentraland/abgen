@@ -649,13 +649,9 @@ impl<'a> Builder<'a> {
             return None;
         }
 
-        // Past this point the image has decoded, so we hold its pixels: there is
-        // always a texture to emit. Size is a capping question, never a
-        // keep-or-discard one — an oversized or oddly-containered source gets
-        // resized (see `max_size` below), not dropped. The only bail-out is the
-        // `images[idx].is_none()` decode failure above, where there are no pixels
-        // to resize.
-        let src = self.source_image(scene, idx);
+        if !texprofile::unity_load_image_would_succeed(&self.source_image(scene, idx)) {
+            return None;
+        }
 
         let canon = self
             .sampler_canon
@@ -693,24 +689,15 @@ impl<'a> Builder<'a> {
             }
         };
         let is_normal = scene.normal_images.contains(&idx);
+        let src = self.source_image(scene, idx);
         let is_dxt1 = self.dxt1_images.contains(&idx);
 
         let is_bc5_normal = self.bc5_normal_images.contains(&idx);
 
-        // Which cap applies, mirroring the fork's `ReduceTextureSizeIfNeeded`:
-        // normally the platform cap, but when `LoadImage` cannot take the source
-        // the fork skips its pre-downscale and the TextureImporter's own default
-        // caps the import instead. Both branches keep the image — the same choice
-        // `standalone.rs` already makes for content-file textures.
-        let platform_cap = if texprofile::unity_load_image_would_succeed(&src) {
-            texprofile::max_texture_size_for(self.target)
-        } else {
-            texprofile::TEXTURE_IMPORTER_DEFAULT_MAX
-        };
         let max_size = if self.lod.is_some() {
-            platform_cap.min(512)
+            texprofile::max_texture_size_for(self.target).min(512)
         } else {
-            platform_cap
+            texprofile::max_texture_size_for(self.target)
         };
         let (mut unc_p, mut bc7_p) = if is_bc5_normal {
             texprofile::texture_profile_bc5_normal(&src, colorspace, mag, mn, max_size)
