@@ -168,6 +168,28 @@ non-digest names).
   `ABGEN_MAGENTA_MISSING` is on, in which case unresolvable deps are dropped from the digest and
   the build substitutes placeholder textures
 
+### Two version lanes: `AB_VERSION` and `WEARABLE_AB_VERSION`
+Scene bundles and wearable/emote bundles live under separate key prefixes. `AB_VERSION` is the scene
+lane; `WEARABLE_AB_VERSION` is wearables and emotes, and defaults to `AB_VERSION` when unset — so a
+deployment that does not set it behaves exactly as it did when the two shared one prefix.
+
+They are split because only a scene's name can carry an invalidation. Scene bundles are digest-named
+(`{hash}_{digest}_{platform}`), so a dependency change or a recipe bump moves them; wearable bundles
+are `{hash}_{platform}`, with nowhere to put one, which leaves the prefix as the only lever they
+have. Sharing one prefix therefore meant every scene-driven bump dragged the whole wearable corpus
+through a rebuild it had no use for, and every wearable-driven bump did the same to the world.
+
+- The conversion path resolves its lane from the entity type (`Proxy::version_for`); everything
+  that is not a scene rides the wearable lane.
+- The serving path has only a bundle name to go on, so it reads both lanes and then
+  `ABGEN_FALLBACK_VERSION` (`Proxy::read_versions`). Safe rather than merely convenient: an
+  entity's bundles exist under exactly one prefix and every name is content-addressed, so a hit is
+  the right bytes whichever lane answered. A miss costs one extra 404.
+- The lambda's already-converted gate accepts a manifest at *either* lane, because the entity type
+  is only known after the entity doc is fetched and the gate deliberately runs before that. Safe
+  while the two are distinct strings: a manifest carries whichever version wrote it, so a bump of
+  either stops matching.
+
 ### Per-asset-type cache keys (recipes)
 `AB_VERSION` prefixes every space key, so bumping it orphans every bundle of every type at once —
 the right hammer for a change to the bundle container, far too big for the usual fix, which changes
