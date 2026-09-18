@@ -393,7 +393,12 @@ mod tests {
     #[test]
     fn a_manifest_is_current_only_at_this_version_and_these_recipes() {
         let good = serde_json::json!({"version": "v49", "files": ["x"], "exitCode": 0});
-        assert!(super::manifest_is_current(&good, ["v49", "v49w"]));
+        // No recipes block means "written before recipes existed": current exactly while
+        // nothing has been bumped since, stale the moment anything has.
+        assert_eq!(
+            super::manifest_is_current(&good, ["v49", "v49w"]),
+            !abgen::recipes::any_bumped()
+        );
         assert!(!super::manifest_is_current(&good, ["v50", "v50w"]));
 
         let failed = serde_json::json!({"version": "v49", "files": [], "exitCode": 12});

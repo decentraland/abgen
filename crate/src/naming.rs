@@ -717,7 +717,12 @@ mod tests {
     #[test]
     fn image_class_digest_folds_each_input() {
         let base = image_class_digest(false, false, false, ".png");
-        assert_eq!(base, "f698278562d3edf9245f7b57f39575b0");
+        // The pre-recipes digest, reproduced exactly while the texture recipe sits at
+        // baseline; a bump of it is the one thing allowed to move this name.
+        assert_eq!(
+            base == "f698278562d3edf9245f7b57f39575b0",
+            recipes::digest_generations(&recipes::image_recipes()).is_empty()
+        );
         assert_eq!(base, image_class_digest(false, false, false, ".png"));
         let variants = [
             base.clone(),
