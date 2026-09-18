@@ -103,11 +103,19 @@ impl Recipe {
     }
 
     /// The current generation. Bump by one, in the commit that changes the output.
+    ///
+    /// History, newest first — a bump is only legible next to the change it names:
+    /// - `Texture` 1: GLB-embedded images past the old 8192 `LoadImage` bound are capped
+    ///   instead of dropped, and standalone images between 8192 and 16384 cap at the
+    ///   platform size (#121).
+    /// - `Skin` 1: skinned renderer bounds are baked over every animation clip instead of
+    ///   the bind pose; gated on a glTF with skins *and* clips, `Skin` being the narrower
+    ///   superset (#119).
     pub const fn generation(self) -> u32 {
         match self {
             Recipe::Glb => 0,
-            Recipe::Texture => 0,
-            Recipe::Skin => 0,
+            Recipe::Texture => 1,
+            Recipe::Skin => 1,
             Recipe::Animation => 0,
         }
     }
