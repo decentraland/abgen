@@ -178,7 +178,7 @@ fn convert_one(
     }
 
     let digest = match naming::deps_digest_for_glb(data, name, ctx.content_by_file, ctx.magenta) {
-        Ok(d) => d,
+        Ok(d) => d.digest,
         Err(e) => {
             sink.emit_json(serde_json::json!({
                 "ev": "file-error",

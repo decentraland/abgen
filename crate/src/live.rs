@@ -137,7 +137,7 @@ fn compute_deps_digests(
     tolerant: bool,
     jobs: usize,
 ) -> (
-    HashMap<String, String>,
+    HashMap<String, naming::GlbDigest>,
     std::collections::HashSet<String>,
     Vec<(String, String, String)>,
 ) {
@@ -149,8 +149,8 @@ fn compute_deps_digests(
         .filter(|(hash, file)| is_convertible(file).0 && seen.insert(hash.clone()))
         .collect();
 
-    let slots: Vec<Mutex<Option<Result<String, (bool, String)>>>> =
-        work.iter().map(|_| Mutex::new(None)).collect();
+    type Slot = Mutex<Option<Result<naming::GlbDigest, (bool, String)>>>;
+    let slots: Vec<Slot> = work.iter().map(|_| Mutex::new(None)).collect();
     let workers = jobs.clamp(1, work.len().max(1));
     let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
@@ -171,7 +171,7 @@ fn compute_deps_digests(
         }
     });
 
-    let mut digests: HashMap<String, String> = HashMap::new();
+    let mut digests: HashMap<String, naming::GlbDigest> = HashMap::new();
     let mut undeployed: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut warns: Vec<(String, String, String)> = Vec::new();
     for ((hash, file), slot) in work.iter().map(|w| (&w.0, &w.1)).zip(slots) {
@@ -223,7 +223,7 @@ pub(crate) struct EntityCtx {
     pub(crate) content_by_file: HashMap<String, String>,
     pub(crate) scan: EntityScan,
 
-    deps_digests: HashMap<String, String>,
+    deps_digests: HashMap<String, naming::GlbDigest>,
     /// GLBs whose referenced textures are not deployed in the entity: prod
     /// skips these (no manifest entry, exit 0), so they must not count as
     /// conversion failures (#59).
@@ -253,6 +253,11 @@ impl EntityCtx {
             &naming::image_key_extension(file),
         )
     }
+
+    /// The recipes that govern an image bundle's bytes, for the union a manifest records.
+    fn image_recipes() -> Vec<crate::recipes::Recipe> {
+        crate::recipes::image_recipes()
+    }
 }
 
 pub struct Proxy {
@@ -262,6 +267,7 @@ pub struct Proxy {
     bundle_dir: PathBuf,
     digests_dir: PathBuf,
     version: String,
+    wearable_version: String,
     date: String,
     uri_cache: UriCache,
 
@@ -717,9 +723,10 @@ impl Proxy {
         if let Some(req_digest) = req_digest {
             if is_glb {
                 match ctx.deps_digests.get(hash) {
-                    Some(d) if d == req_digest => {}
+                    Some(d) if d.digest == req_digest => {}
                     Some(d) => bail!(
-                        "deps digest mismatch for {file} (hash {hash}): requested {req_digest}, computed {d}"
+                        "deps digest mismatch for {file} (hash {hash}): requested {req_digest}, computed {}",
+                        d.digest
                     ),
                     None => bail!(
                         "deps digest unavailable for {file} (hash {hash}): dependency resolution failed at entity scan"
@@ -861,6 +868,45 @@ impl Proxy {
         format!("{version}/{cid}/{file}")
     }
 
+    /// The key prefix an entity's bundles live under.
+    ///
+    /// Scenes and everything else are split because only a scene's name can carry an
+    /// invalidation: its bundles are digest-named, so a deps change or a recipe bump moves
+    /// them. A wearable's are `{hash}_{platform}`, with nowhere to put one, which leaves the
+    /// prefix as the only lever they have. Sharing one prefix therefore meant every scene
+    /// -driven bump dragged the whole wearable corpus through a rebuild it had no use for,
+    /// and every wearable-driven bump did the same to the world.
+    ///
+    /// Emotes ride the wearable lane: the split is about whether a name can be moved, and
+    /// theirs cannot either.
+    pub fn version_for(&self, entity_type: &str) -> &str {
+        if entity_type == "scene" {
+            &self.version
+        } else {
+            &self.wearable_version
+        }
+    }
+
+    /// Prefixes to try when the entity type is not known — the serving path, where all
+    /// there is to go on is a bundle name.
+    ///
+    /// Trying both is safe rather than merely convenient: an entity's bundles exist under
+    /// exactly one prefix, and every name under either is content-addressed, so a hit is
+    /// the right bytes whichever lane answered. The cost of a miss is one more 404.
+    fn read_versions(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for v in [
+            self.version.as_str(),
+            self.wearable_version.as_str(),
+            self.fallback_version.as_str(),
+        ] {
+            if !v.is_empty() && !out.contains(&v) {
+                out.push(v);
+            }
+        }
+        out
+    }
+
     fn asset_bundle_key(version: &str, file: &str) -> String {
         format!("{version}/assets/{file}")
     }
@@ -905,11 +951,7 @@ impl Proxy {
 
     pub fn space_get_bundle(&self, cid: &str, file: &str) -> Option<Vec<u8>> {
         let space = self.space.as_ref()?;
-        let mut versions = vec![self.version.as_str()];
-        if self.fallback_version != self.version {
-            versions.push(self.fallback_version.as_str());
-        }
-        for ver in versions {
+        for ver in self.read_versions() {
             let keys = [
                 Self::asset_bundle_key(ver, file),
                 Self::bundle_key(ver, cid, file),
@@ -927,14 +969,14 @@ impl Proxy {
         None
     }
 
-    fn space_probe_asset(&self, file: &str) -> bool {
+    fn space_probe_asset(&self, version: &str, file: &str) -> bool {
         if !naming::bundle_name_has_digest(file) {
             return false;
         }
         let Some(space) = self.space.as_ref() else {
             return false;
         };
-        let key = Self::asset_bundle_key(&self.version, file);
+        let key = Self::asset_bundle_key(version, file);
         let cache_key = self.reuse_cache_key(&key);
         if let Some(ck) = &cache_key {
             if crate::rediscache::hit(ck) {
@@ -994,7 +1036,7 @@ impl Proxy {
 
     pub fn space_probe_versions(&self, first: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for v in [first, self.version.as_str(), self.fallback_version.as_str()] {
+        for v in std::iter::once(first).chain(self.read_versions()) {
             if !v.is_empty() && !out.iter().any(|o| o == v) {
                 out.push(v.to_string());
             }
@@ -1007,11 +1049,18 @@ impl Proxy {
     }
 
     /// Prod layout: scenes go to the shared assets/ prefix, wearables/emotes entity-scoped.
-    pub fn space_put_bundle(&self, cid: &str, file: &str, shared_placement: bool, bytes: &[u8]) {
+    pub fn space_put_bundle(
+        &self,
+        version: &str,
+        cid: &str,
+        file: &str,
+        shared_placement: bool,
+        bytes: &[u8],
+    ) {
         let key = if shared_placement {
-            Self::asset_bundle_key(&self.version, file)
+            Self::asset_bundle_key(version, file)
         } else {
-            Self::bundle_key(&self.version, cid, file)
+            Self::bundle_key(version, cid, file)
         };
         self.space_put_key(&key, bytes);
     }
@@ -1104,10 +1153,24 @@ impl Proxy {
         }
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        // Which key prefix this entity's bundles live under — scenes and everything else
+        // are separate lanes (`version_for`), so a bump on one never drags the other.
+        let lane_version = self.version_for(&ctx.scene.entity_type);
         let mut prebuilt: Vec<(usize, String)> = Vec::new();
         let mut work: Vec<WorkItem> = Vec::new();
         let mut candidates: Vec<ProbeCandidate> = Vec::new();
         let mut done_pre: usize = 0;
+        // Union over every bundle this manifest will list, reused or rebuilt: the recipes
+        // that govern their bytes. Recorded — generations and all, baselines included — so a
+        // later bump of any of them invalidates this manifest and a bump of one the entity
+        // does not use leaves it alone.
+        //
+        // Stays empty for an entity under bare naming (wearables, emotes, or
+        // `ABGEN_DEPS_DIGEST=0`), and that empty union is the honest answer there: a name
+        // with no digest carries no generation, so no recipe bump governs those bundles and
+        // `AB_VERSION` remains the only thing that can invalidate them.
+        let mut used_recipes: std::collections::BTreeSet<crate::recipes::Recipe> =
+            std::collections::BTreeSet::new();
         for (idx, c) in convertible.iter().enumerate() {
             let order = idx + 1;
             let (is_glb, is_image) = is_convertible(&c.file);
@@ -1119,13 +1182,17 @@ impl Proxy {
             let bare_name = format!("{case_hash}_{platform}");
             let digest_naming = self.deps_digest && ctx.scene.entity_type == "scene";
             let bundle_name = if digest_naming && is_image {
+                crate::recipes::merge_into(&mut used_recipes, &EntityCtx::image_recipes());
                 format!(
                     "{case_hash}_{}_{platform}",
                     ctx.image_digest(&c.hash, &c.file)
                 )
             } else if digest_naming && is_glb {
                 match ctx.deps_digests.get(&c.hash) {
-                    Some(d) => format!("{case_hash}_{d}_{platform}"),
+                    Some(d) => {
+                        crate::recipes::merge_into(&mut used_recipes, &d.recipes);
+                        format!("{case_hash}_{}_{platform}", d.digest)
+                    }
                     None if ctx.undeployed_dep_glbs.contains(&c.hash) => {
                         tracing::warn!(
                             entity = %cid,
@@ -1176,7 +1243,7 @@ impl Proxy {
                         let Some(cand) = candidates.get(i) else {
                             break;
                         };
-                        let hit = self.space_probe_asset(&cand.bundle_name);
+                        let hit = self.space_probe_asset(lane_version, &cand.bundle_name);
                         *hit_slots[i].lock().unwrap() = hit;
                     });
                 }
@@ -1270,14 +1337,20 @@ impl Proxy {
                         match &upload_pool {
                             Some(pool) => {
                                 let key = if shared_placement {
-                                    Self::asset_bundle_key(&self.version, name)
+                                    Self::asset_bundle_key(lane_version, name)
                                 } else {
-                                    Self::bundle_key(&self.version, cid, name)
+                                    Self::bundle_key(lane_version, cid, name)
                                 };
                                 pool.enqueue(key, dst.clone());
                             }
                             None => {
-                                self.space_put_bundle(cid, name, shared_placement, &bytes);
+                                self.space_put_bundle(
+                                    lane_version,
+                                    cid,
+                                    name,
+                                    shared_placement,
+                                    &bytes,
+                                );
                             }
                         }
                     }
@@ -1357,16 +1430,19 @@ impl Proxy {
         let tolerated = tolerated_a.load(Ordering::Relaxed);
         let collapsed_names = collapsed_m.into_inner().unwrap();
         self.merge_names_index(cid, &collapsed_names);
+        let recorded_recipes =
+            crate::recipes::recorded_generations(&used_recipes.into_iter().collect::<Vec<_>>());
         let manifest_path =
             crate::manifest::write_corpus_manifest(&crate::manifest::CorpusManifestSpec {
                 out_root,
                 entity_id: cid,
                 platform,
                 built: &built,
-                ab_version: &self.version,
+                ab_version: lane_version,
                 content_server_url,
                 exit_code: crate::manifest::exit_code_for_failures(failed.len() + tolerated),
                 date: &self.date,
+                recipes: Some(&recorded_recipes),
             })?;
         if self.space_configured() {
             match std::fs::read(&manifest_path) {
@@ -1583,7 +1659,12 @@ pub struct ProxyConfig {
     pub local_root: Option<String>,
 
     pub cache_dir: String,
+    /// Key prefix for scene bundles.
     pub version: String,
+    /// Key prefix for everything that is not a scene — wearables, emotes. Empty means
+    /// "share the scene lane", which is what every deployment did before the lanes split
+    /// and is still the default.
+    pub wearable_version: String,
     pub date: Option<String>,
     pub parity: bool,
     pub magenta_missing: bool,
@@ -1602,6 +1683,7 @@ impl Default for ProxyConfig {
             local_root: None,
             cache_dir: "./abgen-serve-cache".to_string(),
             version: "v41".to_string(),
+            wearable_version: String::new(),
             date: None,
             parity: false,
             magenta_missing: false,
@@ -1674,6 +1756,11 @@ impl Proxy {
             content,
             bundle_dir,
             digests_dir,
+            wearable_version: if cfg.wearable_version.is_empty() {
+                cfg.version.clone()
+            } else {
+                cfg.wearable_version
+            },
             version: cfg.version,
             date,
             uri_cache: UriCache::new(),
@@ -2232,6 +2319,7 @@ mod tests {
         )]);
         let proxy = stub_proxy_reuse(&host, "reuse-layout");
         proxy.space_put_bundle(
+            "v41",
             "bafkcid",
             "Qmhash_0123456789abcdef0123456789abcdef_windows",
             true,
@@ -2260,8 +2348,8 @@ mod tests {
             Vec::new(),
         )]);
         let proxy = stub_proxy_reuse(&host, "reuse-probe");
-        assert!(proxy.space_probe_asset("Qmhit_0123456789abcdef0123456789abcdef_windows"));
-        assert!(!proxy.space_probe_asset("Qmmiss_0123456789abcdef0123456789abcdef_windows"));
+        assert!(proxy.space_probe_asset("v41", "Qmhit_0123456789abcdef0123456789abcdef_windows"));
+        assert!(!proxy.space_probe_asset("v41", "Qmmiss_0123456789abcdef0123456789abcdef_windows"));
         let log = seen.lock().unwrap().clone();
         assert_eq!(
             log,
@@ -2273,7 +2361,9 @@ mod tests {
 
         let (host2, seen2) = super::stub::serve(vec![]);
         let digests_off = stub_proxy(&host2, false, "digests-off-probe");
-        assert!(!digests_off.space_probe_asset("Qmhit_0123456789abcdef0123456789abcdef_windows"));
+        assert!(
+            !digests_off.space_probe_asset("v41", "Qmhit_0123456789abcdef0123456789abcdef_windows")
+        );
         assert_eq!(
             seen2.lock().unwrap().clone(),
             vec!["HEAD /v41/assets/Qmhit_0123456789abcdef0123456789abcdef_windows".to_string()]
@@ -2288,7 +2378,7 @@ mod tests {
             b"SCENE".to_vec(),
         )]);
         let proxy = stub_proxy(&host, false, "digests-off-put");
-        proxy.space_put_bundle("bafkcid", "Qmhash_windows", true, b"B");
+        proxy.space_put_bundle("v41", "bafkcid", "Qmhash_windows", true, b"B");
         let got = proxy.space_get_bundle("bafkcid", "Qmhash_windows");
         assert_eq!(got.as_deref(), Some(&b"SCENE"[..]));
         let log = seen.lock().unwrap().clone();
@@ -2305,8 +2395,8 @@ mod tests {
     fn scene_digestless_puts_canonical_and_wearables_stay_entity_scoped() {
         let (host, seen) = super::stub::serve(vec![]);
         let proxy = stub_proxy_reuse(&host, "reuse-digestless");
-        proxy.space_put_bundle("bafkscene", "Qmhash_windows", true, b"B");
-        proxy.space_put_bundle("bafkwearable", "Qmhash_windows", false, b"B");
+        proxy.space_put_bundle("v41", "bafkscene", "Qmhash_windows", true, b"B");
+        proxy.space_put_bundle("v41", "bafkwearable", "Qmhash_windows", false, b"B");
         let log = seen.lock().unwrap().clone();
         assert_eq!(
             log,
@@ -2326,6 +2416,7 @@ mod tests {
         )]);
         let proxy = stub_proxy_reuse(&host, "kind-over-name");
         proxy.space_put_bundle(
+            "v41",
             "bafkwearable",
             "Qmhash_0123456789abcdef0123456789abcdef_windows",
             false,
@@ -2357,7 +2448,7 @@ mod tests {
             &temp_cache("ro-scene-put"),
             true,
         );
-        proxy.space_put_bundle("bafkscene", "Qmhash_windows", true, b"B");
+        proxy.space_put_bundle("v41", "bafkscene", "Qmhash_windows", true, b"B");
         assert!(seen.lock().unwrap().is_empty());
     }
 
@@ -2422,7 +2513,7 @@ mod tests {
         let (host, seen) = super::stub::serve(vec![]);
         let proxy = stub_proxy_reuse(&host, "digestless-read");
         assert_eq!(proxy.space_get_bundle("bafkcid", "Qmhash_windows"), None);
-        assert!(!proxy.space_probe_asset("Qmhash_windows"));
+        assert!(!proxy.space_probe_asset("v41", "Qmhash_windows"));
         let log = seen.lock().unwrap().clone();
         assert_eq!(
             log,
@@ -3019,6 +3110,39 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir_c);
         let _ = std::fs::remove_dir_all(&dir_d);
+    }
+
+    #[test]
+    fn version_lanes_route_by_entity_type_and_read_both() {
+        let dir = temp_cache("version-lanes");
+        let split = Proxy::new(ProxyConfig {
+            catalyst_url: "http://127.0.0.1:9".to_string(),
+            cache_dir: dir.to_string_lossy().into_owned(),
+            version: "v49".to_string(),
+            wearable_version: "v49w".to_string(),
+            fallback_version: "v41".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(split.version_for("scene"), "v49");
+        // Emotes ride the wearable lane, and so does anything else that turns up: the split
+        // is about whether a name can carry an invalidation, and only a scene's can.
+        for kind in ["wearable", "emote", "profile", ""] {
+            assert_eq!(split.version_for(kind), "v49w", "entity type {kind:?}");
+        }
+        // Serving has only a bundle name to go on, so it tries both lanes then the fallback.
+        assert_eq!(split.read_versions(), vec!["v49", "v49w", "v41"]);
+
+        // Leave WEARABLE_AB_VERSION unset and the lanes collapse into one, which is exactly
+        // the behaviour every deployment had before they were split.
+        let shared = Proxy::new(ProxyConfig {
+            catalyst_url: "http://127.0.0.1:9".to_string(),
+            cache_dir: dir.to_string_lossy().into_owned(),
+            version: "v49".to_string(),
+            fallback_version: "v41".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(shared.version_for("scene"), shared.version_for("wearable"));
+        assert_eq!(shared.read_versions(), vec!["v49", "v41"]);
     }
 
     #[test]

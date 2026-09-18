@@ -31,7 +31,7 @@ use crate::unity::{self, Bundle};
 use crate::value::Value;
 use crate::{
     animation, animation_mecanim, bundle as bundle_io, cabname, dxt_unity, gltf, hashes, materials,
-    mesh_layout, pathids, ress, sbp_order, skeleton, texprofile,
+    mesh_layout, pathids, ress, sbp_order, skeleton, skinbounds, texprofile,
 };
 use anyhow::{anyhow, Context, Result};
 use image::RgbaImage;
@@ -989,4 +989,14 @@ fn hash_matches(bytes: &[u8], expected: &str) -> bool {
     let exp = expected.trim();
     let got = hashes::sha256_hex(bytes);
     got.eq_ignore_ascii_case(exp)
+}
+
+impl<'a> Builder<'a> {
+    /// True when the source glTF carries at least one animation clip; skinned
+    /// renderers then get a baked `m_AABB` covering every clip.
+    pub(super) fn has_gltf_animations(&self) -> bool {
+        self.gltf_json["animations"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+    }
 }
