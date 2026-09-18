@@ -681,7 +681,7 @@ mod tests {
             .collect();
         abgen::naming::compute_deps_digest_for(
             &deps,
-            &abgen::recipes::generations(&abgen::recipes::gltf_recipes(&doc)),
+            &abgen::recipes::digest_generations(&abgen::recipes::gltf_recipes(&doc)),
         )
     }
 

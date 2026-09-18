@@ -117,12 +117,17 @@ impl Recipe {
     }
 }
 
-/// The recorded generations of `recipes`, dropping everything still at [`BASELINE`].
+/// The generations a *digest* folds in: the applicable recipes, dropping everything still at
+/// [`BASELINE`].
+///
+/// Dropping the baselines is what keeps names stable — an asset no bump has touched hashes
+/// the payload it always hashed and keeps the name it is already published under. The
+/// manifest deliberately does the opposite; see [`recorded_generations`].
 ///
 /// A [`BTreeMap`] so the JSON it serializes to is key-ordered and a digest over it is
 /// stable, and so an empty result serializes to `{}` — the shape a caller folds in as
 /// "nothing to say".
-pub fn generations(recipes: &[Recipe]) -> BTreeMap<&'static str, u32> {
+pub fn digest_generations(recipes: &[Recipe]) -> BTreeMap<&'static str, u32> {
     recipes
         .iter()
         .filter(|r| r.generation() != BASELINE)
@@ -130,12 +135,28 @@ pub fn generations(recipes: &[Recipe]) -> BTreeMap<&'static str, u32> {
         .collect()
 }
 
+/// The generations a *manifest* records: every applicable recipe, **including those at
+/// [`BASELINE`]**.
+///
+/// The baselines are the whole point here, and this is the one place they must not be
+/// dropped. A manifest is read back by [`recorded_is_current`], which asks whether every
+/// generation the manifest names still matches. A recipe the manifest does not name is
+/// treated as one the entity does not use — so if a recipe sitting at `0` were omitted, the
+/// bump that takes it to `1` would have nothing to disagree with and the entity would be
+/// skipped with stale bundles.
+///
+/// Recording `{"glb":0,"texture":0}` says something a digest never needs to: *these are the
+/// recipes that govern my bytes, and here is where each stood when I was written.* That is
+/// what makes every bump after the first precise instead of merely safe.
+pub fn recorded_generations(recipes: &[Recipe]) -> BTreeMap<&'static str, u32> {
+    recipes.iter().map(|r| (r.name(), r.generation())).collect()
+}
+
 /// Whether any recipe at all has been bumped off [`BASELINE`].
 ///
-/// While this is false the whole mechanism is inert: digests and manifests are byte-for-byte
-/// what they were before it existed. It is what lets a manifest omit its `recipes` block
-/// entirely rather than write an empty one, and what tells the conversion gate that a
-/// manifest without the block is current rather than merely old.
+/// Only the conversion gate's reading of a *missing* block depends on this: a manifest with
+/// no block at all predates recipes entirely, and is current exactly while nothing has been
+/// bumped since.
 pub fn any_bumped() -> bool {
     Recipe::ALL.iter().any(|r| r.generation() != BASELINE)
 }
@@ -179,20 +200,22 @@ pub fn image_recipes() -> Vec<Recipe> {
     vec![Recipe::Texture]
 }
 
-/// Fold `right` into `left`, for building the per-entity union a manifest records.
-pub fn merge_into(left: &mut BTreeMap<&'static str, u32>, right: &BTreeMap<&'static str, u32>) {
-    for (k, v) in right {
-        left.insert(*k, *v);
-    }
+/// Fold `recipes` into the per-entity set a manifest records.
+pub fn merge_into(set: &mut std::collections::BTreeSet<Recipe>, recipes: &[Recipe]) {
+    set.extend(recipes.iter().copied());
 }
 
 /// Whether the generations a past conversion recorded are still the ones in force.
 ///
 /// `recorded` is a manifest's `recipes` block, or `None` when it has none. A manifest
-/// without the block predates the first bump: current exactly while nothing has been bumped
-/// since. A manifest with one is current when every generation it names still matches —
-/// recipes it does not name are ones its entity does not use, and bumping those cannot have
-/// moved its bytes.
+/// without the block predates recipes entirely: current exactly while nothing has been
+/// bumped since. A manifest with one is current when every generation it names still matches
+/// — recipes it does not name are ones its entity does not use, and bumping those cannot
+/// have moved its bytes.
+///
+/// This only holds because [`recorded_generations`] writes the baselines too. A block that
+/// named only the bumped recipes would read as current after any later `0 -> 1` bump, and
+/// the entity would be skipped holding stale bundles.
 ///
 /// An unreadable block (not an object, or a value that is not a number) is treated as stale
 /// rather than guessed at: a needless reconversion is a cost, a skipped one is a bug.
@@ -218,15 +241,15 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn baseline_generations_fold_in_as_nothing() {
+    fn a_digest_drops_the_baselines_so_published_names_hold() {
         // A recipe at baseline never reaches a digest, so the assets it covers keep the
-        // names they were published under. Stated against the live table so it keeps
-        // holding as recipes get bumped, rather than pinning the table to all-zero.
+        // names they were published under. Stated against the live table so it keeps holding
+        // as recipes get bumped, rather than pinning the table to all-zero.
         let bumped: Vec<Recipe> = Recipe::ALL
             .into_iter()
             .filter(|r| r.generation() != BASELINE)
             .collect();
-        let folded = generations(&Recipe::ALL);
+        let folded = digest_generations(&Recipe::ALL);
         assert_eq!(folded.len(), bumped.len());
         for r in bumped {
             assert_eq!(folded.get(r.name()), Some(&r.generation()));
@@ -235,16 +258,43 @@ mod tests {
     }
 
     #[test]
-    fn names_are_unique_and_round_trip() {
-        let mut seen: Vec<&str> = Recipe::ALL.iter().map(|r| r.name()).collect();
-        let total = seen.len();
-        seen.sort_unstable();
-        seen.dedup();
-        assert_eq!(seen.len(), total);
+    fn a_manifest_keeps_the_baselines_so_a_later_bump_is_detectable() {
+        // The bug this guards: record only the bumped recipes and a later 0 -> 1 bump has
+        // nothing in the block to disagree with, so the entity is skipped holding stale
+        // bundles. Every applicable recipe is named, whatever generation it stands at.
+        let recorded = recorded_generations(&Recipe::ALL);
+        assert_eq!(recorded.len(), Recipe::ALL.len());
         for r in Recipe::ALL {
-            assert_eq!(Recipe::from_name(r.name()), Some(r));
+            assert_eq!(recorded.get(r.name()), Some(&r.generation()));
         }
-        assert_eq!(Recipe::from_name("nosuchrecipe"), None);
+        assert!(recorded_is_current(Some(&serde_json::to_value(&recorded).unwrap())));
+
+        // And the detection itself: whatever generation a recipe stands at now, the block
+        // written before a bump of it stops reading as current.
+        for r in Recipe::ALL {
+            let mut stale = serde_json::Map::new();
+            stale.insert(
+                r.name().to_string(),
+                serde_json::Value::from(u64::from(r.generation()) + 1),
+            );
+            assert!(
+                !recorded_is_current(Some(&serde_json::Value::Object(stale))),
+                "a bumped {} must invalidate",
+                r.name()
+            );
+        }
+    }
+
+    #[test]
+    fn an_entity_is_only_governed_by_the_recipes_it_records() {
+        // A scene of static props records glb+texture and nothing else, so bumping `skin`
+        // leaves it current — that is the saving — while bumping `glb` does not.
+        let props = recorded_generations(&[Recipe::Glb, Recipe::Texture]);
+        assert_eq!(props.len(), 2);
+        assert!(!props.contains_key(Recipe::Skin.name()));
+        assert!(recorded_is_current(Some(
+            &serde_json::to_value(&props).unwrap()
+        )));
     }
 
     #[test]
@@ -293,16 +343,25 @@ mod tests {
             serde_json::to_string(&map).unwrap(),
             r#"{"glb":1,"texture":2}"#
         );
+        // Key order is the map's, so a recorded block is stable across writers too.
+        let all: BTreeMap<&str, u32> = [("texture", 0u32), ("glb", 0), ("skin", 1)]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            serde_json::to_string(&all).unwrap(),
+            r#"{"glb":0,"skin":1,"texture":0}"#
+        );
     }
 
     #[test]
     fn merge_keeps_the_union() {
-        let mut left: BTreeMap<&'static str, u32> = [("glb", 1u32)].into_iter().collect();
-        let right: BTreeMap<&'static str, u32> = [("texture", 3u32)].into_iter().collect();
-        merge_into(&mut left, &right);
-        assert_eq!(left.len(), 2);
-        assert_eq!(left["glb"], 1);
-        assert_eq!(left["texture"], 3);
+        let mut set = std::collections::BTreeSet::new();
+        merge_into(&mut set, &[Recipe::Glb, Recipe::Texture]);
+        merge_into(&mut set, &[Recipe::Glb, Recipe::Skin]);
+        assert_eq!(
+            set.into_iter().collect::<Vec<_>>(),
+            vec![Recipe::Glb, Recipe::Texture, Recipe::Skin]
+        );
     }
 
     #[test]

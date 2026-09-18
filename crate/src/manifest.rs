@@ -27,30 +27,29 @@ pub struct CorpusManifestSpec<'a> {
     pub content_server_url: &'a str,
     pub exit_code: i32,
     pub date: &'a str,
-    /// Generations of the recipes that named the bundles in `built` — the union
-    /// [`crate::recipes::generations`] produced across them — or `None` from a writer that
-    /// cannot vouch for the whole set. See [`recipes_block`].
+    /// Generations of every recipe governing the bundles in `built` — the union
+    /// [`crate::recipes::recorded_generations`] produced across them, baselines included —
+    /// or `None` from a writer that cannot vouch for the whole set. See [`recipes_block`].
     pub recipes: Option<&'a std::collections::BTreeMap<&'static str, u32>>,
 }
 
-/// The `recipes` the manifest carries, or `None` to leave the key out entirely.
+/// The `recipes` block the manifest carries, or `None` to leave the key out entirely.
 ///
-/// While no recipe has been bumped the block says nothing anyone can act on, and omitting it
-/// keeps the manifest byte-identical to the one this converter has always written.
+/// Written whenever the writer can vouch for the whole set, at baseline or not — the block
+/// records every recipe that governs the entity's bundles together with where each stood,
+/// so it is only useful if it is there *before* the bump it is meant to catch. A block that
+/// appeared only once something had been bumped would be too late to catch that first bump,
+/// and a block that listed only the bumped recipes would be blind to every bump after it
+/// ([`crate::recipes::recorded_generations`] explains why).
 ///
-/// Once something *has* been bumped, the block's presence is itself the signal, so a writer
-/// that knows the full set writes it even when it is empty: empty is then a positive claim
-/// that this entity uses no bumped recipe and its bundles are still good, where absent means
-/// "written before the bump, reconvert once". A writer passing `None` declines to make that
-/// claim and gets the reconversion. [`crate::recipes::recorded_is_current`] reads it back.
+/// Absent therefore means one thing: written before recipes existed at all. A writer that
+/// cannot vouch for the whole set passes `None` and takes the reconversion rather than
+/// claim a currency it does not know. [`crate::recipes::recorded_is_current`] reads it back.
 #[cfg(not(target_arch = "wasm32"))]
 fn recipes_block(
     recipes: Option<&std::collections::BTreeMap<&'static str, u32>>,
 ) -> Option<serde_json::Value> {
-    match recipes {
-        Some(r) if crate::recipes::any_bumped() => Some(serde_json::json!(r)),
-        _ => None,
-    }
+    recipes.map(|r| serde_json::json!(r))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -193,16 +192,14 @@ mod tests {
     }
 
     #[test]
-    fn recipes_block_appears_only_once_something_is_bumped() {
-        // While the table is at baseline the manifest must be byte-identical to the one
-        // this converter has always written — no empty block, no new key.
-        let empty = BTreeMap::new();
-        assert_eq!(
-            recipes_block(Some(&empty)).is_some(),
-            crate::recipes::any_bumped()
-        );
+    fn recipes_block_is_written_whenever_the_writer_can_vouch_for_it() {
+        // Written at baseline too: the block has to be in place *before* the bump it is
+        // meant to catch, so gating it on `any_bumped` would miss the first one.
+        let recorded = crate::recipes::recorded_generations(&crate::recipes::Recipe::ALL);
+        assert!(recipes_block(Some(&recorded)).is_some());
+        assert!(recipes_block(Some(&BTreeMap::new())).is_some());
         // A writer that cannot vouch for the set never writes the block, so its manifests
-        // always reconvert once after a bump rather than claiming a currency they don't know.
+        // reconvert once after a bump rather than claiming a currency they don't know.
         assert!(recipes_block(None).is_none());
 
         let tmp = std::env::temp_dir().join(format!("abgen_corpus_recipes_{}", std::process::id()));
@@ -217,12 +214,16 @@ mod tests {
             content_server_url: "http://cs",
             exit_code: 0,
             date: TEST_DATE,
-            recipes: Some(&empty),
+            recipes: Some(&recorded),
         })
         .unwrap();
         let m: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
-        assert_eq!(m.get("recipes").is_some(), crate::recipes::any_bumped());
+        // Appended after `date`, so nothing about the existing field order moves.
+        assert_eq!(
+            m.as_object().unwrap().keys().last().map(String::as_str),
+            Some("recipes")
+        );
         // Whatever the table says, a conversion's own record of it reads back as current.
         assert!(crate::recipes::recorded_is_current(m.get("recipes")));
         let _ = std::fs::remove_dir_all(&tmp);

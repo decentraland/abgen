@@ -353,7 +353,7 @@ pub fn compute_deps_digest(deps: &[(String, String)]) -> String {
 }
 
 /// [`compute_deps_digest`] with the glTF's recipe generations folded in, as
-/// [`crate::recipes::generations`] returns them.
+/// [`crate::recipes::digest_generations`] returns them.
 ///
 /// Bumping a recipe a glTF uses moves this digest, so the bundle gets a new name, misses the
 /// CDN probe, and rebuilds — while every glTF that does not use that recipe keeps the name
@@ -409,7 +409,7 @@ pub fn image_class_digest(
 ) -> String {
     digest_inputs(
         (model_referenced, linear, normal, key_ext),
-        &recipes::generations(&recipes::image_recipes()),
+        &recipes::digest_generations(&recipes::image_recipes()),
         "image class",
     )
 }
@@ -430,16 +430,18 @@ impl std::fmt::Display for DepNotDeployed {
 
 impl std::error::Error for DepNotDeployed {}
 
-/// What naming a GLB's bundle takes from its source: the digest itself, and the recipe
-/// generations that went into it.
+/// What naming a GLB's bundle takes from its source: the digest itself, and the recipes that
+/// govern its bytes.
 ///
-/// The generations come back out because a conversion records the union of them in its
-/// manifest, which is what lets the next job tell a manifest that is merely old from one a
-/// recipe bump has invalidated ([`crate::recipes::recorded_is_current`]).
+/// The recipes come back out as the list, not the folded generations, because the digest and
+/// the manifest want different things from them — the digest drops the baselines to keep
+/// names stable, the manifest keeps them so a later bump is detectable
+/// ([`crate::recipes::recorded_generations`]). Handing back the list lets each do its own
+/// fold.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GlbDigest {
     pub digest: String,
-    pub recipes: BTreeMap<&'static str, u32>,
+    pub recipes: Vec<recipes::Recipe>,
 }
 
 pub fn deps_digest_for_glb(
@@ -450,7 +452,7 @@ pub fn deps_digest_for_glb(
 ) -> Result<GlbDigest> {
     let ext = file_extension(glb_file);
     let doc = parse_gltf_doc(glb_bytes, &ext)?;
-    let recipes = recipes::generations(&recipes::gltf_recipes(&doc));
+    let recipes = recipes::gltf_recipes(&doc);
     let uris = dep_refs_of(&doc);
     let mut seen: Vec<String> = Vec::new();
     let mut deps: Vec<(String, String)> = Vec::new();
@@ -490,7 +492,7 @@ pub fn deps_digest_for_glb(
         deps.push((resolved, h.clone()));
     }
     Ok(GlbDigest {
-        digest: compute_deps_digest_for(&deps, &recipes),
+        digest: compute_deps_digest_for(&deps, &recipes::digest_generations(&recipes)),
         recipes,
     })
 }
@@ -581,7 +583,7 @@ mod tests {
         );
         // And the live table is still at baseline, so the live functions agree too.
         assert_eq!(
-            recipes::generations(&recipes::gltf_recipes(&serde_json::json!({
+            recipes::digest_generations(&recipes::gltf_recipes(&serde_json::json!({
                 "meshes": [{}], "skins": [{}], "animations": [{}],
                 "materials": [{"normalTexture": {}}], "images": [{}],
             })))
@@ -648,7 +650,7 @@ mod tests {
 
         let got = deps_digest_for_glb(glb, "m.gltf", &content, false).unwrap();
         let doc: serde_json::Value = serde_json::from_slice(glb).unwrap();
-        let expected = recipes::generations(&recipes::gltf_recipes(&doc));
+        let expected = recipes::gltf_recipes(&doc);
         assert_eq!(got.recipes, expected);
         assert_eq!(
             got.digest,
@@ -657,7 +659,7 @@ mod tests {
                     ("a.bin".to_string(), "Qmbin".to_string()),
                     ("t.png".to_string(), "Qmtex".to_string()),
                 ],
-                &expected
+                &recipes::digest_generations(&expected)
             )
         );
     }
@@ -674,7 +676,7 @@ mod tests {
         );
         assert_eq!(
             image_class_digest(false, false, false, ".png") == legacy,
-            recipes::generations(&recipes::image_recipes()).is_empty()
+            recipes::digest_generations(&recipes::image_recipes()).is_empty()
         );
     }
 

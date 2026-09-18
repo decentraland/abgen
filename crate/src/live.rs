@@ -5,7 +5,7 @@ use crate::local_store::LocalContentStore;
 use crate::naming;
 use crate::space::Space;
 use anyhow::{anyhow, bail, Context, Result};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -254,10 +254,9 @@ impl EntityCtx {
         )
     }
 
-    /// The recipe generations already folded into an image's class digest, for the union a
-    /// manifest records.
-    fn image_recipes() -> BTreeMap<&'static str, u32> {
-        crate::recipes::generations(&crate::recipes::image_recipes())
+    /// The recipes that govern an image bundle's bytes, for the union a manifest records.
+    fn image_recipes() -> Vec<crate::recipes::Recipe> {
+        crate::recipes::image_recipes()
     }
 }
 
@@ -1115,15 +1114,17 @@ impl Proxy {
         let mut work: Vec<WorkItem> = Vec::new();
         let mut candidates: Vec<ProbeCandidate> = Vec::new();
         let mut done_pre: usize = 0;
-        // Union over every bundle this manifest will list, reused or rebuilt: the
-        // generations that decided their names. Recorded so the next job can tell a
-        // manifest a recipe bump invalidated from one that is merely old.
+        // Union over every bundle this manifest will list, reused or rebuilt: the recipes
+        // that govern their bytes. Recorded — generations and all, baselines included — so a
+        // later bump of any of them invalidates this manifest and a bump of one the entity
+        // does not use leaves it alone.
         //
         // Stays empty for an entity under bare naming (wearables, emotes, or
         // `ABGEN_DEPS_DIGEST=0`), and that empty union is the honest answer there: a name
         // with no digest carries no generation, so no recipe bump governs those bundles and
         // `AB_VERSION` remains the only thing that can invalidate them.
-        let mut used_recipes: BTreeMap<&'static str, u32> = BTreeMap::new();
+        let mut used_recipes: std::collections::BTreeSet<crate::recipes::Recipe> =
+            std::collections::BTreeSet::new();
         for (idx, c) in convertible.iter().enumerate() {
             let order = idx + 1;
             let (is_glb, is_image) = is_convertible(&c.file);
@@ -1377,6 +1378,8 @@ impl Proxy {
         let tolerated = tolerated_a.load(Ordering::Relaxed);
         let collapsed_names = collapsed_m.into_inner().unwrap();
         self.merge_names_index(cid, &collapsed_names);
+        let recorded_recipes =
+            crate::recipes::recorded_generations(&used_recipes.into_iter().collect::<Vec<_>>());
         let manifest_path =
             crate::manifest::write_corpus_manifest(&crate::manifest::CorpusManifestSpec {
                 out_root,
@@ -1387,7 +1390,7 @@ impl Proxy {
                 content_server_url,
                 exit_code: crate::manifest::exit_code_for_failures(failed.len() + tolerated),
                 date: &self.date,
-                recipes: Some(&used_recipes),
+                recipes: Some(&recorded_recipes),
             })?;
         if self.space_configured() {
             match std::fs::read(&manifest_path) {

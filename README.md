@@ -205,14 +205,17 @@ Scope and cost:
 - Only the digest-named lane carries recipes. Wearables and emotes are `{hash}_{platform}`, with
   nowhere to put a generation, so a fix to those still needs `AB_VERSION` — as does anything that
   changes the bundle container, the manifest shape, or the client's side of the contract.
-- Generation `0` folds in as nothing, so adopting this cost no rebuild: every digest and every
-  manifest is byte-for-byte what it was before.
+- Generation `0` folds in as nothing *in a digest*, so adopting this cost no rebuild: every
+  bundle name is byte-for-byte what it was before. Manifests do gain a `recipes` key.
 - `AB_VERSION` stays total. It is the key prefix, never a digest input, and the conversion gate
   gained a conjunct rather than a substitute, so a version bump still reconverts everything.
-- Each conversion records the generations its bundles used in the per-platform manifest's `recipes`
-  block, and `platform_converted` compares it, so the lambda's already-converted skip stays correct
-  without a `force` flag. A manifest predating the *first* bump has no block and reconverts once;
-  after that, a bump only reconverts entities that actually record the bumped recipe.
+- Each conversion records, in the per-platform manifest's `recipes` block, every recipe governing
+  its bundles and the generation each stood at — **baselines included** — and `platform_converted`
+  compares it, so the lambda's already-converted skip stays correct without a `force` flag. A scene
+  of static props records `{"glb":0,"texture":0}`: bumping `skin` leaves it current (that is the
+  saving), bumping `glb` does not. Recording only the *bumped* recipes would be blind to every
+  later `0 -> 1` bump, which is why the baselines are kept here and dropped in the digest.
+  A manifest predating recipes has no block at all and reconverts once.
 - The LOD lane solves the same problem with one counter of its own,
   `crate/src/lodgen/pipeline.rs::LOD_GENERATION`, folded into the reuse state document.
 
