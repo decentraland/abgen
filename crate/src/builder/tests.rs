@@ -679,8 +679,10 @@ fn gltf_with_basecolor_image(img: &[u8], mime: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// `_BaseMap` target of `mat_0`, resolved to the bound Texture2D's dimensions.
-/// `None` means the material shipped with a null base map.
+/// `_BaseMap` target of the fixture's single material, resolved to the bound
+/// Texture2D's dimensions. `None` means the material shipped with a null base
+/// map. The builder names materials by index (`material_0`), not by the glTF
+/// `name`, so the lookup keys on the emitted name.
 fn basecolor_texture_size(data: &[u8]) -> Option<(i64, i64)> {
     let b = ReadBundle::load_bytes(data).expect("bundle parses");
     let mut want: Option<i64> = None;
@@ -693,7 +695,7 @@ fn basecolor_texture_size(data: &[u8]) -> Option<(i64, i64)> {
             match o.class_id {
                 21 => {
                     let v = sf.read_typetree(o).unwrap();
-                    if v.get("m_Name").and_then(|x| x.as_str()) != Some("mat_0") {
+                    if v.get("m_Name").and_then(|x| x.as_str()) != Some("material_0") {
                         continue;
                     }
                     let Some(Value::Array(tex)) = v
