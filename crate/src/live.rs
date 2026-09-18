@@ -254,12 +254,10 @@ impl EntityCtx {
         )
     }
 
-    /// The recipe generations already folded into this image's class digest, for the union
-    /// a manifest records.
-    fn image_recipes(&self, hash: &str) -> BTreeMap<&'static str, u32> {
-        crate::recipes::generations(&crate::recipes::image_recipes(
-            self.scan.normal_refs.contains(hash),
-        ))
+    /// The recipe generations already folded into an image's class digest, for the union a
+    /// manifest records.
+    fn image_recipes() -> BTreeMap<&'static str, u32> {
+        crate::recipes::generations(&crate::recipes::image_recipes())
     }
 }
 
@@ -1137,7 +1135,7 @@ impl Proxy {
             let bare_name = format!("{case_hash}_{platform}");
             let digest_naming = self.deps_digest && ctx.scene.entity_type == "scene";
             let bundle_name = if digest_naming && is_image {
-                crate::recipes::merge_into(&mut used_recipes, &ctx.image_recipes(&c.hash));
+                crate::recipes::merge_into(&mut used_recipes, &EntityCtx::image_recipes());
                 format!(
                     "{case_hash}_{}_{platform}",
                     ctx.image_digest(&c.hash, &c.file)

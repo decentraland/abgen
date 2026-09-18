@@ -49,61 +49,66 @@ use std::collections::BTreeMap;
 pub const BASELINE: u32 = 0;
 
 /// One build-affecting behaviour of the converter, versioned independently of the others.
+///
+/// There are only two kinds of bundle in the digest-named lane, so there are only two base
+/// recipes: [`Recipe::Glb`] and [`Recipe::Texture`]. A bundle is rebuilt whole or not at all
+/// — a GLB bundle carries its meshes, skeleton, clips, materials *and* its resolved textures
+/// in one artifact — so a counter per sub-asset would be false precision: bumping a `mesh`
+/// counter would rebuild every GLB that has meshes, which is all of them.
+///
+/// [`Recipe::Skin`] and [`Recipe::Animation`] earn their place by being *rare*: only a
+/// minority of glTFs declare a skin or carry clips, so a fix gated on one of those rebuilds
+/// a small slice instead of the whole GLB lane. Reach for one only when the fix has a gate
+/// you can point at — #119 is the model, where a glTF with no clips serialized byte for byte
+/// as before. Otherwise bump [`Recipe::Glb`]: too broad costs a rebuild you were going to
+/// pay anyway, too narrow ships stale bundles and says nothing.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub enum Recipe {
-    /// Vertex data and its layout: positions, normals, tangents, UVs, index buffers,
-    /// Draco decode, mesh compression, bounds of unskinned renderers.
-    Mesh,
+    /// Anything that changes what a GLB's bundle serializes to: vertex data and layout,
+    /// Draco, the node graph, materials and shader authoring, renderer bounds. The default
+    /// for a fix in the glTF lane, and the honest one — nearly every glTF has meshes and
+    /// materials, so a counter that split them would rebuild the same set.
+    Glb,
+    /// Texture decode and GPU encode — the BC7/DXT/BC5/crunch lanes, mip generation, resize,
+    /// colour space, normal-map packing. Covers standalone image bundles *and* every glTF
+    /// carrying images, because a GLB bundle embeds the textures it resolves
+    /// (`builder::build_bundle` pulls them in through `opts.resolve`), so a texture fix has
+    /// to reach both.
+    Texture,
     /// Skinning: bind poses, bone weights, the skeleton, and the bounds a
-    /// `SkinnedMeshRenderer` ships. Applies to any glTF that declares a skin, including
-    /// one with no clips of its own — a fix here can move its rest-pose box too.
+    /// `SkinnedMeshRenderer` ships. Applies to a glTF that declares a skin.
     Skin,
     /// Animation clips: curve sampling, interpolation, and the Mecanim tracks built from
-    /// them.
+    /// them. Applies to a glTF that carries clips.
     Animation,
-    /// Material and shader authoring: property values, keywords, render queue.
-    Material,
-    /// Texture decode and GPU encode — the BC7/DXT/crunch lanes, mip generation, resize,
-    /// colour space. Applies to standalone image bundles and to any glTF carrying images,
-    /// since those are encoded into the GLB's own bundle.
-    Texture,
-    /// The normal-map lane specifically: BC5, channel packing, and the reconstruction the
-    /// shader expects.
-    NormalMap,
 }
 
 impl Recipe {
-    pub const ALL: [Recipe; 6] = [
-        Recipe::Mesh,
+    pub const ALL: [Recipe; 4] = [
+        Recipe::Glb,
+        Recipe::Texture,
         Recipe::Skin,
         Recipe::Animation,
-        Recipe::Material,
-        Recipe::Texture,
-        Recipe::NormalMap,
     ];
 
     /// Stable key this recipe is recorded under, in digests and in manifests. Renaming one
     /// invalidates every bundle that folded it in, so these are as fixed as the numbers.
     pub const fn name(self) -> &'static str {
         match self {
-            Recipe::Mesh => "mesh",
+            Recipe::Glb => "glb",
+            Recipe::Texture => "texture",
             Recipe::Skin => "skin",
             Recipe::Animation => "animation",
-            Recipe::Material => "material",
-            Recipe::Texture => "texture",
-            Recipe::NormalMap => "normalMap",
         }
     }
 
     /// The current generation. Bump by one, in the commit that changes the output.
     pub const fn generation(self) -> u32 {
         match self {
-            Recipe::Mesh => 0,
+            Recipe::Glb => 0,
+            Recipe::Texture => 0,
             Recipe::Skin => 0,
             Recipe::Animation => 0,
-            Recipe::Material => 0,
-            Recipe::Texture => 0,
-            Recipe::NormalMap => 0,
         }
     }
 
@@ -144,14 +149,18 @@ fn has_entries(doc: &serde_json::Value, key: &str) -> bool {
 /// The recipes a glTF's bundle bytes are a function of, read off the document's own
 /// structure.
 ///
-/// Deliberately coarse: presence of a `skins` array earns [`Recipe::Skin`] whether or not
-/// any clip poses it, presence of `images` earns [`Recipe::Texture`] whether the image is
-/// embedded or referenced. Over-approximating costs a rebuild that was not strictly needed;
-/// under-approximating ships stale bytes.
+/// [`Recipe::Glb`] always applies — the bundle is a GLB. The other two are the narrowing
+/// ones, and they are read coarsely on purpose: a `skins` array earns [`Recipe::Skin`]
+/// whether or not any clip poses it, an `images` array earns [`Recipe::Texture`] whether the
+/// image is embedded or referenced. Over-approximating costs a rebuild that was not strictly
+/// needed; under-approximating ships stale bytes.
+///
+/// A fix gated on two traits at once (#119 needed skins *and* clips) may bump either of
+/// them: each covers a superset of the assets the fix touched, so both are safe.
 pub fn gltf_recipes(doc: &serde_json::Value) -> Vec<Recipe> {
-    let mut out: Vec<Recipe> = Vec::new();
-    if has_entries(doc, "meshes") {
-        out.push(Recipe::Mesh);
+    let mut out: Vec<Recipe> = vec![Recipe::Glb];
+    if has_entries(doc, "images") {
+        out.push(Recipe::Texture);
     }
     if has_entries(doc, "skins") {
         out.push(Recipe::Skin);
@@ -159,31 +168,15 @@ pub fn gltf_recipes(doc: &serde_json::Value) -> Vec<Recipe> {
     if has_entries(doc, "animations") {
         out.push(Recipe::Animation);
     }
-    if has_entries(doc, "materials") {
-        out.push(Recipe::Material);
-    }
-    if has_entries(doc, "images") {
-        out.push(Recipe::Texture);
-    }
-    let normal_mapped = doc
-        .get("materials")
-        .and_then(|v| v.as_array())
-        .is_some_and(|mats| mats.iter().any(|m| m.get("normalTexture").is_some()));
-    if normal_mapped {
-        out.push(Recipe::NormalMap);
-    }
     out
 }
 
-/// The recipes a standalone image bundle's bytes are a function of. `normal` is the
-/// normal-map classification the bundle is already named for
-/// ([`crate::naming::image_class_digest`]).
-pub fn image_recipes(normal: bool) -> Vec<Recipe> {
-    let mut out = vec![Recipe::Texture];
-    if normal {
-        out.push(Recipe::NormalMap);
-    }
-    out
+/// The recipes a standalone image bundle's bytes are a function of.
+///
+/// Just the one: normal maps are encoded by the same lane, and "is this encoder fix
+/// normal-only?" is exactly the ambiguous question a recipe must not ask.
+pub fn image_recipes() -> Vec<Recipe> {
+    vec![Recipe::Texture]
 }
 
 /// Fold `right` into `left`, for building the per-entity union a manifest records.
@@ -256,63 +249,59 @@ mod tests {
 
     #[test]
     fn gltf_recipes_read_the_documents_structure() {
-        assert!(gltf_recipes(&json!({})).is_empty());
-        assert!(gltf_recipes(&json!({"meshes": [], "skins": []})).is_empty());
+        // Glb always applies: the bundle is a GLB whatever the document holds.
+        assert_eq!(gltf_recipes(&json!({})), vec![Recipe::Glb]);
+        assert_eq!(
+            gltf_recipes(&json!({"meshes": [{}], "materials": [{}], "skins": []})),
+            vec![Recipe::Glb]
+        );
 
         let animated_rig = json!({
-            "meshes": [{}],
-            "skins": [{}],
-            "animations": [{}],
+            "meshes": [{}], "skins": [{}], "animations": [{}],
             "materials": [{"pbrMetallicRoughness": {}}],
         });
         assert_eq!(
             gltf_recipes(&animated_rig),
-            vec![Recipe::Mesh, Recipe::Skin, Recipe::Animation, Recipe::Material]
+            vec![Recipe::Glb, Recipe::Skin, Recipe::Animation]
         );
 
-        let textured = json!({
-            "meshes": [{}],
-            "materials": [{"normalTexture": {"index": 0}}],
-            "images": [{"uri": "n.png"}],
-        });
+        // A GLB embeds the textures it resolves, so a texture fix has to reach it too.
+        let textured = json!({"meshes": [{}], "images": [{"uri": "n.png"}]});
+        assert_eq!(gltf_recipes(&textured), vec![Recipe::Glb, Recipe::Texture]);
+
+        // Clips without a skeleton (transform animation) are the Animation lane alone.
         assert_eq!(
-            gltf_recipes(&textured),
-            vec![
-                Recipe::Mesh,
-                Recipe::Material,
-                Recipe::Texture,
-                Recipe::NormalMap
-            ]
+            gltf_recipes(&json!({"animations": [{}]})),
+            vec![Recipe::Glb, Recipe::Animation]
         );
     }
 
     #[test]
-    fn image_recipes_add_the_normal_lane_only_for_normal_maps() {
-        assert_eq!(image_recipes(false), vec![Recipe::Texture]);
-        assert_eq!(image_recipes(true), vec![Recipe::Texture, Recipe::NormalMap]);
+    fn a_standalone_image_is_governed_by_the_texture_recipe_alone() {
+        assert_eq!(image_recipes(), vec![Recipe::Texture]);
     }
 
     #[test]
     fn generations_drop_the_baseline_and_sort_by_name() {
         // Table-independent: exercises the shape with generations supplied directly, so the
         // test keeps working whatever the live numbers are.
-        let map: BTreeMap<&str, u32> = [("texture", 2u32), ("mesh", 1), ("skin", 0)]
+        let map: BTreeMap<&str, u32> = [("texture", 2u32), ("glb", 1), ("skin", 0)]
             .into_iter()
             .filter(|(_, g)| *g != BASELINE)
             .collect();
         assert_eq!(
             serde_json::to_string(&map).unwrap(),
-            r#"{"mesh":1,"texture":2}"#
+            r#"{"glb":1,"texture":2}"#
         );
     }
 
     #[test]
     fn merge_keeps_the_union() {
-        let mut left: BTreeMap<&'static str, u32> = [("mesh", 1u32)].into_iter().collect();
+        let mut left: BTreeMap<&'static str, u32> = [("glb", 1u32)].into_iter().collect();
         let right: BTreeMap<&'static str, u32> = [("texture", 3u32)].into_iter().collect();
         merge_into(&mut left, &right);
         assert_eq!(left.len(), 2);
-        assert_eq!(left["mesh"], 1);
+        assert_eq!(left["glb"], 1);
         assert_eq!(left["texture"], 3);
     }
 
@@ -339,14 +328,14 @@ mod tests {
         // One recipe recorded a generation ahead of this build's table.
         let mut ahead = serde_json::Map::new();
         ahead.insert(
-            Recipe::Mesh.name().to_string(),
-            serde_json::Value::from(u64::from(Recipe::Mesh.generation()) + 1),
+            Recipe::Glb.name().to_string(),
+            serde_json::Value::from(u64::from(Recipe::Glb.generation()) + 1),
         );
         assert!(!recorded_is_current(Some(&serde_json::Value::Object(ahead))));
 
         // Names this build does not know, and values that are not generations.
         assert!(!recorded_is_current(Some(&json!({"nosuchrecipe": 0}))));
-        assert!(!recorded_is_current(Some(&json!({"mesh": "1"}))));
+        assert!(!recorded_is_current(Some(&json!({"glb": "1"}))));
         assert!(!recorded_is_current(Some(&json!([]))));
     }
 }

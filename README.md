@@ -175,24 +175,40 @@ how one kind of asset is built and leaves the rest byte-identical. Baking skinne
 over the animation clips (#119) rewrote nothing but animated rigs; an `AB_VERSION` bump behind it
 would have rebuilt every texture in the world.
 
-`crate/src/recipes.rs` holds a generation counter per build-affecting behaviour — `mesh`, `skin`,
-`animation`, `material`, `texture`, `normalMap` — and folds the ones an asset actually uses into the
-digest that names its bundle. Which ones apply is read off the source glTF's own structure (a
-`skins` array earns `skin`, an `images` array earns `texture`), deliberately over-approximating:
-a bump may rebuild an asset whose bytes were already fine, never the reverse.
+`crate/src/recipes.rs` holds a generation counter per build-affecting behaviour and folds the ones
+an asset uses into the digest that names its bundle. A bundle is rebuilt whole or not at all — a GLB
+bundle carries its meshes, skeleton, clips, materials *and* its resolved textures in one artifact —
+so there are only two base recipes, one per kind of bundle, plus two narrowing ones that earn their
+place by being rare:
 
-**To ship a fix without an `AB_VERSION` bump:** raise the narrowest matching counter by one, in the
-commit that changes the output, then re-enqueue as you would for a version bump. Bundles whose
-recipes moved get new names, miss the HEAD probe and rebuild; every other bundle keeps its name and
-is reused where it already sits. Never renumber a counter and never reuse a value — a generation
-that comes back around makes stale bundles look fresh.
+| Recipe | Applies to | Rebuilds on a bump |
+|---|---|---|
+| `glb` | every glTF | every glb bundle; no standalone image bundles |
+| `texture` | standalone images, and any glTF with `images` | every image bundle **and** every glb that embeds one |
+| `skin` | a glTF declaring `skins` | only rigs — a minority of glbs |
+| `animation` | a glTF carrying `animations` | only animated glbs — a minority |
+
+**To ship a fix without an `AB_VERSION` bump:** raise the matching counter by one, in the commit that
+changes the output, then re-enqueue as you would for a version bump. Bundles whose recipes moved get
+new names, miss the HEAD probe and rebuild; every other bundle keeps its name and is reused where it
+already sits. Never renumber a counter and never reuse a value — a generation that comes back around
+makes stale bundles look fresh.
+
+Default to `glb`. Reach for `skin` or `animation` only when the fix has a gate you can point at —
+#119 is the model, where a glTF with no clips serialized byte for byte as before. The asymmetry is
+the whole rule: too broad costs a rebuild you were going to pay anyway, too narrow ships stale
+bundles and says nothing. There is deliberately no counter per sub-asset (`mesh`, `material`) — the
+bundle is the unit, so those would rebuild the same set `glb` does — and none for normal maps, since
+"is this encoder fix normal-only?" is exactly the ambiguous question a recipe must not ask.
 
 Scope and cost:
-- Only the digest-named lane carries recipes. Wearables and emotes are named `{hash}_{platform}`,
-  with nowhere to put a generation, so a fix to those still needs `AB_VERSION` — as does anything
-  that changes the bundle container, the manifest shape, or the client's side of the contract.
+- Only the digest-named lane carries recipes. Wearables and emotes are `{hash}_{platform}`, with
+  nowhere to put a generation, so a fix to those still needs `AB_VERSION` — as does anything that
+  changes the bundle container, the manifest shape, or the client's side of the contract.
 - Generation `0` folds in as nothing, so adopting this cost no rebuild: every digest and every
   manifest is byte-for-byte what it was before.
+- `AB_VERSION` stays total. It is the key prefix, never a digest input, and the conversion gate
+  gained a conjunct rather than a substitute, so a version bump still reconverts everything.
 - Each conversion records the generations its bundles used in the per-platform manifest's `recipes`
   block, and `platform_converted` compares it, so the lambda's already-converted skip stays correct
   without a `force` flag. A manifest predating the *first* bump has no block and reconverts once;

@@ -397,8 +397,8 @@ pub fn image_key_extension(file: &str) -> String {
 /// beyond its content hash and the platform suffix: `model_referenced`,
 /// the `linear` color-space classification, the `normal`-map
 /// classification, and the asset-key extension
-/// ([`image_key_extension`]), and the generations of the recipes an image
-/// bundle's bytes are a function of ([`crate::recipes::image_recipes`]).
+/// ([`image_key_extension`]), and the generation of the texture recipe
+/// ([`crate::recipes::image_recipes`]).
 /// Process-wide toggles are excluded — they are fixed per bundle version,
 /// which already prefixes every space key.
 pub fn image_class_digest(
@@ -409,7 +409,7 @@ pub fn image_class_digest(
 ) -> String {
     digest_inputs(
         (model_referenced, linear, normal, key_ext),
-        &recipes::generations(&recipes::image_recipes(normal)),
+        &recipes::generations(&recipes::image_recipes()),
         "image class",
     )
 }
@@ -622,15 +622,15 @@ mod tests {
         // The recipe fold changes the payload's shape, not just its contents, so no recipe
         // map can ever hash to the digest some other dependency list already owns.
         let recipes: BTreeMap<&'static str, u32> =
-            [(recipes::Recipe::Mesh.name(), 1u32)].into_iter().collect();
+            [(recipes::Recipe::Glb.name(), 1u32)].into_iter().collect();
         let with = compute_deps_digest_for(&[("a/b.bin".to_string(), "hashX".to_string())], &recipes);
         for deps in [
             vec![],
             vec![("a/b.bin".to_string(), "hashX".to_string())],
-            vec![("mesh".to_string(), "1".to_string())],
+            vec![("glb".to_string(), "1".to_string())],
             vec![
                 ("a/b.bin".to_string(), "hashX".to_string()),
-                ("mesh".to_string(), "1".to_string()),
+                ("glb".to_string(), "1".to_string()),
             ],
         ] {
             assert_ne!(compute_deps_digest_for(&deps, &BTreeMap::new()), with);
@@ -674,7 +674,7 @@ mod tests {
         );
         assert_eq!(
             image_class_digest(false, false, false, ".png") == legacy,
-            recipes::generations(&recipes::image_recipes(false)).is_empty()
+            recipes::generations(&recipes::image_recipes()).is_empty()
         );
     }
 
