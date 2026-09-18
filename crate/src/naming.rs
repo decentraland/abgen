@@ -1,6 +1,7 @@
 use crate::hashes::Sha256;
+use crate::recipes;
 use anyhow::{bail, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub const GLTF_EXTENSIONS: [&str; 2] = [".glb", ".gltf"];
 
@@ -121,12 +122,20 @@ pub fn parse_gltf_image_uris(data: &[u8], ext: &str) -> Result<Vec<String>> {
     Ok(uris)
 }
 
-pub fn parse_gltf_dep_refs(data: &[u8], ext: &str) -> Result<Vec<String>> {
+pub fn parse_gltf_doc(data: &[u8], ext: &str) -> Result<serde_json::Value> {
     let doc: serde_json::Value = serde_json::from_str(&extract_gltf_json(data, ext)?)?;
     if !doc.is_object() {
         bail!("glTF root must be an object");
     }
+    Ok(doc)
+}
 
+pub fn parse_gltf_dep_refs(data: &[u8], ext: &str) -> Result<Vec<String>> {
+    Ok(dep_refs_of(&parse_gltf_doc(data, ext)?))
+}
+
+/// Every non-embedded `images`/`buffers` URI the document references, sorted and deduped.
+fn dep_refs_of(doc: &serde_json::Value) -> Vec<String> {
     let mut uris: Vec<String> = Vec::new();
     for key in ["images", "buffers"] {
         let arr = match doc.get(key).and_then(|v| v.as_array()) {
@@ -150,7 +159,7 @@ pub fn parse_gltf_dep_refs(data: &[u8], ext: &str) -> Result<Vec<String>> {
         }
     }
     uris.sort();
-    Ok(uris)
+    uris
 }
 
 fn has_scheme(uri: &str) -> bool {
@@ -313,7 +322,46 @@ fn short_digest(payload: &[u8]) -> String {
     digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
 }
 
+/// The payload a digest hashes once any of the asset's recipes is off baseline: the inputs
+/// the digest always covered, plus the generations that now decide the same bytes.
+///
+/// A different *shape*, not an extra field, so it cannot collide with the bare-inputs
+/// payload — and when the map is empty the bare payload is hashed unchanged, which is what
+/// keeps every name minted before [`crate::recipes`] existed valid.
+#[derive(serde::Serialize)]
+struct RecipedInputs<'a, T: serde::Serialize> {
+    inputs: T,
+    recipes: &'a BTreeMap<&'static str, u32>,
+}
+
+fn digest_inputs<T: serde::Serialize>(
+    inputs: T,
+    recipes: &BTreeMap<&'static str, u32>,
+    what: &'static str,
+) -> String {
+    let json = if recipes.is_empty() {
+        serde_json::to_string(&inputs)
+    } else {
+        serde_json::to_string(&RecipedInputs { inputs, recipes })
+    }
+    .unwrap_or_else(|e| panic!("serialize {what}: {e}"));
+    short_digest(json.as_bytes())
+}
+
 pub fn compute_deps_digest(deps: &[(String, String)]) -> String {
+    compute_deps_digest_for(deps, &BTreeMap::new())
+}
+
+/// [`compute_deps_digest`] with the glTF's recipe generations folded in, as
+/// [`crate::recipes::digest_generations`] returns them.
+///
+/// Bumping a recipe a glTF uses moves this digest, so the bundle gets a new name, misses the
+/// CDN probe, and rebuilds — while every glTF that does not use that recipe keeps the name
+/// it already published under.
+pub fn compute_deps_digest_for(
+    deps: &[(String, String)],
+    recipes: &BTreeMap<&'static str, u32>,
+) -> String {
     let mut ordered: Vec<&(String, String)> = deps
         .iter()
         .filter(|(f, _)| GLB_DEP_EXTENSIONS.contains(&file_extension(f).as_str()))
@@ -324,8 +372,7 @@ pub fn compute_deps_digest(deps: &[(String, String)]) -> String {
         .map(|(f, h)| [f.as_str(), h.as_str()])
         .collect();
 
-    let json = serde_json::to_string(&payload).expect("serialize deps");
-    short_digest(json.as_bytes())
+    digest_inputs(payload, recipes, "deps")
 }
 
 /// Extension a standalone image bundle bakes into its asset key: the
@@ -350,17 +397,21 @@ pub fn image_key_extension(file: &str) -> String {
 /// beyond its content hash and the platform suffix: `model_referenced`,
 /// the `linear` color-space classification, the `normal`-map
 /// classification, and the asset-key extension
-/// ([`image_key_extension`]). Process-wide toggles are excluded — they
-/// are fixed per bundle version, which already prefixes every space key.
+/// ([`image_key_extension`]), and the generation of the texture recipe
+/// ([`crate::recipes::image_recipes`]).
+/// Process-wide toggles are excluded — they are fixed per bundle version,
+/// which already prefixes every space key.
 pub fn image_class_digest(
     model_referenced: bool,
     linear: bool,
     normal: bool,
     key_ext: &str,
 ) -> String {
-    let json = serde_json::to_string(&(model_referenced, linear, normal, key_ext))
-        .expect("serialize image class");
-    short_digest(json.as_bytes())
+    digest_inputs(
+        (model_referenced, linear, normal, key_ext),
+        &recipes::digest_generations(&recipes::image_recipes()),
+        "image class",
+    )
 }
 
 /// Marker for a GLB dependency that is absent from the entity's deployed
@@ -379,14 +430,30 @@ impl std::fmt::Display for DepNotDeployed {
 
 impl std::error::Error for DepNotDeployed {}
 
+/// What naming a GLB's bundle takes from its source: the digest itself, and the recipes that
+/// govern its bytes.
+///
+/// The recipes come back out as the list, not the folded generations, because the digest and
+/// the manifest want different things from them — the digest drops the baselines to keep
+/// names stable, the manifest keeps them so a later bump is detectable
+/// ([`crate::recipes::recorded_generations`]). Handing back the list lets each do its own
+/// fold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GlbDigest {
+    pub digest: String,
+    pub recipes: Vec<recipes::Recipe>,
+}
+
 pub fn deps_digest_for_glb(
     glb_bytes: &[u8],
     glb_file: &str,
     content_by_file: &HashMap<String, String>,
     tolerant: bool,
-) -> Result<String> {
+) -> Result<GlbDigest> {
     let ext = file_extension(glb_file);
-    let uris = parse_gltf_dep_refs(glb_bytes, &ext)?;
+    let doc = parse_gltf_doc(glb_bytes, &ext)?;
+    let recipes = recipes::gltf_recipes(&doc);
+    let uris = dep_refs_of(&doc);
     let mut seen: Vec<String> = Vec::new();
     let mut deps: Vec<(String, String)> = Vec::new();
     for uri in &uris {
@@ -424,7 +491,10 @@ pub fn deps_digest_for_glb(
         seen.push(key);
         deps.push((resolved, h.clone()));
     }
-    Ok(compute_deps_digest(&deps))
+    Ok(GlbDigest {
+        digest: compute_deps_digest_for(&deps, &recipes::digest_generations(&recipes)),
+        recipes,
+    })
 }
 
 pub fn split_bundle_stem(stem: &str) -> (&str, Option<&str>) {
@@ -496,6 +566,118 @@ mod tests {
     #[test]
     fn deps_digest_empty() {
         assert_eq!(compute_deps_digest(&[]), "4f53cda18c2baa0c0354bb5f9a3ecbe5");
+    }
+
+    #[test]
+    fn baseline_recipes_leave_every_published_name_valid() {
+        // The two pinned digests above are what the CDN is full of. Folding an empty recipe
+        // map has to reproduce them exactly, or adopting recipes orphans the world.
+        let deps = [("a/b.bin".to_string(), "hashX".to_string())];
+        assert_eq!(
+            compute_deps_digest_for(&deps, &BTreeMap::new()),
+            compute_deps_digest(&deps)
+        );
+        assert_eq!(
+            compute_deps_digest_for(&[], &BTreeMap::new()),
+            "4f53cda18c2baa0c0354bb5f9a3ecbe5"
+        );
+        // And the live table is still at baseline, so the live functions agree too.
+        assert_eq!(
+            recipes::digest_generations(&recipes::gltf_recipes(&serde_json::json!({
+                "meshes": [{}], "skins": [{}], "animations": [{}],
+                "materials": [{"normalTexture": {}}], "images": [{}],
+            })))
+            .is_empty(),
+            !recipes::any_bumped()
+        );
+    }
+
+    #[test]
+    fn a_bumped_recipe_renames_the_bundle_it_covers() {
+        // Generations supplied directly, so this holds whatever the live table says.
+        let deps = [("a/b.bin".to_string(), "hashX".to_string())];
+        let base = compute_deps_digest_for(&deps, &BTreeMap::new());
+        let gen1: BTreeMap<&'static str, u32> = [(recipes::Recipe::Skin.name(), 1u32)].into_iter().collect();
+        let gen2: BTreeMap<&'static str, u32> = [(recipes::Recipe::Skin.name(), 2u32)].into_iter().collect();
+        let other: BTreeMap<&'static str, u32> =
+            [(recipes::Recipe::Texture.name(), 1u32)].into_iter().collect();
+
+        for d in [&gen1, &gen2, &other] {
+            assert_ne!(compute_deps_digest_for(&deps, d), base);
+        }
+        assert_ne!(
+            compute_deps_digest_for(&deps, &gen1),
+            compute_deps_digest_for(&deps, &gen2)
+        );
+        assert_ne!(
+            compute_deps_digest_for(&deps, &gen1),
+            compute_deps_digest_for(&deps, &other)
+        );
+        // Still a 32-hex digest, so the name shape and `bundle_name_has_digest` are untouched.
+        let bumped = compute_deps_digest_for(&deps, &gen1);
+        let named = canonical_filename("Qmhash", ".glb", "windows", Some(&bumped)).unwrap();
+        assert!(bundle_name_has_digest(&named), "{named}");
+    }
+
+    #[test]
+    fn a_bumped_recipe_cannot_collide_with_a_different_dep_set() {
+        // The recipe fold changes the payload's shape, not just its contents, so no recipe
+        // map can ever hash to the digest some other dependency list already owns.
+        let recipes: BTreeMap<&'static str, u32> =
+            [(recipes::Recipe::Glb.name(), 1u32)].into_iter().collect();
+        let with = compute_deps_digest_for(&[("a/b.bin".to_string(), "hashX".to_string())], &recipes);
+        for deps in [
+            vec![],
+            vec![("a/b.bin".to_string(), "hashX".to_string())],
+            vec![("glb".to_string(), "1".to_string())],
+            vec![
+                ("a/b.bin".to_string(), "hashX".to_string()),
+                ("glb".to_string(), "1".to_string()),
+            ],
+        ] {
+            assert_ne!(compute_deps_digest_for(&deps, &BTreeMap::new()), with);
+        }
+    }
+
+    #[test]
+    fn glb_digest_reports_the_recipes_it_folded() {
+        let glb = br#"{"asset":{"version":"2.0"},
+            "meshes":[{}],"skins":[{}],"animations":[{}],
+            "images":[{"uri":"t.png"}],"buffers":[{"uri":"a.bin"}]}"#;
+        let mut content: HashMap<String, String> = HashMap::new();
+        content.insert("t.png".to_string(), "Qmtex".to_string());
+        content.insert("a.bin".to_string(), "Qmbin".to_string());
+
+        let got = deps_digest_for_glb(glb, "m.gltf", &content, false).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(glb).unwrap();
+        let expected = recipes::gltf_recipes(&doc);
+        assert_eq!(got.recipes, expected);
+        assert_eq!(
+            got.digest,
+            compute_deps_digest_for(
+                &[
+                    ("a.bin".to_string(), "Qmbin".to_string()),
+                    ("t.png".to_string(), "Qmtex".to_string()),
+                ],
+                &recipes::digest_generations(&expected)
+            )
+        );
+    }
+
+    #[test]
+    fn image_class_digest_moves_only_with_the_recipes_an_image_uses() {
+        // Pins the standalone-image lane's side of the adoption promise: the name is the
+        // pre-recipes one exactly while no recipe that governs *this* image is bumped, so a
+        // fix to, say, meshes leaves every texture bundle where it sits.
+        let legacy = short_digest(
+            serde_json::to_string(&(false, false, false, ".png"))
+                .unwrap()
+                .as_bytes(),
+        );
+        assert_eq!(
+            image_class_digest(false, false, false, ".png") == legacy,
+            recipes::digest_generations(&recipes::image_recipes()).is_empty()
+        );
     }
 
     #[test]

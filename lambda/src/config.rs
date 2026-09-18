@@ -2,7 +2,12 @@ use std::path::PathBuf;
 
 pub struct Config {
     pub platforms: Vec<String>,
+    /// Key prefix for scene bundles (`AB_VERSION`).
     pub version: String,
+    /// Key prefix for wearables and emotes (`WEARABLE_AB_VERSION`), defaulting to
+    /// [`Config::version`] so a deployment that does not set it behaves exactly as it did
+    /// when the two lanes shared one prefix.
+    pub wearable_version: String,
     pub cache_dir: String,
     pub default_content_server: String,
     pub out_root: PathBuf,
@@ -32,9 +37,14 @@ impl Config {
                 default_levels()
             }
         };
+        let version = std::env::var("AB_VERSION").unwrap_or_else(|_| "v49".to_string());
         Config {
             platforms,
-            version: std::env::var("AB_VERSION").unwrap_or_else(|_| "v49".to_string()),
+            version: version.clone(),
+            wearable_version: std::env::var("WEARABLE_AB_VERSION")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or(version),
             cache_dir: std::env::var("ABGEN_CACHE_DIR").unwrap_or_else(|_| {
                 std::env::temp_dir()
                     .join("abgen-cache")

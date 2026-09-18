@@ -5,8 +5,11 @@ use abgen::live::Proxy;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
-/// Bucket+version-scoped so an `AB_VERSION` bump can't suppress reconversion;
-/// only verdicts read back from S3 are cached — never our own fail-soft uploads.
+/// Scoped by bucket and by *both* version lanes, so a bump of either can't be suppressed by
+/// a marker written before it; and recipe-scoped for the same reason, since a recipe bump
+/// leaves both versions alone. The entity type is not known at this point, which is why both
+/// lanes are in the key rather than the one that applies.
+/// Only verdicts read back from S3 are cached — never our own fail-soft uploads.
 pub fn converted_marker_key(
     proxy: &Arc<Proxy>,
     cfg: &Config,
@@ -18,9 +21,50 @@ pub fn converted_marker_key(
     }
     let bucket = proxy.space_bucket()?;
     Some(format!(
-        "abgen:converted:{bucket}:{}:{entity_id}_{platform}",
-        cfg.version
+        "abgen:converted:{bucket}:{}|{}{}:{entity_id}_{platform}",
+        cfg.version,
+        cfg.wearable_version,
+        recipe_marker_scope()
     ))
+}
+
+/// Appended to the converted marker so a recipe bump cannot be answered out of a cache
+/// filled before it. Empty while nothing is bumped, which keeps the keys already in Redis
+/// exactly where they are.
+fn recipe_marker_scope() -> String {
+    use abgen::recipes::Recipe;
+    if !abgen::recipes::any_bumped() {
+        return String::new();
+    }
+    let table: Vec<String> = Recipe::ALL
+        .iter()
+        .filter(|r| r.generation() != abgen::recipes::BASELINE)
+        .map(|r| format!("{}{}", r.name(), r.generation()))
+        .collect();
+    format!("+{}", table.join("."))
+}
+
+/// Whether a manifest read back from S3 says this platform is already built the way this
+/// build would build it.
+///
+/// Three questions, all of which must answer yes: the conversion succeeded, it ran at a
+/// version still in force, and the per-asset-type recipes it recorded are the ones in force
+/// ([`abgen::recipes::recorded_is_current`]). The third is what lets a fix ship without a
+/// version bump: the entity is reconverted, but every bundle whose recipes did not move
+/// keeps its name and is reused off the CDN rather than rebuilt.
+///
+/// `versions` is both lanes, because the entity type is only known after the entity doc is
+/// fetched and this gate deliberately runs before that — the whole point of it is to skip an
+/// already-converted entity without paying a catalyst round-trip. Accepting either is safe
+/// while the two are distinct strings: a manifest carries whichever version wrote it, so a
+/// wearable's names its wearable lane and a scene's names its scene lane, and a bump of
+/// either stops matching. Configure them equal and this collapses to the single-lane
+/// behaviour it had before the split.
+fn manifest_is_current(json: &serde_json::Value, versions: [&str; 2]) -> bool {
+    let version = json.get("version").and_then(serde_json::Value::as_str);
+    json.get("exitCode").and_then(serde_json::Value::as_i64) == Some(0)
+        && version.is_some_and(|v| versions.contains(&v))
+        && abgen::recipes::recorded_is_current(json.get("recipes"))
 }
 
 pub fn platform_converted(
@@ -41,8 +85,7 @@ pub fn platform_converted(
     let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return false;
     };
-    let converted = json.get("exitCode").and_then(serde_json::Value::as_i64) == Some(0)
-        && json.get("version").and_then(serde_json::Value::as_str) == Some(cfg.version.as_str());
+    let converted = manifest_is_current(&json, [&cfg.version, &cfg.wearable_version]);
     if converted {
         if let Some(key) = &marker {
             abgen::rediscache::mark(key);
@@ -217,6 +260,7 @@ mod tests {
         crate::config::Config {
             platforms: vec!["windows".to_string(), "mac".to_string()],
             version: "v49".to_string(),
+            wearable_version: "v49w".to_string(),
             cache_dir: std::env::temp_dir()
                 .join(format!("abgen-output-test-{tag}-{}", std::process::id()))
                 .to_string_lossy()
@@ -343,6 +387,73 @@ mod tests {
             !log.iter()
                 .any(|l| l == "PUT /manifest/bafkpart_windows.json"),
             "{log:?}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_is_current_only_at_this_version_and_these_recipes() {
+        let good = serde_json::json!({"version": "v49", "files": ["x"], "exitCode": 0});
+        assert!(super::manifest_is_current(&good, ["v49", "v49w"]));
+        assert!(!super::manifest_is_current(&good, ["v50", "v50w"]));
+
+        let failed = serde_json::json!({"version": "v49", "files": [], "exitCode": 12});
+        assert!(!super::manifest_is_current(&failed, ["v49", "v49w"]));
+
+        let skin = abgen::recipes::Recipe::Skin;
+        let with_recipes = |gen: u64| {
+            let mut m = good.clone();
+            let mut block = serde_json::Map::new();
+            block.insert(skin.name().to_string(), serde_json::Value::from(gen));
+            m["recipes"] = serde_json::Value::Object(block);
+            m
+        };
+
+        // A block naming a generation this build does not have is stale, whatever the
+        // version says — that is the whole point of shipping a fix without bumping it.
+        assert!(!super::manifest_is_current(
+            &with_recipes(u64::from(skin.generation()) + 1),
+            ["v49", "v49w"]
+        ));
+        // A block recording exactly what is in force is current.
+        assert!(super::manifest_is_current(
+            &with_recipes(u64::from(skin.generation())),
+            ["v49", "v49w"]
+        ));
+
+        // AB_VERSION stays total. Recipes are a conjunct, never a substitute: a manifest
+        // whose recipes are perfectly current is still stale at a bumped AB_VERSION, so a
+        // version bump reconverts everything exactly as it did before recipes existed.
+        assert!(!super::manifest_is_current(
+            &with_recipes(u64::from(skin.generation())),
+            ["v50", "v50w"]
+        ));
+    }
+
+    #[test]
+    fn the_two_version_lanes_invalidate_independently() {
+        // The point of the split: a scene manifest survives a wearable-lane bump, and a
+        // wearable manifest survives a scene-lane bump. Neither drags the other.
+        let scene = serde_json::json!({"version": "v49", "files": ["x"], "exitCode": 0});
+        let wearable = serde_json::json!({"version": "v49w", "files": ["x"], "exitCode": 0});
+
+        assert!(super::manifest_is_current(&scene, ["v49", "v49w"]));
+        assert!(super::manifest_is_current(&wearable, ["v49", "v49w"]));
+
+        // Wearable lane bumped, scene lane untouched.
+        assert!(super::manifest_is_current(&scene, ["v49", "v50w"]));
+        assert!(!super::manifest_is_current(&wearable, ["v49", "v50w"]));
+
+        // Scene lane bumped, wearable lane untouched.
+        assert!(!super::manifest_is_current(&scene, ["v50", "v49w"]));
+        assert!(super::manifest_is_current(&wearable, ["v50", "v49w"]));
+    }
+
+    #[test]
+    fn the_converted_marker_is_scoped_to_the_recipe_table() {
+        // Empty while nothing is bumped, so no key already in Redis moves on adoption.
+        assert_eq!(
+            super::recipe_marker_scope().is_empty(),
+            !abgen::recipes::any_bumped()
         );
     }
 
