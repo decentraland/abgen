@@ -110,6 +110,19 @@ impl Recipe {
     ///   *and* carries clips, so either trait's recipe is a safe superset of it;
     ///   `Animation` carries it because a rig with no clips is exactly the case the fix
     ///   leaves serializing byte for byte as before.
+    ///
+    /// Deliberately *not* bumped, recorded so the next reader does not take it for an
+    /// oversight:
+    /// - `Texture`, against #121, which caps GLB-embedded images past the old 8192
+    ///   `LoadImage` bound instead of dropping them. The asset that motivated it is a
+    ///   wearable, and wearables are bare-named `{hash}_{platform}` with nowhere to put a
+    ///   generation, so that fix reaches them through `WEARABLE_AB_VERSION`; no recipe
+    ///   could have delivered it. Bumping `Texture` would instead have renamed the entire
+    ///   scene texture lane — every standalone image bundle and every glTF carrying an
+    ///   `images` array — for content the fix was never about. The scene-lane assets it
+    ///   does touch (an in-GLB image over 8192, a standalone one between 8192 and 16384)
+    ///   keep their published names and their stale bytes until something else moves
+    ///   them. That deferral is deliberate, and it is the cost of not renaming the world.
     pub const fn generation(self) -> u32 {
         match self {
             Recipe::Glb => 0,
