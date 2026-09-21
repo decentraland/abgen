@@ -272,3 +272,55 @@ jobs:
           name: node-green-${{ steps.hash.outputs.h }}
           path: .node-green
           retention-days: 30
+
+  palkia-e2e:
+    # One real world converted end to end, held to a committed digest of every bundle
+    # (ci/e2e-palkia.sh). Catches the failure no unit test can: output that moves at a key
+    # the CDN already serves, where every probe and every client keeps the stale bytes.
+    #
+    # palkia.dcl.eth 0,0 is the Pride Theme Genesis Plaza — a scene the platform actually
+    # serves, with the full spread the converter has to get right (skinned rigs with clips,
+    # animated props without skins, standalone images, in-glTF textures, a dedup pool).
+    #
+    # Not a nix check, and it cannot be one — it fetches ~1 GB of real content from the
+    # worlds content server, and nix builds have no network. Memoized on the tree hash like
+    # the other lanes: the same tree converts to the same bytes, so a re-run buys nothing.
+    name: palkia e2e
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - id: hash
+        uses: ./.github/actions/tree-hash
+      - id: memo
+        uses: ./.github/actions/artifact-hit
+        with:
+          name: palkia-e2e-green-${{ steps.hash.outputs.h }}
+      - name: skip notice
+        if: steps.memo.outputs.hit == 'true'
+        run: echo "palkia e2e already green for tree ${{ steps.hash.outputs.h }} (verdict artifact); skipping."
+      - uses: ./.github/actions/nix-store-cache
+        if: steps.memo.outputs.hit != 'true'
+        with:
+          flavor: lambda
+      - name: build abgen-lambda
+        if: steps.memo.outputs.hit != 'true'
+        run: nix build .#abgen-lambda || nix build .#abgen-lambda --print-build-logs
+      - name: convert palkia.dcl.eth 0,0 and check every bundle
+        if: steps.memo.outputs.hit != 'true'
+        env:
+          ABGEN_LAMBDA_BIN: result/bin/abgen-lambda
+          ABGEN_ROOT: ${{ github.workspace }}
+        run: ci/e2e-palkia.sh
+      - uses: ./.github/actions/nix-store-cache/save
+        if: success() || failure()
+        continue-on-error: true
+      - name: write verdict
+        if: steps.memo.outputs.hit != 'true'
+        run: echo green > .palkia-green
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: steps.memo.outputs.hit != 'true'
+        with:
+          name: palkia-e2e-green-${{ steps.hash.outputs.h }}
+          path: .palkia-green
+          retention-days: 30
