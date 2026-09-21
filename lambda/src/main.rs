@@ -20,7 +20,7 @@ fn main() {
                 std::process::exit(2);
             };
             init();
-            let mut cfg = config::Config::from_env();
+            let mut cfg = config_or_exit();
             cfg.keep_output = true;
             let result = run_once(&cfg, path);
             emf::flush();
@@ -70,10 +70,19 @@ fn main() {
         }
         None => {
             init();
-            let cfg = config::Config::from_env();
+            let cfg = config_or_exit();
             runtime::serve(&cfg, handle);
         }
     }
+}
+
+/// Same shape as `init`'s template check: a misconfigured environment is fatal at startup,
+/// not something to carry into a conversion.
+fn config_or_exit() -> config::Config {
+    config::Config::from_env().unwrap_or_else(|e| {
+        eprintln!("fatal: {e}");
+        std::process::exit(2);
+    })
 }
 
 fn init() {
@@ -484,7 +493,7 @@ mod tests {
         config::Config {
             platforms: vec!["windows".to_string(), "mac".to_string()],
             version: "v49".to_string(),
-            wearable_version: "v49w".to_string(),
+            wearable_version: "v1500".to_string(),
             cache_dir: "/tmp/cache".to_string(),
             default_content_server: "https://peer.decentraland.org/content".to_string(),
             out_root: std::path::PathBuf::from("/tmp/out"),

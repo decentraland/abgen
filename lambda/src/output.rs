@@ -260,7 +260,7 @@ mod tests {
         crate::config::Config {
             platforms: vec!["windows".to_string(), "mac".to_string()],
             version: "v49".to_string(),
-            wearable_version: "v49w".to_string(),
+            wearable_version: "v1500".to_string(),
             cache_dir: std::env::temp_dir()
                 .join(format!("abgen-output-test-{tag}-{}", std::process::id()))
                 .to_string_lossy()
@@ -399,13 +399,13 @@ mod tests {
         // No recipes block means "written before recipes existed": current exactly while
         // nothing has been bumped since, stale the moment anything has.
         assert_eq!(
-            super::manifest_is_current(&good, ["v49", "v49w"]),
+            super::manifest_is_current(&good, ["v49", "v1500"]),
             !abgen::recipes::any_bumped()
         );
-        assert!(!super::manifest_is_current(&good, ["v50", "v50w"]));
+        assert!(!super::manifest_is_current(&good, ["v50", "v1501"]));
 
         let failed = serde_json::json!({"version": "v49", "files": [], "exitCode": 12});
-        assert!(!super::manifest_is_current(&failed, ["v49", "v49w"]));
+        assert!(!super::manifest_is_current(&failed, ["v49", "v1500"]));
 
         let skin = abgen::recipes::Recipe::Skin;
         let with_recipes = |gen: u64| {
@@ -420,12 +420,12 @@ mod tests {
         // version says — that is the whole point of shipping a fix without bumping it.
         assert!(!super::manifest_is_current(
             &with_recipes(u64::from(skin.generation()) + 1),
-            ["v49", "v49w"]
+            ["v49", "v1500"]
         ));
         // A block recording exactly what is in force is current.
         assert!(super::manifest_is_current(
             &with_recipes(u64::from(skin.generation())),
-            ["v49", "v49w"]
+            ["v49", "v1500"]
         ));
 
         // AB_VERSION stays total. Recipes are a conjunct, never a substitute: a manifest
@@ -433,7 +433,7 @@ mod tests {
         // version bump reconverts everything exactly as it did before recipes existed.
         assert!(!super::manifest_is_current(
             &with_recipes(u64::from(skin.generation())),
-            ["v50", "v50w"]
+            ["v50", "v1501"]
         ));
     }
 
@@ -448,20 +448,20 @@ mod tests {
             "recipes": abgen::recipes::recorded_generations(&abgen::recipes::Recipe::ALL),
         });
         let wearable = serde_json::json!({
-            "version": "v49w", "files": ["x"], "exitCode": 0,
+            "version": "v1500", "files": ["x"], "exitCode": 0,
             "recipes": abgen::recipes::recorded_generations(&abgen::recipes::Recipe::ALL),
         });
 
-        assert!(super::manifest_is_current(&scene, ["v49", "v49w"]));
-        assert!(super::manifest_is_current(&wearable, ["v49", "v49w"]));
+        assert!(super::manifest_is_current(&scene, ["v49", "v1500"]));
+        assert!(super::manifest_is_current(&wearable, ["v49", "v1500"]));
 
         // Wearable lane bumped, scene lane untouched.
-        assert!(super::manifest_is_current(&scene, ["v49", "v50w"]));
-        assert!(!super::manifest_is_current(&wearable, ["v49", "v50w"]));
+        assert!(super::manifest_is_current(&scene, ["v49", "v1501"]));
+        assert!(!super::manifest_is_current(&wearable, ["v49", "v1501"]));
 
         // Scene lane bumped, wearable lane untouched.
-        assert!(!super::manifest_is_current(&scene, ["v50", "v49w"]));
-        assert!(super::manifest_is_current(&wearable, ["v50", "v49w"]));
+        assert!(!super::manifest_is_current(&scene, ["v50", "v1500"]));
+        assert!(super::manifest_is_current(&wearable, ["v50", "v1500"]));
     }
 
     #[test]
