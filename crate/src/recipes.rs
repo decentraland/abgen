@@ -105,11 +105,19 @@ impl Recipe {
     /// The current generation. Bump by one, in the commit that changes the output.
     ///
     /// History, newest first — a bump is only legible next to the change it names:
-    /// - `Animation` 1: skinned renderer bounds are baked over every animation clip
-    ///   instead of the bind pose (#119). The fix is gated on a glTF that declares a skin
-    ///   *and* carries clips, so either trait's recipe is a safe superset of it;
-    ///   `Animation` carries it because a rig with no clips is exactly the case the fix
-    ///   leaves serializing byte for byte as before.
+    /// - `Skin` 1: skinned renderer bounds are baked over every animation clip instead of
+    ///   the bind pose (#119). The fix is gated on a glTF that declares a skin *and*
+    ///   carries clips (`builder::nodes`: `skin_idx` plus `has_gltf_animations`), and no
+    ///   recipe can name an intersection — a bundle folds in every recipe that applies to
+    ///   it — so the choice was between two supersets. `Skin` is the tighter one on the
+    ///   lane that has recipes at all: a glTF with a skin and no clips is the avatar
+    ///   shape, and avatars are wearables, which are bare-named and carry no recipes at
+    ///   all; a glTF with clips and no skin is an ordinary animated prop, and scenes are
+    ///   full of them. Measured over two converted scenes (2026-09-21): `boedo.dcl.eth`
+    ///   0,0 has 36 rigs with clips, 0 skins without clips and 0 clips without skins, so
+    ///   the two choices are identical there; Genesis 0,0 has 126 rigs with clips, 0
+    ///   skins without clips and 21 clips without skins, which `Animation` would have
+    ///   renamed and rebuilt for nothing.
     ///
     /// Deliberately *not* bumped, recorded so the next reader does not take it for an
     /// oversight:
@@ -127,8 +135,8 @@ impl Recipe {
         match self {
             Recipe::Glb => 0,
             Recipe::Texture => 0,
-            Recipe::Skin => 0,
-            Recipe::Animation => 1,
+            Recipe::Skin => 1,
+            Recipe::Animation => 0,
         }
     }
 
