@@ -3119,7 +3119,7 @@ mod tests {
             catalyst_url: "http://127.0.0.1:9".to_string(),
             cache_dir: dir.to_string_lossy().into_owned(),
             version: "v49".to_string(),
-            wearable_version: "v49w".to_string(),
+            wearable_version: "v1500".to_string(),
             fallback_version: "v41".to_string(),
             ..Default::default()
         });
@@ -3127,10 +3127,10 @@ mod tests {
         // Emotes ride the wearable lane, and so does anything else that turns up: the split
         // is about whether a name can carry an invalidation, and only a scene's can.
         for kind in ["wearable", "emote", "profile", ""] {
-            assert_eq!(split.version_for(kind), "v49w", "entity type {kind:?}");
+            assert_eq!(split.version_for(kind), "v1500", "entity type {kind:?}");
         }
         // Serving has only a bundle name to go on, so it tries both lanes then the fallback.
-        assert_eq!(split.read_versions(), vec!["v49", "v49w", "v41"]);
+        assert_eq!(split.read_versions(), vec!["v49", "v1500", "v41"]);
 
         // Leave WEARABLE_AB_VERSION unset and the lanes collapse into one, which is exactly
         // the behaviour every deployment had before they were split.
