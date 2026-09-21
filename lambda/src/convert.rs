@@ -32,6 +32,7 @@ pub fn make_proxy(cfg: &Config, content_server: &str) -> std::sync::Arc<abgen::l
         catalyst_url: content_server.to_string(),
         cache_dir: cfg.cache_dir.clone(),
         version: cfg.version.clone(),
+        wearable_version: cfg.wearable_version.clone(),
         deps_digest: true,
         use_space: true,
         ..Default::default()

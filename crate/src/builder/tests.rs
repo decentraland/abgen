@@ -629,6 +629,161 @@ fn v38_compat_dcl_scene_default_material() {
     );
 }
 
+fn b64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// A one-triangle glTF whose single material takes its base colour from an
+/// embedded image, so the in-glb texture path runs.
+fn gltf_with_basecolor_image(img: &[u8], mime: &str) -> Vec<u8> {
+    const BUF_B64: &str = "AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAAAAABAAIA";
+    let img_b64 = b64_encode(img);
+    format!(
+        "{{\"asset\":{{\"version\":\"2.0\"}},\
+         \"scene\":0,\"scenes\":[{{\"nodes\":[0]}}],\
+         \"nodes\":[{{\"mesh\":0,\"name\":\"tri\"}}],\
+         \"meshes\":[{{\"primitives\":[{{\"attributes\":{{\"POSITION\":0}},\
+           \"indices\":1,\"material\":0}}]}}],\
+         \"materials\":[{{\"name\":\"mat_0\",\"pbrMetallicRoughness\":\
+           {{\"baseColorTexture\":{{\"index\":0}}}}}}],\
+         \"textures\":[{{\"source\":0}}],\
+         \"images\":[{{\"uri\":\"data:{mime};base64,{img_b64}\"}}],\
+         \"accessors\":[\
+           {{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\",\
+             \"min\":[0,0,0],\"max\":[1,1,0]}},\
+           {{\"bufferView\":1,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}}],\
+         \"bufferViews\":[\
+           {{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36}},\
+           {{\"buffer\":0,\"byteOffset\":36,\"byteLength\":6}}],\
+         \"buffers\":[{{\"byteLength\":42,\
+           \"uri\":\"data:application/octet-stream;base64,{BUF_B64}\"}}]}}"
+    )
+    .into_bytes()
+}
+
+/// `_BaseMap` target of the fixture's single material, resolved to the bound
+/// Texture2D's dimensions. `None` means the material shipped with a null base
+/// map. The builder names materials by index (`material_0`), not by the glTF
+/// `name`, so the lookup keys on the emitted name.
+fn basecolor_texture_size(data: &[u8]) -> Option<(i64, i64)> {
+    let b = ReadBundle::load_bytes(data).expect("bundle parses");
+    let mut want: Option<i64> = None;
+    let mut sizes: Vec<(i64, (i64, i64))> = Vec::new();
+    for f in &b.files {
+        let FileContent::Serialized(sf) = &f.content else {
+            continue;
+        };
+        for o in &sf.objects {
+            match o.class_id {
+                21 => {
+                    let v = sf.read_typetree(o).unwrap();
+                    if v.get("m_Name").and_then(|x| x.as_str()) != Some("material_0") {
+                        continue;
+                    }
+                    let Some(Value::Array(tex)) = v
+                        .get("m_SavedProperties")
+                        .and_then(|sp| sp.get("m_TexEnvs"))
+                    else {
+                        continue;
+                    };
+                    for e in tex {
+                        let Value::Array(pair) = e else { continue };
+                        if pair.len() != 2 || pair[0].as_str() != Some("_BaseMap") {
+                            continue;
+                        }
+                        let pid = pair[1]
+                            .get("m_Texture")
+                            .and_then(|t| t.get("m_PathID"))
+                            .and_then(|x| x.as_i64())
+                            .unwrap_or(0);
+                        if pid != 0 {
+                            want = Some(pid);
+                        }
+                    }
+                }
+                28 => {
+                    let v = sf.read_typetree(o).unwrap();
+                    let w = v.get("m_Width").and_then(|x| x.as_i64()).unwrap_or(0);
+                    let h = v.get("m_Height").and_then(|x| x.as_i64()).unwrap_or(0);
+                    sizes.push((o.path_id, (w, h)));
+                }
+                _ => {}
+            }
+        }
+    }
+    let pid = want?;
+    sizes.iter().find(|(p, _)| *p == pid).map(|(_, wh)| *wh)
+}
+
+fn build_with_image(img: &[u8], mime: &str) -> Vec<u8> {
+    let gltf = gltf_with_basecolor_image(img, mime);
+    let opts = BuildOpts {
+        source_file: Some("test.gltf"),
+        ..BuildOpts::default()
+    };
+    build_bundle(
+        &gltf,
+        "QmTestOversizeTex_windows",
+        "QmTestOversizeTex",
+        &opts,
+    )
+    .expect("build_bundle")
+    .data
+}
+
+/// Regression for wearable `QmXisDGjquRHzGrZMkTEjwXM1h9eq2APZLmB7Yea8NNWhE`: a
+/// 7340x8563 embedded JPEG used to trip the old 8192 `LoadImage` bound and be
+/// dropped outright, leaving the dress material with a null `_BaseMap` and the
+/// dress white. An image that decoded must always be resized to fit, never
+/// discarded.
+#[test]
+fn oversized_inglb_image_is_capped_not_dropped() {
+    // Past the old 8192 gate, inside Unity's real 16384 limit: the platform cap
+    // (1024 on windows) applies.
+    let got = basecolor_texture_size(&build_with_image(&lod_jpg_bytes(8500, 64), "image/jpeg"));
+    assert_eq!(
+        got,
+        Some((1024, 8)),
+        "an 8500px-wide JPEG must be downscaled to the windows cap and bound, \
+         not dropped (got {got:?})"
+    );
+
+    // Past Unity's limit too: the fork skips its pre-downscale and the importer
+    // default caps the import — still bound, still not dropped.
+    let got = basecolor_texture_size(&build_with_image(&lod_png_bytes(17000, 64), "image/png"));
+    assert_eq!(
+        got,
+        Some((2048, 8)),
+        "a 17000px-wide PNG must fall back to the importer cap and stay bound \
+         (got {got:?})"
+    );
+}
+
+/// An ordinary in-cap image is untouched by the capping logic.
+#[test]
+fn in_cap_inglb_image_keeps_its_size() {
+    let got = basecolor_texture_size(&build_with_image(&lod_png_bytes(256, 256), "image/png"));
+    assert_eq!(got, Some((256, 256)));
+}
+
 fn build_tiny_force_dcl_scene(n_materials: usize) -> BundleProbe {
     let gltf = tiny_gltf(n_materials);
     let opts = BuildOpts {

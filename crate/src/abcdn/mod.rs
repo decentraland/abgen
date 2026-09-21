@@ -86,6 +86,10 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
         local_root: cfg.content_disk.clone(),
         cache_dir: cfg.live_cache_dir.clone(),
         version: cfg.live_version.clone(),
+        wearable_version: std::env::var("WEARABLE_AB_VERSION")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_default(),
         template_root: cfg.abgen_root.clone(),
         use_space,
         fallback_version,

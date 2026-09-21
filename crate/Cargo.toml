@@ -76,6 +76,10 @@ name = "objdump"
 path = "examples/objdump.rs"
 
 [[example]]
+name = "skinclips"
+path = "examples/skinclips.rs"
+
+[[example]]
 name = "metadump"
 path = "examples/metadump.rs"
 

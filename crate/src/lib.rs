@@ -88,6 +88,7 @@ pub mod normals;
 pub mod pathids;
 pub mod placeholder;
 pub mod png;
+pub mod recipes;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod rediscache;
 pub mod resize;
@@ -96,6 +97,7 @@ pub mod resolver;
 pub mod ress;
 pub mod sbp_order;
 pub mod skeleton;
+pub mod skinbounds;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod sns;
 #[cfg(not(target_arch = "wasm32"))]

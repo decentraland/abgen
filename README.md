@@ -168,6 +168,79 @@ non-digest names).
   `ABGEN_MAGENTA_MISSING` is on, in which case unresolvable deps are dropped from the digest and
   the build substitutes placeholder textures
 
+### Two version lanes: `AB_VERSION` and `WEARABLE_AB_VERSION`
+Scene bundles and wearable/emote bundles live under separate key prefixes. `AB_VERSION` is the scene
+lane; `WEARABLE_AB_VERSION` is wearables and emotes, and defaults to `AB_VERSION` when unset — so a
+deployment that does not set it behaves exactly as it did when the two shared one prefix.
+
+They are split because only a scene's name can carry an invalidation. Scene bundles are digest-named
+(`{hash}_{digest}_{platform}`), so a dependency change or a recipe bump moves them; wearable bundles
+are `{hash}_{platform}`, with nowhere to put one, which leaves the prefix as the only lever they
+have. Sharing one prefix therefore meant every scene-driven bump dragged the whole wearable corpus
+through a rebuild it had no use for, and every wearable-driven bump did the same to the world.
+
+- The conversion path resolves its lane from the entity type (`Proxy::version_for`); everything
+  that is not a scene rides the wearable lane.
+- The serving path has only a bundle name to go on, so it reads both lanes and then
+  `ABGEN_FALLBACK_VERSION` (`Proxy::read_versions`). Safe rather than merely convenient: an
+  entity's bundles exist under exactly one prefix and every name is content-addressed, so a hit is
+  the right bytes whichever lane answered. A miss costs one extra 404.
+- The lambda's already-converted gate accepts a manifest at *either* lane, because the entity type
+  is only known after the entity doc is fetched and the gate deliberately runs before that. Safe
+  while the two are distinct strings: a manifest carries whichever version wrote it, so a bump of
+  either stops matching.
+
+### Per-asset-type cache keys (recipes)
+`AB_VERSION` prefixes every space key, so bumping it orphans every bundle of every type at once —
+the right hammer for a change to the bundle container, far too big for the usual fix, which changes
+how one kind of asset is built and leaves the rest byte-identical. Baking skinned-renderer bounds
+over the animation clips (#119) rewrote nothing but animated rigs; an `AB_VERSION` bump behind it
+would have rebuilt every texture in the world.
+
+`crate/src/recipes.rs` holds a generation counter per build-affecting behaviour and folds the ones
+an asset uses into the digest that names its bundle. A bundle is rebuilt whole or not at all — a GLB
+bundle carries its meshes, skeleton, clips, materials *and* its resolved textures in one artifact —
+so there are only two base recipes, one per kind of bundle, plus two narrowing ones that earn their
+place by being rare:
+
+| Recipe | Applies to | Rebuilds on a bump |
+|---|---|---|
+| `glb` | every glTF | every glb bundle; no standalone image bundles |
+| `texture` | standalone images, and any glTF with `images` | every image bundle **and** every glb that embeds one |
+| `skin` | a glTF declaring `skins` | only rigs — a minority of glbs |
+| `animation` | a glTF carrying `animations` | only animated glbs — a minority |
+
+**To ship a fix without an `AB_VERSION` bump:** raise the matching counter by one, in the commit that
+changes the output, then re-enqueue as you would for a version bump. Bundles whose recipes moved get
+new names, miss the HEAD probe and rebuild; every other bundle keeps its name and is reused where it
+already sits. Never renumber a counter and never reuse a value — a generation that comes back around
+makes stale bundles look fresh.
+
+Default to `glb`. Reach for `skin` or `animation` only when the fix has a gate you can point at —
+#119 is the model, where a glTF with no clips serialized byte for byte as before. The asymmetry is
+the whole rule: too broad costs a rebuild you were going to pay anyway, too narrow ships stale
+bundles and says nothing. There is deliberately no counter per sub-asset (`mesh`, `material`) — the
+bundle is the unit, so those would rebuild the same set `glb` does — and none for normal maps, since
+"is this encoder fix normal-only?" is exactly the ambiguous question a recipe must not ask.
+
+Scope and cost:
+- Only the digest-named lane carries recipes. Wearables and emotes are `{hash}_{platform}`, with
+  nowhere to put a generation, so a fix to those still needs `AB_VERSION` — as does anything that
+  changes the bundle container, the manifest shape, or the client's side of the contract.
+- Generation `0` folds in as nothing *in a digest*, so adopting this cost no rebuild: every
+  bundle name is byte-for-byte what it was before. Manifests do gain a `recipes` key.
+- `AB_VERSION` stays total. It is the key prefix, never a digest input, and the conversion gate
+  gained a conjunct rather than a substitute, so a version bump still reconverts everything.
+- Each conversion records, in the per-platform manifest's `recipes` block, every recipe governing
+  its bundles and the generation each stood at — **baselines included** — and `platform_converted`
+  compares it, so the lambda's already-converted skip stays correct without a `force` flag. A scene
+  of static props records `{"glb":0,"texture":0}`: bumping `skin` leaves it current (that is the
+  saving), bumping `glb` does not. Recording only the *bumped* recipes would be blind to every
+  later `0 -> 1` bump, which is why the baselines are kept here and dropped in the digest.
+  A manifest predating recipes has no block at all and reconverts once.
+- The LOD lane solves the same problem with one counter of its own,
+  `crate/src/lodgen/pipeline.rs::LOD_GENERATION`, folded into the reuse state document.
+
 Display-only files — `autogenerated-thumbnail.png` anywhere in the content map, and whatever
 `metadata.display.navmapThumbnail` points at — are dropped from the conversion input, matching the
 prod converter's `-skippedHashes` flag: no bundle, no manifest entry, and no contribution to the

@@ -866,6 +866,7 @@ mod tests {
         Config {
             platforms: vec!["windows".to_string(), "mac".to_string()],
             version: "v49".to_string(),
+            wearable_version: "v49".to_string(),
             cache_dir: "/tmp/cache".to_string(),
             default_content_server: "https://peer.decentraland.org/content".to_string(),
             out_root: PathBuf::from("/tmp/out"),
