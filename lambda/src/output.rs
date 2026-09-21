@@ -109,6 +109,22 @@ pub fn converted_lane(
     Some(lane)
 }
 
+/// The configured platforms already converted the way this build would convert them,
+/// each with the lane its manifest names — the platforms a job skips, and what their
+/// finished events report.
+pub fn already_converted(
+    proxy: &Arc<Proxy>,
+    cfg: &Config,
+    entity_id: &str,
+) -> Vec<(String, String)> {
+    cfg.platforms
+        .iter()
+        .filter_map(|platform| {
+            converted_lane(proxy, cfg, entity_id, platform).map(|lane| (platform.clone(), lane))
+        })
+        .collect()
+}
+
 /// The entity's type as the catalyst reports it, `scene` when the document does not
 /// say — the same reading `Proxy::version_for` routes lanes by.
 pub fn entity_type(entity_doc: &serde_json::Value) -> &str {
@@ -312,6 +328,31 @@ mod tests {
         }
     }
 
+    /// Points the S3 space at a fake server for the duration of the returned guard, which
+    /// also holds the process-wide env lock so tests do not race on the variables.
+    fn point_space_at(host: &str) -> (std::sync::MutexGuard<'static, ()>, EnvGuard) {
+        let lock = crate::convert::TEST_SPACE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ABGEN_S3_ENDPOINT", format!("http://{host}"));
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIATEST");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+        (lock, EnvGuard)
+    }
+
+    struct EnvGuard;
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for k in [
+                "ABGEN_S3_ENDPOINT",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+            ] {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
     /// Trimmed copy of `abgen::live::stub::serve` (that one is `cfg(test)`
     /// and invisible to this crate).
     fn serve(routes: Vec<(String, u16, Vec<u8>)>) -> (String, Arc<Mutex<Vec<String>>>) {
@@ -386,25 +427,7 @@ mod tests {
             ("/manifest/bafkpart_windows.json".to_string(), 200, good),
             ("/manifest/bafkpart_mac.json".to_string(), 200, Vec::new()),
         ]);
-        let _env = crate::convert::TEST_SPACE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        struct EnvGuard;
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                for k in [
-                    "ABGEN_S3_ENDPOINT",
-                    "AWS_ACCESS_KEY_ID",
-                    "AWS_SECRET_ACCESS_KEY",
-                ] {
-                    std::env::remove_var(k);
-                }
-            }
-        }
-        let _guard = EnvGuard;
-        std::env::set_var("ABGEN_S3_ENDPOINT", format!("http://{host}"));
-        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIATEST");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+        let _space = point_space_at(&host);
 
         let cfg = cfg("tombstone-partial");
         let proxy = crate::convert::make_proxy(&cfg, "http://127.0.0.1:9");
@@ -477,6 +500,82 @@ mod tests {
             &with_recipes(u64::from(skin.generation())),
             ["v50", "v50w"]
         ));
+    }
+
+    /// Regression for the v0.19.0 registry records: every wearable's finished event said
+    /// `AB_VERSION` while its bundles sat under `WEARABLE_AB_VERSION`, and the registry
+    /// (which stores the event's version verbatim, status 13 included) sent every client
+    /// to 404s. This walks the skip path from the manifest on S3 to the event body and
+    /// pins the version to the manifest's lane — never to a config default.
+    #[test]
+    fn the_registry_hears_the_lane_the_manifest_names_not_the_config_default() {
+        let recipes = abgen::recipes::recorded_generations(&abgen::recipes::Recipe::ALL);
+        // A wearable published after the lane split: both platforms under the wearable
+        // lane, which is not the scene lane `cfg.version` holds.
+        let wearable_manifest = |platform: &str| {
+            serde_json::json!({
+                "version": "v49w", "files": [format!("qmhash_{platform}"), "dcl"],
+                "exitCode": 0, "contentServerUrl": "cs", "date": "d", "recipes": recipes,
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let (host, _seen) = serve(vec![
+            (
+                "/manifest/bafkwear_windows.json".to_string(),
+                200,
+                wearable_manifest("windows"),
+            ),
+            (
+                "/manifest/bafkwear_mac.json".to_string(),
+                200,
+                wearable_manifest("mac"),
+            ),
+        ]);
+        let _space = point_space_at(&host);
+
+        let cfg = cfg("registry-lane");
+        assert_ne!(
+            cfg.version, cfg.wearable_version,
+            "the test needs two lanes"
+        );
+        let proxy = crate::convert::make_proxy(&cfg, "http://127.0.0.1:9");
+
+        // The skip path: every platform is already converted, and the job notifies
+        // without ever fetching the entity — so the lane can only come from the manifest.
+        let already = super::already_converted(&proxy, &cfg, "bafkwear");
+        assert_eq!(already.len(), 2, "{already:?}");
+        let finished: Vec<crate::notify::Finished> = already
+            .iter()
+            .map(|(p, lane)| crate::notify::Finished::already_converted(p, lane))
+            .collect();
+        let events = crate::notify::finished_events("bafkwear", "cs", 0, &finished);
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            let version = event["metadata"]["version"].as_str().unwrap();
+            assert_eq!(
+                version, "v49w",
+                "{} must report the lane its manifest names: {event}",
+                event["metadata"]["platform"]
+            );
+            assert_ne!(
+                version, cfg.version,
+                "the scene lane is the config default, not where this wearable is"
+            );
+        }
+
+        // The build path routes by entity type the same way the writer does, so a fresh
+        // wearable conversion reports the wearable lane too.
+        let wearable_doc = serde_json::json!({ "type": "wearable" });
+        assert_eq!(
+            proxy.version_for(super::entity_type(&wearable_doc)),
+            cfg.wearable_version
+        );
+        let scene_doc = serde_json::json!({ "type": "scene" });
+        assert_eq!(
+            proxy.version_for(super::entity_type(&scene_doc)),
+            cfg.version
+        );
     }
 
     #[test]

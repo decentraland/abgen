@@ -17,6 +17,17 @@ pub struct Finished<'a> {
     pub version: String,
 }
 
+impl<'a> Finished<'a> {
+    /// A platform skipped as already converted, reporting the lane its manifest names.
+    pub fn already_converted(platform: &'a str, lane: &str) -> Self {
+        Finished {
+            platform,
+            status_code: STATUS_ALREADY_CONVERTED,
+            version: lane.to_string(),
+        }
+    }
+}
+
 /// One `AssetBundleConversionFinishedEvent` per platform, byte-compatible
 /// with what consumer-server publishes (adapters/sns.ts). Must target a
 /// DEDICATED topic, never the shared event-driven-sns bus — the prod
@@ -46,9 +57,12 @@ pub fn send_finished(entity_id: &str, content_server: &str, finished: &[Finished
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let is_world = content_server.contains("worlds-content-server");
-    for f in finished {
-        let event = finished_event(entity_id, is_world, timestamp, f);
+    for (f, event) in finished.iter().zip(finished_events(
+        entity_id,
+        content_server,
+        timestamp,
+        finished,
+    )) {
         sns.publish(
             &event.to_string(),
             &[("type", "asset-bundle"), ("subType", "converted")],
@@ -60,6 +74,21 @@ pub fn send_finished(entity_id: &str, content_server: &str, finished: &[Finished
         finished.len()
     );
     Ok(true)
+}
+
+/// The event bodies `send_finished` publishes, one per platform, in order — the seam the
+/// registry-facing tests read, since publishing itself needs SNS.
+pub fn finished_events(
+    entity_id: &str,
+    content_server: &str,
+    timestamp: u64,
+    finished: &[Finished],
+) -> Vec<serde_json::Value> {
+    let is_world = content_server.contains("worlds-content-server");
+    finished
+        .iter()
+        .map(|f| finished_event(entity_id, is_world, timestamp, f))
+        .collect()
 }
 
 /// The `AssetBundleConversionFinishedEvent` body (@dcl/schemas base.ts /

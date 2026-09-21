@@ -284,27 +284,18 @@ fn convert_asset_bundles(
     // finished event reports for them, since that is where their bundles are.
     let mut already: Vec<(String, String)> = Vec::new();
     if !job.force {
-        pending.retain(|platform| {
-            match output::converted_lane(proxy, cfg, &job.entity_id, platform) {
-                Some(lane) => {
-                    eprintln!(
-                        "skip: {} {platform} already converted at {lane}",
-                        job.entity_id
-                    );
-                    already.push((platform.clone(), lane));
-                    false
-                }
-                None => true,
-            }
-        });
+        already = output::already_converted(proxy, cfg, &job.entity_id);
+        for (platform, lane) in &already {
+            eprintln!(
+                "skip: {} {platform} already converted at {lane}",
+                job.entity_id
+            );
+        }
+        pending.retain(|platform| !already.iter().any(|(done, _)| done == platform));
         if pending.is_empty() {
             let finished: Vec<notify::Finished> = already
                 .iter()
-                .map(|(p, lane)| notify::Finished {
-                    platform: p,
-                    status_code: notify::STATUS_ALREADY_CONVERTED,
-                    version: lane.clone(),
-                })
+                .map(|(p, lane)| notify::Finished::already_converted(p, lane))
                 .collect();
             let notified = notify::send_finished(&job.entity_id, content_server, &finished)?;
             return Ok(serde_json::json!({
@@ -361,11 +352,11 @@ fn convert_asset_bundles(
                     version: built_lane.clone(),
                 })
                 .collect();
-            finished.extend(already.iter().map(|(p, lane)| notify::Finished {
-                platform: p,
-                status_code: notify::STATUS_ALREADY_CONVERTED,
-                version: lane.clone(),
-            }));
+            finished.extend(
+                already
+                    .iter()
+                    .map(|(p, lane)| notify::Finished::already_converted(p, lane)),
+            );
             notify::send_finished(&job.entity_id, content_server, &finished)
         },
     );
