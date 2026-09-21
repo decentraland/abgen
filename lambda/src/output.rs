@@ -61,37 +61,61 @@ fn recipe_marker_scope() -> String {
 /// either stops matching. Configure them equal and this collapses to the single-lane
 /// behaviour it had before the split.
 fn manifest_is_current(json: &serde_json::Value, versions: [&str; 2]) -> bool {
-    let version = json.get("version").and_then(serde_json::Value::as_str);
-    json.get("exitCode").and_then(serde_json::Value::as_i64) == Some(0)
-        && version.is_some_and(|v| versions.contains(&v))
-        && abgen::recipes::recorded_is_current(json.get("recipes"))
+    current_lane(json, versions).is_some()
 }
 
-pub fn platform_converted(
+/// [`manifest_is_current`] with the answer's payload: the version lane the manifest
+/// names, which is where its bundles live. `None` when the manifest is not current.
+fn current_lane(json: &serde_json::Value, versions: [&str; 2]) -> Option<String> {
+    let version = json.get("version").and_then(serde_json::Value::as_str)?;
+    (json.get("exitCode").and_then(serde_json::Value::as_i64) == Some(0)
+        && versions.contains(&version)
+        && abgen::recipes::recorded_is_current(json.get("recipes")))
+    .then(|| version.to_string())
+}
+
+/// `Some(lane)` when this platform is already converted the way this build would convert
+/// it, where `lane` is the version lane its manifest names.
+///
+/// The lane is the manifest's and not the entity type's on purpose: it is what the
+/// finished event reports to the registry, and the registry's record has to name the
+/// prefix the bundles are actually under. A wearable converted before the lane split
+/// sits under the scene lane with a manifest that says so, and stays current there
+/// until a bump moves it; deriving its lane from its type would send clients to keys
+/// that do not exist. The Redis marker carries the same lane as its value, so a marker
+/// hit answers with it too — a marker from before lanes were recorded holds `"1"`,
+/// which is not a lane in force and falls through to one manifest read that re-marks it.
+pub fn converted_lane(
     proxy: &Arc<Proxy>,
     cfg: &Config,
     entity_id: &str,
     platform: &str,
-) -> bool {
+) -> Option<String> {
+    let lanes = [cfg.version.as_str(), cfg.wearable_version.as_str()];
     let marker = converted_marker_key(proxy, cfg, entity_id, platform);
     if let Some(key) = &marker {
-        if abgen::rediscache::hit(key) {
-            return true;
+        if let Some(lane) = abgen::rediscache::get(key) {
+            if lanes.contains(&lane.as_str()) {
+                return Some(lane);
+            }
         }
     }
-    let Some(bytes) = proxy.space_get_manifest(&format!("{entity_id}_{platform}")) else {
-        return false;
-    };
-    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return false;
-    };
-    let converted = manifest_is_current(&json, [&cfg.version, &cfg.wearable_version]);
-    if converted {
-        if let Some(key) = &marker {
-            abgen::rediscache::mark(key);
-        }
+    let bytes = proxy.space_get_manifest(&format!("{entity_id}_{platform}"))?;
+    let json = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+    let lane = current_lane(&json, lanes)?;
+    if let Some(key) = &marker {
+        abgen::rediscache::mark_with(key, &lane);
     }
-    converted
+    Some(lane)
+}
+
+/// The entity's type as the catalyst reports it, `scene` when the document does not
+/// say — the same reading `Proxy::version_for` routes lanes by.
+pub fn entity_type(entity_doc: &serde_json::Value) -> &str {
+    entity_doc
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("scene")
 }
 
 pub fn publish(
@@ -114,12 +138,8 @@ pub fn publish(
         }));
     }
 
-    let entity_type = entity_doc
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("scene");
     let mut scene_sources = 0usize;
-    if entity_type == "scene" && outcome.exit_code() == 0 {
+    if entity_type(entity_doc) == "scene" && outcome.exit_code() == 0 {
         scene_sources = upload_scene_sources(cfg, agent, proxy, entity_doc, outcome);
     }
 
@@ -138,7 +158,10 @@ pub fn publish(
 }
 
 /// Prod's manifest shape with no files and UNEXPECTED_ERROR; never mistaken
-/// for a conversion — `platform_converted` requires `exitCode == 0`.
+/// for a conversion — `converted_lane` requires `exitCode == 0`. Written under the
+/// scene lane whatever the entity is: this path runs when the job failed, possibly
+/// before the entity document was ever fetched, so the type is not known here; and a
+/// tombstone names no bundles, so no client resolves anything through its lane.
 fn failure_manifest(cfg: &Config, content_server: &str, date: &str) -> Vec<u8> {
     serde_json::json!({
         "version": cfg.version,
@@ -151,6 +174,14 @@ fn failure_manifest(cfg: &Config, content_server: &str, date: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// What the tombstone pass did with one platform.
+pub struct TombstoneOutcome {
+    pub platform: String,
+    /// `Some(lane)` when a current manifest was found and left alone, naming the lane it
+    /// lives under; `None` when a tombstone was written in its place.
+    pub converted_lane: Option<String>,
+}
+
 /// One tombstone per platform without a good manifest; errors propagate —
 /// a tombstone we cannot land must still reach the DLQ.
 pub fn publish_failure_tombstones(
@@ -158,20 +189,25 @@ pub fn publish_failure_tombstones(
     proxy: &Arc<Proxy>,
     entity_id: &str,
     content_server: &str,
-) -> Result<Vec<String>> {
-    let mut tombstoned = Vec::new();
+) -> Result<Vec<TombstoneOutcome>> {
+    let mut outcomes = Vec::with_capacity(cfg.platforms.len());
+    let mut tombstoned = 0u64;
     for platform in &cfg.platforms {
-        if platform_converted(proxy, cfg, entity_id, platform) {
-            continue;
+        let converted_lane = converted_lane(proxy, cfg, entity_id, platform);
+        if converted_lane.is_none() {
+            let bytes = failure_manifest(cfg, content_server, proxy.date());
+            proxy
+                .space_put_manifest_strict(&format!("{entity_id}_{platform}"), &bytes)
+                .with_context(|| format!("tombstone manifest for {entity_id} {platform}"))?;
+            tombstoned += 1;
         }
-        let bytes = failure_manifest(cfg, content_server, proxy.date());
-        proxy
-            .space_put_manifest_strict(&format!("{entity_id}_{platform}"), &bytes)
-            .with_context(|| format!("tombstone manifest for {entity_id} {platform}"))?;
-        tombstoned.push(platform.clone());
+        outcomes.push(TombstoneOutcome {
+            platform: platform.clone(),
+            converted_lane,
+        });
     }
-    metrics::counter!("abgen_lambda_tombstones_total").increment(tombstoned.len() as u64);
-    Ok(tombstoned)
+    metrics::counter!("abgen_lambda_tombstones_total").increment(tombstoned);
+    Ok(outcomes)
 }
 
 /// Entity-supplied file names end up in S3 object keys, and `uri_encode_key`
@@ -372,14 +408,20 @@ mod tests {
 
         let cfg = cfg("tombstone-partial");
         let proxy = crate::convert::make_proxy(&cfg, "http://127.0.0.1:9");
-        let tombstoned = super::publish_failure_tombstones(
+        let outcomes = super::publish_failure_tombstones(
             &cfg,
             &proxy,
             "bafkpart",
             "https://peer.decentraland.org/content",
         )
         .unwrap();
-        assert_eq!(tombstoned, vec!["mac".to_string()]);
+        let summary: Vec<(&str, Option<&str>)> = outcomes
+            .iter()
+            .map(|o| (o.platform.as_str(), o.converted_lane.as_deref()))
+            .collect();
+        // windows keeps its manifest and reports the lane that manifest names; mac
+        // gets a tombstone.
+        assert_eq!(summary, vec![("windows", Some("v49")), ("mac", None)]);
 
         let log = seen.lock().unwrap().clone();
         assert!(
@@ -435,6 +477,33 @@ mod tests {
             &with_recipes(u64::from(skin.generation())),
             ["v50", "v50w"]
         ));
+    }
+
+    #[test]
+    fn a_current_manifest_names_the_lane_its_bundles_live_under() {
+        let recipes = abgen::recipes::recorded_generations(&abgen::recipes::Recipe::ALL);
+        let pre_split_wearable = serde_json::json!({
+            "version": "v49", "exitCode": 0, "recipes": recipes,
+        });
+        let post_split_wearable = serde_json::json!({
+            "version": "v49w", "exitCode": 0, "recipes": recipes,
+        });
+        let failed = serde_json::json!({ "version": "v49w", "exitCode": 5 });
+        // The lane is read off the manifest, not inferred from the entity: a wearable
+        // still sitting under the scene lane reports the scene lane.
+        assert_eq!(
+            super::current_lane(&pre_split_wearable, ["v49", "v49w"]).as_deref(),
+            Some("v49")
+        );
+        assert_eq!(
+            super::current_lane(&post_split_wearable, ["v49", "v49w"]).as_deref(),
+            Some("v49w")
+        );
+        assert_eq!(super::current_lane(&failed, ["v49", "v49w"]), None);
+        assert_eq!(
+            super::current_lane(&post_split_wearable, ["v49", "v50w"]),
+            None
+        );
     }
 
     #[test]
