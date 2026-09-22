@@ -1468,8 +1468,16 @@ mod conformance {
             ..Default::default()
         };
         let d = decompose_unity(&mat_trs(&t));
-        assert!(d.scale.iter().all(|s| (s - 1.0).abs() < 1e-9), "{:?}", d.scale);
-        assert!(same_rotation(d.rotation, [0.0, 1.0, 0.0, 0.0], 1e-9), "{:?}", d.rotation);
+        assert!(
+            d.scale.iter().all(|s| (s - 1.0).abs() < 1e-9),
+            "{:?}",
+            d.scale
+        );
+        assert!(
+            same_rotation(d.rotation, [0.0, 1.0, 0.0, 0.0], 1e-9),
+            "{:?}",
+            d.rotation
+        );
         assert_eq!(d.position, [8.0, 0.0, 8.0]);
 
         let t = Trs {
@@ -1479,7 +1487,10 @@ mod conformance {
         assert_eq!(mat_trs(&t), MAT4_IDENTITY);
 
         assert_eq!(unit_quaternion([0.0, 0.0, 0.0, 2.0]), IDENTITY_ROTATION);
-        assert_eq!(unit_quaternion([0.0, 0.0, 0.0, f64::NAN]), IDENTITY_ROTATION);
+        assert_eq!(
+            unit_quaternion([0.0, 0.0, 0.0, f64::NAN]),
+            IDENTITY_ROTATION
+        );
     }
 
     #[test]
