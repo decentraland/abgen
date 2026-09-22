@@ -433,6 +433,25 @@ index. No finished event is published for LODs (see
 whether a build already exists — see
 [Reusing an unchanged build](#reusing-an-unchanged-build).
 
+Every per-scene object is published twice: under its scene-id-only key and under a
+content-addressed twin in the same directory, `{sid}_{digest}_…` where `digest` is the first
+32 hex characters of the build's LOD state digest (`LOD/1/{sid}_{digest}_1_{platform}`,
+`lods-unity/manifests/{sid}_{digest}_InitialSceneState.json`, `lods-unity/lods/{sid}_{digest}_1.glb`).
+The scene's per-entity manifests (served `no-cache`) then get a `lods` block naming the twins:
+
+```json
+"lods": {
+  "digest": "…",
+  "descriptor": "{sid}_{digest}_InitialSceneState.json",
+  "levels": [{ "level": 1, "file": "{sid}_{digest}_1" }]
+}
+```
+
+A client that reads the block requests immutable objects, so a regeneration that changes a
+scene's LODs lands beside the old ones and no CDN or client cache needs invalidating; one that
+does not keeps composing the scene-id-only names. A reused build carries the record's digest,
+so two deployments with the same state name their twins alike.
+
 The LOD result is nested under the conversion summary's `lods` key
 (`reusedBy`, `reusedFrom`, `levels`, `objects`, `keys`, `exitCode`, …, or a
 single `skipped` / `error` field). **A LOD failure never fails the job**: the

@@ -146,6 +146,15 @@ fn acquire_placements_independently(
 /// every scene rebuilds once and republishes under the new generation.
 pub const LOD_GENERATION: &str = "1";
 
+/// Bump when a change to placement derivation means the placements a deployment's inputs
+/// produced before may differ from what they produce now. Folded into the reuse inputs
+/// document only: a stored build filed under this deployment's code and snapshot is not
+/// trusted on its own, the scene is executed and its state compared instead, so only the
+/// scenes whose placements actually changed rebuild while the rest copy the build they had.
+/// 2: `mat_trs` normalises transform quaternions; placements derived from a non-unit
+/// quaternion carried its magnitude as scale (and threw parented children off).
+pub const PLACEMENT_GENERATION: &str = "2";
+
 /// The descriptor document a build publishes, with how many placements resolved to a
 /// content hash and how many were dropped because the deployment does not ship one.
 pub fn iss_document(

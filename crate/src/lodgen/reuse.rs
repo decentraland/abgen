@@ -48,6 +48,9 @@ pub fn state_index_key(digest: &str) -> String {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Inputs {
+    /// [`super::PLACEMENT_GENERATION`] at the time of the build: how placements were derived
+    /// from these inputs. A bump makes every stored inputs record miss, so the scene is
+    /// executed and judged by its state instead of trusted on its code alone.
     pub generation: String,
     pub runtime_version: String,
     pub base: String,
@@ -92,7 +95,7 @@ pub fn inputs(ent: &Scene) -> Result<Option<Inputs>> {
         return Ok(None);
     }
     Ok(Some(Inputs {
-        generation: super::LOD_GENERATION.to_string(),
+        generation: super::PLACEMENT_GENERATION.to_string(),
         runtime_version: runtime_version.to_string(),
         base: format!("{},{}", base.0, base.1),
         parcels,
@@ -468,6 +471,35 @@ mod tests {
         assert_eq!(
             r.accepts_inputs(&ins, &listing(&now_shipped), &[1], &plats),
             Err("models/Missing.glb is now shipped".to_string())
+        );
+    }
+
+    #[test]
+    fn a_placement_generation_bump_misses_by_inputs_but_still_reuses_by_state() {
+        // A record filed before a placement-derivation change: its inputs carry the old
+        // placement generation while its bundles are still right for its state. The inputs
+        // shortcut must not hand them out untested; the state comparison may.
+        let mut r = record();
+        let current = r.inputs.clone().unwrap();
+        let mut stored = current.clone();
+        stored.generation = "1".to_string();
+        r.inputs = Some(stored.clone());
+        r.inputs_digest = Some(inputs_digest(&stored));
+        let same = listing(&owned(BASE));
+        let plats = vec!["windows".to_string()];
+
+        assert_ne!(inputs_digest(&stored), inputs_digest(&current));
+        assert_eq!(
+            r.accepts_inputs(&current, &same, &[1], &plats),
+            Err("inputs differ".to_string())
+        );
+        assert_eq!(r.accepts_state(&r.state, &same, &[1], &plats), Ok(()));
+        assert_eq!(
+            inputs(&scene("7", &["0,0", "1,0"], &owned(BASE)))
+                .unwrap()
+                .unwrap()
+                .generation,
+            super::super::PLACEMENT_GENERATION
         );
     }
 
