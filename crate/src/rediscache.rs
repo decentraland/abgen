@@ -407,8 +407,25 @@ impl State {
     }
 
     fn mark(&self, key: &str) {
+        self.mark_with(key, "1");
+    }
+
+    fn mark_with(&self, key: &str, value: &str) {
         let ttl = self.ttl_seconds.to_string();
-        self.with_conn("set", |c| c.expect_ok(&["SET", key, "1", "EX", &ttl]));
+        self.with_conn("set", |c| c.expect_ok(&["SET", key, value, "EX", &ttl]));
+    }
+
+    /// The key's value, `None` on a miss. Counted under the same op as `hit`: a value
+    /// read is an existence check that also brings the payload back.
+    fn get(&self, key: &str) -> Option<String> {
+        let r = self.with_conn("get", |c| match c.command(&["GET", key])? {
+            Reply::Bulk(v) => Ok(v),
+            Reply::Error(e) => Err(io_err(format!("GET: {e}"))),
+            other => Err(io_err(format!("GET: unexpected reply {other:?}"))),
+        })?;
+        let result = if r.is_some() { "hit" } else { "miss" };
+        metrics::counter!("abgen_rediscache_total", "op" => "get", "result" => result).increment(1);
+        r.and_then(|bytes| String::from_utf8(bytes).ok())
     }
 
     /// `false` when the DEL did not run or failed (backoff window, connect or
@@ -434,6 +451,22 @@ pub fn mark(key: &str) {
     if let Some(st) = state() {
         st.mark(key);
     }
+}
+
+/// Like [`mark`], but the marker carries `value` for [`get`] to read back — for a
+/// verdict that has a payload (which version lane a manifest names) and not just a
+/// yes. Fire-and-forget.
+pub fn mark_with(key: &str, value: &str) {
+    if let Some(st) = state() {
+        st.mark_with(key, value);
+    }
+}
+
+/// The value a [`mark_with`] left under the key. `None` on a miss, a disabled cache,
+/// any error, or a value that is not UTF-8 — every one of those sends the caller back
+/// to the source of truth.
+pub fn get(key: &str) -> Option<String> {
+    state().and_then(|st| st.get(key))
 }
 
 /// Drops a key so the next check goes back to the source of truth. Fail-open
@@ -671,6 +704,34 @@ mod tests {
                     "EX".to_string(),
                     "60".to_string(),
                 ],
+            ]
+        );
+    }
+
+    #[test]
+    fn mark_with_stores_the_value_and_get_reads_it_back() {
+        let (target, commands, server) =
+            fake_redis(vec![vec![b"+OK\r\n", b"$5\r\nv1500\r\n", b"$-1\r\n"]]);
+        let st = test_state(target, 60);
+
+        st.mark_with("abgen:converted:b:k", "v1500");
+        assert_eq!(st.get("abgen:converted:b:k").as_deref(), Some("v1500"));
+        assert_eq!(st.get("abgen:converted:b:other"), None);
+        server.join().expect("server");
+
+        let got = commands.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                vec![
+                    "SET".to_string(),
+                    "abgen:converted:b:k".to_string(),
+                    "v1500".to_string(),
+                    "EX".to_string(),
+                    "60".to_string(),
+                ],
+                vec!["GET".to_string(), "abgen:converted:b:k".to_string()],
+                vec!["GET".to_string(), "abgen:converted:b:other".to_string()],
             ]
         );
     }

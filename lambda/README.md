@@ -89,6 +89,17 @@ with `rawMessageDelivery: true` receives byte-compatible bodies:
 - already-converted skips publish `statusCode: 13`, matching prod's
   triage fast path — one event per processed job, and a redelivered SQS
   message re-notifies if an earlier publish failed after upload
+- `metadata.version` is the lane the platform's manifest names — the
+  `{version}/**` prefix its bundles are actually under — never a config
+  default. The registry stores it verbatim as
+  `versions.assets.{platform}.version` on every succeeded event (13 included)
+  and clients build bundle URLs from it. A freshly built platform reports the
+  lane the build chose (`AB_VERSION` for scenes, `WEARABLE_AB_VERSION` for
+  wearables and emotes); a skipped one reports what its manifest says, so a
+  wearable still sitting under the scene lane from before the split keeps
+  reporting the scene lane until a bump moves it. Tombstoned platforms report
+  the lane the tombstone was written under (`AB_VERSION`; the entity type may
+  never have been fetched on that path, and a tombstone names no bundles).
 - the LOD step of a scene conversion (`ENABLE_LODS=1`) publishes nothing:
   `isLods` is always `false`. The registry's per-platform `lods` status is
   not maintained by this pipeline and must not be read as one; the
@@ -138,8 +149,12 @@ Semantics (mirrors consumer-server's asset-reuse cache):
 - **fail-open** — any Redis error is a miss, the S3 probe runs as before, and
   the client backs off for 30 s so an outage can't make probes slower than
   no cache at all.
-- keys are scoped to bucket (and version for entity markers), so caches for
-  different CDNs can never cross-contaminate; a `force` job deletes the
+- keys are scoped to bucket (and both version lanes plus the recipe table for
+  entity markers), so caches for different CDNs can never cross-contaminate.
+  An entity marker's value is the lane its manifest names, so a marker hit
+  can answer the finished event's `version` without a manifest read; a marker
+  holding anything else (the pre-lane `"1"`) falls through to one manifest
+  GET that re-marks it. A `force` job deletes the
   entity markers it bypasses — both before converting and again after its
   result is published — since a reconversion can downgrade a manifest.
 - 24 h TTL bounds the keyspace across `AB_VERSION` bumps.

@@ -280,28 +280,24 @@ fn convert_asset_bundles(
     content_server: &str,
 ) -> Result<serde_json::Value> {
     let mut pending: Vec<String> = cfg.platforms.clone();
-    let mut already: Vec<String> = Vec::new();
+    // Platforms already converted, each with the lane its manifest names — what the
+    // finished event reports for them, since that is where their bundles are.
+    let mut already: Vec<(String, String)> = Vec::new();
     if !job.force {
-        pending.retain(|platform| {
-            let done = output::platform_converted(proxy, cfg, &job.entity_id, platform);
-            if done {
-                eprintln!(
-                    "skip: {} {platform} already converted at {}",
-                    job.entity_id, cfg.version
-                );
-                already.push(platform.clone());
-            }
-            !done
-        });
+        already = output::already_converted(proxy, cfg, &job.entity_id);
+        for (platform, lane) in &already {
+            eprintln!(
+                "skip: {} {platform} already converted at {lane}",
+                job.entity_id
+            );
+        }
+        pending.retain(|platform| !already.iter().any(|(done, _)| done == platform));
         if pending.is_empty() {
             let finished: Vec<notify::Finished> = already
                 .iter()
-                .map(|p| notify::Finished {
-                    platform: p,
-                    status_code: notify::STATUS_ALREADY_CONVERTED,
-                })
+                .map(|(p, lane)| notify::Finished::already_converted(p, lane))
                 .collect();
-            let notified = notify::send_finished(cfg, &job.entity_id, content_server, &finished)?;
+            let notified = notify::send_finished(&job.entity_id, content_server, &finished)?;
             return Ok(serde_json::json!({
                 "entityId": job.entity_id, "skipped": "already-converted", "notified": notified
             }));
@@ -316,6 +312,11 @@ fn convert_asset_bundles(
 
     let agent = catalyst::agent();
     let entity_doc = catalyst::fetch_entity(&agent, content_server, &job.entity_id)?;
+    // The lane this build writes the pending platforms under (`Proxy::version_for`):
+    // the scene lane for scenes, the wearable lane for everything else.
+    let built_lane = proxy
+        .version_for(output::entity_type(&entity_doc))
+        .to_string();
 
     let outcome = convert::convert_entity(cfg, proxy, &job.entity_id, content_server, &pending)?;
 
@@ -348,13 +349,15 @@ fn convert_asset_bundles(
                 .map(|p| notify::Finished {
                     platform: &p.platform,
                     status_code: p.exit_code,
+                    version: built_lane.clone(),
                 })
                 .collect();
-            finished.extend(already.iter().map(|p| notify::Finished {
-                platform: p,
-                status_code: notify::STATUS_ALREADY_CONVERTED,
-            }));
-            notify::send_finished(cfg, &job.entity_id, content_server, &finished)
+            finished.extend(
+                already
+                    .iter()
+                    .map(|(p, lane)| notify::Finished::already_converted(p, lane)),
+            );
+            notify::send_finished(&job.entity_id, content_server, &finished)
         },
     );
     if !cfg.keep_output {
@@ -391,20 +394,25 @@ fn convert_asset_bundles(
     }))
 }
 
-/// Converted platforms re-notify 13: if notify itself was the repeated
-/// failure, this pass is the registry's last chance to hear about them.
+/// Converted platforms re-notify 13 with the lane their manifest names: if notify
+/// itself was the repeated failure, this pass is the registry's last chance to hear
+/// about them. Tombstoned platforms report the lane the tombstone was written under.
 fn tombstone_statuses<'a>(
-    platforms: &'a [String],
-    tombstoned: &'a [String],
+    cfg: &config::Config,
+    outcomes: &'a [output::TombstoneOutcome],
 ) -> Vec<notify::Finished<'a>> {
-    platforms
+    outcomes
         .iter()
-        .map(|p| notify::Finished {
-            platform: p,
-            status_code: if tombstoned.contains(p) {
-                notify::STATUS_UNEXPECTED_ERROR
-            } else {
-                notify::STATUS_ALREADY_CONVERTED
+        .map(|o| match &o.converted_lane {
+            Some(lane) => notify::Finished {
+                platform: &o.platform,
+                status_code: notify::STATUS_ALREADY_CONVERTED,
+                version: lane.clone(),
+            },
+            None => notify::Finished {
+                platform: &o.platform,
+                status_code: notify::STATUS_UNEXPECTED_ERROR,
+                version: cfg.version.clone(),
             },
         })
         .collect()
@@ -440,13 +448,18 @@ fn tombstone_final_failure(
     if !proxy.space_configured() {
         return Err(err.context("no space configured — cannot publish a failure tombstone"));
     }
-    let tombstoned =
+    let outcomes =
         match output::publish_failure_tombstones(cfg, &proxy, &job.entity_id, content_server) {
             Ok(t) => t,
             Err(e) => return Err(err.context(format!("{e:#}"))),
         };
-    let finished = tombstone_statuses(&cfg.platforms, &tombstoned);
-    let notified = match notify::send_finished(cfg, &job.entity_id, content_server, &finished) {
+    let tombstoned: Vec<&str> = outcomes
+        .iter()
+        .filter(|o| o.converted_lane.is_none())
+        .map(|o| o.platform.as_str())
+        .collect();
+    let finished = tombstone_statuses(cfg, &outcomes);
+    let notified = match notify::send_finished(&job.entity_id, content_server, &finished) {
         Ok(n) => n,
         Err(e) => return Err(err.context(format!("{e:#}"))),
     };
@@ -772,14 +785,27 @@ mod tests {
 
     #[test]
     fn tombstone_statuses_map_5_for_failed_and_13_for_converted() {
-        let platforms = vec!["windows".to_string(), "mac".to_string()];
-        let tombstoned = vec!["mac".to_string()];
-        let finished = tombstone_statuses(&platforms, &tombstoned);
+        let cfg = test_cfg();
+        let outcomes = vec![
+            output::TombstoneOutcome {
+                platform: "windows".to_string(),
+                converted_lane: Some("v49w".to_string()),
+            },
+            output::TombstoneOutcome {
+                platform: "mac".to_string(),
+                converted_lane: None,
+            },
+        ];
+        let finished = tombstone_statuses(&cfg, &outcomes);
         assert_eq!(finished.len(), 2);
         assert_eq!(finished[0].platform, "windows");
         assert_eq!(finished[0].status_code, notify::STATUS_ALREADY_CONVERTED);
+        // The converted platform reports the lane its manifest names, not a default.
+        assert_eq!(finished[0].version, "v49w");
         assert_eq!(finished[1].platform, "mac");
         assert_eq!(finished[1].status_code, notify::STATUS_UNEXPECTED_ERROR);
+        // The tombstone was written under the scene lane, so that is what it reports.
+        assert_eq!(finished[1].version, "v49");
     }
 
     #[test]
