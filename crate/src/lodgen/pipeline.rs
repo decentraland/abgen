@@ -144,7 +144,9 @@ fn acquire_placements_independently(
 /// Bump when a pipeline change makes an already published LOD bundle wrong to reuse.
 /// A signature carrying a different generation never matches, so the next deployment of
 /// every scene rebuilds once and republishes under the new generation.
-pub const LOD_GENERATION: &str = "1";
+/// 2: `mat_trs` normalises transform quaternions; placements derived from a non-unit
+/// quaternion carried its magnitude as scale (and threw parented children off).
+pub const LOD_GENERATION: &str = "2";
 
 /// The descriptor document a build publishes, with how many placements resolved to a
 /// content hash and how many were dropped because the deployment does not ship one.
