@@ -155,11 +155,25 @@ const MAT4_IDENTITY: Mat4 = [
     [0.0, 0.0, 0.0, 1.0],
 ];
 
-/// `Matrix4x4.TRS(position, rotation, scale)`: the quaternion is expanded as
-/// given (Unity does not renormalise it), each rotation column is scaled by
+/// Scene transforms reach the explorer through `Transform.SetPositionAndRotation`,
+/// and Unity normalises every quaternion written to a `Transform`. Expanding the
+/// raw components in a TRS matrix instead would turn the excess magnitude into
+/// scale: a scene that stores Euler degrees in the field (`{x:0, y:180, z:0, w:0}`
+/// renders as a half turn) came out with scale 64799 on two axes. A zero-length
+/// quaternion has no direction to keep, so it becomes the identity.
+fn unit_quaternion(q: [f64; 4]) -> [f64; 4] {
+    let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+    if len == 0.0 || !len.is_finite() {
+        return IDENTITY_ROTATION;
+    }
+    q.map(|c| c / len)
+}
+
+/// `Matrix4x4.TRS(position, rotation, scale)` of the transform as a `Transform`
+/// would hold it (see [`unit_quaternion`]): each rotation column is scaled by
 /// its axis, column 3 carries the translation.
 fn mat_trs(t: &Trs) -> Mat4 {
-    let [x, y, z, w] = t.rotation;
+    let [x, y, z, w] = unit_quaternion(t.rotation);
     let (xx, yy, zz) = (x * x, y * y, z * z);
     let (xy, xz, yz) = (x * y, x * z, y * z);
     let (wx, wy, wz) = (w * x, w * y, w * z);
@@ -1441,6 +1455,31 @@ mod conformance {
             "{:?}",
             p.scale
         );
+    }
+
+    #[test]
+    fn non_unit_rotation_is_normalised_like_a_unity_transform() {
+        // Scene at -13,-6: Euler degrees written into the quaternion field. The
+        // explorer shows a half turn about Y at scale 1; the raw expansion gave
+        // scale (64799, 1, 64799).
+        let t = Trs {
+            position: [8.0, 0.0, 8.0],
+            rotation: [0.0, 180.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        let d = decompose_unity(&mat_trs(&t));
+        assert!(d.scale.iter().all(|s| (s - 1.0).abs() < 1e-9), "{:?}", d.scale);
+        assert!(same_rotation(d.rotation, [0.0, 1.0, 0.0, 0.0], 1e-9), "{:?}", d.rotation);
+        assert_eq!(d.position, [8.0, 0.0, 8.0]);
+
+        let t = Trs {
+            rotation: [0.0, 0.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        assert_eq!(mat_trs(&t), MAT4_IDENTITY);
+
+        assert_eq!(unit_quaternion([0.0, 0.0, 0.0, 2.0]), IDENTITY_ROTATION);
+        assert_eq!(unit_quaternion([0.0, 0.0, 0.0, f64::NAN]), IDENTITY_ROTATION);
     }
 
     #[test]
