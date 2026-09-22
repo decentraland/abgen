@@ -60,6 +60,7 @@ fn recipe_marker_scope() -> String {
 /// wearable's names its wearable lane and a scene's names its scene lane, and a bump of
 /// either stops matching. Configure them equal and this collapses to the single-lane
 /// behaviour it had before the split.
+#[cfg(test)]
 fn manifest_is_current(json: &serde_json::Value, versions: [&str; 2]) -> bool {
     current_lane(json, versions).is_some()
 }
