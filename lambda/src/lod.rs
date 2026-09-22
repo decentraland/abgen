@@ -87,8 +87,15 @@ fn convert(
     }
 
     let scene_dir = staging.join(&outcome.scene_id);
-    let objects = abgen::lods::published_objects(&scene_dir, &cfg.lod_levels);
+    let digest =
+        abgen::lods::lod_name_digest(&abgen::lodgen::state_digest(&outcome.lod_state)).to_string();
+    let objects = abgen::lods::with_digest_twins(
+        abgen::lods::published_objects(&scene_dir, &cfg.lod_levels),
+        &outcome.scene_id,
+        &digest,
+    );
     let published = publish(cfg, proxy, &objects)?;
+    let mut manifests_named = 0usize;
     if published.uploaded {
         let record = record_for_build(
             &outcome,
@@ -98,6 +105,12 @@ fn convert(
             inputs,
         );
         publish_record(proxy, &record);
+        manifests_named = name_lods_in_manifests(
+            proxy,
+            entity_id,
+            &platforms,
+            &abgen::lods::lods_manifest_block(&outcome.scene_id, &digest, &cfg.lod_levels),
+        );
     }
 
     let bundle_bytes: usize = outcome.levels.iter().map(|l| l.bundle_bytes).sum();
@@ -132,6 +145,8 @@ fn convert(
         published.uploaded,
     );
     summary["lods"]["keys"] = serde_json::json!(published.keys);
+    summary["lods"]["digest"] = serde_json::json!(digest);
+    summary["lods"]["manifestsNamed"] = serde_json::json!(manifests_named);
     Ok(summary)
 }
 
@@ -398,6 +413,8 @@ fn republish(
     let entity_id = ent.entity_id.as_str();
     let scene_id = ent.entity_id.to_lowercase();
     let from_scene = record.built_by.to_lowercase();
+    // Same state, so the same digest: this scene's twins are named like the build's were.
+    let digest = abgen::lods::lod_name_digest(&record.state_digest).to_string();
     let mut keys: Vec<String> = Vec::new();
     let mut levels: Vec<(u32, usize)> = cfg.lod_levels.iter().map(|&l| (l, 0)).collect();
     for item in copy_items(&from_scene, &scene_id, &cfg.lod_levels, platforms) {
@@ -420,12 +437,21 @@ fn republish(
         if item.from != item.to {
             proxy.space_put_key(&item.to, &bytes);
         }
+        if let Some(twin) = abgen::lods::digest_named_key(&item.to, &scene_id, &digest) {
+            proxy.space_put_key(&twin, &bytes);
+            keys.push(twin);
+        }
         keys.push(item.to);
     }
 
     // The descriptor is the one object not copied: it names its own scene.
     let iss_key = descriptor_key(&scene_id);
-    proxy.space_put_key(&iss_key, serde_json::to_string_pretty(&doc)?.as_bytes());
+    let doc_text = serde_json::to_string_pretty(&doc)?;
+    proxy.space_put_key(&iss_key, doc_text.as_bytes());
+    if let Some(twin) = abgen::lods::digest_named_key(&iss_key, &scene_id, &digest) {
+        proxy.space_put_key(&twin, doc_text.as_bytes());
+        keys.push(twin);
+    }
     keys.push(iss_key);
 
     // This deployment now holds the bytes too, and it is the newest to; point both indexes
@@ -435,6 +461,12 @@ fn republish(
     record.inputs = inputs.cloned();
     record.inputs_digest = inputs.map(reuse::inputs_digest);
     publish_record(proxy, &record);
+    let manifests_named = name_lods_in_manifests(
+        proxy,
+        entity_id,
+        platforms,
+        &abgen::lods::lods_manifest_block(&scene_id, &digest, &cfg.lod_levels),
+    );
 
     eprintln!(
         "reused: {entity_id} lods scene={scene_id} from={from_scene} by={by} levels={} \
@@ -454,7 +486,59 @@ fn republish(
     summary["lods"]["reusedFrom"] = serde_json::json!(from_scene);
     summary["lods"]["reusedBy"] = serde_json::json!(by);
     summary["lods"]["keys"] = serde_json::json!(keys);
+    summary["lods"]["digest"] = serde_json::json!(digest);
+    summary["lods"]["manifestsNamed"] = serde_json::json!(manifests_named);
     Ok(Some(summary))
+}
+
+/// Write the `lods` block into the scene's per-entity manifests, one per LOD platform, so the
+/// client learns the content-addressed names. Manifests are served `no-cache`, so the rewrite
+/// is seen on the next request, and every object the block names is immutable under its name.
+/// Returns how many manifests now carry it. A manifest that is not there or will not write
+/// costs the client the digest names for that platform, never the job: it composes the
+/// scene-id-only names, which stay published too.
+fn name_lods_in_manifests(
+    proxy: &Arc<Proxy>,
+    entity_id: &str,
+    platforms: &[String],
+    block: &serde_json::Value,
+) -> usize {
+    let mut named = 0usize;
+    for platform in platforms {
+        let stem = format!("{entity_id}_{platform}");
+        let Some(bytes) = proxy.space_get_manifest(&stem) else {
+            eprintln!("lods: {entity_id}: no {platform} manifest to name the LODs in");
+            continue;
+        };
+        let mut manifest: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                eprintln!("lods: {entity_id}: {platform} manifest does not parse ({e}); LODs stay unnamed there");
+                continue;
+            }
+        };
+        let Some(fields) = manifest.as_object_mut() else {
+            eprintln!(
+                "lods: {entity_id}: {platform} manifest is not an object; LODs stay unnamed there"
+            );
+            continue;
+        };
+        fields.insert("lods".to_string(), block.clone());
+        let text = match serde_json::to_vec_pretty(&manifest) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("lods: {entity_id}: could not serialize the {platform} manifest ({e})");
+                continue;
+            }
+        };
+        match proxy.space_put_manifest_strict(&stem, &text) {
+            Ok(()) => named += 1,
+            Err(e) => eprintln!(
+                "lods: {entity_id}: could not rewrite the {platform} manifest ({e:#}); LODs stay unnamed there"
+            ),
+        }
+    }
+    named
 }
 
 /// File `record` under both of its content addresses. A failure here only costs a later
@@ -594,6 +678,39 @@ impl Drop for StagingGuard {
 #[cfg(test)]
 mod reuse_tests {
     use super::*;
+
+    /// The reuse path's copy targets and descriptor key each have a digest-named twin in the
+    /// same directory, spelled the way the manifest block names them for the client.
+    #[test]
+    fn digest_twins_share_the_directory_of_the_keys_they_shadow() {
+        let d = "0123456789abcdef0123456789abcdef";
+        let sid = "bafkscene";
+        let plats = vec!["windows".to_string()];
+        for item in copy_items("bafkprev", sid, &[1], &plats) {
+            let twin = abgen::lods::digest_named_key(&item.to, sid, d).expect("a twin");
+            assert_eq!(
+                twin.rsplit_once('/').unwrap().0,
+                item.to.rsplit_once('/').unwrap().0
+            );
+            assert!(twin.contains(&format!("{sid}_{d}_")), "{twin}");
+        }
+        let block = abgen::lods::lods_manifest_block(sid, d, &[1]);
+        assert_eq!(
+            abgen::lods::digest_named_key(&descriptor_key(sid), sid, d).unwrap(),
+            format!(
+                "{}/{}",
+                abgen::lods::MANIFEST_KEY_DIR,
+                block["descriptor"].as_str().unwrap()
+            )
+        );
+        assert_eq!(
+            abgen::lods::digest_named_key("LOD/1/bafkscene_1_windows", sid, d).unwrap(),
+            format!(
+                "LOD/1/{}_windows",
+                block["levels"][0]["file"].as_str().unwrap()
+            )
+        );
+    }
 
     /// Every key the lambda publishes lives under the one `LOD/` root, and the two
     /// independent code paths that name the same object agree on its key.

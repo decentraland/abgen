@@ -212,6 +212,72 @@ pub fn published_glb_name(scene_id: &str, level: u32) -> String {
     format!("{}_{}.glb", scene_id.to_lowercase(), level)
 }
 
+/// Width of the digest a content-addressed LOD name carries: the first characters of the
+/// build's [`crate::lodgen::state_digest`], as wide as the deps digest in a bundle's `files[]`
+/// name.
+pub const LOD_NAME_DIGEST_LEN: usize = 32;
+
+/// The digest a build's LOD objects are named by, cut from its full state digest.
+pub fn lod_name_digest(state_digest: &str) -> &str {
+    &state_digest[..state_digest.len().min(LOD_NAME_DIGEST_LEN)]
+}
+
+/// The content-addressed twin of a per-scene LOD key: `{sid}_{rest}` becomes
+/// `{sid}_{digest}_{rest}` in the same directory, for every family (`LOD/{level}/{sid}_{level}_{platform}`,
+/// the descriptor under [`MANIFEST_KEY_DIR`], the GLB under [`GLB_KEY_DIR`]). `None` for a key
+/// whose file does not start with the scene id.
+///
+/// Bytes under a twin never change: a build whose state differs digests differently and lands
+/// beside the old objects instead of over them, so the CDN, the client's disk cache and Unity's
+/// bundle cache all key on content and nothing is ever invalidated. The unsuffixed keys stay
+/// published for clients that compose names from the scene id alone.
+pub fn digest_named_key(key: &str, scene_id: &str, digest: &str) -> Option<String> {
+    let (dir, file) = match key.rfind('/') {
+        Some(i) => (&key[..=i], &key[i + 1..]),
+        None => ("", key),
+    };
+    let prefix = format!("{}_", scene_id.to_lowercase());
+    let rest = file.strip_prefix(prefix.as_str())?;
+    Some(format!("{dir}{prefix}{digest}_{rest}"))
+}
+
+/// `objects` followed by the digest-named twin of each: the same file, published under its
+/// content-addressed key as well.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn with_digest_twins(
+    mut objects: Vec<PublishedObject>,
+    scene_id: &str,
+    digest: &str,
+) -> Vec<PublishedObject> {
+    let twins: Vec<PublishedObject> = objects
+        .iter()
+        .filter_map(|o| {
+            Some(PublishedObject {
+                key: digest_named_key(&o.key, scene_id, digest)?,
+                path: o.path.clone(),
+            })
+        })
+        .collect();
+    objects.extend(twins);
+    objects
+}
+
+/// The `lods` block of a scene's per-entity manifest: the content-addressed names the client
+/// requests the scene's LOD objects by. `levels[].file` is the bundle name without the platform
+/// suffix, which the client appends (`_windows`, `_mac`) as it does to a bare bundle hash.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn lods_manifest_block(scene_id: &str, digest: &str, levels: &[u32]) -> serde_json::Value {
+    let sid = scene_id.to_lowercase();
+    serde_json::json!({
+        "digest": digest,
+        "descriptor": format!("{sid}_{digest}{}", crate::lodgen::placements::ISS_SUFFIX),
+        "levels": levels
+            .iter()
+            .map(|level| serde_json::json!({ "level": level, "file": format!("{sid}_{digest}_{level}") }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn lod_rel_path(level: u32, bundle_name: &str) -> String {
     format!("LOD/{level}/{bundle_name}")
@@ -834,6 +900,52 @@ mod tests {
         assert_eq!(objs[3].path, scene.join("lods-unity/lods/bafkscene_1.glb"));
         assert!(published_objects(&base.join("missing"), &[0, 1]).is_empty());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn digest_named_twins_sit_beside_the_unsuffixed_keys() {
+        let d = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            digest_named_key("LOD/1/bafkscene_1_windows", "BafkScene", d).unwrap(),
+            format!("LOD/1/bafkscene_{d}_1_windows")
+        );
+        assert_eq!(
+            digest_named_key(
+                "LOD/lods-unity/manifests/bafkscene_InitialSceneState.json",
+                "bafkscene",
+                d
+            )
+            .unwrap(),
+            format!("LOD/lods-unity/manifests/bafkscene_{d}_InitialSceneState.json")
+        );
+        assert_eq!(
+            digest_named_key("LOD/lods-unity/lods/bafkscene_1.glb", "bafkscene", d).unwrap(),
+            format!("LOD/lods-unity/lods/bafkscene_{d}_1.glb")
+        );
+        assert!(digest_named_key("LOD/1/other_1_windows", "bafkscene", d).is_none());
+        assert_eq!(lod_name_digest(&"ab".repeat(32)), "ab".repeat(16));
+        assert_eq!(lod_name_digest("short"), "short");
+
+        let objs = with_digest_twins(
+            vec![PublishedObject {
+                key: "LOD/1/bafkscene_1_mac".into(),
+                path: PathBuf::from("LOD/1/bafkscene_1_mac"),
+            }],
+            "bafkscene",
+            d,
+        );
+        assert_eq!(objs.len(), 2);
+        assert_eq!(objs[1].key, format!("LOD/1/bafkscene_{d}_1_mac"));
+        assert_eq!(objs[1].path, objs[0].path);
+
+        let block = lods_manifest_block("BafkScene", d, &[1]);
+        assert_eq!(block["digest"], d);
+        assert_eq!(
+            block["descriptor"],
+            format!("bafkscene_{d}_InitialSceneState.json")
+        );
+        assert_eq!(block["levels"][0]["level"], 1);
+        assert_eq!(block["levels"][0]["file"], format!("bafkscene_{d}_1"));
     }
 
     #[test]
