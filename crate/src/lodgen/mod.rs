@@ -31,7 +31,7 @@ pub use pipeline::{
     expected_rel_path, generate, iss_document, lod_state, normalize_levels, parse_parcel,
     resolve_scene, scene_geometry, staged_glb_name, state_digest, write_iss_descriptor,
     GenerateOutcome, GenerateParams, LevelBuild, PlacementStats, SimplifyLane, LOD_GENERATION,
-    TRIS_PER_PARCEL,
+    PLACEMENT_GENERATION, TRIS_PER_PARCEL,
 };
 
 #[cfg(test)]

@@ -879,7 +879,7 @@ mod reuse_tests {
         };
         let keys = vec!["LOD/1/bafkscene_1_windows".to_string()];
         let inputs = Inputs {
-            generation: abgen::lodgen::LOD_GENERATION.to_string(),
+            generation: abgen::lodgen::PLACEMENT_GENERATION.to_string(),
             runtime_version: "7".into(),
             base: "0,0".into(),
             parcels: vec!["0,0".into()],
