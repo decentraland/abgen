@@ -1,4 +1,5 @@
 mod finalize;
+mod font;
 mod material;
 mod mesh;
 mod nodes;
@@ -11,6 +12,7 @@ mod texture;
 pub use templates::require_templates;
 pub use templates::template_available;
 pub use templates::template_identity;
+pub use font::{FONT_ASSET_NAME, TMP_ASSET_NAME, UITK_ASSET_NAME};
 pub use templates::template_source;
 pub use templates::templates_missing;
 pub use templates::templates_missing_in;
@@ -652,6 +654,12 @@ pub fn build_bundle(
         ".glb"
     };
 
+    if crate::fontgen::is_font_file(bytes) {
+        let mut out =
+            font::build_font_bundles(bytes, &[bundle_name.to_string()], root_hash, opts)?;
+        return Ok(out.remove(0));
+    }
+
     if !is_glb_or_gltf(bytes, ext) {
         let (mut bundle, proto, base) = load_template()?;
         let mut b = StandaloneTextureBuilder::new(
@@ -829,6 +837,10 @@ pub fn build_bundle_multi(
     } else {
         ".glb"
     };
+
+    if crate::fontgen::is_font_file(bytes) {
+        return font::build_font_bundles(bytes, bundle_names, root_hash, opts);
+    }
 
     if !is_glb_or_gltf(bytes, ext) {
         let (mut bundle, proto, base) = load_template()?;

@@ -414,6 +414,26 @@ pub fn image_class_digest(
     )
 }
 
+/// Extension a font bundle bakes into its container key, lowercased; `.ttf` when the file names
+/// none the font lane takes.
+pub fn font_key_extension(file: &str) -> String {
+    let last_seg = file.rsplit(['/', '\\']).next().unwrap_or(file);
+    match last_seg.rfind('.').map(|dot| last_seg[dot..].to_ascii_lowercase()) {
+        Some(ext) if ext == ".ttf" || ext == ".otf" => ext,
+        _ => ".ttf".to_string(),
+    }
+}
+
+/// Digest over a font bundle's build inputs beyond its content hash and platform: the key
+/// extension ([`font_key_extension`]) and the font recipe's generation.
+pub fn font_class_digest(key_ext: &str) -> String {
+    digest_inputs(
+        ("font", key_ext),
+        &recipes::digest_generations(&recipes::font_recipes()),
+        "font class",
+    )
+}
+
 /// Marker for a GLB dependency that is absent from the entity's deployed
 /// content. This is a static property of the deployment (a broken upload),
 /// not a conversion error: prod's pipeline skips such GLBs — no manifest

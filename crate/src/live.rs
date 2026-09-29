@@ -13,6 +13,9 @@ const CONVERTIBLE_EXTS: [&str; 5] = [".glb", ".gltf", ".png", ".jpg", ".jpeg"];
 
 const DEPENDENCY_EXTS: [&str; 1] = [".bin"];
 
+/// Scene fonts (`font_src`), converted for scenes only: nothing else renders them.
+const FONT_EXTS: [&str; 2] = [".ttf", ".otf"];
+
 struct BuildTelemetry<'a> {
     entity: &'a str,
     entity_type: &'a str,
@@ -46,6 +49,10 @@ fn is_convertible(file: &str) -> (bool, bool) {
     (is_glb, is_image)
 }
 
+fn is_font(file: &str) -> bool {
+    crate::fontgen::is_font_path(file)
+}
+
 /// Entity files a conversion actually emits bundles for: convertible by
 /// extension, minus the hashes upstream drops via `-skippedHashes`. Skipped
 /// files leave no manifest entry and no failure, matching the prod converter's
@@ -60,7 +67,9 @@ fn convertible_entries<'a>(
         .iter()
         .filter(|c| {
             let lf = c.file.to_lowercase();
-            CONVERTIBLE_EXTS.iter().any(|e| lf.ends_with(e)) && !skipped_hashes.contains(&c.hash)
+            let convertible = CONVERTIBLE_EXTS.iter().any(|e| lf.ends_with(e))
+                || (scene.entity_type == "scene" && is_font(&c.file));
+            convertible && !skipped_hashes.contains(&c.hash)
         })
         .collect()
 }
@@ -258,6 +267,10 @@ impl EntityCtx {
     fn image_recipes() -> Vec<crate::recipes::Recipe> {
         crate::recipes::image_recipes()
     }
+
+    fn font_digest(file: &str) -> String {
+        naming::font_class_digest(&naming::font_key_extension(file))
+    }
 }
 
 pub struct Proxy {
@@ -297,6 +310,8 @@ pub struct Proxy {
     /// Content is immutable per hash, so a standalone image's decode verdict
     /// holds for every platform and repeat conversion in this process.
     decode_ok: Mutex<HashMap<String, bool>>,
+    /// The same, for whether a scene font is one the font lane can bake.
+    font_ok: Mutex<HashMap<String, bool>>,
 }
 
 #[derive(Clone)]
@@ -580,6 +595,22 @@ impl Proxy {
         v
     }
 
+    /// Whether a scene font bakes. One that does not (a web font renamed `.ttf`, a
+    /// truncated upload) gets no bundle and no failure: the explorer rejects the same
+    /// files at runtime and falls back to its built-in font either way.
+    fn font_supported(&self, hash: &str) -> bool {
+        if let Some(v) = self.font_ok.lock().unwrap().get(hash) {
+            return *v;
+        }
+        self.ensure_content(hash).ok();
+        let Ok(raw) = self.content.fetch_mmap(hash) else {
+            return false;
+        };
+        let v = crate::fontgen::is_supported(&raw);
+        self.font_ok.lock().unwrap().insert(hash.to_string(), v);
+        v
+    }
+
     /// Dependency names embedded in a GLB bundle's metadata.json. Each must be
     /// the exact name the referenced image bundle is uploaded under (clients
     /// download dependencies by these names verbatim), so this mirrors the
@@ -692,7 +723,7 @@ impl Proxy {
                     return false;
                 }
                 let (g, i) = is_convertible(&c.file);
-                g || i
+                g || i || is_font(&c.file)
             })
             .or_else(|| {
                 ctx.scene
@@ -717,8 +748,9 @@ impl Proxy {
         let hash: &str = &item.hash;
         let file = item.file.clone();
         let (is_glb, is_image) = is_convertible(&file);
-        if !is_glb && !is_image {
-            bail!("content {file} (hash {hash}) is not a convertible glb/image");
+        let is_font = !is_glb && !is_image && is_font(&file);
+        if !is_glb && !is_image && !is_font {
+            bail!("content {file} (hash {hash}) is not a convertible glb/image/font");
         }
         if let Some(req_digest) = req_digest {
             if is_glb {
@@ -731,6 +763,13 @@ impl Proxy {
                     None => bail!(
                         "deps digest unavailable for {file} (hash {hash}): dependency resolution failed at entity scan"
                     ),
+                }
+            } else if is_font {
+                let d = EntityCtx::font_digest(&file);
+                if d != req_digest {
+                    bail!(
+                        "font class digest mismatch for {file} (hash {hash}): requested {req_digest}, computed {d}"
+                    );
                 }
             } else {
                 let d = ctx.image_digest(hash, &file);
@@ -1142,6 +1181,7 @@ impl Proxy {
             bundle_name: String,
             bare_name: String,
             is_image: bool,
+            is_font: bool,
         }
         struct ProbeCandidate {
             order: usize,
@@ -1150,6 +1190,7 @@ impl Proxy {
             bundle_name: String,
             bare_name: String,
             is_image: bool,
+            is_font: bool,
         }
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1174,6 +1215,7 @@ impl Proxy {
         for (idx, c) in convertible.iter().enumerate() {
             let order = idx + 1;
             let (is_glb, is_image) = is_convertible(&c.file);
+            let is_font = !is_glb && !is_image && is_font(&c.file);
             let case_hash = if platform == "mac" {
                 c.hash.to_lowercase()
             } else {
@@ -1187,6 +1229,9 @@ impl Proxy {
                     "{case_hash}_{}_{platform}",
                     ctx.image_digest(&c.hash, &c.file)
                 )
+            } else if digest_naming && is_font {
+                crate::recipes::merge_into(&mut used_recipes, &crate::recipes::font_recipes());
+                format!("{case_hash}_{}_{platform}", EntityCtx::font_digest(&c.file))
             } else if digest_naming && is_glb {
                 match ctx.deps_digests.get(&c.hash) {
                     Some(d) => {
@@ -1229,6 +1274,7 @@ impl Proxy {
                 bundle_name,
                 bare_name,
                 is_image,
+                is_font,
             });
         }
 
@@ -1267,6 +1313,7 @@ impl Proxy {
                 bundle_name: cand.bundle_name,
                 bare_name: cand.bare_name,
                 is_image: cand.is_image,
+                is_font: cand.is_font,
             });
         }
         let miss_images: Vec<(String, String)> = work
@@ -1292,6 +1339,17 @@ impl Proxy {
         let shared_placement = ctx.scene.entity_type == "scene";
         let run_item = |it: &WorkItem| -> Result<()> {
             self.progress_update(cid, done.load(Ordering::Relaxed), total, &it.file);
+            if it.is_font && !self.font_supported(&it.hash) {
+                tracing::warn!(
+                    entity = %cid,
+                    file = %it.file,
+                    hash = %it.hash,
+                    "font is not a TrueType/OpenType file the font lane bakes — no bundle"
+                );
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                self.progress_update(cid, d, total, &it.file);
+                return Ok(());
+            }
             let decode_ok = !it.is_image || self.image_decode_ok(&it.hash);
             let name = if decode_ok {
                 &it.bundle_name
@@ -1479,6 +1537,7 @@ impl Proxy {
             if !CONVERTIBLE_EXTS
                 .iter()
                 .chain(DEPENDENCY_EXTS.iter())
+                .chain(FONT_EXTS.iter())
                 .any(|e| lf.ends_with(e))
             {
                 continue;
@@ -1790,6 +1849,7 @@ impl Proxy {
             deps_digest,
             build_progress: Mutex::new(HashMap::new()),
             decode_ok: Mutex::new(HashMap::new()),
+            font_ok: Mutex::new(HashMap::new()),
         })
     }
 

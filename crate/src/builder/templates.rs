@@ -3,14 +3,19 @@ use std::borrow::Cow;
 
 pub const ALL_TYPES_TEMPLATE: &str = "all-types.windows.bundle";
 
-pub const REQUIRED_TEMPLATES: [&str; 4] = [
+/// Unity 6000.5's `Font`, `TMP_FontAsset` and UI Toolkit `FontAsset` layouts, built by
+/// `template/src/FontTypesTemplate.cs`. Type trees do not depend on the platform.
+pub const FONT_TYPES_TEMPLATE: &str = "font-types.mac.bundle";
+
+pub const REQUIRED_TEMPLATES: [&str; 5] = [
     ALL_TYPES_TEMPLATE,
     "animated-types.windows.bundle",
     "emote-types.windows.bundle",
     "skinned-types.windows.bundle",
+    FONT_TYPES_TEMPLATE,
 ];
 
-const EMBEDDED: [(&str, &[u8]); 4] = [
+const EMBEDDED: [(&str, &[u8]); 5] = [
     (
         ALL_TYPES_TEMPLATE,
         include_bytes!("../../../template/all-types.windows.bundle"),
@@ -26,6 +31,10 @@ const EMBEDDED: [(&str, &[u8]); 4] = [
     (
         "skinned-types.windows.bundle",
         include_bytes!("../../../template/skinned-types.windows.bundle"),
+    ),
+    (
+        FONT_TYPES_TEMPLATE,
+        include_bytes!("../../../template/font-types.mac.bundle"),
     ),
 ];
 
@@ -175,7 +184,7 @@ fn template_all_bytes() -> Result<Cow<'static, [u8]>> {
     template_bytes(ALL_TYPES_TEMPLATE)
 }
 
-fn read_template_bundle(file: &str) -> std::result::Result<Bundle, String> {
+pub(super) fn read_template_bundle(file: &str) -> std::result::Result<Bundle, String> {
     let bytes = template_bytes(file).map_err(|e| format!("{e:#}"))?;
     Bundle::load_bytes(&bytes).map_err(|e| format!("{e:#}"))
 }
