@@ -553,10 +553,14 @@ pub fn assemble_from_recording(
         }
     }
 
-    let parsed: Vec<(String, Result<(crate::scene::Scene, String)>)> = uniq
+    // Outer error: the fetch failed (transient, fatal). Inner error: the deployed
+    // bytes do not decode (deterministic; skipped like an unresolvable placement,
+    // as the Explorer renders nothing for that entity either).
+    #[allow(clippy::type_complexity)]
+    let parsed: Vec<(String, Result<Result<(crate::scene::Scene, String)>>)> = uniq
         .par_iter()
         .map(|hash| {
-            let r = (|| -> Result<(crate::scene::Scene, String)> {
+            let r = (|| -> Result<Result<(crate::scene::Scene, String)>> {
                 let mut bytes = fetch(hash)?;
                 sanitize_glb_json_padding(&mut bytes);
                 let src_name = file_by_hash
@@ -572,9 +576,11 @@ pub fn assemble_from_recording(
                     let h = crate::naming::uri_content_hash(uri, &src_name, by_file)?;
                     fetch(h).ok()
                 };
-                let parsed = crate::gltf::parse(&bytes, ext, Some(&resolve_fn), false, true)
-                    .with_context(|| format!("parse {src_name}"))?;
-                Ok((parsed, src_name))
+                Ok(
+                    crate::gltf::parse(&bytes, ext, Some(&resolve_fn), false, true)
+                        .with_context(|| format!("parse {src_name}"))
+                        .map(|parsed| (parsed, src_name)),
+                )
             })();
             (hash.clone(), r)
         })
@@ -588,13 +594,18 @@ pub fn assemble_from_recording(
     let mut mat_by_key: HashMap<MatKey, usize> = HashMap::new();
     let mut used_names: HashSet<String> = HashSet::new();
     let mut prepared: HashMap<String, Prepared> = HashMap::new();
-    let mut parse_errs: Vec<String> = Vec::new();
+    let mut fetch_errs: Vec<String> = Vec::new();
+    let mut undecodable: Vec<String> = Vec::new();
 
     for (hash, r) in parsed {
         let (mut src, name) = match r {
-            Ok(x) => x,
+            Ok(Ok(x)) => x,
+            Ok(Err(e)) => {
+                undecodable.push(format!("{hash}: {e:#}"));
+                continue;
+            }
             Err(e) => {
-                parse_errs.push(format!("{hash}: {e:#}"));
+                fetch_errs.push(format!("{hash}: {e:#}"));
                 continue;
             }
         };
@@ -695,17 +706,29 @@ pub fn assemble_from_recording(
             },
         );
     }
-    if !parse_errs.is_empty() {
+    if !fetch_errs.is_empty() {
         bail!(
-            "assemble: {} asset(s) failed to fetch/parse:\n{}",
-            parse_errs.len(),
-            parse_errs.join("\n")
+            "assemble: {} asset(s) failed to fetch:\n{}",
+            fetch_errs.len(),
+            fetch_errs.join("\n")
         );
+    }
+    if prepared.is_empty() && primitives.is_empty() {
+        bail!(
+            "assemble: all {} asset(s) failed to parse:\n{}",
+            undecodable.len(),
+            undecodable.join("\n")
+        );
+    }
+    for u in &undecodable {
+        eprintln!("assemble: skipping undecodable asset {u}");
     }
 
     let mut counters = Counters::default();
     for &(pi, p, ref hash) in &placed {
-        let prep = &prepared[hash.as_str()];
+        let Some(prep) = prepared.get(hash.as_str()) else {
+            continue;
+        };
         if p.scale.contains(&0.0) {
             let n: usize = prep
                 .scene
@@ -735,6 +758,9 @@ pub fn assemble_from_recording(
     }
     for u in &unresolved {
         model.log.push(format!("skipped unresolvable {u}"));
+    }
+    for u in &undecodable {
+        model.log.push(format!("skipped undecodable asset {u}"));
     }
     place_primitives(
         primitives,

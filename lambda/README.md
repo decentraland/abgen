@@ -345,8 +345,8 @@ was a function of (`abgen::lodgen::reuse`):
   pipeline generation, the `main.crdt` hash, the base and parcels from `scene.json`, and
   the hash of every `.js` file plus the scene's `main`. The runtime gives the scene no real
   network and a fixed virtual clock, so equal inputs execute to equal placements. Only
-  SDK7 scenes have inputs; an SDK6 scene runs through an adaption layer fetched from the
-  network at build time, which nothing here can pin.
+  SDK7 scenes have inputs; an SDK6 scene runs through the vendored adaption layer
+  (`crate/src/lodgen/scenerun/sdk6/`), which the digest does not record yet.
 - `lod-reuse/by-state/{digest}.json` — the digest of the **LOD state**: the descriptor
   minus its `sceneId`, the SDK primitives the descriptor omits, and the generation. This
   is everything a build is a function of once placements are known.

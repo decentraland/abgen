@@ -27,9 +27,14 @@ impl Default for EngineLimits {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-pub const SDK6_ADAPTION_LAYER_URL: &str =
-    "https://renderer-artifacts.decentraland.org/sdk6-adaption-layer/main/index.js";
+/// The SDK6 adaption layer, vendored rather than fetched: the published
+/// `sdk6-adaption-layer/main/index.js` is mutable, and a bad upload there
+/// (2026-09-28: an appended block with an unterminated `try`) turns every SDK6
+/// scene into "no renderer state". This is the Explorer's own pinned build
+/// (`Explorer/Assets/StreamingAssets/Js/sdk6-adapter.min.js`); the provenance
+/// file next to it names the source commit and the sha256 the tests check.
+#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
+const SDK6_ADAPTION_LAYER: &str = include_str!("sdk6/sdk6-adapter.min.js");
 
 #[cfg(not(target_arch = "wasm32"))]
 pub const SDK6_ADAPTION_URL_ENV: &str = "ABGEN_LOD_SDK6_ADAPTION_URL";
@@ -50,6 +55,10 @@ pub struct SceneJob {
 pub struct CaptureOutcome {
     pub sent: bool,
     pub stream: Vec<u8>,
+    /// Why the scene script threw at top level, if it did. The run goes on
+    /// (a scene may throw after sending state), but an empty stream plus this
+    /// error names the real cause instead of "no renderer state".
+    pub eval_error: Option<String>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -79,10 +88,12 @@ pub(crate) fn initial_state_parts(main_crdt: Option<&[u8]>) -> Vec<Vec<u8>> {
 #[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
 fn fetch_sdk6_adaption_layer() -> anyhow::Result<String> {
     use anyhow::Context;
-    let source = std::env::var(SDK6_ADAPTION_URL_ENV)
+    let Some(source) = std::env::var(SDK6_ADAPTION_URL_ENV)
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| SDK6_ADAPTION_LAYER_URL.to_string());
+    else {
+        return Ok(SDK6_ADAPTION_LAYER.to_string());
+    };
     if !source.starts_with("http://") && !source.starts_with("https://") {
         return std::fs::read_to_string(&source)
             .with_context(|| format!("read sdk6 adaption layer from {source}"));
@@ -180,6 +191,9 @@ fn run_scene_with(
     };
     let outcome = engine.run_capture(job)?;
     if outcome.stream.is_empty() {
+        if let Some(e) = outcome.eval_error {
+            anyhow::bail!("scene {} script failed to evaluate: {e}", ent.entity_id);
+        }
         return Ok(None);
     }
     let mut placements = crdt::placements_from_crdt(&outcome.stream, &content);
@@ -190,6 +204,20 @@ fn run_scene_with(
 #[cfg(all(test, not(target_arch = "wasm32"), feature = "scene-runtime"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vendored_sdk6_adaption_layer_matches_its_provenance() {
+        use sha2::Digest;
+        let provenance: serde_json::Value =
+            serde_json::from_str(include_str!("sdk6/sdk6-adapter.provenance.json")).unwrap();
+        let want = provenance["sha256"].as_str().unwrap();
+        let got: String = sha2::Sha256::digest(SDK6_ADAPTION_LAYER.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(SDK6_ADAPTION_LAYER.len() as u64, provenance["bytes"].as_u64().unwrap());
+    }
 
     #[test]
     fn initial_state_parts_mirror_the_getstate_array() {

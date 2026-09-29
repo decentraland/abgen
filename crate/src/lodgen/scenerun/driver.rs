@@ -19,12 +19,14 @@ pub(super) trait EngineSession {
     fn pump(&mut self) -> Result<()>;
 }
 
-pub(super) fn drive(session: &mut dyn EngineSession, code: &str) -> Result<()> {
+/// Returns the scene script's top-level eval error, which is not fatal here.
+pub(super) fn drive(session: &mut dyn EngineSession, code: &str) -> Result<Option<String>> {
     session
         .eval(PRELUDE)
         .map_err(|e| anyhow!("prelude eval: {e}"))?;
     session.pump()?;
-    if let Err(e) = session.eval(&cjs_wrap(code)) {
+    let eval_error = session.eval(&cjs_wrap(code)).err();
+    if let Some(e) = &eval_error {
         tracing::warn!("scene eval failed: {e}");
     }
     session.pump()?;
@@ -36,7 +38,7 @@ pub(super) fn drive(session: &mut dyn EngineSession, code: &str) -> Result<()> {
         }
         tick(session, "update", FRAME_DT_SECS)?;
     }
-    Ok(())
+    Ok(eval_error)
 }
 
 fn tick(session: &mut dyn EngineSession, kind: &str, dt: f64) -> Result<()> {
