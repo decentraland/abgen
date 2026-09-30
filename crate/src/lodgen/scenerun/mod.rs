@@ -99,8 +99,7 @@ fn sdk6_adaption_layer() -> anyhow::Result<String> {
     else {
         return Ok(SDK6_ADAPTION_LAYER.to_string());
     };
-    std::fs::read_to_string(&path)
-        .with_context(|| format!("read sdk6 adaption layer from {path}"))
+    std::fs::read_to_string(&path).with_context(|| format!("read sdk6 adaption layer from {path}"))
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
@@ -206,7 +205,10 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(got, want);
-        assert_eq!(SDK6_ADAPTION_LAYER.len() as u64, provenance["bytes"].as_u64().unwrap());
+        assert_eq!(
+            SDK6_ADAPTION_LAYER.len() as u64,
+            provenance["bytes"].as_u64().unwrap()
+        );
     }
 
     #[test]

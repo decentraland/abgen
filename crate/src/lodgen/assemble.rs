@@ -141,15 +141,16 @@ fn repair_short_json_chunk(bytes: &mut [u8], json_pos: usize, data_end: usize) -
     };
     // A file whose header length is right is well-formed as far as we can tell (it may
     // carry another chunk before BIN); only a file short in both places is repaired.
-    if data_end == bytes.len()
-        || is_bin_at(bytes, data_end)
-        || rd(bytes, 8) as usize == bytes.len()
+    if data_end == bytes.len() || is_bin_at(bytes, data_end) || rd(bytes, 8) as usize == bytes.len()
     {
         return data_end;
     }
     let json_start = json_pos + 8;
     let parses = |json: &[u8]| {
-        let end = json.iter().rposition(|&c| c != 0 && c != b' ').map_or(0, |i| i + 1);
+        let end = json
+            .iter()
+            .rposition(|&c| c != 0 && c != b' ')
+            .map_or(0, |i| i + 1);
         serde_json::from_slice::<serde::de::IgnoredAny>(&json[..end]).is_ok()
     };
     if parses(&bytes[json_start..data_end]) {
@@ -166,6 +167,19 @@ fn repair_short_json_chunk(bytes: &mut [u8], json_pos: usize, data_end: usize) -
         }
     }
     data_end
+}
+
+/// Whether a content fetch failed because the content does not exist (a catalyst 404,
+/// after every fallback: `CatalystClient::get`'s `"404 {url}"`; or a CID the local store
+/// lacks) rather than transiently. Kept here rather than in `catalyst`, which wasm does not
+/// build. Missing
+/// content fails the same way on every retry, so callers treat it like a file the
+/// deployment does not list.
+fn is_missing_content(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        let s = cause.to_string();
+        s.starts_with("404 ") || s.starts_with("local content store has no CID")
+    })
 }
 
 pub(crate) fn resolve_placement_hash(
@@ -629,7 +643,7 @@ pub fn assemble_from_recording(
                     let h = crate::naming::uri_content_hash(uri, &src_name, by_file)?;
                     match fetch(h) {
                         Ok(b) => Some(b),
-                        Err(e) if crate::catalyst::is_missing_content(&e) => None,
+                        Err(e) if is_missing_content(&e) => None,
                         Err(e) => {
                             if let Ok(mut slot) = dep_fetch_err.lock() {
                                 slot.get_or_insert(
@@ -2116,6 +2130,18 @@ mod tests {
             assert!((a_min[i] - b_min[i]).abs() < 1e-5);
             assert!((a_max[i] - b_max[i]).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn only_404s_and_absent_cids_count_as_missing_content() {
+        let not_found = anyhow::anyhow!("404 https://peer.test/content/contents/bafy")
+            .context("fetch content bafy");
+        assert!(is_missing_content(&not_found));
+        let local = anyhow::anyhow!("local content store has no CID bafy: not found");
+        assert!(is_missing_content(&local));
+        let transient =
+            anyhow::anyhow!("GET /contents/bafy: HTTP 503").context("fetch content bafy");
+        assert!(!is_missing_content(&transient));
     }
 
     #[test]
