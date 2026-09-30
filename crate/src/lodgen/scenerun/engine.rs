@@ -91,14 +91,16 @@ fn run_on_thread(job: SceneJob) -> Result<CaptureOutcome> {
         context: &context,
         expired: &expired,
     };
-    driver::drive(&mut session, &code)?;
+    let eval_error = driver::drive(&mut session, &code)?;
     runtime.set_interrupt_handler(None);
     drop(context);
     drop(runtime);
-    Ok(match Rc::try_unwrap(capture) {
+    let mut outcome = match Rc::try_unwrap(capture) {
         Ok(cell) => cell.into_inner(),
         Err(shared) => shared.borrow().clone(),
-    })
+    };
+    outcome.eval_error = eval_error;
+    Ok(outcome)
 }
 
 struct QuickJsSession<'a> {

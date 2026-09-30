@@ -111,6 +111,7 @@ pub fn sanitize_glb_json_padding(bytes: &mut [u8]) {
             return;
         };
         if ctype == 0x4E4F_534A {
+            let data_end = repair_short_json_chunk(bytes, pos, data_end);
             let mut i = data_end;
             while i > data_start && bytes[i - 1] == 0 {
                 bytes[i - 1] = b' ';
@@ -120,6 +121,65 @@ pub fn sanitize_glb_json_padding(bytes: &mut [u8]) {
         }
         pos = data_end;
     }
+}
+
+/// Some old exporters wrote a JSON chunk length (and the header's total length) a few
+/// bytes short, cutting the JSON mid-token (the builder's `FloorBaseGrass_01.glb`, 8
+/// bytes short). When the header's total length is short too, the declared JSON end is
+/// not followed by a BIN chunk header, and a BIN chunk a few words later runs exactly to
+/// the end of the file, the JSON chunk really ends there: rewrite both lengths and
+/// return the corrected JSON end. The declared JSON must fail to parse and the corrected
+/// one must parse; anything less certain leaves the bytes alone.
+fn repair_short_json_chunk(bytes: &mut [u8], json_pos: usize, data_end: usize) -> usize {
+    const BIN: u32 = 0x004E_4942;
+    const MAX_SHORT: usize = 64;
+    let rd = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+    let is_bin_at = |b: &[u8], at: usize| {
+        at + 8 <= b.len()
+            && rd(b, at + 4) == BIN
+            && (at + 8).checked_add(rd(b, at) as usize) == Some(b.len())
+    };
+    // A file whose header length is right is well-formed as far as we can tell (it may
+    // carry another chunk before BIN); only a file short in both places is repaired.
+    if data_end == bytes.len() || is_bin_at(bytes, data_end) || rd(bytes, 8) as usize == bytes.len()
+    {
+        return data_end;
+    }
+    let json_start = json_pos + 8;
+    let parses = |json: &[u8]| {
+        let end = json
+            .iter()
+            .rposition(|&c| c != 0 && c != b' ')
+            .map_or(0, |i| i + 1);
+        serde_json::from_slice::<serde::de::IgnoredAny>(&json[..end]).is_ok()
+    };
+    if parses(&bytes[json_start..data_end]) {
+        return data_end;
+    }
+    for short in (4..=MAX_SHORT).step_by(4) {
+        let at = data_end + short;
+        if is_bin_at(bytes, at) && parses(&bytes[json_start..at]) {
+            let json_len = (at - json_pos - 8) as u32;
+            bytes[json_pos..json_pos + 4].copy_from_slice(&json_len.to_le_bytes());
+            let total = bytes.len() as u32;
+            bytes[8..12].copy_from_slice(&total.to_le_bytes());
+            return at;
+        }
+    }
+    data_end
+}
+
+/// Whether a content fetch failed because the content does not exist (a catalyst 404,
+/// after every fallback: `CatalystClient::get`'s `"404 {url}"`; or a CID the local store
+/// lacks) rather than transiently. Kept here rather than in `catalyst`, which wasm does not
+/// build. Missing
+/// content fails the same way on every retry, so callers treat it like a file the
+/// deployment does not list.
+fn is_missing_content(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        let s = cause.to_string();
+        s.starts_with("404 ") || s.starts_with("local content store has no CID")
+    })
 }
 
 pub(crate) fn resolve_placement_hash(
@@ -553,10 +613,14 @@ pub fn assemble_from_recording(
         }
     }
 
-    let parsed: Vec<(String, Result<(crate::scene::Scene, String)>)> = uniq
+    // Outer error: the fetch failed (transient, fatal). Inner error: the deployed
+    // bytes do not decode (deterministic; skipped like an unresolvable placement,
+    // as the Explorer renders nothing for that entity either).
+    #[allow(clippy::type_complexity)]
+    let parsed: Vec<(String, Result<Result<(crate::scene::Scene, String)>>)> = uniq
         .par_iter()
         .map(|hash| {
-            let r = (|| -> Result<(crate::scene::Scene, String)> {
+            let r = (|| -> Result<Result<(crate::scene::Scene, String)>> {
                 let mut bytes = fetch(hash)?;
                 sanitize_glb_json_padding(&mut bytes);
                 let src_name = file_by_hash
@@ -568,13 +632,34 @@ pub fn assemble_from_recording(
                 } else {
                     ".glb"
                 };
+                // A dependency the deployment does not list, or one the catalyst does not
+                // have (404, absent CID), is the asset's own fault and resolves to nothing,
+                // as before: a missing texture is dropped, a missing buffer makes the asset
+                // undecodable. Any other fetch failure is transient and stays fatal, rather
+                // than surfacing as an undecodable asset.
+                let dep_fetch_err: std::sync::Mutex<Option<anyhow::Error>> =
+                    std::sync::Mutex::new(None);
                 let resolve_fn = |uri: &str| -> Option<Vec<u8>> {
                     let h = crate::naming::uri_content_hash(uri, &src_name, by_file)?;
-                    fetch(h).ok()
+                    match fetch(h) {
+                        Ok(b) => Some(b),
+                        Err(e) if is_missing_content(&e) => None,
+                        Err(e) => {
+                            if let Ok(mut slot) = dep_fetch_err.lock() {
+                                slot.get_or_insert(
+                                    e.context(format!("fetch {uri:?} for {src_name}")),
+                                );
+                            }
+                            None
+                        }
+                    }
                 };
                 let parsed = crate::gltf::parse(&bytes, ext, Some(&resolve_fn), false, true)
-                    .with_context(|| format!("parse {src_name}"))?;
-                Ok((parsed, src_name))
+                    .with_context(|| format!("parse {src_name}"));
+                if let Some(e) = dep_fetch_err.into_inner().ok().flatten() {
+                    return Err(e);
+                }
+                Ok(parsed.map(|parsed| (parsed, src_name)))
             })();
             (hash.clone(), r)
         })
@@ -588,13 +673,18 @@ pub fn assemble_from_recording(
     let mut mat_by_key: HashMap<MatKey, usize> = HashMap::new();
     let mut used_names: HashSet<String> = HashSet::new();
     let mut prepared: HashMap<String, Prepared> = HashMap::new();
-    let mut parse_errs: Vec<String> = Vec::new();
+    let mut fetch_errs: Vec<String> = Vec::new();
+    let mut undecodable: Vec<String> = Vec::new();
 
     for (hash, r) in parsed {
         let (mut src, name) = match r {
-            Ok(x) => x,
+            Ok(Ok(x)) => x,
+            Ok(Err(e)) => {
+                undecodable.push(format!("{hash}: {e:#}"));
+                continue;
+            }
             Err(e) => {
-                parse_errs.push(format!("{hash}: {e:#}"));
+                fetch_errs.push(format!("{hash}: {e:#}"));
                 continue;
             }
         };
@@ -695,17 +785,29 @@ pub fn assemble_from_recording(
             },
         );
     }
-    if !parse_errs.is_empty() {
+    if !fetch_errs.is_empty() {
         bail!(
-            "assemble: {} asset(s) failed to fetch/parse:\n{}",
-            parse_errs.len(),
-            parse_errs.join("\n")
+            "assemble: {} asset(s) failed to fetch:\n{}",
+            fetch_errs.len(),
+            fetch_errs.join("\n")
         );
+    }
+    if prepared.is_empty() && primitives.is_empty() {
+        bail!(
+            "assemble: all {} asset(s) failed to parse:\n{}",
+            undecodable.len(),
+            undecodable.join("\n")
+        );
+    }
+    for u in &undecodable {
+        eprintln!("assemble: skipping undecodable asset {u}");
     }
 
     let mut counters = Counters::default();
     for &(pi, p, ref hash) in &placed {
-        let prep = &prepared[hash.as_str()];
+        let Some(prep) = prepared.get(hash.as_str()) else {
+            continue;
+        };
         if p.scale.contains(&0.0) {
             let n: usize = prep
                 .scene
@@ -735,6 +837,9 @@ pub fn assemble_from_recording(
     }
     for u in &unresolved {
         model.log.push(format!("skipped unresolvable {u}"));
+    }
+    for u in &undecodable {
+        model.log.push(format!("skipped undecodable asset {u}"));
     }
     place_primitives(
         primitives,
@@ -779,7 +884,16 @@ fn place_primitives(
     let mut textures: HashMap<TextureSource, Option<usize>> = HashMap::new();
     for (pi, p) in primitives.iter().enumerate() {
         let shape = p.spec.shape.name();
-        if p.scale.contains(&0.0) {
+        // A plane is flat in local Z (every vertex has z = 0), so a zero Z scale leaves
+        // it unchanged and the Explorer draws it. Treat that axis as 1: positions are
+        // identical and the normal matrix stays invertible.
+        let is_plane = matches!(p.spec.shape, primitives::PrimitiveShape::Plane);
+        let scale = if is_plane && p.scale[2] == 0.0 {
+            [p.scale[0], p.scale[1], 1.0]
+        } else {
+            p.scale
+        };
+        if scale.contains(&0.0) {
             counters.primitives_zero_scale += 1;
             model.log.push(format!(
                 "primitive {pi} {shape}: skipped zero scale {:?}",
@@ -828,7 +942,7 @@ fn place_primitives(
         let geometry = geometries
             .entry(p.spec.cache_key())
             .or_insert_with(|| primitives::build_geometry(&p.spec));
-        let world = model::mat4_from_trs(p.position, p.rotation, p.scale);
+        let world = model::mat4_from_trs(p.position, p.rotation, scale);
         let det = model::det3(&world);
         let nmat = model::inv_transpose3(&world);
         let positions: Vec<[f32; 3]> = geometry
@@ -889,6 +1003,58 @@ fn place_primitives(
 mod tests {
     use super::*;
     use crate::lodgen::emit::emit_glb;
+
+    fn glb(json: &[u8], declared_json_len: u32, bin: &[u8]) -> Vec<u8> {
+        let total = 12 + 8 + json.len() + 8 + bin.len();
+        let short = json.len() as u32 - declared_json_len;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"glTF");
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(&(total as u32 - short).to_le_bytes());
+        b.extend_from_slice(&declared_json_len.to_le_bytes());
+        b.extend_from_slice(b"JSON");
+        b.extend_from_slice(json);
+        b.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+        b.extend_from_slice(b"BIN\0");
+        b.extend_from_slice(bin);
+        b
+    }
+
+    #[test]
+    fn short_json_chunk_length_is_repaired_when_bin_ends_the_file() {
+        let json = br#"{"asset":{"version":"2.0"},"buffers":[{"byteLength":4}]}    "#;
+        assert_eq!(json.len() % 4, 0);
+        let mut bytes = glb(json, json.len() as u32 - 8, &[1, 2, 3, 4]);
+        sanitize_glb_json_padding(&mut bytes);
+        assert_eq!(bytes, glb(json, json.len() as u32, &[1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn well_formed_and_unrecoverable_glbs_are_left_alone() {
+        let json = br#"{"asset":{"version":"2.0"},"buffers":[{"byteLength":4}]}    "#;
+        let good = glb(json, json.len() as u32, &[1, 2, 3, 4]);
+        let mut bytes = good.clone();
+        sanitize_glb_json_padding(&mut bytes);
+        assert_eq!(bytes, good);
+        let mut truncated = glb(json, json.len() as u32 - 8, &[1, 2, 3, 4]);
+        truncated.pop();
+        let before = truncated.clone();
+        sanitize_glb_json_padding(&mut truncated);
+        assert_eq!(truncated, before);
+
+        // A wrong total length plus a small extra chunk between JSON and BIN: the
+        // declared JSON parses, so the extra chunk is not folded into it.
+        let mut extra = glb(json, json.len() as u32, &[1, 2, 3, 4]);
+        let tail = extra.split_off(20 + json.len());
+        extra.extend_from_slice(&4u32.to_le_bytes());
+        extra.extend_from_slice(b"XTRA\0\0\0\0");
+        extra.extend_from_slice(&tail);
+        let total = (extra.len() - 8) as u32;
+        extra[8..12].copy_from_slice(&total.to_le_bytes());
+        let before = extra.clone();
+        sanitize_glb_json_padding(&mut extra);
+        assert_eq!(extra, before);
+    }
     use crate::lodgen::model::LodImage;
     use serde_json::{json, Value};
 
@@ -1963,6 +2129,54 @@ mod tests {
         for i in 0..3 {
             assert!((a_min[i] - b_min[i]).abs() < 1e-5);
             assert!((a_max[i] - b_max[i]).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn only_404s_and_absent_cids_count_as_missing_content() {
+        let not_found = anyhow::anyhow!("404 https://peer.test/content/contents/bafy")
+            .context("fetch content bafy");
+        assert!(is_missing_content(&not_found));
+        let local = anyhow::anyhow!("local content store has no CID bafy: not found");
+        assert!(is_missing_content(&local));
+        let transient =
+            anyhow::anyhow!("GET /contents/bafy: HTTP 503").context("fetch content bafy");
+        assert!(!is_missing_content(&transient));
+    }
+
+    #[test]
+    fn plane_with_zero_z_scale_is_kept_and_rotated() {
+        use super::super::primitives::{PrimitiveMaterial, PrimitiveShape, PrimitiveSpec};
+        let by_file: HashMap<String, String> = HashMap::new();
+        let file_by_hash: HashMap<&str, &str> = HashMap::new();
+        let fetch = |hash: &str| -> Result<Vec<u8>> { bail!("no glb {hash}") };
+        let fetch_texture = |src: &TextureSource| -> Result<Vec<u8>> { bail!("no {src:?}") };
+        let half = std::f64::consts::FRAC_1_SQRT_2;
+        let plane = |scale: [f64; 3]| PrimitivePlacement {
+            spec: PrimitiveSpec::simple(PrimitiveShape::Plane),
+            material: PrimitiveMaterial::default(),
+            position: [8.0, 1.0, 8.0],
+            // 90 degrees about Y: the plane's +-Z normal turns into +-X
+            rotation: [0.0, half, 0.0, half],
+            scale,
+        };
+        let (model, _) = assemble_from_recording(
+            "plane_1",
+            &by_file,
+            &file_by_hash,
+            &[],
+            &[plane([4.0, 2.5, 0.0]), plane([0.0, 2.5, 1.0])],
+            &fetch,
+            &fetch_texture,
+            Default::default(),
+        )
+        .unwrap();
+        // flat along its own Z: drawn; collapsed along X: skipped
+        assert_eq!(model.primitives.len(), 1);
+        assert!(summary_line(&model).contains("primitives_zero_scale_skipped=1"));
+        for n in &model.primitives[0].normals {
+            let turned = (n[0].abs() - 1.0).abs() < 1e-6;
+            assert!(turned && n[1].abs() < 1e-6 && n[2].abs() < 1e-6, "{n:?}");
         }
     }
 

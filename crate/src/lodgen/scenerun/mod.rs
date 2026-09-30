@@ -27,12 +27,20 @@ impl Default for EngineLimits {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-pub const SDK6_ADAPTION_LAYER_URL: &str =
-    "https://renderer-artifacts.decentraland.org/sdk6-adaption-layer/main/index.js";
+/// The SDK6 adaption layer, embedded rather than fetched: the published
+/// `sdk6-adaption-layer/main/index.js` is mutable, and a bad upload there
+/// (2026-09-28: an appended block with an unterminated `try`) turns every SDK6
+/// scene into "no renderer state". This is the Explorer's own pinned build
+/// (`Explorer/Assets/StreamingAssets/Js/sdk6-adapter.min.js`, unity-explorer#10057,
+/// byte-identical to its merge commit 58f5188d4 when vendored); the provenance file next
+/// to it is that PR's, and the test only guards the vendored bytes against later edits.
+/// Its validation is partial (`PASS_RETAINED_REGRESSIONS`: 21 retained regressions,
+/// native conformance not run).
+#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
+const SDK6_ADAPTION_LAYER: &str = include_str!("sdk6/sdk6-adapter.min.js");
 
 #[cfg(not(target_arch = "wasm32"))]
-pub const SDK6_ADAPTION_URL_ENV: &str = "ABGEN_LOD_SDK6_ADAPTION_URL";
+pub const SDK6_ADAPTION_FILE_ENV: &str = "ABGEN_LOD_SDK6_ADAPTION_FILE";
 
 #[cfg(not(target_arch = "wasm32"))]
 pub type ReadFileFn = Box<dyn Fn(&str) -> anyhow::Result<(Vec<u8>, String)> + Send + 'static>;
@@ -50,6 +58,10 @@ pub struct SceneJob {
 pub struct CaptureOutcome {
     pub sent: bool,
     pub stream: Vec<u8>,
+    /// Why the scene script threw at top level, if it did. The run goes on
+    /// (a scene may throw after sending state), but an empty stream plus this
+    /// error names the real cause instead of "no renderer state".
+    pub eval_error: Option<String>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -76,30 +88,18 @@ pub(crate) fn initial_state_parts(main_crdt: Option<&[u8]>) -> Vec<Vec<u8>> {
     parts
 }
 
+/// The embedded adaption layer, or a local file named by [`SDK6_ADAPTION_FILE_ENV`].
+/// Never a network fetch: the layer is code every SDK6 scene runs.
 #[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
-fn fetch_sdk6_adaption_layer() -> anyhow::Result<String> {
+fn sdk6_adaption_layer() -> anyhow::Result<String> {
     use anyhow::Context;
-    let source = std::env::var(SDK6_ADAPTION_URL_ENV)
+    let Some(path) = std::env::var(SDK6_ADAPTION_FILE_ENV)
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| SDK6_ADAPTION_LAYER_URL.to_string());
-    if !source.starts_with("http://") && !source.starts_with("https://") {
-        return std::fs::read_to_string(&source)
-            .with_context(|| format!("read sdk6 adaption layer from {source}"));
-    }
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(120)))
-        .build()
-        .into();
-    let resp = agent
-        .get(&source)
-        .header("User-Agent", crate::catalyst::UA)
-        .call()
-        .map_err(|e| anyhow::anyhow!("GET {source}: {e}"))?;
-    let mut buf = Vec::new();
-    use std::io::Read;
-    resp.into_body().into_reader().read_to_end(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    else {
+        return Ok(SDK6_ADAPTION_LAYER.to_string());
+    };
+    std::fs::read_to_string(&path).with_context(|| format!("read sdk6 adaption layer from {path}"))
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
@@ -151,7 +151,7 @@ fn run_scene_with(
             .with_context(|| format!("fetch scene bundle {main} for {}", ent.entity_id))?;
         (String::from_utf8_lossy(&bundle).into_owned(), main_crdt)
     } else {
-        (fetch_sdk6_adaption_layer()?, None)
+        (sdk6_adaption_layer()?, None)
     };
     let read_content = content.clone();
     let read_client = client.clone();
@@ -180,6 +180,9 @@ fn run_scene_with(
     };
     let outcome = engine.run_capture(job)?;
     if outcome.stream.is_empty() {
+        if let Some(e) = outcome.eval_error {
+            anyhow::bail!("scene {} script failed to evaluate: {e}", ent.entity_id);
+        }
         return Ok(None);
     }
     let mut placements = crdt::placements_from_crdt(&outcome.stream, &content);
@@ -190,6 +193,23 @@ fn run_scene_with(
 #[cfg(all(test, not(target_arch = "wasm32"), feature = "scene-runtime"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vendored_sdk6_adaption_layer_matches_its_provenance() {
+        use sha2::Digest;
+        let provenance: serde_json::Value =
+            serde_json::from_str(include_str!("sdk6/sdk6-adapter.provenance.json")).unwrap();
+        let want = provenance["sha256"].as_str().unwrap();
+        let got: String = sha2::Sha256::digest(SDK6_ADAPTION_LAYER.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(
+            SDK6_ADAPTION_LAYER.len() as u64,
+            provenance["bytes"].as_u64().unwrap()
+        );
+    }
 
     #[test]
     fn initial_state_parts_mirror_the_getstate_array() {
@@ -237,7 +257,7 @@ module.exports.onUpdate = async function () {
         std::fs::create_dir_all(&dir).unwrap();
         let layer = dir.join("adaption.js");
         std::fs::write(&layer, FAKE_ADAPTION_LAYER).unwrap();
-        std::env::set_var(SDK6_ADAPTION_URL_ENV, &layer);
+        std::env::set_var(SDK6_ADAPTION_FILE_ENV, &layer);
         crate::local_store::LocalContentStore::new(&dir)
             .write("hscene", &[1, 2])
             .unwrap();
@@ -256,7 +276,7 @@ module.exports.onUpdate = async function () {
             metadata: serde_json::json!({"runtimeVersion": "6"}),
         };
         let got = run_scene_placements(&client, &ent);
-        std::env::remove_var(SDK6_ADAPTION_URL_ENV);
+        std::env::remove_var(SDK6_ADAPTION_FILE_ENV);
         let _ = std::fs::remove_dir_all(&dir);
         let full = got.unwrap().expect("sdk6 scene should emit placements");
         assert_eq!(full.placements.len(), 1);
@@ -383,7 +403,7 @@ module.exports.onUpdate = async function () {
                     .map(|h| client.fetch_content(h).unwrap());
                 (String::from_utf8_lossy(&bundle).into_owned(), main_crdt)
             } else {
-                (fetch_sdk6_adaption_layer().unwrap(), None)
+                (sdk6_adaption_layer().unwrap(), None)
             };
             let cache: Arc<Mutex<HashMap<String, (Vec<u8>, String)>>> =
                 Arc::new(Mutex::new(HashMap::new()));

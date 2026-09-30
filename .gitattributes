@@ -8,5 +8,9 @@ crate/src/lodgen/testdata/** text eol=lf
 crate/src/lodgen/scenerun/prelude.js text eol=lf
 crate/src/gpu/shaders/*.wgsl text eol=lf
 
+# Vendored third-party build, checked byte-for-byte against its provenance sha256:
+# never converted, on any platform.
+crate/src/lodgen/scenerun/sdk6/** -text
+
 # A CRLF shell script is not executable on Linux.
 *.sh text eol=lf

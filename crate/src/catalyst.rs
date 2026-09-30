@@ -118,8 +118,13 @@ fn backoff(attempt: u32) -> Duration {
     Duration::from_secs_f64(0.5 * 2f64.powi(attempt as i32))
 }
 
+/// An entity file fetched by its hash is that entity, so the hash fills in an id the
+/// file lacks or leaves empty (some deployments store `"id": ""`).
 pub(crate) fn ensure_entity_id(v: &mut serde_json::Value, id: &str) {
-    if v.get("id").and_then(|x| x.as_str()).is_none() {
+    if v.get("id")
+        .and_then(|x| x.as_str())
+        .is_none_or(str::is_empty)
+    {
         if let Some(obj) = v.as_object_mut() {
             obj.insert("id".to_string(), serde_json::Value::String(id.to_string()));
         }
@@ -557,6 +562,19 @@ mod tests {
     use std::io::Write;
     use std::net::TcpListener;
     use std::sync::Barrier;
+
+    #[test]
+    fn entity_hash_fills_a_missing_or_empty_id() {
+        let mut empty = serde_json::json!({"id": "", "type": "scene"});
+        ensure_entity_id(&mut empty, "bafyhash");
+        assert_eq!(empty["id"], "bafyhash");
+        let mut missing = serde_json::json!({"type": "scene"});
+        ensure_entity_id(&mut missing, "bafyhash");
+        assert_eq!(missing["id"], "bafyhash");
+        let mut present = serde_json::json!({"id": "bafyother"});
+        ensure_entity_id(&mut present, "bafyhash");
+        assert_eq!(present["id"], "bafyother");
+    }
 
     #[test]
     fn pointer_detection() {
