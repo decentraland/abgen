@@ -27,6 +27,11 @@ fn scale_26_6(v: f64, scale: i64) -> f64 {
     fixed as f64 / 64.0
 }
 
+/// `f64::hypot` links glibc's `hypot`, which is newer than the floor the shipped binaries hold to.
+fn length(dx: f64, dy: f64) -> f64 {
+    (dx * dx + dy * dy).sqrt()
+}
+
 /// Flattening tolerance in pixels. Far below what an 8-bit field can show.
 const FLATTEN_TOLERANCE: f64 = 1.0 / 32.0;
 
@@ -152,7 +157,7 @@ impl OutlineBuilder for Outline {
         let p0 = self.last;
         let c = self.point(x1, y1);
         let p = self.point(x, y);
-        let deviation = ((p0[0] - 2.0 * c[0] + p[0]).hypot(p0[1] - 2.0 * c[1] + p[1])) / 4.0;
+        let deviation = length(p0[0] - 2.0 * c[0] + p[0], p0[1] - 2.0 * c[1] + p[1]) / 4.0;
         self.curve(deviation, |t| {
             let u = 1.0 - t;
             [
@@ -167,8 +172,8 @@ impl OutlineBuilder for Outline {
         let c1 = self.point(x1, y1);
         let c2 = self.point(x2, y2);
         let p = self.point(x, y);
-        let d1 = (p0[0] - 2.0 * c1[0] + c2[0]).hypot(p0[1] - 2.0 * c1[1] + c2[1]);
-        let d2 = (c1[0] - 2.0 * c2[0] + p[0]).hypot(c1[1] - 2.0 * c2[1] + p[1]);
+        let d1 = length(p0[0] - 2.0 * c1[0] + c2[0], p0[1] - 2.0 * c1[1] + c2[1]);
+        let d2 = length(c1[0] - 2.0 * c2[0] + p[0], c1[1] - 2.0 * c2[1] + p[1]);
         self.curve(d1.max(d2) * 0.75, |t| {
             let u = 1.0 - t;
             let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
