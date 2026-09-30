@@ -111,6 +111,7 @@ pub fn sanitize_glb_json_padding(bytes: &mut [u8]) {
             return;
         };
         if ctype == 0x4E4F_534A {
+            let data_end = repair_short_json_chunk(bytes, pos, data_end);
             let mut i = data_end;
             while i > data_start && bytes[i - 1] == 0 {
                 bytes[i - 1] = b' ';
@@ -120,6 +121,42 @@ pub fn sanitize_glb_json_padding(bytes: &mut [u8]) {
         }
         pos = data_end;
     }
+}
+
+/// Some old exporters wrote a JSON chunk length (and the header's total length) a few
+/// bytes short, cutting the JSON mid-token (the builder's `FloorBaseGrass_01.glb`, 8
+/// bytes short). When the header's total length is short too, the declared JSON end is
+/// not followed by a BIN chunk header, and a BIN chunk a few words later runs exactly to
+/// the end of the file, the JSON chunk really ends there: rewrite both lengths and
+/// return the corrected JSON end. Anything less certain leaves the bytes alone.
+fn repair_short_json_chunk(bytes: &mut [u8], json_pos: usize, data_end: usize) -> usize {
+    const BIN: u32 = 0x004E_4942;
+    const MAX_SHORT: usize = 64;
+    let rd = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+    let is_bin_at = |b: &[u8], at: usize| {
+        at + 8 <= b.len()
+            && rd(b, at + 4) == BIN
+            && (at + 8).checked_add(rd(b, at) as usize) == Some(b.len())
+    };
+    // A file whose header length is right is well-formed as far as we can tell (it may
+    // carry another chunk before BIN); only a file short in both places is repaired.
+    if data_end == bytes.len()
+        || is_bin_at(bytes, data_end)
+        || rd(bytes, 8) as usize == bytes.len()
+    {
+        return data_end;
+    }
+    for short in (4..=MAX_SHORT).step_by(4) {
+        let at = data_end + short;
+        if is_bin_at(bytes, at) {
+            let json_len = (at - json_pos - 8) as u32;
+            bytes[json_pos..json_pos + 4].copy_from_slice(&json_len.to_le_bytes());
+            let total = bytes.len() as u32;
+            bytes[8..12].copy_from_slice(&total.to_le_bytes());
+            return at;
+        }
+    }
+    data_end
 }
 
 pub(crate) fn resolve_placement_hash(
@@ -572,15 +609,31 @@ pub fn assemble_from_recording(
                 } else {
                     ".glb"
                 };
+                // A dependency the deployment does not list is the asset's own fault; one
+                // that is listed but fails to fetch is transient and must stay fatal, not
+                // surface as an undecodable asset.
+                let dep_fetch_err: std::sync::Mutex<Option<anyhow::Error>> =
+                    std::sync::Mutex::new(None);
                 let resolve_fn = |uri: &str| -> Option<Vec<u8>> {
                     let h = crate::naming::uri_content_hash(uri, &src_name, by_file)?;
-                    fetch(h).ok()
+                    match fetch(h) {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            if let Ok(mut slot) = dep_fetch_err.lock() {
+                                slot.get_or_insert(
+                                    e.context(format!("fetch {uri:?} for {src_name}")),
+                                );
+                            }
+                            None
+                        }
+                    }
                 };
-                Ok(
-                    crate::gltf::parse(&bytes, ext, Some(&resolve_fn), false, true)
-                        .with_context(|| format!("parse {src_name}"))
-                        .map(|parsed| (parsed, src_name)),
-                )
+                let parsed = crate::gltf::parse(&bytes, ext, Some(&resolve_fn), false, true)
+                    .with_context(|| format!("parse {src_name}"));
+                if let Some(e) = dep_fetch_err.into_inner().ok().flatten() {
+                    return Err(e);
+                }
+                Ok(parsed.map(|parsed| (parsed, src_name)))
             })();
             (hash.clone(), r)
         })
@@ -915,6 +968,45 @@ fn place_primitives(
 mod tests {
     use super::*;
     use crate::lodgen::emit::emit_glb;
+
+    fn glb(json: &[u8], declared_json_len: u32, bin: &[u8]) -> Vec<u8> {
+        let total = 12 + 8 + json.len() + 8 + bin.len();
+        let short = json.len() as u32 - declared_json_len;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"glTF");
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(&(total as u32 - short).to_le_bytes());
+        b.extend_from_slice(&declared_json_len.to_le_bytes());
+        b.extend_from_slice(b"JSON");
+        b.extend_from_slice(json);
+        b.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+        b.extend_from_slice(b"BIN\0");
+        b.extend_from_slice(bin);
+        b
+    }
+
+    #[test]
+    fn short_json_chunk_length_is_repaired_when_bin_ends_the_file() {
+        let json = br#"{"asset":{"version":"2.0"},"buffers":[{"byteLength":4}]}    "#;
+        assert_eq!(json.len() % 4, 0);
+        let mut bytes = glb(json, json.len() as u32 - 8, &[1, 2, 3, 4]);
+        sanitize_glb_json_padding(&mut bytes);
+        assert_eq!(bytes, glb(json, json.len() as u32, &[1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn well_formed_and_unrecoverable_glbs_are_left_alone() {
+        let json = br#"{"asset":{"version":"2.0"},"buffers":[{"byteLength":4}]}    "#;
+        let good = glb(json, json.len() as u32, &[1, 2, 3, 4]);
+        let mut bytes = good.clone();
+        sanitize_glb_json_padding(&mut bytes);
+        assert_eq!(bytes, good);
+        let mut truncated = glb(json, json.len() as u32 - 8, &[1, 2, 3, 4]);
+        truncated.pop();
+        let before = truncated.clone();
+        sanitize_glb_json_padding(&mut truncated);
+        assert_eq!(truncated, before);
+    }
     use crate::lodgen::model::LodImage;
     use serde_json::{json, Value};
 
