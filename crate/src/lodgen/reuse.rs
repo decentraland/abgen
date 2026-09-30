@@ -43,7 +43,7 @@ pub fn state_index_key(digest: &str) -> String {
 /// change under identical inputs when an asset is re-uploaded under the same name.
 ///
 /// Only SDK7 scenes have inputs. An SDK6 scene runs its `game.js` through the vendored
-/// adaption layer (or an `ABGEN_LOD_SDK6_ADAPTION_URL` override), which this document does
+/// adaption layer (or an `ABGEN_LOD_SDK6_ADAPTION_FILE` override), which this document does
 /// not record, so those scenes go straight to the state comparison.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
