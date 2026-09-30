@@ -118,6 +118,17 @@ fn backoff(attempt: u32) -> Duration {
     Duration::from_secs_f64(0.5 * 2f64.powi(attempt as i32))
 }
 
+/// Whether a content fetch failed because the content does not exist (a catalyst 404,
+/// after every fallback, or a CID the local store lacks) rather than transiently. Missing
+/// content fails the same way on every retry, so callers treat it like a file the
+/// deployment does not list.
+pub fn is_missing_content(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        let s = cause.to_string();
+        s.starts_with("404 ") || s.starts_with("local content store has no CID")
+    })
+}
+
 /// An entity file fetched by its hash is that entity, so the hash fills in an id the
 /// file lacks or leaves empty (some deployments store `"id": ""`).
 pub(crate) fn ensure_entity_id(v: &mut serde_json::Value, id: &str) {
@@ -559,6 +570,17 @@ mod tests {
     use std::io::Write;
     use std::net::TcpListener;
     use std::sync::Barrier;
+
+    #[test]
+    fn only_404s_and_absent_cids_count_as_missing_content() {
+        let not_found = anyhow!("404 https://peer.test/content/contents/bafy")
+            .context("fetch content bafy");
+        assert!(is_missing_content(&not_found));
+        let local = anyhow!("local content store has no CID bafy: not found");
+        assert!(is_missing_content(&local));
+        let transient = anyhow!("GET /contents/bafy: HTTP 503").context("fetch content bafy");
+        assert!(!is_missing_content(&transient));
+    }
 
     #[test]
     fn entity_hash_fills_a_missing_or_empty_id() {

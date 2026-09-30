@@ -32,8 +32,10 @@ impl Default for EngineLimits {
 /// (2026-09-28: an appended block with an unterminated `try`) turns every SDK6
 /// scene into "no renderer state". This is the Explorer's own pinned build
 /// (`Explorer/Assets/StreamingAssets/Js/sdk6-adapter.min.js`, unity-explorer#10057,
-/// byte-identical to its merge commit 58f5188d4); the provenance
-/// file next to it names the source commit and the sha256 the tests check.
+/// byte-identical to its merge commit 58f5188d4 when vendored); the provenance file next
+/// to it is that PR's, and the test only guards the vendored bytes against later edits.
+/// Its validation is partial (`PASS_RETAINED_REGRESSIONS`: 21 retained regressions,
+/// native conformance not run).
 #[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
 const SDK6_ADAPTION_LAYER: &str = include_str!("sdk6/sdk6-adapter.min.js");
 

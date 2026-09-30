@@ -128,7 +128,8 @@ pub fn sanitize_glb_json_padding(bytes: &mut [u8]) {
 /// bytes short). When the header's total length is short too, the declared JSON end is
 /// not followed by a BIN chunk header, and a BIN chunk a few words later runs exactly to
 /// the end of the file, the JSON chunk really ends there: rewrite both lengths and
-/// return the corrected JSON end. Anything less certain leaves the bytes alone.
+/// return the corrected JSON end. The declared JSON must fail to parse and the corrected
+/// one must parse; anything less certain leaves the bytes alone.
 fn repair_short_json_chunk(bytes: &mut [u8], json_pos: usize, data_end: usize) -> usize {
     const BIN: u32 = 0x004E_4942;
     const MAX_SHORT: usize = 64;
@@ -146,9 +147,17 @@ fn repair_short_json_chunk(bytes: &mut [u8], json_pos: usize, data_end: usize) -
     {
         return data_end;
     }
+    let json_start = json_pos + 8;
+    let parses = |json: &[u8]| {
+        let end = json.iter().rposition(|&c| c != 0 && c != b' ').map_or(0, |i| i + 1);
+        serde_json::from_slice::<serde::de::IgnoredAny>(&json[..end]).is_ok()
+    };
+    if parses(&bytes[json_start..data_end]) {
+        return data_end;
+    }
     for short in (4..=MAX_SHORT).step_by(4) {
         let at = data_end + short;
-        if is_bin_at(bytes, at) {
+        if is_bin_at(bytes, at) && parses(&bytes[json_start..at]) {
             let json_len = (at - json_pos - 8) as u32;
             bytes[json_pos..json_pos + 4].copy_from_slice(&json_len.to_le_bytes());
             let total = bytes.len() as u32;
@@ -609,15 +618,18 @@ pub fn assemble_from_recording(
                 } else {
                     ".glb"
                 };
-                // A dependency the deployment does not list is the asset's own fault; one
-                // that is listed but fails to fetch is transient and must stay fatal, not
-                // surface as an undecodable asset.
+                // A dependency the deployment does not list, or one the catalyst does not
+                // have (404, absent CID), is the asset's own fault and resolves to nothing,
+                // as before: a missing texture is dropped, a missing buffer makes the asset
+                // undecodable. Any other fetch failure is transient and stays fatal, rather
+                // than surfacing as an undecodable asset.
                 let dep_fetch_err: std::sync::Mutex<Option<anyhow::Error>> =
                     std::sync::Mutex::new(None);
                 let resolve_fn = |uri: &str| -> Option<Vec<u8>> {
                     let h = crate::naming::uri_content_hash(uri, &src_name, by_file)?;
                     match fetch(h) {
                         Ok(b) => Some(b),
+                        Err(e) if crate::catalyst::is_missing_content(&e) => None,
                         Err(e) => {
                             if let Ok(mut slot) = dep_fetch_err.lock() {
                                 slot.get_or_insert(
@@ -1015,6 +1027,19 @@ mod tests {
         let before = truncated.clone();
         sanitize_glb_json_padding(&mut truncated);
         assert_eq!(truncated, before);
+
+        // A wrong total length plus a small extra chunk between JSON and BIN: the
+        // declared JSON parses, so the extra chunk is not folded into it.
+        let mut extra = glb(json, json.len() as u32, &[1, 2, 3, 4]);
+        let tail = extra.split_off(20 + json.len());
+        extra.extend_from_slice(&4u32.to_le_bytes());
+        extra.extend_from_slice(b"XTRA\0\0\0\0");
+        extra.extend_from_slice(&tail);
+        let total = (extra.len() - 8) as u32;
+        extra[8..12].copy_from_slice(&total.to_le_bytes());
+        let before = extra.clone();
+        sanitize_glb_json_padding(&mut extra);
+        assert_eq!(extra, before);
     }
     use crate::lodgen::model::LodImage;
     use serde_json::{json, Value};
