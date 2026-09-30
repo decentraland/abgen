@@ -20,14 +20,27 @@ pub(super) trait EngineSession {
 }
 
 /// The scene author writes the eval error text; it ends up in lane errors and logs, so
-/// keep a bounded prefix.
+/// keep a bounded, single-line prefix: control characters (newlines included) are escaped.
 const MAX_EVAL_ERROR_CHARS: usize = 512;
 
 fn bounded_error(e: String) -> String {
-    match e.char_indices().nth(MAX_EVAL_ERROR_CHARS) {
-        Some((cut, _)) => format!("{}… ({} chars)", &e[..cut], e.chars().count()),
-        None => e,
+    let total = e.chars().count();
+    let mut out: String = e
+        .chars()
+        .take(MAX_EVAL_ERROR_CHARS)
+        .flat_map(|c| {
+            let escaped: Vec<char> = if c.is_control() {
+                c.escape_default().collect()
+            } else {
+                vec![c]
+            };
+            escaped
+        })
+        .collect();
+    if total > MAX_EVAL_ERROR_CHARS {
+        out.push_str(&format!("… ({total} chars)"));
     }
+    out
 }
 
 /// Returns the scene script's top-level eval error (bounded), which is not fatal here.
@@ -70,5 +83,11 @@ mod tests {
         let cut = bounded_error(long);
         assert!(cut.starts_with(&"é".repeat(MAX_EVAL_ERROR_CHARS)));
         assert!(cut.ends_with(&format!("… ({} chars)", MAX_EVAL_ERROR_CHARS + 10)));
+    }
+
+    #[test]
+    fn eval_errors_are_one_line() {
+        let got = bounded_error("Error: boom\n    at eval_script:1:2\u{1b}[31m".into());
+        assert_eq!(got, "Error: boom\\n    at eval_script:1:2\\u{1b}[31m");
     }
 }
