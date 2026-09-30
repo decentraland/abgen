@@ -858,7 +858,16 @@ fn place_primitives(
     let mut textures: HashMap<TextureSource, Option<usize>> = HashMap::new();
     for (pi, p) in primitives.iter().enumerate() {
         let shape = p.spec.shape.name();
-        if p.scale.contains(&0.0) {
+        // A plane is flat in local Z (every vertex has z = 0), so a zero Z scale leaves
+        // it unchanged and the Explorer draws it. Treat that axis as 1: positions are
+        // identical and the normal matrix stays invertible.
+        let is_plane = matches!(p.spec.shape, primitives::PrimitiveShape::Plane);
+        let scale = if is_plane && p.scale[2] == 0.0 {
+            [p.scale[0], p.scale[1], 1.0]
+        } else {
+            p.scale
+        };
+        if scale.contains(&0.0) {
             counters.primitives_zero_scale += 1;
             model.log.push(format!(
                 "primitive {pi} {shape}: skipped zero scale {:?}",
@@ -907,7 +916,7 @@ fn place_primitives(
         let geometry = geometries
             .entry(p.spec.cache_key())
             .or_insert_with(|| primitives::build_geometry(&p.spec));
-        let world = model::mat4_from_trs(p.position, p.rotation, p.scale);
+        let world = model::mat4_from_trs(p.position, p.rotation, scale);
         let det = model::det3(&world);
         let nmat = model::inv_transpose3(&world);
         let positions: Vec<[f32; 3]> = geometry
@@ -2081,6 +2090,42 @@ mod tests {
         for i in 0..3 {
             assert!((a_min[i] - b_min[i]).abs() < 1e-5);
             assert!((a_max[i] - b_max[i]).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn plane_with_zero_z_scale_is_kept_and_rotated() {
+        use super::super::primitives::{PrimitiveMaterial, PrimitiveShape, PrimitiveSpec};
+        let by_file: HashMap<String, String> = HashMap::new();
+        let file_by_hash: HashMap<&str, &str> = HashMap::new();
+        let fetch = |hash: &str| -> Result<Vec<u8>> { bail!("no glb {hash}") };
+        let fetch_texture = |src: &TextureSource| -> Result<Vec<u8>> { bail!("no {src:?}") };
+        let half = std::f64::consts::FRAC_1_SQRT_2;
+        let plane = |scale: [f64; 3]| PrimitivePlacement {
+            spec: PrimitiveSpec::simple(PrimitiveShape::Plane),
+            material: PrimitiveMaterial::default(),
+            position: [8.0, 1.0, 8.0],
+            // 90 degrees about Y: the plane's +-Z normal turns into +-X
+            rotation: [0.0, half, 0.0, half],
+            scale,
+        };
+        let (model, _) = assemble_from_recording(
+            "plane_1",
+            &by_file,
+            &file_by_hash,
+            &[],
+            &[plane([4.0, 2.5, 0.0]), plane([0.0, 2.5, 1.0])],
+            &fetch,
+            &fetch_texture,
+            Default::default(),
+        )
+        .unwrap();
+        // flat along its own Z: drawn; collapsed along X: skipped
+        assert_eq!(model.primitives.len(), 1);
+        assert!(summary_line(&model).contains("primitives_zero_scale_skipped=1"));
+        for n in &model.primitives[0].normals {
+            let turned = (n[0].abs() - 1.0).abs() < 1e-6;
+            assert!(turned && n[1].abs() < 1e-6 && n[2].abs() < 1e-6, "{n:?}");
         }
     }
 
