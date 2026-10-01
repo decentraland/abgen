@@ -9,10 +9,10 @@ mod templates;
 mod tests;
 mod texture;
 
+pub use font::{FONT_ASSET_NAME, TMP_ASSET_NAME, UITK_ASSET_NAME};
 pub use templates::require_templates;
 pub use templates::template_available;
 pub use templates::template_identity;
-pub use font::{FONT_ASSET_NAME, TMP_ASSET_NAME, UITK_ASSET_NAME};
 pub use templates::template_source;
 pub use templates::templates_missing;
 pub use templates::templates_missing_in;
@@ -655,8 +655,7 @@ pub fn build_bundle(
     };
 
     if crate::fontgen::is_font_file(bytes) {
-        let mut out =
-            font::build_font_bundles(bytes, &[bundle_name.to_string()], root_hash, opts)?;
+        let mut out = font::build_font_bundles(bytes, &[bundle_name.to_string()], root_hash, opts)?;
         return Ok(out.remove(0));
     }
 

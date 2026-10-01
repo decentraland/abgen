@@ -118,6 +118,7 @@ fn main() {
     println!("metric mismatches {metric_bad}; texels {n}; |diff| histogram 0..=5+: {hist:?}; within 3px of the edge: {band:?}");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn side_by_side(
     ours: &[u8],
     ox: i64,
