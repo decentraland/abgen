@@ -21,10 +21,11 @@
 //! rather than through `ttf-parser`, so the walk that is bounded is the walk that runs: every
 //! composite is sized from the component graph (nodes, points and nesting) before any outline
 //! is expanded, and every `cmap` range is clamped and charged against a budget before any code
-//! point is visited. Glyph parsing mirrors `ttf-parser` 0.25 (composite arguments are read only
-//! with `ARGS_ARE_XY_VALUES`, no grid rounding or scaled offsets, a one-point glyph is empty),
-//! which is what the fidelity test compares against. A font past a bound is
-//! [`Refused`](super::Refused).
+//! point is visited. Glyph parsing follows the specification's layout and `ttf-parser` 0.25's
+//! semantics where they are a choice (no grid rounding or scaled offsets, a one-point glyph is
+//! empty, a malformed glyph is empty, a component outside the font is skipped), which is what
+//! the fidelity test compares against; anchored components, which `ttf-parser` misreads, are
+//! placed by their matched points. A font past a bound is [`Refused`](super::Refused).
 
 use super::kerning::KernPair;
 use super::{MAX_FONT_BYTES, MAX_GLYPH_POINTS};
@@ -142,7 +143,7 @@ fn f2dot14(v: i16) -> f32 {
 }
 
 /// A composite component's affine transform, `ttf-parser`'s `Transform`: `x' = ax + cy + e`,
-/// `y' = bx + dy + f`.
+/// `y' = bx + dy + f`. The offset is added unscaled, as `ttf-parser` and FreeType's default do.
 #[derive(Clone, Copy)]
 struct Transform {
     a: f32,
@@ -162,29 +163,14 @@ impl Transform {
         e: 0.0,
         f: 0.0,
     };
-
-    fn combine(ts1: Self, ts2: Self) -> Self {
-        Transform {
-            a: ts1.a * ts2.a + ts1.c * ts2.b,
-            b: ts1.b * ts2.a + ts1.d * ts2.b,
-            c: ts1.a * ts2.c + ts1.c * ts2.d,
-            d: ts1.b * ts2.c + ts1.d * ts2.d,
-            e: ts1.a * ts2.e + ts1.c * ts2.f + ts1.e,
-            f: ts1.b * ts2.e + ts1.d * ts2.f + ts1.f,
-        }
-    }
-
-    fn apply(&self, x: f32, y: f32) -> (f32, f32) {
-        (
-            self.a * x + self.c * y + self.e,
-            self.b * x + self.d * y + self.f,
-        )
-    }
 }
 
 struct Component {
     glyph: u16,
     transform: Transform,
+    /// `(parent point, child point)` when the component is placed by matching points rather
+    /// than by an offset (`ARGS_ARE_XY_VALUES` clear).
+    anchor: Option<(u16, u16)>,
 }
 
 /// The source's `glyf` and `loca` tables, read raw.
@@ -192,27 +178,36 @@ struct GlyfTables<'a> {
     glyf: &'a [u8],
     loca: &'a [u8],
     long_offsets: bool,
+    /// Glyphs the font has: `maxp`'s count, or fewer when `loca` holds fewer entries. The one
+    /// bound every walk here uses, so no glyph is flattened that was not sized.
+    glyphs: usize,
 }
 
 impl<'a> GlyfTables<'a> {
     fn of(face: &Face<'a>) -> Option<Self> {
         let raw = face.raw_face();
+        let glyf = raw.table(Tag::from_bytes(b"glyf"))?;
+        let loca = raw.table(Tag::from_bytes(b"loca"))?;
+        let long_offsets = matches!(
+            face.tables().head.index_to_location_format,
+            ttf_parser::head::IndexToLocationFormat::Long
+        );
+        let entry = if long_offsets { 4 } else { 2 };
+        let glyphs = (loca.len() / entry)
+            .saturating_sub(1)
+            .min(face.number_of_glyphs() as usize);
         Some(GlyfTables {
-            glyf: raw.table(Tag::from_bytes(b"glyf"))?,
-            loca: raw.table(Tag::from_bytes(b"loca"))?,
-            long_offsets: matches!(
-                face.tables().head.index_to_location_format,
-                ttf_parser::head::IndexToLocationFormat::Long
-            ),
+            glyf,
+            loca,
+            long_offsets,
+            glyphs,
         })
     }
 
-    fn glyph_count(&self) -> usize {
-        let entry = if self.long_offsets { 4 } else { 2 };
-        (self.loca.len() / entry).saturating_sub(1)
-    }
-
     fn glyph(&self, gid: usize) -> &'a [u8] {
+        if gid >= self.glyphs {
+            return &[];
+        }
         let range = if self.long_offsets {
             be_u32(self.loca, 4 * gid).zip(be_u32(self.loca, 4 * gid + 4))
         } else {
@@ -226,8 +221,9 @@ impl<'a> GlyfTables<'a> {
             .unwrap_or(&[])
     }
 
-    /// A composite's components, read the way `ttf-parser` reads them: arguments only with
-    /// `ARGS_ARE_XY_VALUES`, no grid rounding, no scaled offsets.
+    /// A composite's components, laid out as the specification stores them: two arguments are
+    /// always present (bytes or words), read as an offset with `ARGS_ARE_XY_VALUES` and as a
+    /// pair of point numbers without it. No grid rounding, no scaled offsets.
     fn components(data: &[u8]) -> Result<Vec<Component>> {
         if be_i16(data, 0).is_none_or(|n| n >= 0) {
             return Ok(Vec::new());
@@ -236,22 +232,30 @@ impl<'a> GlyfTables<'a> {
         let mut at = 10;
         while let (Some(flags), Some(glyph)) = (be_u16(data, at), be_u16(data, at + 2)) {
             at += 4;
+            let (arg1, arg2) = if flags & ARG_1_AND_2_ARE_WORDS != 0 {
+                let (Some(a), Some(b)) = (be_u16(data, at), be_u16(data, at + 2)) else {
+                    break;
+                };
+                at += 4;
+                (a, b)
+            } else {
+                let (Some(a), Some(b)) = (be_u8(data, at), be_u8(data, at + 1)) else {
+                    break;
+                };
+                at += 2;
+                (a as u16, b as u16)
+            };
             let mut t = Transform::IDENTITY;
-            if flags & ARGS_ARE_XY_VALUES != 0 {
+            let anchor = if flags & ARGS_ARE_XY_VALUES != 0 {
                 if flags & ARG_1_AND_2_ARE_WORDS != 0 {
-                    let (Some(e), Some(f)) = (be_i16(data, at), be_i16(data, at + 2)) else {
-                        break;
-                    };
-                    (t.e, t.f) = (e as f32, f as f32);
-                    at += 4;
+                    (t.e, t.f) = (arg1 as i16 as f32, arg2 as i16 as f32);
                 } else {
-                    let (Some(e), Some(f)) = (be_u8(data, at), be_u8(data, at + 1)) else {
-                        break;
-                    };
-                    (t.e, t.f) = (e as i8 as f32, f as i8 as f32);
-                    at += 2;
+                    (t.e, t.f) = (arg1 as u8 as i8 as f32, arg2 as u8 as i8 as f32);
                 }
-            }
+                None
+            } else {
+                Some((arg1, arg2))
+            };
             if flags & WE_HAVE_A_TWO_BY_TWO != 0 {
                 let Some(v) = (0..4)
                     .map(|i| be_i16(data, at + 2 * i))
@@ -277,6 +281,7 @@ impl<'a> GlyfTables<'a> {
             out.push(Component {
                 glyph,
                 transform: t,
+                anchor,
             });
             if out.len() > MAX_GLYPH_COMPONENTS {
                 refuse!("a composite glyph references over {MAX_GLYPH_COMPONENTS} components");
@@ -304,72 +309,64 @@ impl<'a> GlyfTables<'a> {
         }
     }
 
-    /// A simple glyph's contours in font units.
-    fn simple_contours(data: &[u8]) -> Result<Vec<Vec<(f32, f32, bool)>>> {
+    /// A simple glyph's contours in font units. `None` for a glyph whose data does not hold what
+    /// its header declares, which `ttf-parser` cannot outline either.
+    fn simple_contours(data: &[u8]) -> Option<Vec<Vec<(f32, f32, bool)>>> {
         let Some(n) = be_i16(data, 0).filter(|n| *n > 0) else {
-            return Ok(Vec::new());
+            return Some(Vec::new());
         };
         let n = n as usize;
         let ends: Vec<u16> = (0..n)
             .map(|i| be_u16(data, 10 + 2 * i))
-            .collect::<Option<_>>()
-            .unwrap_or_default();
+            .collect::<Option<_>>()?;
         let total = ends.last().map_or(0, |e| *e as usize + 1);
-        if ends.len() != n || total <= 1 {
-            return Ok(Vec::new());
+        if total <= 1 {
+            return Some(Vec::new());
         }
         let mut at = 10 + 2 * n;
-        let instructions = be_u16(data, at).unwrap_or(0) as usize;
+        let instructions = be_u16(data, at)? as usize;
         at += 2 + instructions;
 
         let mut flags = Vec::with_capacity(total);
         while flags.len() < total {
-            let Some(flag) = be_u8(data, at) else {
-                refuse!("glyph flags run past the end of its data");
-            };
+            let flag = be_u8(data, at)?;
             at += 1;
             let repeats = if flag & REPEAT != 0 {
-                let Some(r) = be_u8(data, at) else {
-                    refuse!("glyph flags run past the end of its data");
-                };
+                let r = be_u8(data, at)?;
                 at += 1;
                 r as usize + 1
             } else {
                 1
             };
             if flags.len() + repeats > total {
-                refuse!("glyph flag repeats run past its point count");
+                return None;
             }
             flags.extend(std::iter::repeat_n(flag, repeats));
         }
 
-        let mut read_axis = |short: u8, same_or_positive: u8| -> Result<Vec<f32>> {
+        let mut read_axis = |short: u8, same_or_positive: u8| -> Option<Vec<f32>> {
             let mut out = Vec::with_capacity(total);
             let mut v = 0i32;
             for &flag in &flags {
                 let delta = if flag & short != 0 {
-                    let Some(d) = be_u8(data, at) else {
-                        refuse!("glyph coordinates run past the end of its data");
-                    };
+                    let d = be_u8(data, at)? as i32;
                     at += 1;
                     if flag & same_or_positive != 0 {
-                        d as i32
+                        d
                     } else {
-                        -(d as i32)
+                        -d
                     }
                 } else if flag & same_or_positive != 0 {
                     0
                 } else {
-                    let Some(d) = be_i16(data, at) else {
-                        refuse!("glyph coordinates run past the end of its data");
-                    };
+                    let d = be_i16(data, at)? as i32;
                     at += 2;
-                    d as i32
+                    d
                 };
                 v += delta;
                 out.push(v as f32);
             }
-            Ok(out)
+            Some(out)
         };
         let xs = read_axis(X_SHORT, X_SAME_OR_POSITIVE)?;
         let ys = read_axis(Y_SHORT, Y_SAME_OR_POSITIVE)?;
@@ -379,7 +376,7 @@ impl<'a> GlyfTables<'a> {
         for end in ends {
             let end = end as usize + 1;
             if end <= start || end > total {
-                refuse!("glyph contour ends are not increasing");
+                return None;
             }
             contours.push(
                 (start..end)
@@ -388,7 +385,7 @@ impl<'a> GlyfTables<'a> {
             );
             start = end;
         }
-        Ok(contours)
+        Some(contours)
     }
 }
 
@@ -397,14 +394,17 @@ impl<'a> GlyfTables<'a> {
 struct Sizing {
     nodes: usize,
     points: usize,
+    /// Composite levels below this glyph.
     height: usize,
 }
 
 /// Sizes every glyph before any outline is built. Counts saturate just past their caps, and a
-/// glyph over a cap, a cycle, or nesting past `ttf-parser`'s depth is refused here.
-fn size_glyphs(tables: &GlyfTables<'_>, n: usize) -> Result<Vec<Sizing>> {
+/// glyph over a cap, a cycle, or nesting past `ttf-parser`'s depth is refused here. The depth
+/// is checked on the way down, so the sizing itself never recurses past it.
+fn size_glyphs(tables: &GlyfTables<'_>) -> Result<Vec<Sizing>> {
     const UNVISITED: usize = usize::MAX;
     const IN_PROGRESS: usize = usize::MAX - 1;
+    let n = tables.glyphs;
     let mut memo = vec![
         Sizing {
             nodes: UNVISITED,
@@ -414,7 +414,17 @@ fn size_glyphs(tables: &GlyfTables<'_>, n: usize) -> Result<Vec<Sizing>> {
         n
     ];
 
-    fn visit(tables: &GlyfTables<'_>, gid: usize, memo: &mut [Sizing]) -> Result<Sizing> {
+    fn visit(
+        tables: &GlyfTables<'_>,
+        gid: usize,
+        depth: usize,
+        memo: &mut [Sizing],
+    ) -> Result<Sizing> {
+        // `ttf-parser` gives up at this depth; refusing before recursing is what bounds the
+        // stack here.
+        if depth >= MAX_COMPOSITE_DEPTH {
+            refuse!("composite glyphs nest {MAX_COMPOSITE_DEPTH} deep or more");
+        }
         let Some(entry) = memo.get(gid).copied() else {
             // A component outside the font: `ttf-parser` skips it.
             return Ok(Sizing {
@@ -426,7 +436,12 @@ fn size_glyphs(tables: &GlyfTables<'_>, n: usize) -> Result<Vec<Sizing>> {
         match entry.nodes {
             IN_PROGRESS => refuse!("glyph {gid} is a composite of itself"),
             UNVISITED => {}
-            _ => return Ok(entry),
+            _ => {
+                if depth + entry.height >= MAX_COMPOSITE_DEPTH {
+                    refuse!("composite glyphs nest {MAX_COMPOSITE_DEPTH} deep or more");
+                }
+                return Ok(entry);
+            }
         }
         memo[gid].nodes = IN_PROGRESS;
         let data = tables.glyph(gid);
@@ -441,7 +456,7 @@ fn size_glyphs(tables: &GlyfTables<'_>, n: usize) -> Result<Vec<Sizing>> {
             height: 0,
         };
         for c in components {
-            let child = visit(tables, c.glyph as usize, memo)?;
+            let child = visit(tables, c.glyph as usize, depth + 1, memo)?;
             sizing.nodes = sizing
                 .nodes
                 .saturating_add(child.nodes)
@@ -451,9 +466,6 @@ fn size_glyphs(tables: &GlyfTables<'_>, n: usize) -> Result<Vec<Sizing>> {
                 .saturating_add(child.points)
                 .min(MAX_GLYPH_POINTS + 1);
             sizing.height = sizing.height.max(child.height + 1);
-            if sizing.height > MAX_COMPOSITE_DEPTH {
-                refuse!("composite glyphs nest deeper than {MAX_COMPOSITE_DEPTH}");
-            }
         }
         memo[gid] = sizing;
         Ok(sizing)
@@ -461,7 +473,7 @@ fn size_glyphs(tables: &GlyfTables<'_>, n: usize) -> Result<Vec<Sizing>> {
 
     let (mut nodes, mut points) = (0usize, 0usize);
     for gid in 0..n {
-        let s = visit(tables, gid, &mut memo)?;
+        let s = visit(tables, gid, 0, &mut memo)?;
         if s.nodes > MAX_GLYPH_NODES {
             refuse!("glyph {gid} flattens through over {MAX_GLYPH_NODES} glyphs");
         }
@@ -480,41 +492,53 @@ fn size_glyphs(tables: &GlyfTables<'_>, n: usize) -> Result<Vec<Sizing>> {
     Ok(memo)
 }
 
-/// A glyph's contours with composites flattened, in font units. Bounded by [`size_glyphs`]
-/// having passed the glyph.
-fn flatten(
-    tables: &GlyfTables<'_>,
-    gid: usize,
-    transform: Transform,
-    out: &mut Vec<Vec<(f32, f32, bool)>>,
-) -> Result<()> {
+/// A glyph's contours in its own space, composites flattened: each component's points go
+/// through its transform, with an anchored component moved so its matched point lands on the
+/// parent's. `None` when a glyph on the way is malformed, which empties the whole glyph as it
+/// does in `ttf-parser`. Bounded by [`size_glyphs`] having passed the glyph.
+fn flatten(tables: &GlyfTables<'_>, gid: usize) -> Result<Option<Vec<Vec<(f32, f32, bool)>>>> {
     let data = tables.glyph(gid);
     let components = GlyfTables::components(data)?;
     if components.is_empty() {
-        for contour in GlyfTables::simple_contours(data)? {
-            out.push(
+        return Ok(GlyfTables::simple_contours(data));
+    }
+    let mut out: Vec<Vec<(f32, f32, bool)>> = Vec::new();
+    for c in components {
+        if c.glyph as usize >= tables.glyphs {
+            continue;
+        }
+        let Some(child) = flatten(tables, c.glyph as usize)? else {
+            return Ok(None);
+        };
+        let t = c.transform;
+        let scaled: Vec<Vec<(f32, f32, bool)>> = child
+            .into_iter()
+            .map(|contour| {
                 contour
                     .into_iter()
-                    .map(|(x, y, on)| {
-                        let (x, y) = transform.apply(x, y);
-                        (x, y, on)
-                    })
-                    .collect(),
-            );
-        }
-        return Ok(());
+                    .map(|(x, y, on)| (t.a * x + t.c * y, t.b * x + t.d * y, on))
+                    .collect()
+            })
+            .collect();
+        let (e, f) = match c.anchor {
+            None => (t.e, t.f),
+            Some((parent, child)) => {
+                let parent = out.iter().flatten().nth(parent as usize);
+                let child = scaled.iter().flatten().nth(child as usize);
+                match (parent, child) {
+                    (Some(p), Some(q)) => (p.0 - q.0, p.1 - q.1),
+                    _ => (0.0, 0.0),
+                }
+            }
+        };
+        out.extend(scaled.into_iter().map(|contour| {
+            contour
+                .into_iter()
+                .map(|(x, y, on)| (x + e, y + f, on))
+                .collect()
+        }));
     }
-    for c in components {
-        if (c.glyph as usize) < tables.glyph_count() {
-            flatten(
-                tables,
-                c.glyph as usize,
-                Transform::combine(transform, c.transform),
-                out,
-            )?;
-        }
-    }
-    Ok(())
+    Ok(Some(out))
 }
 
 /// Integer contours as TrueType stores them, range-checked as floats first: nested composite
@@ -607,24 +631,24 @@ fn encode_glyph(contours: &[Vec<(i32, i32, bool)>]) -> (Vec<u8>, Option<(i32, i3
 fn glyph_records(face: &Face<'_>) -> Result<Vec<GlyphRecord>> {
     let n = face.number_of_glyphs() as usize;
     let advance = |gid: usize| face.glyph_hor_advance(GlyphId(gid as u16)).unwrap_or(0);
+    let empty = |gid: usize| GlyphRecord {
+        data: Vec::new(),
+        bbox: None,
+        advance: advance(gid),
+        points: 0,
+        contours: 0,
+    };
     let Some(tables) = GlyfTables::of(face) else {
         // No outlines at all: every glyph is empty. The bake refuses the font later if nothing
         // it pre-fills can be drawn.
-        return Ok((0..n)
-            .map(|gid| GlyphRecord {
-                data: Vec::new(),
-                bbox: None,
-                advance: advance(gid),
-                points: 0,
-                contours: 0,
-            })
-            .collect());
+        return Ok((0..n).map(empty).collect());
     };
-    size_glyphs(&tables, n)?;
+    size_glyphs(&tables)?;
     (0..n)
         .map(|gid| {
-            let mut raw = Vec::new();
-            flatten(&tables, gid, Transform::IDENTITY, &mut raw)?;
+            let Some(raw) = flatten(&tables, gid)? else {
+                return Ok(empty(gid));
+            };
             let contours = to_points(&raw)?;
             let (data, bbox) = encode_glyph(&contours);
             Ok(GlyphRecord {
@@ -709,8 +733,12 @@ fn walk_subtable(data: &[u8], budget: &mut usize, mut map: impl FnMut(u32, u16))
             if let (Some(first), Some(count)) = (be_u16(data, 6), be_u16(data, 8)) {
                 charge(budget, count as usize)?;
                 for i in 0..count as usize {
+                    let cp = first as u32 + i as u32;
+                    if cp > 0xFFFF {
+                        break;
+                    }
                     if let Some(g) = be_u16(data, 10 + 2 * i) {
-                        map(first as u32 + i as u32, g);
+                        map(cp, g);
                     }
                 }
             }
@@ -745,11 +773,11 @@ fn walk_subtable(data: &[u8], budget: &mut usize, mut map: impl FnMut(u32, u16))
                 charge(budget, (hi - lo) as usize + 1)?;
                 for cp in lo..=hi {
                     let g = if format == 12 {
-                        glyph.wrapping_add(cp - start)
+                        glyph.checked_add(cp - start)
                     } else {
-                        glyph
+                        Some(glyph)
                     };
-                    if g <= u16::MAX as u32 {
+                    if let Some(g) = g.filter(|g| *g <= u16::MAX as u32) {
                         map(cp, g as u16);
                     }
                 }
@@ -790,6 +818,10 @@ pub(super) fn unicode_map(face: &Face<'_>) -> Result<BTreeMap<u32, u16>> {
         let Some(data) = raw.get(offset as usize..) else {
             continue;
         };
+        // As `ttf-parser`: a Windows full-range record only counts with a full-range format.
+        if platform == 3 && encoding == 10 && !matches!(be_u16(data, 0), Some(12) | Some(13)) {
+            continue;
+        }
         walk_subtable(data, &mut budget, |cp, g| {
             if g != 0 && g < glyphs && char::from_u32(cp).is_some() {
                 map.entry(cp).or_insert(g);
@@ -1426,7 +1458,18 @@ pub(crate) mod tests {
     /// A TrueType file of `glyphs` with 1000 units per em, 600-unit advances, the given `cmap`
     /// and any `extra` tables.
     pub fn fixture(glyphs: &[Vec<u8>], cmap: Vec<u8>, extra: Vec<([u8; 4], Vec<u8>)>) -> Vec<u8> {
-        let n = glyphs.len();
+        fixture_declaring(glyphs, glyphs.len(), cmap, extra)
+    }
+
+    /// [`fixture`] with `maxp` and `hhea` declaring `declared` glyphs, however many `glyphs`
+    /// the `loca` holds.
+    pub fn fixture_declaring(
+        glyphs: &[Vec<u8>],
+        declared: usize,
+        cmap: Vec<u8>,
+        extra: Vec<([u8; 4], Vec<u8>)>,
+    ) -> Vec<u8> {
+        let n = declared;
         let mut head = W::default();
         head.u32(0x0001_0000);
         head.u32(0x0001_0000);
@@ -1575,55 +1618,176 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn components_are_read_as_ttf_parser_reads_them() {
-        // With ARGS_ARE_XY_VALUES clear, ttf-parser reads no arguments, so the bytes that follow
-        // are the next component's flags and glyph. A parser that always skipped two argument
-        // bytes would read a different second component: the flattener must agree with
-        // ttf-parser, or a font could hide components from the sizing.
+    fn a_loca_longer_than_maxp_is_bounded_by_maxp() {
+        // maxp declares two glyphs; loca holds three, and the third is a composite of itself
+        // that glyph 1 references. Sized or not, nothing past maxp may be flattened.
+        let glyphs = vec![
+            simple_glyph(4),
+            composite_glyph(&[2]),
+            composite_glyph(&[2]),
+        ];
+        let font = fixture_declaring(&glyphs, 2, cmap_format12(&[(0x41, 0x42, 0)]), Vec::new());
+        let face = Face::parse(&font, 0).unwrap();
+        assert_eq!(face.number_of_glyphs(), 2);
+        let (rebuilt, _) = rebuild(&face, &[]).unwrap();
+        let rebuilt = Face::parse(&rebuilt, 0).unwrap();
+        assert_eq!(rebuilt.number_of_glyphs(), 2);
+        let mut log = PointLog::default();
+        // Glyph 1's only component is outside the font: skipped, so the glyph is empty.
+        assert!(rebuilt.outline_glyph(GlyphId(1), &mut log).is_none());
+    }
+
+    #[test]
+    fn a_long_chain_is_refused_before_the_stack_runs_out() {
+        // 65535 composites, each referencing the next: refused at depth 32, not followed down.
+        let mut glyphs: Vec<Vec<u8>> = (1..65535u16).map(|i| composite_glyph(&[i])).collect();
+        glyphs.push(empty_glyph());
+        let font = fixture(&glyphs, cmap_format12(&[(0x41, 0x41, 0)]), Vec::new());
+        let err = refusal(&font);
+        assert!(err.to_string().contains("nest"), "{err:#}");
+    }
+
+    #[test]
+    fn a_chain_of_exactly_the_depth_limit_is_refused_as_ttf_parser_gives_up() {
+        // 33 glyphs: glyph 0 flattens through 32 composite levels. ttf-parser stops at a depth
+        // of 32, so this is the shortest chain it would draw empty.
+        let mut glyphs: Vec<Vec<u8>> = (1..=32u16).map(|i| composite_glyph(&[i])).collect();
+        glyphs.push(simple_glyph(4));
+        let font = fixture(&glyphs, cmap_format12(&[(0x41, 0x41, 0)]), Vec::new());
+        let face = Face::parse(&font, 0).unwrap();
+        let mut log = PointLog::default();
+        assert!(face.outline_glyph(GlyphId(0), &mut log).is_none());
+        refusal(&font);
+        // One level less draws, in both.
+        let mut glyphs: Vec<Vec<u8>> = (1..=31u16).map(|i| composite_glyph(&[i])).collect();
+        glyphs.push(simple_glyph(4));
+        let font = fixture(&glyphs, cmap_format12(&[(0x41, 0x41, 0)]), Vec::new());
+        let (a, b) = outline_pair(&font);
+        assert!(!a.is_empty());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn the_point_cap_holds_without_the_node_cap() {
+        // Fifty copies of a 200-point glyph: 51 visits, 10,000 points.
+        let glyphs = vec![composite_glyph(&[1; 50]), simple_glyph(200)];
+        let font = fixture(&glyphs, cmap_format12(&[(0x41, 0x41, 0)]), Vec::new());
+        let err = refusal(&font);
+        assert!(err.to_string().contains("expands to over"), "{err:#}");
+    }
+
+    #[test]
+    fn the_font_point_cap_is_reached_before_the_output() {
+        // 505 composites of one 8000-point glyph: 4.04M points, two visits each, 12 MB out.
+        let mut glyphs = vec![simple_glyph(8000)];
+        glyphs.extend((0..505).map(|_| composite_glyph(&[0])));
+        let font = fixture(&glyphs, cmap_format12(&[(0x41, 0x41, 0)]), Vec::new());
+        let err = refusal(&font);
+        assert!(err.to_string().contains("font outlines expand"), "{err:#}");
+    }
+
+    #[test]
+    fn the_font_node_cap_is_reached_with_no_points_at_all() {
+        // 60,000 composites of seventeen empty leaves: 1.08M visits, zero points.
+        let mut glyphs: Vec<Vec<u8>> = (0..60_000)
+            .map(|_| composite_glyph(&[60_000; 17]))
+            .collect();
+        glyphs.push(empty_glyph());
+        let font = fixture(&glyphs, cmap_format12(&[(0x41, 0x41, 0)]), Vec::new());
+        let err = refusal(&font);
+        assert!(
+            err.to_string().contains("font composites flatten"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn anchored_components_consume_their_arguments_and_match_points() {
+        // Component 1 is anchored (ARGS_ARE_XY_VALUES clear): its two argument bytes name the
+        // parent's point 2 and its own point 0. Component 2 is offset by (10, 20). Glyph 2's
+        // point 0 must land on glyph 1's point 2, and glyph 3 must still be read after it.
         let mut g = W::default();
         g.i16(-1);
         for _ in 0..4 {
             g.i16(0);
         }
-        g.u16(MORE_COMPONENTS); // no ARGS_ARE_XY_VALUES: no arguments follow
+        g.u16(ARGS_ARE_XY_VALUES | MORE_COMPONENTS);
         g.u16(1);
-        g.u16(ARGS_ARE_XY_VALUES);
+        g.u8(0);
+        g.u8(0);
+        g.u16(MORE_COMPONENTS); // anchored
         g.u16(2);
+        g.u8(2);
+        g.u8(0);
+        g.u16(ARGS_ARE_XY_VALUES);
+        g.u16(3);
         g.u8(10);
         g.u8(20);
         g.pad4();
-        let glyphs = vec![g.0, simple_glyph(8), simple_glyph(5)];
+        let glyphs = vec![g.0, simple_glyph(5), simple_glyph(4), simple_glyph(3)];
         let font = fixture(&glyphs, cmap_format12(&[(0x41, 0x41, 0)]), Vec::new());
-        let (a, b) = outline_pair(&font);
-        // Both components drawn: glyph 1's eight points and glyph 2's five, offset by (10, 20).
-        assert!(a.iter().filter(|p| p.0 == 'M').count() == 2, "{a:?}");
-        assert_eq!(a, b);
+        let face = Face::parse(&font, 0).unwrap();
+        let (rebuilt, _) = rebuild(&face, &[]).unwrap();
+        let rebuilt = Face::parse(&rebuilt, 0).unwrap();
+        let mut log = PointLog::default();
+        rebuilt.outline_glyph(GlyphId(0), &mut log);
+        let moves: Vec<(f32, f32)> = log
+            .0
+            .iter()
+            .filter(|p| p.0 == 'M')
+            .map(|p| (p.1, p.2))
+            .collect();
+        // simple_glyph(n) point i is (7i mod 600, 13i mod 700): glyph 1's point 2 is (14, 26).
+        assert_eq!(moves, vec![(0.0, 0.0), (14.0, 26.0), (10.0, 20.0)]);
     }
 
     #[test]
-    fn flattened_composites_match_ttf_parser() {
-        // A base with a scaled, offset accent: the transform path of the flattener.
-        let mut accent = W::default();
-        accent.i16(-1);
+    fn nested_transforms_compose_like_ttf_parser() {
+        // Three levels: a 2x2 at the top, an x/y scale with a negative byte offset below it,
+        // a uniform scale with word offsets at the bottom. Compared against ttf-parser's own
+        // walk of the original, so the order of composition is pinned.
+        let mut top = W::default();
+        top.i16(-1);
         for _ in 0..4 {
-            accent.i16(0);
+            top.i16(0);
         }
-        accent.u16(ARGS_ARE_XY_VALUES | ARG_1_AND_2_ARE_WORDS | MORE_COMPONENTS);
-        accent.u16(1);
-        accent.i16(0);
-        accent.i16(0);
-        accent.u16(ARGS_ARE_XY_VALUES | ARG_1_AND_2_ARE_WORDS | WE_HAVE_AN_X_AND_Y_SCALE);
-        accent.u16(1);
-        accent.i16(120);
-        accent.i16(300);
-        accent.i16(8192); // 0.5
-        accent.i16(-8192);
-        accent.pad4();
-        let glyphs = vec![accent.0, simple_glyph(9)];
+        top.u16(ARGS_ARE_XY_VALUES | ARG_1_AND_2_ARE_WORDS | WE_HAVE_A_TWO_BY_TWO);
+        top.u16(1);
+        top.i16(100);
+        top.i16(-40);
+        top.i16(0); // a = 0
+        top.i16(16384); // b = 1
+        top.i16(-16384); // c = -1
+        top.i16(0); // d = 0
+        top.pad4();
+        let mut mid = W::default();
+        mid.i16(-1);
+        for _ in 0..4 {
+            mid.i16(0);
+        }
+        mid.u16(ARGS_ARE_XY_VALUES | WE_HAVE_AN_X_AND_Y_SCALE);
+        mid.u16(2);
+        mid.u8((-30i8) as u8);
+        mid.u8(50);
+        mid.i16(8192); // 0.5
+        mid.i16(-8192);
+        mid.pad4();
+        let mut low = W::default();
+        low.i16(-1);
+        for _ in 0..4 {
+            low.i16(0);
+        }
+        low.u16(ARGS_ARE_XY_VALUES | ARG_1_AND_2_ARE_WORDS | WE_HAVE_A_SCALE);
+        low.u16(3);
+        low.i16(7);
+        low.i16(-9);
+        low.i16(24576); // 1.5
+        low.pad4();
+        let glyphs = vec![top.0, mid.0, low.0, simple_glyph(7)];
         let font = fixture(&glyphs, cmap_format12(&[(0x41, 0x41, 0)]), Vec::new());
         let (a, b) = outline_pair(&font);
         assert_eq!(a.len(), b.len());
-        assert!(a.len() > 9);
+        assert!(a.len() > 7);
         for (p, q) in a.iter().zip(&b) {
             assert_eq!(p.0, q.0);
             assert!(
@@ -1631,6 +1795,30 @@ pub(crate) mod tests {
                 "{p:?} vs {q:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_malformed_glyph_is_written_empty_not_refused() {
+        // Flags that run past the glyph's data: ttf-parser cannot outline it and skips it. A
+        // parent that uses it is empty too, as in ttf-parser.
+        let mut bad = W::default();
+        bad.i16(1);
+        for _ in 0..4 {
+            bad.i16(0);
+        }
+        bad.u16(9); // ten points
+        bad.u16(0);
+        bad.u8(ON_CURVE); // one flag, then nothing
+        bad.pad4();
+        let glyphs = vec![simple_glyph(4), bad.0, composite_glyph(&[1])];
+        let font = fixture(&glyphs, cmap_format12(&[(0x41, 0x43, 0)]), Vec::new());
+        let face = Face::parse(&font, 0).unwrap();
+        let (rebuilt, _) = rebuild(&face, &[]).unwrap();
+        let rebuilt = Face::parse(&rebuilt, 0).unwrap();
+        let mut log = PointLog::default();
+        assert!(rebuilt.outline_glyph(GlyphId(0), &mut log).is_some());
+        assert!(rebuilt.outline_glyph(GlyphId(1), &mut log).is_none());
+        assert!(rebuilt.outline_glyph(GlyphId(2), &mut log).is_none());
     }
 
     #[test]
