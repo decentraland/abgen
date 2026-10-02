@@ -492,17 +492,47 @@ fn size_glyphs(tables: &GlyfTables<'_>) -> Result<Vec<Sizing>> {
     Ok(memo)
 }
 
-/// A glyph's contours in its own space, composites flattened: each component's points go
-/// through its transform, with an anchored component moved so its matched point lands on the
-/// parent's. `None` when a glyph on the way is malformed, which empties the whole glyph as it
-/// does in `ttf-parser`. Bounded by [`size_glyphs`] having passed the glyph.
-fn flatten(tables: &GlyfTables<'_>, gid: usize) -> Result<Option<Vec<Vec<(f32, f32, bool)>>>> {
+/// A flattened glyph: every point in order, with the index one past each contour's end. One
+/// buffer per glyph, so an anchor is an index and a component costs its own points to copy.
+#[derive(Default)]
+struct Flat {
+    points: Vec<(f32, f32, bool)>,
+    ends: Vec<usize>,
+}
+
+impl Flat {
+    fn from_contours(contours: Vec<Vec<(f32, f32, bool)>>) -> Self {
+        let mut flat = Flat::default();
+        for c in contours {
+            flat.points.extend(c);
+            flat.ends.push(flat.points.len());
+        }
+        flat
+    }
+
+    fn into_contours(self) -> Vec<Vec<(f32, f32, bool)>> {
+        let mut out = Vec::with_capacity(self.ends.len());
+        let mut start = 0;
+        for end in self.ends {
+            out.push(self.points[start..end].to_vec());
+            start = end;
+        }
+        out
+    }
+}
+
+/// A glyph in its own space, composites flattened: each component's points go through its
+/// transform, with an anchored component moved so its matched point lands on the parent's.
+/// `None` when a glyph on the way is malformed, which empties the whole glyph as it does in
+/// `ttf-parser`. Bounded by [`size_glyphs`] having passed the glyph: the work is one copy of
+/// each point the glyph expands to, plus one index lookup per anchor.
+fn flatten(tables: &GlyfTables<'_>, gid: usize) -> Result<Option<Flat>> {
     let data = tables.glyph(gid);
     let components = GlyfTables::components(data)?;
     if components.is_empty() {
-        return Ok(GlyfTables::simple_contours(data));
+        return Ok(GlyfTables::simple_contours(data).map(Flat::from_contours));
     }
-    let mut out: Vec<Vec<(f32, f32, bool)>> = Vec::new();
+    let mut out = Flat::default();
     for c in components {
         if c.glyph as usize >= tables.glyphs {
             continue;
@@ -511,32 +541,29 @@ fn flatten(tables: &GlyfTables<'_>, gid: usize) -> Result<Option<Vec<Vec<(f32, f
             return Ok(None);
         };
         let t = c.transform;
-        let scaled: Vec<Vec<(f32, f32, bool)>> = child
-            .into_iter()
-            .map(|contour| {
-                contour
-                    .into_iter()
-                    .map(|(x, y, on)| (t.a * x + t.c * y, t.b * x + t.d * y, on))
-                    .collect()
-            })
-            .collect();
+        let first = out.points.len();
+        out.points.extend(
+            child
+                .points
+                .iter()
+                .map(|&(x, y, on)| (t.a * x + t.c * y, t.b * x + t.d * y, on)),
+        );
         let (e, f) = match c.anchor {
             None => (t.e, t.f),
-            Some((parent, child)) => {
-                let parent = out.iter().flatten().nth(parent as usize);
-                let child = scaled.iter().flatten().nth(child as usize);
-                match (parent, child) {
+            Some((parent, child_point)) => {
+                let parent = out.points[..first].get(parent as usize);
+                let child_point = out.points[first..].get(child_point as usize);
+                match (parent, child_point) {
                     (Some(p), Some(q)) => (p.0 - q.0, p.1 - q.1),
                     _ => (0.0, 0.0),
                 }
             }
         };
-        out.extend(scaled.into_iter().map(|contour| {
-            contour
-                .into_iter()
-                .map(|(x, y, on)| (x + e, y + f, on))
-                .collect()
-        }));
+        for p in &mut out.points[first..] {
+            p.0 += e;
+            p.1 += f;
+        }
+        out.ends.extend(child.ends.iter().map(|end| first + end));
     }
     Ok(Some(out))
 }
@@ -649,7 +676,7 @@ fn glyph_records(face: &Face<'_>) -> Result<Vec<GlyphRecord>> {
             let Some(raw) = flatten(&tables, gid)? else {
                 return Ok(empty(gid));
             };
-            let contours = to_points(&raw)?;
+            let contours = to_points(&raw.into_contours())?;
             let (data, bbox) = encode_glyph(&contours);
             Ok(GlyphRecord {
                 data,
@@ -1795,6 +1822,18 @@ pub(crate) mod tests {
                 "{p:?} vs {q:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_component_shorter_than_its_header_is_empty_and_its_parent_still_draws() {
+        // ttf-parser 0.25 reads a six-byte glyph as empty and keeps the composite's other
+        // components; the rebuild does the same.
+        let stub = vec![0u8; 6];
+        let glyphs = vec![composite_glyph(&[1, 2]), stub, simple_glyph(4)];
+        let font = fixture(&glyphs, cmap_format12(&[(0x41, 0x41, 0)]), Vec::new());
+        let (a, b) = outline_pair(&font);
+        assert!(!a.is_empty());
+        assert_eq!(a, b);
     }
 
     #[test]
