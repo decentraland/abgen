@@ -225,7 +225,7 @@ pub fn render_cost(o: &Outline, padding: u32, gradient_scale: f64) -> u64 {
 ///
 /// A texel a full gradient scale from the outline already saturates the byte, so each segment
 /// only visits the texels within that spread of it, and every byte comes out as it would from
-/// the distance to every segment. Inside and outside follow the nonzero winding rule both TrueType and CFF
+/// the distance to every segment. Inside and outside follow the nonzero winding rule TrueType
 /// outlines use, resolved once per row from the sorted edge crossings.
 pub fn render(o: &Outline, padding: u32, gradient_scale: f64) -> (Vec<u8>, u32, u32) {
     let (ox, oy, fw, fh) = field_box(o, padding);

@@ -636,6 +636,11 @@ impl<'a> Default for BuildOpts<'a> {
     }
 }
 
+fn is_font_input(bytes: &[u8], opts: &BuildOpts<'_>) -> bool {
+    crate::fontgen::is_font_file(bytes)
+        && opts.source_file.is_some_and(crate::fontgen::is_font_path)
+}
+
 pub fn build_bundle(
     bytes: &[u8],
     bundle_name: &str,
@@ -654,7 +659,9 @@ pub fn build_bundle(
         ".glb"
     };
 
-    if crate::fontgen::is_font_file(bytes) {
+    // By path and by content: font bytes under an image name stay on the image lane, where
+    // the decode gate and the manifest treat them as the image they claim to be.
+    if is_font_input(bytes, opts) {
         let mut out = font::build_font_bundles(bytes, &[bundle_name.to_string()], root_hash, opts)?;
         return Ok(out.remove(0));
     }
@@ -837,7 +844,7 @@ pub fn build_bundle_multi(
         ".glb"
     };
 
-    if crate::fontgen::is_font_file(bytes) {
+    if is_font_input(bytes, opts) {
         return font::build_font_bundles(bytes, bundle_names, root_hash, opts);
     }
 

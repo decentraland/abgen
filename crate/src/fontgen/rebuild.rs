@@ -16,19 +16,36 @@
 //! Hinting programs, variation data, colour and bitmap glyphs, layout rules other than kerning,
 //! and any table this file does not name are dropped. Glyph ids are kept, so the pre-filled
 //! assets and the rebuilt font agree on them.
+//!
+//! Every walk over the source is bounded before it starts: composite glyphs are sized from the
+//! `glyf` component graph before any outline is expanded, and `cmap` ranges are clamped and
+//! budgeted before any code point is visited. A font past a bound is [`Refused`](super::Refused).
 
 use super::kerning::KernPair;
 use super::{MAX_FONT_BYTES, MAX_GLYPH_POINTS};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
-use ttf_parser::{name_id, Face, GlyphId, OutlineBuilder};
+use ttf_parser::{name_id, Face, GlyphId, OutlineBuilder, Tag};
 
 /// Outline points across every glyph of the font, composites expanded. Bounds the rebuild the
 /// way [`MAX_GLYPH_POINTS`] bounds one glyph.
 pub const MAX_FONT_POINTS: usize = 4_000_000;
 
+/// Components one composite glyph may reference directly. Real composites reference a handful.
+pub const MAX_GLYPH_COMPONENTS: usize = 64;
+
+/// Composite nesting the rebuild follows: `ttf-parser`'s own ceiling.
+const MAX_COMPOSITE_DEPTH: usize = 32;
+
+/// Encoding records a `cmap` may hold. Real fonts have two to four.
+pub const MAX_CMAP_SUBTABLES: usize = 32;
+
+/// Code points the `cmap` walk visits across every subtable: every Unicode scalar twice, which
+/// covers a full-repertoire font carrying both a BMP and a full-range subtable.
+pub const MAX_CMAP_CODEPOINTS: usize = 2 * 0x11_0000;
+
 /// Coordinates are re-encoded as 16-bit deltas, so they must stay within half the range.
-const MAX_COORDINATE: i32 = 16383;
+const MAX_COORDINATE: f32 = 16383.0;
 
 /// Characters a name record keeps.
 const MAX_NAME_CHARS: usize = 63;
@@ -41,6 +58,12 @@ const X_SHORT: u8 = 0x02;
 const Y_SHORT: u8 = 0x04;
 const X_SAME_OR_POSITIVE: u8 = 0x10;
 const Y_SAME_OR_POSITIVE: u8 = 0x20;
+
+const ARG_1_AND_2_ARE_WORDS: u16 = 0x0001;
+const WE_HAVE_A_SCALE: u16 = 0x0008;
+const MORE_COMPONENTS: u16 = 0x0020;
+const WE_HAVE_AN_X_AND_Y_SCALE: u16 = 0x0040;
+const WE_HAVE_A_TWO_BY_TWO: u16 = 0x0080;
 
 #[derive(Default)]
 struct W(Vec<u8>);
@@ -80,6 +103,160 @@ impl W {
     }
 }
 
+fn be_u16(data: &[u8], at: usize) -> Option<u16> {
+    data.get(at..at + 2)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]))
+}
+
+fn be_i16(data: &[u8], at: usize) -> Option<i16> {
+    be_u16(data, at).map(|v| v as i16)
+}
+
+fn be_u32(data: &[u8], at: usize) -> Option<u32> {
+    data.get(at..at + 4)
+        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// The source's `glyf` and `loca` tables, read raw to size composites before expanding them.
+struct GlyfTables<'a> {
+    glyf: &'a [u8],
+    loca: &'a [u8],
+    long_offsets: bool,
+}
+
+impl<'a> GlyfTables<'a> {
+    fn of(face: &Face<'a>) -> Option<Self> {
+        let raw = face.raw_face();
+        Some(GlyfTables {
+            glyf: raw.table(Tag::from_bytes(b"glyf"))?,
+            loca: raw.table(Tag::from_bytes(b"loca"))?,
+            long_offsets: matches!(
+                face.tables().head.index_to_location_format,
+                ttf_parser::head::IndexToLocationFormat::Long
+            ),
+        })
+    }
+
+    fn glyph(&self, gid: usize) -> Option<&'a [u8]> {
+        let (start, end) = if self.long_offsets {
+            (
+                be_u32(self.loca, 4 * gid)? as usize,
+                be_u32(self.loca, 4 * gid + 4)? as usize,
+            )
+        } else {
+            (
+                be_u16(self.loca, 2 * gid)? as usize * 2,
+                be_u16(self.loca, 2 * gid + 2)? as usize * 2,
+            )
+        };
+        (start <= end).then(|| self.glyf.get(start..end)).flatten()
+    }
+
+    /// The glyph ids a composite glyph references, in order; empty for a simple glyph.
+    fn components(&self, data: &[u8]) -> Result<Vec<u16>> {
+        if be_i16(data, 0).is_none_or(|n| n >= 0) {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let mut at = 10;
+        while let (Some(flags), Some(gid)) = (be_u16(data, at), be_u16(data, at + 2)) {
+            out.push(gid);
+            if out.len() > MAX_GLYPH_COMPONENTS {
+                refuse!("a composite glyph references over {MAX_GLYPH_COMPONENTS} components");
+            }
+            at += 4 + if flags & ARG_1_AND_2_ARE_WORDS != 0 {
+                4
+            } else {
+                2
+            };
+            at += if flags & WE_HAVE_A_SCALE != 0 {
+                2
+            } else if flags & WE_HAVE_AN_X_AND_Y_SCALE != 0 {
+                4
+            } else if flags & WE_HAVE_A_TWO_BY_TWO != 0 {
+                8
+            } else {
+                0
+            };
+            if flags & MORE_COMPONENTS == 0 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Points a simple glyph stores: one past its last contour end.
+    fn simple_points(data: &[u8]) -> usize {
+        match be_i16(data, 0) {
+            Some(n) if n > 0 => {
+                be_u16(data, 10 + 2 * (n as usize - 1)).map_or(0, |e| e as usize + 1)
+            }
+            _ => 0,
+        }
+    }
+}
+
+/// Points each glyph expands to once composites are flattened, from the component graph alone,
+/// before any outline is built. Counts saturate just past [`MAX_GLYPH_POINTS`].
+fn expanded_points(face: &Face<'_>) -> Result<Vec<usize>> {
+    let n = face.number_of_glyphs() as usize;
+    let Some(tables) = GlyfTables::of(face) else {
+        return Ok(vec![0; n]);
+    };
+    const UNVISITED: usize = usize::MAX;
+    const IN_PROGRESS: usize = usize::MAX - 1;
+    let cap = MAX_GLYPH_POINTS + 1;
+    let mut memo = vec![UNVISITED; n];
+
+    fn visit(
+        tables: &GlyfTables<'_>,
+        gid: usize,
+        depth: usize,
+        memo: &mut [usize],
+        cap: usize,
+    ) -> Result<usize> {
+        if gid >= memo.len() {
+            return Ok(0);
+        }
+        match memo[gid] {
+            IN_PROGRESS => refuse!("glyph {gid} is a composite of itself"),
+            UNVISITED => {}
+            done => return Ok(done),
+        }
+        if depth > MAX_COMPOSITE_DEPTH {
+            refuse!("composite glyphs nest deeper than {MAX_COMPOSITE_DEPTH}");
+        }
+        memo[gid] = IN_PROGRESS;
+        let data = tables.glyph(gid).unwrap_or(&[]);
+        let components = tables.components(data)?;
+        let mut points = if components.is_empty() {
+            GlyfTables::simple_points(data)
+        } else {
+            0
+        };
+        for c in components {
+            points = points
+                .saturating_add(visit(tables, c as usize, depth + 1, memo, cap)?)
+                .min(cap);
+        }
+        memo[gid] = points;
+        Ok(points)
+    }
+
+    let mut total = 0usize;
+    for gid in 0..n {
+        let points = visit(&tables, gid, 0, &mut memo, cap)?;
+        if points > MAX_GLYPH_POINTS {
+            refuse!("glyph {gid} expands to over {MAX_GLYPH_POINTS} outline points");
+        }
+        total += points;
+        if total > MAX_FONT_POINTS {
+            refuse!("font outlines expand to over {MAX_FONT_POINTS} points");
+        }
+    }
+    Ok(memo)
+}
+
 /// A glyph's contours in font units, as `ttf-parser` walks them: `(x, y, on_curve)`.
 #[derive(Default)]
 struct Contours {
@@ -91,6 +268,13 @@ struct Contours {
 impl Contours {
     fn push(&mut self, x: f32, y: f32, on: bool) {
         self.points += 1;
+        // The component graph was sized first, so this only ever holds for a glyph the sizing
+        // could not see; it bounds memory while the outline runs to its end.
+        if self.points > MAX_GLYPH_POINTS {
+            self.error
+                .get_or_insert("more outline points than the component graph declared");
+            return;
+        }
         match self.contours.last_mut() {
             Some(c) => c.push((x, y, on)),
             None => self.error = Some("outline does not start with a move"),
@@ -121,11 +305,16 @@ impl Contours {
                     continue;
                 }
                 let (x, y, on) = c[i];
-                let (x, y) = (x.round() as i32, y.round() as i32);
-                if x.abs() > MAX_COORDINATE || y.abs() > MAX_COORDINATE {
+                // Checked as floats: nested composite scales can push a value past what the
+                // integer cast would saturate to.
+                if !x.is_finite()
+                    || !y.is_finite()
+                    || x.abs() > MAX_COORDINATE
+                    || y.abs() > MAX_COORDINATE
+                {
                     return Err("coordinate out of range");
                 }
-                contour.push((x, y, on));
+                contour.push((x.round() as i32, y.round() as i32, on));
             }
             if !contour.is_empty() {
                 out.push(contour);
@@ -225,27 +414,24 @@ fn encode_glyph(contours: &[Vec<(i32, i32, bool)>]) -> (Vec<u8>, Option<(i32, i3
 }
 
 fn glyph_records(face: &Face<'_>) -> Result<Vec<GlyphRecord>> {
-    let mut total = 0usize;
+    // Sized from the component graph before any glyph is expanded.
+    expanded_points(face)?;
     (0..face.number_of_glyphs())
         .map(|gid| {
             let gid = GlyphId(gid);
             let mut c = Contours::default();
-            face.outline_glyph(gid, &mut c);
-            if c.points > MAX_GLYPH_POINTS {
-                bail!(
-                    "glyph {} has {} outline points, over {MAX_GLYPH_POINTS}",
-                    gid.0,
-                    c.points
-                );
-            }
-            total += c.points;
-            if total > MAX_FONT_POINTS {
-                bail!("font outlines exceed {MAX_FONT_POINTS} points");
+            // A glyph `ttf-parser` cannot outline whole is written empty, not from the part
+            // it managed.
+            if face.outline_glyph(gid, &mut c).is_none() {
+                c.contours.clear();
             }
             if let Some(e) = c.error {
-                bail!("glyph {}: {e}", gid.0);
+                refuse!("glyph {}: {e}", gid.0);
             }
-            let contours = c.to_points().map_err(|e| anyhow!("glyph {}: {e}", gid.0))?;
+            let contours = match c.to_points() {
+                Ok(c) => c,
+                Err(e) => refuse!("glyph {}: {e}", gid.0),
+            };
             let (data, bbox) = encode_glyph(&contours);
             Ok(GlyphRecord {
                 data,
@@ -258,22 +444,111 @@ fn glyph_records(face: &Face<'_>) -> Result<Vec<GlyphRecord>> {
         .collect()
 }
 
-/// The Unicode mappings the face resolves, as `ttf-parser` picks among its subtables.
-fn unicode_map(face: &Face<'_>) -> BTreeMap<u32, u16> {
-    let mut codepoints = Vec::new();
-    if let Some(cmap) = face.tables().cmap {
-        for subtable in cmap.subtables.into_iter().filter(|s| s.is_unicode()) {
-            subtable.codepoints(|cp| codepoints.push(cp));
+/// Whether the `cmap` holds few enough encoding records for every lookup through it to stay
+/// cheap: `ttf-parser` tries each unicode record on every `glyph_index`.
+pub(super) fn cmap_records_bounded(face: &Face<'_>) -> bool {
+    face.raw_face()
+        .table(Tag::from_bytes(b"cmap"))
+        .and_then(|raw| be_u16(raw, 2))
+        .is_none_or(|count| count as usize <= MAX_CMAP_SUBTABLES)
+}
+
+/// The code point ranges a `cmap` subtable declares, read raw so each can be clamped before it
+/// is walked. Formats with no plain ranges (2, 14) map nothing here.
+fn subtable_ranges(data: &[u8]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    match be_u16(data, 0) {
+        Some(0) => out.push((0, 255)),
+        Some(4) => {
+            let seg_count = be_u16(data, 6).unwrap_or(0) as usize / 2;
+            let ends = 14;
+            let starts = ends + 2 * seg_count + 2;
+            for i in 0..seg_count {
+                if let (Some(start), Some(end)) =
+                    (be_u16(data, starts + 2 * i), be_u16(data, ends + 2 * i))
+                {
+                    out.push((start as u32, end as u32));
+                }
+            }
         }
+        Some(6) => {
+            if let (Some(first), Some(count)) = (be_u16(data, 6), be_u16(data, 8)) {
+                out.push((first as u32, first as u32 + count.saturating_sub(1) as u32));
+            }
+        }
+        Some(10) => {
+            if let (Some(start), Some(count)) = (be_u32(data, 12), be_u32(data, 16)) {
+                out.push((start, start.saturating_add(count.saturating_sub(1))));
+            }
+        }
+        Some(12) | Some(13) => {
+            let groups = be_u32(data, 12).unwrap_or(0) as usize;
+            for i in 0..groups {
+                let at = 16 + 12 * i;
+                match (be_u32(data, at), be_u32(data, at + 4)) {
+                    (Some(start), Some(end)) => out.push((start, end)),
+                    _ => break,
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// The Unicode mappings the face resolves, as `ttf-parser` picks among its subtables: the
+/// first unicode subtable mapping a code point wins. Each subtable is walked over its own
+/// declared ranges, clamped to Unicode, under [`MAX_CMAP_CODEPOINTS`] for the whole font.
+fn unicode_map(face: &Face<'_>) -> Result<BTreeMap<u32, u16>> {
+    let mut map = BTreeMap::new();
+    let raw = face.raw_face().table(Tag::from_bytes(b"cmap"));
+    let (Some(raw), Some(cmap)) = (raw, face.tables().cmap) else {
+        return Ok(map);
+    };
+    let records = be_u16(raw, 2).unwrap_or(0) as usize;
+    if records > MAX_CMAP_SUBTABLES {
+        refuse!("cmap has {records} encoding records, over {MAX_CMAP_SUBTABLES}");
     }
     let glyphs = face.number_of_glyphs();
-    codepoints
-        .into_iter()
-        .filter_map(|cp| {
-            let gid = face.glyph_index(char::from_u32(cp)?)?;
-            (gid.0 != 0 && gid.0 < glyphs).then_some((cp, gid.0))
-        })
-        .collect()
+    let mut budget = MAX_CMAP_CODEPOINTS;
+    let mut seen = Vec::new();
+    for (i, subtable) in cmap.subtables.into_iter().enumerate() {
+        if !subtable.is_unicode() {
+            continue;
+        }
+        let Some(offset) = be_u32(raw, 4 + 8 * i + 4) else {
+            break;
+        };
+        if seen.contains(&offset) {
+            continue;
+        }
+        seen.push(offset);
+        let Some(data) = raw.get(offset as usize..) else {
+            continue;
+        };
+        for (lo, hi) in subtable_ranges(data) {
+            let hi = hi.min(0x10_FFFF);
+            if lo > hi {
+                continue;
+            }
+            let span = (hi - lo) as usize + 1;
+            if span > budget {
+                refuse!("cmap ranges cover over {MAX_CMAP_CODEPOINTS} code points");
+            }
+            budget -= span;
+            for cp in lo..=hi {
+                if char::from_u32(cp).is_none() {
+                    continue;
+                }
+                if let Some(gid) = subtable.glyph_index(cp) {
+                    if gid.0 != 0 && gid.0 < glyphs {
+                        map.entry(cp).or_insert(gid.0);
+                    }
+                }
+            }
+        }
+    }
+    Ok(map)
 }
 
 /// Runs of consecutive code points mapped to consecutive glyphs: `(first cp, last cp, first gid)`.
@@ -430,8 +705,9 @@ fn name_table(face: &Face<'_>) -> Vec<u8> {
 }
 
 /// One `kern` feature over a single pair-positioning lookup, for both the default and Latin
-/// scripts. Pairs that do not fit the subtable's 16-bit offsets are dropped smallest first.
-fn gpos_table(pairs: &[KernPair]) -> Option<Vec<u8>> {
+/// scripts, with the pairs it holds. Pairs that do not fit the subtable's 16-bit offsets are
+/// dropped smallest first, so the caller writes the same pairs into the font assets.
+fn gpos_table(pairs: &[KernPair]) -> Option<(Vec<u8>, Vec<KernPair>)> {
     let mut kept: Vec<KernPair> = pairs.to_vec();
     kept.sort_by_key(|p| std::cmp::Reverse(p.x_advance.unsigned_abs()));
     let header = 10 + 2 + 2 * 26 + 2 + 6 + 2 + 2 + 6 + 8;
@@ -528,7 +804,7 @@ fn gpos_table(pairs: &[KernPair]) -> Option<Vec<u8>> {
     w.u16(1);
     w.u16(8);
     w.bytes(&pp.0);
-    (w.len() <= MAX_GPOS_BYTES).then_some(w.0)
+    (w.len() <= MAX_GPOS_BYTES).then_some((w.0, kept))
 }
 
 fn checksum(data: &[u8]) -> u32 {
@@ -539,15 +815,51 @@ fn checksum(data: &[u8]) -> u32 {
     })
 }
 
-/// Rewrites `face` as a TrueType file of regenerated tables, kerned by `pairs`.
-pub fn rebuild(face: &Face<'_>, pairs: &[KernPair]) -> Result<Vec<u8>> {
+/// An sfnt file over `tables`: the sorted directory, each table padded to four bytes, and
+/// `head`'s checksum adjustment set so the whole file sums to the magic.
+fn assemble(mut tables: Vec<([u8; 4], Vec<u8>)>) -> Vec<u8> {
+    tables.sort_by_key(|t| t.0);
+    let n = tables.len() as u16;
+    let search = 16 * (1u16 << (n as f64).log2().floor() as u16);
+    let mut font = W::default();
+    font.u32(0x0001_0000);
+    font.u16(n);
+    font.u16(search);
+    font.u16((search / 16).trailing_zeros() as u16);
+    font.u16(n * 16 - search);
+    let mut offset = 12 + 16 * tables.len();
+    let mut head_at = None;
+    for (tag, data) in &tables {
+        font.bytes(tag);
+        font.u32(checksum(data));
+        font.u32(offset as u32);
+        font.u32(data.len() as u32);
+        if tag == b"head" {
+            head_at = Some(offset);
+        }
+        offset += data.len().div_ceil(4) * 4;
+    }
+    for (_, data) in &tables {
+        font.bytes(data);
+        font.pad4();
+    }
+    if let Some(head_at) = head_at {
+        let adjustment = 0xB1B0_AFBAu32.wrapping_sub(checksum(&font.0));
+        font.0[head_at + 8..head_at + 12].copy_from_slice(&adjustment.to_be_bytes());
+    }
+    font.0
+}
+
+/// Rewrites `face` as a TrueType file of regenerated tables, kerned by as many of `pairs` as
+/// the GPOS can hold; returns the file and the pairs it kept.
+pub fn rebuild(face: &Face<'_>, pairs: &[KernPair]) -> Result<(Vec<u8>, Vec<KernPair>)> {
     let glyphs = glyph_records(face)?;
     let num_glyphs = glyphs.len();
     if num_glyphs == 0 {
-        bail!("font has no glyphs");
+        refuse!("font has no glyphs");
     }
     let upem = face.units_per_em();
-    let map = unicode_map(face);
+    let map = unicode_map(face)?;
 
     let mut glyf = W::default();
     let mut loca = W::default();
@@ -595,7 +907,7 @@ pub fn rebuild(face: &Face<'_>, pairs: &[KernPair]) -> Result<Vec<u8>> {
     let mut head = W::default();
     head.u32(0x0001_0000);
     head.u32(0x0001_0000);
-    head.u32(0); // checkSumAdjustment, patched
+    head.u32(0); // checkSumAdjustment, set by `assemble`
     head.u32(0x5F0F_3CF5);
     head.u16(0x0009); // baseline at y=0, integer ppem
     head.u16(upem);
@@ -749,49 +1061,25 @@ pub fn rebuild(face: &Face<'_>, pairs: &[KernPair]) -> Result<Vec<u8>> {
         (*b"name", name_table(face)),
         (*b"post", post.0),
     ];
-    if let Some(gpos) = gpos_table(pairs) {
-        out_tables.push((*b"GPOS", gpos));
-    }
-    out_tables.sort_by_key(|t| t.0);
-
-    let n = out_tables.len() as u16;
-    let search = 16 * (1u16 << (n as f64).log2().floor() as u16);
-    let mut font = W::default();
-    font.u32(0x0001_0000);
-    font.u16(n);
-    font.u16(search);
-    font.u16((search / 16).trailing_zeros() as u16);
-    font.u16(n * 16 - search);
-    let mut offset = 12 + 16 * out_tables.len();
-    let mut head_at = 0usize;
-    for (tag, data) in &out_tables {
-        font.bytes(tag);
-        font.u32(checksum(data));
-        font.u32(offset as u32);
-        font.u32(data.len() as u32);
-        if tag == b"head" {
-            head_at = offset;
+    let kept = match gpos_table(pairs) {
+        Some((gpos, kept)) => {
+            out_tables.push((*b"GPOS", gpos));
+            kept
         }
-        offset += data.len().div_ceil(4) * 4;
-    }
-    for (_, data) in &out_tables {
-        font.bytes(data);
-        font.pad4();
-    }
-    let adjustment = 0xB1B0_AFBAu32.wrapping_sub(checksum(&font.0));
-    font.0[head_at + 8..head_at + 12].copy_from_slice(&adjustment.to_be_bytes());
-
+        None => Vec::new(),
+    };
+    let font = assemble(out_tables);
     if font.len() > MAX_FONT_BYTES {
         return Err(anyhow!(
             "rebuilt font is {} bytes, over the {MAX_FONT_BYTES}-byte cap",
             font.len()
         ));
     }
-    Ok(font.0)
+    Ok((font, kept))
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -806,5 +1094,232 @@ mod tests {
     #[test]
     fn checksum_pads_the_last_word() {
         assert_eq!(checksum(&[0, 0, 0, 1, 0, 0, 1]), 1 + 256);
+    }
+
+    /// A simple glyph of `n` points on one contour.
+    pub fn simple_glyph(n: usize) -> Vec<u8> {
+        let contour: Vec<(i32, i32, bool)> = (0..n as i32)
+            .map(|i| (i * 7 % 600, i * 13 % 700, true))
+            .collect();
+        encode_glyph(&[contour]).0
+    }
+
+    /// A composite glyph of `components`, each placed at the origin.
+    pub fn composite_glyph(components: &[u16]) -> Vec<u8> {
+        let mut w = W::default();
+        w.i16(-1);
+        for _ in 0..4 {
+            w.i16(0);
+        }
+        for (i, &gid) in components.iter().enumerate() {
+            let more = if i + 1 < components.len() {
+                MORE_COMPONENTS
+            } else {
+                0
+            };
+            w.u16(0x0002 | more); // ARGS_ARE_XY_VALUES
+            w.u16(gid);
+            w.u8(0);
+            w.u8(0);
+        }
+        w.pad4();
+        w.0
+    }
+
+    /// A `cmap` with one format 12 subtable of the given groups `(start, end, start glyph)`.
+    pub fn cmap_format12(groups: &[(u32, u32, u32)]) -> Vec<u8> {
+        let mut w = W::default();
+        w.u16(0);
+        w.u16(1);
+        w.u16(3);
+        w.u16(10);
+        w.u32(12);
+        w.u16(12);
+        w.u16(0);
+        w.u32((16 + 12 * groups.len()) as u32);
+        w.u32(0);
+        w.u32(groups.len() as u32);
+        for &(s, e, g) in groups {
+            w.u32(s);
+            w.u32(e);
+            w.u32(g);
+        }
+        w.0
+    }
+
+    /// A TrueType file of `glyphs` with 1000 units per em, 600-unit advances, the given `cmap`
+    /// and any `extra` tables.
+    pub fn fixture(glyphs: &[Vec<u8>], cmap: Vec<u8>, extra: Vec<([u8; 4], Vec<u8>)>) -> Vec<u8> {
+        let n = glyphs.len();
+        let mut head = W::default();
+        head.u32(0x0001_0000);
+        head.u32(0x0001_0000);
+        head.u32(0);
+        head.u32(0x5F0F_3CF5);
+        head.u16(0x0009);
+        head.u16(1000);
+        head.i64(0);
+        head.i64(0);
+        for _ in 0..4 {
+            head.i16(0);
+        }
+        head.u16(0);
+        head.u16(8);
+        head.i16(2);
+        head.i16(1); // long loca offsets
+        head.i16(0);
+
+        let mut hhea = W::default();
+        hhea.u32(0x0001_0000);
+        hhea.i16(800);
+        hhea.i16(-200);
+        hhea.i16(0);
+        hhea.u16(600);
+        hhea.i16(0);
+        hhea.i16(0);
+        hhea.i16(600);
+        hhea.i16(1);
+        for _ in 0..7 {
+            hhea.i16(0);
+        }
+        hhea.u16(n as u16);
+
+        let mut maxp = W::default();
+        maxp.u32(0x0001_0000);
+        maxp.u16(n as u16);
+        maxp.u16(u16::MAX);
+        maxp.u16(1);
+        maxp.u16(u16::MAX);
+        maxp.u16(1);
+        maxp.u16(1);
+        for _ in 0..8 {
+            maxp.u16(0);
+        }
+
+        let mut hmtx = W::default();
+        for _ in 0..n {
+            hmtx.u16(600);
+            hmtx.i16(0);
+        }
+
+        let (mut glyf, mut loca) = (W::default(), W::default());
+        for g in glyphs {
+            loca.u32(glyf.len() as u32);
+            glyf.bytes(g);
+            glyf.pad4();
+        }
+        loca.u32(glyf.len() as u32);
+
+        let mut tables = vec![
+            (*b"cmap", cmap),
+            (*b"glyf", glyf.0),
+            (*b"head", head.0),
+            (*b"hhea", hhea.0),
+            (*b"hmtx", hmtx.0),
+            (*b"loca", loca.0),
+            (*b"maxp", maxp.0),
+        ];
+        tables.extend(extra);
+        assemble(tables)
+    }
+
+    fn is_refused(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<super::super::Refused>().is_some()
+    }
+
+    #[test]
+    fn a_composite_bomb_is_refused_before_it_expands() {
+        // Glyph i is two copies of glyph i+1; the last is 100 points. Flattened, glyph 0 would
+        // hold 100 << 30 points.
+        let mut glyphs: Vec<Vec<u8>> = (0..30u16)
+            .map(|i| composite_glyph(&[i + 1, i + 1]))
+            .collect();
+        glyphs.push(simple_glyph(100));
+        let font = fixture(&glyphs, cmap_format12(&[(0x41, 0x41, 0)]), Vec::new());
+        let face = Face::parse(&font, 0).unwrap();
+        let err = rebuild(&face, &[]).unwrap_err();
+        assert!(is_refused(&err), "{err:#}");
+        assert!(err.to_string().contains("expands to over"), "{err:#}");
+    }
+
+    #[test]
+    fn a_composite_cycle_is_refused() {
+        let glyphs = vec![composite_glyph(&[1]), composite_glyph(&[0])];
+        let font = fixture(&glyphs, cmap_format12(&[(0x41, 0x41, 0)]), Vec::new());
+        let face = Face::parse(&font, 0).unwrap();
+        let err = rebuild(&face, &[]).unwrap_err();
+        assert!(is_refused(&err), "{err:#}");
+    }
+
+    #[test]
+    fn a_cmap_group_over_all_code_points_is_clamped() {
+        let glyphs = vec![Vec::new(), simple_glyph(4)];
+        let font = fixture(
+            &glyphs,
+            cmap_format12(&[(0x41, 0xFFFF_FFFF, 1)]),
+            Vec::new(),
+        );
+        let face = Face::parse(&font, 0).unwrap();
+        let (rebuilt, _) = rebuild(&face, &[]).unwrap();
+        let rebuilt = Face::parse(&rebuilt, 0).unwrap();
+        assert_eq!(rebuilt.glyph_index('A'), Some(GlyphId(1)));
+        // 'B' would be glyph 2, which the font does not have.
+        assert_eq!(rebuilt.glyph_index('B'), None);
+    }
+
+    #[test]
+    fn cmap_ranges_past_the_budget_are_refused() {
+        let glyphs = vec![Vec::new(), simple_glyph(4)];
+        let groups: Vec<(u32, u32, u32)> = (0..3).map(|_| (0, 0x10_FFFF, 1)).collect();
+        // Three full-range groups in one subtable: 3 × 0x110000 visits, over the budget.
+        let font = fixture(&glyphs, cmap_format12(&groups), Vec::new());
+        let face = Face::parse(&font, 0).unwrap();
+        let err = rebuild(&face, &[]).unwrap_err();
+        assert!(is_refused(&err), "{err:#}");
+    }
+
+    #[test]
+    fn too_many_cmap_records_are_refused() {
+        let glyphs = vec![Vec::new(), simple_glyph(4)];
+        let mut cmap = W::default();
+        cmap.u16(0);
+        cmap.u16(40);
+        for _ in 0..40 {
+            cmap.u16(3);
+            cmap.u16(10);
+            cmap.u32(4 + 8 * 40);
+        }
+        cmap.u16(12);
+        cmap.u16(0);
+        cmap.u32(16);
+        cmap.u32(0);
+        cmap.u32(0);
+        let font = fixture(&glyphs, cmap.0, Vec::new());
+        let face = Face::parse(&font, 0).unwrap();
+        assert!(!cmap_records_bounded(&face));
+        let err = rebuild(&face, &[]).unwrap_err();
+        assert!(is_refused(&err), "{err:#}");
+    }
+
+    #[test]
+    fn the_rebuilt_file_checksums_like_an_sfnt() {
+        let glyphs = vec![Vec::new(), simple_glyph(12), simple_glyph(5)];
+        let font = fixture(&glyphs, cmap_format12(&[(0x41, 0x42, 1)]), Vec::new());
+        let face = Face::parse(&font, 0).unwrap();
+        let (rebuilt, _) = rebuild(&face, &[]).unwrap();
+        assert_eq!(checksum(&rebuilt), 0xB1B0_AFBA);
+        let count = be_u16(&rebuilt, 4).unwrap() as usize;
+        for i in 0..count {
+            let at = 12 + 16 * i;
+            let tag = &rebuilt[at..at + 4];
+            let sum = be_u32(&rebuilt, at + 4).unwrap();
+            let off = be_u32(&rebuilt, at + 8).unwrap() as usize;
+            let len = be_u32(&rebuilt, at + 12).unwrap() as usize;
+            let mut data = rebuilt[off..off + len].to_vec();
+            if tag == b"head" {
+                data[8..12].copy_from_slice(&[0; 4]);
+            }
+            assert_eq!(checksum(&data), sum, "{}", String::from_utf8_lossy(tag));
+        }
     }
 }

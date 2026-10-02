@@ -738,7 +738,7 @@ mod tests {
         use ttf_parser::{Face, GlyphId};
         let original_bytes = template_font();
         let original = Face::parse(&original_bytes, 0).unwrap();
-        let rebuilt_bytes = fontgen::rebuild::rebuild(&original, &[]).unwrap();
+        let (rebuilt_bytes, _) = fontgen::rebuild::rebuild(&original, &[]).unwrap();
         let rebuilt = Face::parse(&rebuilt_bytes, 0).unwrap();
 
         assert_eq!(rebuilt.number_of_glyphs(), original.number_of_glyphs());
@@ -811,7 +811,11 @@ mod tests {
             },
         ];
         pairs.sort_by_key(|p| (p.first, p.second));
-        let rebuilt_bytes = fontgen::rebuild::rebuild(&original, &pairs).unwrap();
+        let (rebuilt_bytes, kept) = fontgen::rebuild::rebuild(&original, &pairs).unwrap();
+        assert_eq!(
+            kept, pairs,
+            "every pair fit, so the assets and the GPOS hold the same"
+        );
         let rebuilt = Face::parse(&rebuilt_bytes, 0).unwrap();
         let glyphs = ['A', 'V', 'T', 'o'].map(gid);
         let mut read = kerning::pairs(&rebuilt, &glyphs);
@@ -840,6 +844,35 @@ mod tests {
             .unwrap();
         assert_ne!(embedded, upload);
         assert!(fontgen::is_supported(&embedded));
+    }
+
+    #[test]
+    fn the_font_template_round_trips_through_the_format_23_writer() {
+        use crate::unity::serialized_file::SerializedFile;
+        let bundle = read_template_bundle(FONT_TYPES_TEMPLATE).unwrap();
+        let sf = bundle.serialized().unwrap();
+        assert_eq!(sf.version, 23);
+        let again = SerializedFile::parse(&sf.save()).unwrap();
+        assert_eq!(again.version, 23);
+        assert_eq!(again.unity_version, sf.unity_version);
+        assert_eq!(again.types.len(), sf.types.len());
+        for (a, b) in again.types.iter().zip(&sf.types) {
+            assert_eq!(a.class_id, b.class_id);
+            assert_eq!(a.script_id, b.script_id);
+            assert_eq!(a.old_type_hash, b.old_type_hash);
+            assert_eq!(a.type_tree_hash, b.type_tree_hash);
+            assert_eq!(a.type_tree_version, b.type_tree_version);
+            assert_eq!(a.node, b.node);
+        }
+        let by_pid = |sf: &SerializedFile| -> std::collections::BTreeMap<i64, (i32, Vec<u8>)> {
+            sf.objects
+                .iter()
+                .map(|o| (o.path_id, (o.type_id, o.data.clone())))
+                .collect()
+        };
+        assert_eq!(by_pid(&again), by_pid(sf));
+        assert_eq!(again.script_types, sf.script_types);
+        assert_eq!(again.externals.len(), sf.externals.len());
     }
 
     #[test]

@@ -15,12 +15,37 @@
 //! The font a bundle carries is never the uploaded file: [`rebuild`] rewrites it from validated
 //! values, with the kerning [`kerning`] read from the original, and the bake works from that
 //! rebuilt file so the atlas and the font FreeType later reads agree.
+//!
+//! Scene fonts are untrusted input. A font the lane will not take is turned away with
+//! [`Refused`], which the conversion tolerates (no bundle, the explorer keeps its built-in
+//! font) and keeps apart from an error of its own.
+
+/// A font the lane turns away: not a TrueType file, over one of its limits, or not one it can
+/// rebuild. Distinct from an infrastructure error, so the conversion can tolerate it.
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "font refused: {}", self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Returns a [`Refused`] error from the enclosing function. Defined ahead of the submodules so
+/// they see it.
+macro_rules! refuse {
+    ($($arg:tt)*) => {
+        return Err(anyhow::Error::from($crate::fontgen::Refused(format!($($arg)*))))
+    };
+}
 
 pub mod kerning;
 pub mod rebuild;
 pub mod sdf;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use ttf_parser::{name_id, Face, GlyphId};
 
 /// The explorer's `RuntimeFontAssetFactory` settings; a bundle must match them or its assets
@@ -48,8 +73,13 @@ pub const MAX_GLYPH_POINTS: usize = 8192;
 /// Flattened segments across every pre-filled glyph, which are all held until the atlas is
 /// packed.
 pub const MAX_PREFILL_SEGMENTS: usize = 1_000_000;
-/// [`sdf::render_cost`] summed over the pre-filled glyphs: a few hundred milliseconds of work.
+/// [`sdf::render_cost`] summed over the pre-filled glyphs. Azeret Mono and Inter use about 2%
+/// of it and bake, rebuild included, in 10–20 ms; the full budget is well under a second of
+/// work. `fontcal` prints a font's figure.
 pub const MAX_RENDER_WORK: u64 = 400_000_000;
+
+/// The file type a scene's `font_src` names.
+pub const FONT_EXTENSION: &str = ".ttf";
 
 /// Pre-filled in this order until the list ends or the atlas is full. ASCII first, then the
 /// punctuation word processors substitute into ASCII text, then the Latin-1 letters and marks
@@ -133,6 +163,8 @@ pub struct BakedFont {
     pub free_rects: Vec<GlyphRect>,
     /// `ATLAS_SIZE`² Alpha8 texels, bottom row first.
     pub atlas: Vec<u8>,
+    /// What rendering the atlas cost, against [`MAX_RENDER_WORK`].
+    pub render_work: u64,
 }
 
 /// A TrueType font: the sfnt version `0x00010000`, the only one `font_src` takes (the protocol
@@ -142,18 +174,20 @@ pub fn is_font_file(bytes: &[u8]) -> bool {
     bytes.len() <= MAX_FONT_BYTES && bytes.get(..4) == Some(&[0x00, 0x01, 0x00, 0x00])
 }
 
-/// `.ttf`, the file type a scene's `font_src` names.
+/// Whether a scene path names a font file ([`FONT_EXTENSION`]).
 pub fn is_font_path(path: &str) -> bool {
-    path.to_ascii_lowercase().ends_with(".ttf")
+    path.to_ascii_lowercase().ends_with(FONT_EXTENSION)
 }
 
-/// Whether [`bake`] can take this font: a TrueType file within [`MAX_FONT_BYTES`] that parses and
-/// maps at least one of the pre-filled characters. Cheap enough to gate a conversion on; the
-/// outline and render limits are only known once [`bake`] measures them.
+/// Whether [`bake`] can take this font: a TrueType file within [`MAX_FONT_BYTES`] that parses,
+/// keeps its `cmap` small enough to query, and maps at least one of the pre-filled characters.
+/// Cheap enough to gate a conversion on; the outline and render limits are only known once
+/// [`bake`] measures them.
 pub fn is_supported(bytes: &[u8]) -> bool {
     is_font_file(bytes)
         && Face::parse(bytes, 0).is_ok_and(|face| {
             face.units_per_em() > 0
+                && rebuild::cmap_records_bounded(&face)
                 && priority_characters()
                     .into_iter()
                     .any(|c| face.glyph_index(c).is_some())
@@ -165,26 +199,37 @@ struct Prepared {
     outline: Option<sdf::Outline>,
 }
 
+/// Rebuilds the font and pre-fills the atlas from the rebuilt file. A font the lane will not take
+/// is [`Refused`]; any other error is the lane's own.
 pub fn bake(bytes: &[u8]) -> Result<BakedFont> {
     if bytes.len() > MAX_FONT_BYTES {
-        bail!(
+        refuse!(
             "font is {} bytes, over the {MAX_FONT_BYTES}-byte cap",
             bytes.len()
         );
     }
     if !is_font_file(bytes) {
-        bail!("not a TrueType font");
+        refuse!("not a TrueType font");
     }
-    let source = Face::parse(bytes, 0).map_err(|e| anyhow!("font does not parse: {e}"))?;
+    let source = match Face::parse(bytes, 0) {
+        Ok(face) => face,
+        Err(e) => refuse!("font does not parse: {e}"),
+    };
     if source.units_per_em() == 0 {
-        bail!("font declares no units per em");
+        refuse!("font declares no units per em");
+    }
+    if !rebuild::cmap_records_bounded(&source) {
+        refuse!(
+            "cmap has over {} encoding records",
+            rebuild::MAX_CMAP_SUBTABLES
+        );
     }
     let prefill: Vec<GlyphId> = priority_characters()
         .into_iter()
         .filter_map(|c| source.glyph_index(c))
         .collect();
     let pairs = kerning::pairs(&source, &prefill);
-    let font_data = rebuild::rebuild(&source, &pairs)?;
+    let (font_data, pairs) = rebuild::rebuild(&source, &pairs)?;
     let face =
         Face::parse(&font_data, 0).map_err(|e| anyhow!("rebuilt font does not parse: {e}"))?;
     let mut baked = bake_face(&face, pairs)?;
@@ -224,12 +269,17 @@ fn bake_face(face: &Face<'_>, mut pairs: Vec<kerning::KernPair>) -> Result<Baked
         let p = prepare_glyph(face, gid, scale, outline_scale)?;
         segments += p.outline.as_ref().map_or(0, |o| o.segment_count());
         if segments > MAX_PREFILL_SEGMENTS {
-            bail!("pre-filled outlines exceed {MAX_PREFILL_SEGMENTS} segments");
+            refuse!("pre-filled outlines exceed {MAX_PREFILL_SEGMENTS} segments");
         }
         prepared.push(p);
     }
     if characters.is_empty() {
-        bail!("font maps none of the pre-filled characters");
+        refuse!("font maps none of the pre-filled characters");
+    }
+    // A bitmap-only or empty font maps characters to glyphs with nothing to draw; its atlas
+    // would be blank and its text invisible.
+    if prepared.iter().all(|p| p.outline.is_none()) {
+        refuse!("font has no outlines for any pre-filled character");
     }
 
     let slots = pack_prefix(&prepared);
@@ -240,7 +290,7 @@ fn bake_face(face: &Face<'_>, mut pairs: Vec<kerning::KernPair>) -> Result<Baked
         .map(|o| sdf::render_cost(o, ATLAS_PADDING, GRADIENT_SCALE as f64))
         .sum();
     if work > MAX_RENDER_WORK {
-        bail!("pre-filled glyphs would take {work} distance evaluations, over {MAX_RENDER_WORK}");
+        refuse!("pre-filled glyphs would take {work} distance evaluations, over {MAX_RENDER_WORK}");
     }
     let mut atlas = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE) as usize];
     let mut glyphs = Vec::with_capacity(kept);
@@ -295,6 +345,7 @@ fn bake_face(face: &Face<'_>, mut pairs: Vec<kerning::KernPair>) -> Result<Baked
         used_rects,
         free_rects,
         atlas,
+        render_work: work,
     })
 }
 
@@ -374,8 +425,10 @@ fn prepare_glyph(
     let advance = face.glyph_hor_advance(gid).unwrap_or(0) as f64 * scale;
     let mut outline = sdf::Outline::new(outline_scale);
     let drawn = face.outline_glyph(gid, &mut outline).is_some() && !outline.is_empty();
+    // The rebuilt font has no composites and was sized when it was written, so this only
+    // restates a bound the rebuild already enforced.
     if outline.points > MAX_GLYPH_POINTS {
-        bail!(
+        refuse!(
             "glyph {} has {} outline points, over {MAX_GLYPH_POINTS}",
             gid.0,
             outline.points

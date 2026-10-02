@@ -4,13 +4,21 @@
 //! glyph it adds at runtime, and a pre-filled asset has to carry the records for the glyphs it
 //! ships with. The rebuilt font keeps only the pairs read here (see `rebuild`), so the original
 //! GPOS table, one of the most intricate structures a font parser walks, never reaches a client.
+//!
+//! The reader is bounded before it reads: a font whose `kern` feature points at more lookup
+//! indices, lookups or subtables than the caps allow ships without kerning rather than being
+//! walked.
 
 use ttf_parser::gpos::{PairAdjustment, PositioningSubtable};
 use ttf_parser::{Face, GlyphId, Tag};
 
-/// Lookup subtables a font may make the reader visit. Every pair query walks each one, so this
-/// bounds the work a hostile font can ask for; a font past it ships without kerning.
-const MAX_KERN_SUBTABLES: usize = 256;
+/// Lookups plus subtables the reader visits. Every pair query walks each subtable, so this bounds
+/// the work a hostile font can ask for.
+pub const MAX_KERN_TABLES: usize = 256;
+
+/// Lookup indices the `kern` feature records may name in total. Feature records are six bytes
+/// and may all point at one feature of 65535 indices, so this is counted, not collected.
+pub const MAX_KERN_FEATURE_INDICES: usize = 65536;
 
 /// A horizontal kerning pair: `x_advance` font units added after `first` when `second` follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,9 +28,9 @@ pub struct KernPair {
     pub x_advance: i16,
 }
 
-/// The pairs among `glyphs` the font kerns, sorted by glyph. GPOS `kern` lookups win; a font
-/// without them falls back to the legacy `kern` table. Pairs whose adjustment sums to zero are
-/// dropped.
+/// The pairs among `glyphs` the font kerns, sorted by glyph. A GPOS `kern` feature wins; a font
+/// without one falls back to the legacy `kern` table. A GPOS past the caps, or one `ttf-parser`
+/// cannot follow, yields no pairs at all. Pairs whose adjustment sums to zero are dropped.
 pub fn pairs(face: &Face<'_>, glyphs: &[GlyphId]) -> Vec<KernPair> {
     let mut glyphs = glyphs.to_vec();
     glyphs.sort_by_key(|g| g.0);
@@ -33,20 +41,25 @@ pub fn pairs(face: &Face<'_>, glyphs: &[GlyphId]) -> Vec<KernPair> {
     out
 }
 
-/// `None` when the font has no GPOS `kern` lookups to read, or more of them than the reader
-/// will visit.
+/// `None` when the font has no GPOS `kern` feature to read. An empty list when it has one the
+/// reader will not walk: over a cap, or with a lookup index the table does not resolve.
 fn gpos_pairs(face: &Face<'_>, glyphs: &[GlyphId]) -> Option<Vec<KernPair>> {
     let gpos = face.tables().gpos?;
     let kern = Tag::from_bytes(b"kern");
-    let mut lookups: Vec<u16> = gpos
-        .features
-        .into_iter()
-        .filter(|f| f.tag == kern)
-        .flat_map(|f| f.lookup_indices.into_iter())
-        .collect();
-    lookups.sort_unstable();
-    lookups.dedup();
-    if lookups.is_empty() {
+    let mut wanted = [0u64; 1024];
+    let mut any = false;
+    let mut named = 0usize;
+    for feature in gpos.features.into_iter().filter(|f| f.tag == kern) {
+        any = true;
+        for index in feature.lookup_indices {
+            named += 1;
+            if named > MAX_KERN_FEATURE_INDICES {
+                return Some(Vec::new());
+            }
+            wanted[index as usize / 64] |= 1 << (index % 64);
+        }
+    }
+    if !any {
         return None;
     }
 
@@ -54,13 +67,19 @@ fn gpos_pairs(face: &Face<'_>, glyphs: &[GlyphId]) -> Option<Vec<KernPair>> {
     // decides it.
     let mut subtables: Vec<Vec<PairAdjustment<'_>>> = Vec::new();
     let mut visited = 0usize;
-    for index in lookups {
-        let lookup = gpos.lookups.get(index)?;
+    for index in (0..=u16::MAX).filter(|&i| wanted[i as usize / 64] & (1 << (i % 64)) != 0) {
+        visited += 1;
+        if visited > MAX_KERN_TABLES {
+            return Some(Vec::new());
+        }
+        let Some(lookup) = gpos.lookups.get(index) else {
+            return Some(Vec::new());
+        };
         let mut pairs = Vec::new();
         for subtable in lookup.subtables.into_iter::<PositioningSubtable>() {
             visited += 1;
-            if visited > MAX_KERN_SUBTABLES {
-                return None;
+            if visited > MAX_KERN_TABLES {
+                return Some(Vec::new());
             }
             if let PositioningSubtable::Pair(p) = subtable {
                 pairs.push(p);
@@ -116,7 +135,7 @@ fn kern_table_pairs(face: &Face<'_>, glyphs: &[GlyphId]) -> Vec<KernPair> {
         .subtables
         .into_iter()
         .filter(|s| s.horizontal && !s.variable && !s.has_cross_stream && !s.has_state_machine)
-        .take(MAX_KERN_SUBTABLES)
+        .take(MAX_KERN_TABLES)
         .collect();
     let mut out = Vec::new();
     for &first in glyphs {
@@ -134,4 +153,75 @@ fn kern_table_pairs(face: &Face<'_>, glyphs: &[GlyphId]) -> Vec<KernPair> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::rebuild::tests::{cmap_format12, fixture, simple_glyph};
+    use super::*;
+
+    /// A GPOS whose `kern` feature list holds `records` entries all pointing at one feature of
+    /// 65535 lookup indices, over an empty pair lookup.
+    fn gpos_feature_overlay(records: usize) -> Vec<u8> {
+        let mut w: Vec<u8> = Vec::new();
+        let u16 = |w: &mut Vec<u8>, v: u16| w.extend_from_slice(&v.to_be_bytes());
+        // Header: ScriptList at 10, LookupList at 30, FeatureList at 40.
+        u16(&mut w, 1);
+        u16(&mut w, 0);
+        u16(&mut w, 10);
+        u16(&mut w, 40);
+        u16(&mut w, 30);
+        // ScriptList: DFLT -> Script -> default LangSys running feature 0.
+        u16(&mut w, 1);
+        w.extend_from_slice(b"DFLT");
+        u16(&mut w, 8);
+        u16(&mut w, 4);
+        u16(&mut w, 0);
+        u16(&mut w, 0);
+        u16(&mut w, 0xFFFF);
+        u16(&mut w, 1);
+        u16(&mut w, 0);
+        assert_eq!(w.len(), 30);
+        // LookupList: one pair lookup with no subtables.
+        u16(&mut w, 1);
+        u16(&mut w, 4);
+        u16(&mut w, 2);
+        u16(&mut w, 0);
+        u16(&mut w, 0);
+        assert_eq!(w.len(), 40);
+        // FeatureList: every record is `kern` at the same feature.
+        u16(&mut w, records as u16);
+        let feature = 2 + 6 * records;
+        for _ in 0..records {
+            w.extend_from_slice(b"kern");
+            u16(&mut w, feature as u16);
+        }
+        u16(&mut w, 0);
+        u16(&mut w, 65535);
+        for i in 0..65535u16 {
+            u16(&mut w, i);
+        }
+        w
+    }
+
+    #[test]
+    fn a_feature_overlay_ships_without_kerning_instead_of_being_walked() {
+        let glyphs = vec![Vec::new(), simple_glyph(4), simple_glyph(4)];
+        let font = fixture(
+            &glyphs,
+            cmap_format12(&[(0x41, 0x42, 1)]),
+            vec![(*b"GPOS", gpos_feature_overlay(2000))],
+        );
+        let face = Face::parse(&font, 0).unwrap();
+        assert!(face.tables().gpos.is_some());
+        assert!(pairs(&face, &[GlyphId(1), GlyphId(2)]).is_empty());
+    }
+
+    #[test]
+    fn a_font_without_gpos_or_kern_has_no_pairs() {
+        let glyphs = vec![Vec::new(), simple_glyph(4)];
+        let font = fixture(&glyphs, cmap_format12(&[(0x41, 0x41, 1)]), Vec::new());
+        let face = Face::parse(&font, 0).unwrap();
+        assert!(pairs(&face, &[GlyphId(1)]).is_empty());
+    }
 }

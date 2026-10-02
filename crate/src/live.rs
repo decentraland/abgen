@@ -14,7 +14,7 @@ const CONVERTIBLE_EXTS: [&str; 5] = [".glb", ".gltf", ".png", ".jpg", ".jpeg"];
 const DEPENDENCY_EXTS: [&str; 1] = [".bin"];
 
 /// Scene fonts (`font_src`, TrueType only), converted for scenes only: nothing else renders them.
-const FONT_EXTS: [&str; 1] = [".ttf"];
+const FONT_EXTS: [&str; 1] = [crate::fontgen::FONT_EXTENSION];
 
 struct BuildTelemetry<'a> {
     entity: &'a str,
@@ -597,14 +597,15 @@ impl Proxy {
 
     /// Whether a scene font is one the font lane takes. One that is not (a web font renamed
     /// `.ttf`, a truncated upload) gets no bundle and counts as a tolerated failure; the
-    /// explorer keeps its built-in font.
+    /// explorer keeps its built-in font. Content that cannot be read is not a verdict: the
+    /// build runs and surfaces the error, as `image_decode_ok` does.
     fn font_supported(&self, hash: &str) -> bool {
         if let Some(v) = self.font_ok.lock().unwrap().get(hash) {
             return *v;
         }
         self.ensure_content(hash).ok();
         let Ok(raw) = self.content.fetch_mmap(hash) else {
-            return false;
+            return true;
         };
         let v = crate::fontgen::is_supported(&raw);
         self.font_ok.lock().unwrap().insert(hash.to_string(), v);
@@ -723,7 +724,7 @@ impl Proxy {
                     return false;
                 }
                 let (g, i) = is_convertible(&c.file);
-                g || i || is_font(&c.file)
+                g || i || (is_font(&c.file) && ctx.scene.entity_type == "scene")
             })
             .or_else(|| {
                 ctx.scene
@@ -748,7 +749,7 @@ impl Proxy {
         let hash: &str = &item.hash;
         let file = item.file.clone();
         let (is_glb, is_image) = is_convertible(&file);
-        let is_font = !is_glb && !is_image && is_font(&file);
+        let is_font = !is_glb && !is_image && is_font(&file) && ctx.scene.entity_type == "scene";
         if !is_glb && !is_image && !is_font {
             bail!("content {file} (hash {hash}) is not a convertible glb/image/font");
         }
@@ -1427,8 +1428,9 @@ impl Proxy {
                 // A font the lane refuses (over a limit, or not rebuildable) gets no bundle, and
                 // the explorer keeps its built-in font. It is tolerated like an undecodable
                 // image: the manifest's exit code records it, and its name never reaches the
-                // failed list.
-                Err(e) if it.is_font => {
+                // failed list. Only the lane's own verdict is tolerated; a template, cache or
+                // fetch error is a failure like any other, so a retry gets to build the font.
+                Err(e) if it.is_font && e.downcast_ref::<crate::fontgen::Refused>().is_some() => {
                     tracing::warn!(
                         entity = %cid,
                         bundle = %name,
@@ -1437,6 +1439,8 @@ impl Proxy {
                         "font refused by the font lane — no bundle, exitCode will be non-zero"
                     );
                     tolerated_a.fetch_add(1, Ordering::Relaxed);
+                    // The verdict holds for every platform and request: no second bake.
+                    self.font_ok.lock().unwrap().insert(it.hash.clone(), false);
                 }
                 Err(e) => {
                     tracing::error!(

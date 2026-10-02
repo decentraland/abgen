@@ -415,7 +415,7 @@ pub fn image_class_digest(
 }
 
 /// Extension a font bundle bakes into its container key: scene fonts are TrueType only.
-pub const FONT_KEY_EXTENSION: &str = ".ttf";
+pub const FONT_KEY_EXTENSION: &str = crate::fontgen::FONT_EXTENSION;
 
 /// Digest over a font bundle's build inputs beyond its content hash and platform: the key
 /// extension ([`FONT_KEY_EXTENSION`]) and the font recipe's generation.

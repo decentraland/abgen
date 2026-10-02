@@ -19,12 +19,14 @@ fn main() {
     let t = std::time::Instant::now();
     let baked = fontgen::bake(&font).unwrap();
     println!(
-        "bake {:?}: {} glyphs {} chars used={} free={}",
+        "bake {:?}: {} glyphs {} chars used={} free={} render_work={} ({:.1}% of the budget)",
         t.elapsed(),
         baked.glyphs.len(),
         baked.characters.len(),
         baked.used_rects.len(),
-        baked.free_rects.len()
+        baked.free_rects.len(),
+        baked.render_work,
+        baked.render_work as f64 * 100.0 / fontgen::MAX_RENDER_WORK as f64
     );
     println!("face {:?}", baked.face);
     let mb = &unity["MonoBehaviour"];
