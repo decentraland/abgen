@@ -595,9 +595,9 @@ impl Proxy {
         v
     }
 
-    /// Whether a scene font bakes. One that does not (a web font renamed `.ttf`, a
-    /// truncated upload) gets no bundle and no failure: the explorer rejects the same
-    /// files at runtime and falls back to its built-in font either way.
+    /// Whether a scene font is one the font lane takes. One that is not (a web font renamed
+    /// `.ttf`, a truncated upload) gets no bundle and counts as a tolerated failure; the
+    /// explorer keeps its built-in font.
     fn font_supported(&self, hash: &str) -> bool {
         if let Some(v) = self.font_ok.lock().unwrap().get(hash) {
             return *v;
@@ -1344,8 +1344,9 @@ impl Proxy {
                     entity = %cid,
                     file = %it.file,
                     hash = %it.hash,
-                    "font is not a TrueType file within the font lane's limits — no bundle"
+                    "font is not a TrueType file within the font lane's limits — no bundle, exitCode will be non-zero"
                 );
+                tolerated_a.fetch_add(1, Ordering::Relaxed);
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                 self.progress_update(cid, d, total, &it.file);
                 return Ok(());
@@ -1423,16 +1424,19 @@ impl Proxy {
                         tolerated_a.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                // A font the lane refuses (over a limit, or not rebuildable) is untrusted input
-                // turned away, not a conversion failure: the explorer keeps its built-in font.
+                // A font the lane refuses (over a limit, or not rebuildable) gets no bundle, and
+                // the explorer keeps its built-in font. It is tolerated like an undecodable
+                // image: the manifest's exit code records it, and its name never reaches the
+                // failed list.
                 Err(e) if it.is_font => {
                     tracing::warn!(
                         entity = %cid,
                         bundle = %name,
                         file = %it.file,
                         error = %format!("{e:#}"),
-                        "font refused by the font lane — no bundle"
+                        "font refused by the font lane — no bundle, exitCode will be non-zero"
                     );
+                    tolerated_a.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
                     tracing::error!(
