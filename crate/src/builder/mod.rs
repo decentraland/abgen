@@ -1,4 +1,5 @@
 mod finalize;
+mod font;
 mod material;
 mod mesh;
 mod nodes;
@@ -8,6 +9,7 @@ mod templates;
 mod tests;
 mod texture;
 
+pub use font::{FONT_ASSET_NAME, TMP_ASSET_NAME, UITK_ASSET_NAME};
 pub use templates::require_templates;
 pub use templates::template_available;
 pub use templates::template_identity;
@@ -634,6 +636,22 @@ impl<'a> Default for BuildOpts<'a> {
     }
 }
 
+/// Whether `bytes` take the font lane: a `.ttf` path holding a TrueType file. A `.ttf` path
+/// holding anything else is refused outright rather than handed to the texture builder, which
+/// would ship an image bundle under the font's name.
+fn is_font_input(bytes: &[u8], opts: &BuildOpts<'_>) -> Result<bool> {
+    if !opts.source_file.is_some_and(crate::fontgen::is_font_path) {
+        return Ok(false);
+    }
+    if !crate::fontgen::is_font_file(bytes) {
+        return Err(crate::fontgen::Refused(
+            "a .ttf that is not a TrueType file within the size cap".into(),
+        )
+        .into());
+    }
+    Ok(true)
+}
+
 pub fn build_bundle(
     bytes: &[u8],
     bundle_name: &str,
@@ -651,6 +669,13 @@ pub fn build_bundle(
     } else {
         ".glb"
     };
+
+    // By path and by content: font bytes under an image name stay on the image lane, where
+    // the decode gate and the manifest treat them as the image they claim to be.
+    if is_font_input(bytes, opts)? {
+        let mut out = font::build_font_bundles(bytes, &[bundle_name.to_string()], root_hash, opts)?;
+        return Ok(out.remove(0));
+    }
 
     if !is_glb_or_gltf(bytes, ext) {
         let (mut bundle, proto, base) = load_template()?;
@@ -829,6 +854,10 @@ pub fn build_bundle_multi(
     } else {
         ".glb"
     };
+
+    if is_font_input(bytes, opts)? {
+        return font::build_font_bundles(bytes, bundle_names, root_hash, opts);
+    }
 
     if !is_glb_or_gltf(bytes, ext) {
         let (mut bundle, proto, base) = load_template()?;

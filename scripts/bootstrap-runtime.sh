@@ -13,6 +13,7 @@ declare -A TEMPLATE_SHAS=(
   [animated-types.windows.bundle]=91236453b18b4badd5f5d66412b83d8164f46c03ab577b94b1ff857de9d2e62f
   [emote-types.windows.bundle]=f0f0246cb218cbb31185f66f71d75ed3370aca85dc3af6582de7aba78e02c1f4
   [skinned-types.windows.bundle]=b2ce6065b03ddb9e62d1f8c2e5a1ec7e20d0d92faf4beb736156901d82b5e6d3
+  [font-types.mac.bundle]=439906b8737d4e2ce0910594114251471e222005102145f0705ff9a597277d9d
 )
 
 fail=0

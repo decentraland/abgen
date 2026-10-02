@@ -12,6 +12,10 @@ pub struct SerializedType {
     pub script_type_index: i16,
     pub script_id: Option<[u8; 16]>,
     pub old_type_hash: Option<[u8; 16]>,
+    /// Format 23 (Unity 6000.5) adds a second hash after `old_type_hash`.
+    pub type_tree_hash: Option<[u8; 16]>,
+    /// Format 23 prefixes each type tree with `mhtt` and this version.
+    pub type_tree_version: u32,
     pub node: Option<TypeTreeNode>,
 
     pub type_dependencies: Vec<i32>,
@@ -54,6 +58,8 @@ pub struct SerializedFile {
     pub user_information: String,
 }
 
+const TYPE_TREE_MAGIC: &[u8; 4] = b"mhtt";
+
 fn read_serialized_type(
     r: &mut Reader,
     version: u32,
@@ -83,9 +89,19 @@ fn read_serialized_type(
         let mut h = [0u8; 16];
         h.copy_from_slice(r.read_bytes(16));
         st.old_type_hash = Some(h);
+        if version >= 23 {
+            let mut h = [0u8; 16];
+            h.copy_from_slice(r.read_bytes(16));
+            st.type_tree_hash = Some(h);
+        }
     }
 
     if enable_type_tree {
+        if version >= 23 {
+            let _record_size = r.read_u32();
+            let _magic = r.read_bytes(4);
+            st.type_tree_version = r.read_u32();
+        }
         st.node = Some(TypeTreeNode::parse_blob(r, version));
         if version >= 21 {
             if is_ref_type {
@@ -128,10 +144,23 @@ fn write_serialized_type(
             w.write_bytes(&st.script_id.unwrap_or([0u8; 16]));
         }
         w.write_bytes(&st.old_type_hash.unwrap_or([0u8; 16]));
+        if version >= 23 {
+            w.write_bytes(&st.type_tree_hash.unwrap_or([0u8; 16]));
+        }
     }
     if enable_type_tree {
         if let Some(node) = &st.node {
-            node.dump_blob(w, version);
+            if version >= 23 {
+                let mut record = Writer::new(w.big_endian);
+                record.write_bytes(TYPE_TREE_MAGIC);
+                record.write_u32(st.type_tree_version);
+                node.dump_blob(&mut record, version);
+                let record = record.into_bytes();
+                w.write_u32(record.len() as u32);
+                w.write_bytes(&record);
+            } else {
+                node.dump_blob(w, version);
+            }
         }
         if version >= 21 && !is_ref_type {
             w.write_i32(st.type_dependencies.len() as i32);
