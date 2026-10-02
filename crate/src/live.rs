@@ -13,8 +13,8 @@ const CONVERTIBLE_EXTS: [&str; 5] = [".glb", ".gltf", ".png", ".jpg", ".jpeg"];
 
 const DEPENDENCY_EXTS: [&str; 1] = [".bin"];
 
-/// Scene fonts (`font_src`), converted for scenes only: nothing else renders them.
-const FONT_EXTS: [&str; 2] = [".ttf", ".otf"];
+/// Scene fonts (`font_src`, TrueType only), converted for scenes only: nothing else renders them.
+const FONT_EXTS: [&str; 1] = [".ttf"];
 
 struct BuildTelemetry<'a> {
     entity: &'a str,
@@ -268,8 +268,8 @@ impl EntityCtx {
         crate::recipes::image_recipes()
     }
 
-    fn font_digest(file: &str) -> String {
-        naming::font_class_digest(&naming::font_key_extension(file))
+    fn font_digest() -> String {
+        naming::font_class_digest()
     }
 }
 
@@ -765,7 +765,7 @@ impl Proxy {
                     ),
                 }
             } else if is_font {
-                let d = EntityCtx::font_digest(&file);
+                let d = EntityCtx::font_digest();
                 if d != req_digest {
                     bail!(
                         "font class digest mismatch for {file} (hash {hash}): requested {req_digest}, computed {d}"
@@ -1231,7 +1231,7 @@ impl Proxy {
                 )
             } else if digest_naming && is_font {
                 crate::recipes::merge_into(&mut used_recipes, &crate::recipes::font_recipes());
-                format!("{case_hash}_{}_{platform}", EntityCtx::font_digest(&c.file))
+                format!("{case_hash}_{}_{platform}", EntityCtx::font_digest())
             } else if digest_naming && is_glb {
                 match ctx.deps_digests.get(&c.hash) {
                     Some(d) => {
@@ -1344,7 +1344,7 @@ impl Proxy {
                     entity = %cid,
                     file = %it.file,
                     hash = %it.hash,
-                    "font is not a TrueType/OpenType file the font lane bakes — no bundle"
+                    "font is not a TrueType file within the font lane's limits — no bundle"
                 );
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                 self.progress_update(cid, d, total, &it.file);

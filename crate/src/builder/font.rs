@@ -1,4 +1,4 @@
-//! Font bundles: one scene `.ttf`/`.otf` in, one bundle holding the explorer's two font assets
+//! Font bundles: one scene `.ttf` in, one bundle holding the explorer's two font assets
 //! for it out.
 //!
 //! The bundle carries the source `Font` (with its data, so FreeType can keep adding glyphs), a
@@ -241,7 +241,6 @@ impl FontBuilder {
     pub(super) fn new(
         bytes: &[u8],
         root_hash: &str,
-        source_file: Option<&str>,
         toggles: Toggles,
         target: &str,
     ) -> Result<Self> {
@@ -326,7 +325,7 @@ impl FontBuilder {
             [pids.font, pids.font_texture, pids.font_material].map(|p| sbp_order::Obj::new(0, p));
 
         let lower = root_hash.to_ascii_lowercase();
-        let ext = crate::naming::font_key_extension(source_file.unwrap_or(""));
+        let ext = crate::naming::FONT_KEY_EXTENSION;
         let mut entries = vec![
             ContainerEntry {
                 key: format!("{lower}{ext}"),
@@ -533,7 +532,6 @@ pub(super) fn build_font_bundles(
     let mut b = FontBuilder::new(
         bytes,
         root_hash,
-        opts.source_file,
         Toggles::from_opts(opts),
         target_from_bundle_name(first),
     )?;

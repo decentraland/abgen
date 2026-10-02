@@ -42,6 +42,8 @@ const MAX_CURVE_SEGMENTS: usize = 64;
 pub struct Outline {
     scale: i64,
     segments: Vec<[f64; 4]>,
+    /// Every point the font fed in, on and off the curve, composites expanded.
+    pub points: usize,
     start: [f64; 2],
     last: [f64; 2],
     open: bool,
@@ -69,7 +71,12 @@ impl Outline {
         self.segments.is_empty()
     }
 
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
     fn point(&mut self, x: f32, y: f32) -> [f64; 2] {
+        self.points += 1;
         let p = [
             scale_26_6(x as f64, self.scale),
             scale_26_6(y as f64, self.scale),
@@ -102,39 +109,6 @@ impl Outline {
             ((deviation / FLATTEN_TOLERANCE).sqrt().ceil() as usize).clamp(1, MAX_CURVE_SEGMENTS);
         for i in 1..=n {
             self.line(eval(i as f64 / n as f64));
-        }
-    }
-
-    /// Signed distance from `(px, py)` to the outline: positive inside under the nonzero
-    /// winding rule both TrueType and CFF outlines use.
-    fn signed_distance(&self, px: f64, py: f64) -> f64 {
-        let mut best = f64::INFINITY;
-        let mut winding = 0i32;
-        for &[x0, y0, x1, y1] in &self.segments {
-            let (dx, dy) = (x1 - x0, y1 - y0);
-            let len2 = dx * dx + dy * dy;
-            let t = if len2 > 0.0 {
-                (((px - x0) * dx + (py - y0) * dy) / len2).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let (ex, ey) = (x0 + t * dx - px, y0 + t * dy - py);
-            best = best.min(ex * ex + ey * ey);
-
-            let cross = dx * (py - y0) - (px - x0) * dy;
-            if y0 <= py {
-                if y1 > py && cross > 0.0 {
-                    winding += 1;
-                }
-            } else if y1 <= py && cross < 0.0 {
-                winding -= 1;
-            }
-        }
-        let d = best.sqrt();
-        if winding != 0 {
-            d
-        } else {
-            -d
         }
     }
 }
@@ -199,20 +173,115 @@ pub fn bitmap_box(o: &Outline) -> (i32, i32, u32, u32) {
     (left, bottom, (right - left) as u32, (top - bottom) as u32)
 }
 
+/// Squared distance from `(px, py)` to the segment `[x0, y0, x1, y1]`.
+fn segment_distance2(&[x0, y0, x1, y1]: &[f64; 4], px: f64, py: f64) -> f64 {
+    let (dx, dy) = (x1 - x0, y1 - y0);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 0.0 {
+        (((px - x0) * dx + (py - y0) * dy) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let (ex, ey) = (x0 + t * dx - px, y0 + t * dy - py);
+    ex * ex + ey * ey
+}
+
+/// The texel range `[first, last]` whose centres lie within `spread` of `[lo, hi]`, on an axis
+/// whose texel `i` is centred at `origin + i + 0.5`. `None` when it misses the field.
+fn texel_span(lo: f64, hi: f64, spread: f64, origin: f64, len: u32) -> Option<(u32, u32)> {
+    let first = (lo - spread - origin - 0.5).ceil().max(0.0);
+    let last = (hi + spread - origin - 0.5).floor().min(len as f64 - 1.0);
+    (first <= last).then(|| (first as u32, last as u32))
+}
+
+/// The field a glyph renders into: its bitmap box grown by `padding` on every side.
+fn field_box(o: &Outline, padding: u32) -> (f64, f64, u32, u32) {
+    let (left, bottom, w, h) = bitmap_box(o);
+    (
+        left as f64 - padding as f64,
+        bottom as f64 - padding as f64,
+        w + 2 * padding,
+        h + 2 * padding,
+    )
+}
+
+/// What [`render`] will cost: one distance evaluation per segment and texel within the
+/// gradient spread of it, plus one crossing test per segment and row.
+pub fn render_cost(o: &Outline, padding: u32, gradient_scale: f64) -> u64 {
+    let (ox, oy, fw, fh) = field_box(o, padding);
+    let mut cost = o.segments.len() as u64 * fh as u64;
+    for &[x0, y0, x1, y1] in &o.segments {
+        let xs = texel_span(x0.min(x1), x0.max(x1), gradient_scale, ox, fw);
+        let ys = texel_span(y0.min(y1), y0.max(y1), gradient_scale, oy, fh);
+        if let (Some((i0, i1)), Some((j0, j1))) = (xs, ys) {
+            cost += (i1 - i0 + 1) as u64 * (j1 - j0 + 1) as u64;
+        }
+    }
+    cost
+}
+
 /// Renders the glyph's field over its bitmap box grown by `padding` on every side. Rows run
 /// bottom-up, like the Alpha8 atlas the field is copied into.
+///
+/// A texel a full gradient scale from the outline already saturates the byte, so each segment
+/// only visits the texels within that spread of it, and every byte comes out as it would from
+/// the distance to every segment. Inside and outside follow the nonzero winding rule both TrueType and CFF
+/// outlines use, resolved once per row from the sorted edge crossings.
 pub fn render(o: &Outline, padding: u32, gradient_scale: f64) -> (Vec<u8>, u32, u32) {
-    let (left, bottom, w, h) = bitmap_box(o);
-    let fw = w + 2 * padding;
-    let fh = h + 2 * padding;
+    let (ox, oy, fw, fh) = field_box(o, padding);
+    let spread = gradient_scale;
+    let mut dist2 = vec![spread * spread; (fw * fh) as usize];
+    for seg in &o.segments {
+        let &[x0, y0, x1, y1] = seg;
+        let xs = texel_span(x0.min(x1), x0.max(x1), spread, ox, fw);
+        let ys = texel_span(y0.min(y1), y0.max(y1), spread, oy, fh);
+        let (Some((i0, i1)), Some((j0, j1))) = (xs, ys) else {
+            continue;
+        };
+        for j in j0..=j1 {
+            let py = oy + j as f64 + 0.5;
+            let row = (j * fw) as usize;
+            for i in i0..=i1 {
+                let d2 = segment_distance2(seg, ox + i as f64 + 0.5, py);
+                let slot = &mut dist2[row + i as usize];
+                if d2 < *slot {
+                    *slot = d2;
+                }
+            }
+        }
+    }
+
     let step = 255.0 / (2.0 * gradient_scale);
     let mut field = vec![0u8; (fw * fh) as usize];
+    let mut crossings: Vec<(f64, i32)> = Vec::new();
     for j in 0..fh {
-        let py = bottom as f64 - padding as f64 + j as f64 + 0.5;
+        let py = oy + j as f64 + 0.5;
+        // An upward edge counts +1 and a downward one -1 for every texel left of where it
+        // crosses this row; the half-open span keeps a shared vertex from counting twice.
+        crossings.clear();
+        for &[x0, y0, x1, y1] in &o.segments {
+            let dir = if y0 <= py && y1 > py {
+                1
+            } else if y1 <= py && y0 > py {
+                -1
+            } else {
+                continue;
+            };
+            crossings.push((x0 + (py - y0) * (x1 - x0) / (y1 - y0), dir));
+        }
+        crossings.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let total: i32 = crossings.iter().map(|c| c.1).sum();
+        let (mut passed, mut left_of) = (0usize, 0i32);
         for i in 0..fw {
-            let px = left as f64 - padding as f64 + i as f64 + 0.5;
-            let d = o.signed_distance(px, py);
-            field[(j * fw + i) as usize] = (127.5 + d * step).round().clamp(0.0, 255.0) as u8;
+            let px = ox + i as f64 + 0.5;
+            while passed < crossings.len() && crossings[passed].0 <= px {
+                left_of += crossings[passed].1;
+                passed += 1;
+            }
+            let idx = (j * fw + i) as usize;
+            let d = dist2[idx].sqrt();
+            let d = if total - left_of != 0 { d } else { -d };
+            field[idx] = (127.5 + d * step).round().clamp(0.0, 255.0) as u8;
         }
     }
     (field, fw, fh)
@@ -224,6 +293,43 @@ mod tests {
 
     /// One font unit to one pixel.
     const UNIT: i64 = 64 << 16;
+
+    /// The definition [`render`] must reproduce: exact distance to every segment, winding by
+    /// the cross product, per texel.
+    fn signed_distance(o: &Outline, px: f64, py: f64) -> f64 {
+        let mut best = f64::INFINITY;
+        let mut winding = 0i32;
+        for seg in &o.segments {
+            let &[x0, y0, x1, y1] = seg;
+            best = best.min(segment_distance2(seg, px, py));
+            let cross = (x1 - x0) * (py - y0) - (px - x0) * (y1 - y0);
+            if y0 <= py {
+                if y1 > py && cross > 0.0 {
+                    winding += 1;
+                }
+            } else if y1 <= py && cross < 0.0 {
+                winding -= 1;
+            }
+        }
+        if winding != 0 {
+            best.sqrt()
+        } else {
+            -best.sqrt()
+        }
+    }
+
+    fn render_exhaustively(o: &Outline, padding: u32, gradient_scale: f64) -> Vec<u8> {
+        let (ox, oy, fw, fh) = field_box(o, padding);
+        let step = 255.0 / (2.0 * gradient_scale);
+        let mut field = Vec::with_capacity((fw * fh) as usize);
+        for j in 0..fh {
+            for i in 0..fw {
+                let d = signed_distance(o, ox + i as f64 + 0.5, oy + j as f64 + 0.5);
+                field.push((127.5 + d * step).round().clamp(0.0, 255.0) as u8);
+            }
+        }
+        field
+    }
 
     fn square(size: f32) -> Outline {
         let mut o = Outline::new(UNIT);
@@ -238,8 +344,28 @@ mod tests {
     #[test]
     fn distance_is_positive_inside_and_negative_outside() {
         let o = square(10.0);
-        assert!((o.signed_distance(5.0, 5.0) - 5.0).abs() < 1e-9);
-        assert!((o.signed_distance(-2.0, 5.0) + 2.0).abs() < 1e-9);
+        assert!((signed_distance(&o, 5.0, 5.0) - 5.0).abs() < 1e-9);
+        assert!((signed_distance(&o, -2.0, 5.0) + 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn culled_render_equals_the_exhaustive_field() {
+        // A ring of quadratic curves with a counter-wound hole, larger than the spread.
+        let mut o = Outline::new(UNIT);
+        o.move_to(0.0, 30.0);
+        o.quad_to(0.0, 0.0, 30.0, 0.0);
+        o.quad_to(60.0, 0.0, 60.0, 30.0);
+        o.quad_to(60.0, 60.0, 30.0, 60.0);
+        o.quad_to(0.0, 60.0, 0.0, 30.0);
+        o.close();
+        o.move_to(15.0, 30.0);
+        o.line_to(30.0, 45.0);
+        o.line_to(45.0, 30.0);
+        o.line_to(30.0, 15.0);
+        o.close();
+        let (field, _, _) = render(&o, 9, 10.0);
+        assert_eq!(field, render_exhaustively(&o, 9, 10.0));
+        assert!(render_cost(&o, 9, 10.0) > 0);
     }
 
     #[test]

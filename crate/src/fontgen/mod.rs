@@ -33,6 +33,18 @@ pub const GRADIENT_SCALE: u32 = ATLAS_PADDING + PACKING_MODIFIER;
 /// Unity's legacy `Font` object reports its metrics at this size.
 const LEGACY_FONT_SIZE: f64 = 16.0;
 
+/// Scene fonts are untrusted input, so every stage of a bake is bounded. The file cap is the
+/// explorer's own (`FontFileStore.MAX_FILE_BYTES`).
+pub const MAX_FONT_BYTES: usize = 16 * 1024 * 1024;
+/// Outline points one glyph may expand to, composites included. Real glyphs use a few hundred;
+/// TrueType's own ceiling is 65535.
+pub const MAX_GLYPH_POINTS: usize = 8192;
+/// Flattened segments across every pre-filled glyph, which are all held until the atlas is
+/// packed.
+pub const MAX_PREFILL_SEGMENTS: usize = 1_000_000;
+/// [`sdf::render_cost`] summed over the pre-filled glyphs: a few hundred milliseconds of work.
+pub const MAX_RENDER_WORK: u64 = 400_000_000;
+
 /// Pre-filled in this order until the list ends or the atlas is full. ASCII first, then the
 /// punctuation word processors substitute into ASCII text, then the Latin-1 letters and marks
 /// of the languages Decentraland scenes are written in. Anything else is added at runtime.
@@ -41,6 +53,7 @@ const PRIORITY_EXTRA: &str = "’‘“”–—…•€\
 ãõçâêôàÃÕÇÂÊÔÀ\
 èìòùëïîûÈÌÒÙËÏÎÛ\
 äöÄÖß\
+åæøÅÆØýÝÿ\
 «»°©®™·×÷";
 
 pub fn priority_characters() -> Vec<char> {
@@ -112,23 +125,21 @@ pub struct BakedFont {
     pub atlas: Vec<u8>,
 }
 
-/// An sfnt container FreeType reads: TrueType, OpenType/CFF, or Apple's `true`. Collections
-/// and web fonts are left to the runtime loader, which rejects them the same way.
+/// A TrueType font: the sfnt version `0x00010000`, the only one `font_src` takes (the protocol
+/// defines it as a ttf file, and the explorer checks the same header). OpenType/CFF, Apple's
+/// `true`, collections and web fonts are not scene fonts.
 pub fn is_font_file(bytes: &[u8]) -> bool {
-    matches!(
-        bytes.get(..4),
-        Some([0x00, 0x01, 0x00, 0x00]) | Some(b"OTTO") | Some(b"true")
-    )
+    bytes.len() <= MAX_FONT_BYTES && bytes.get(..4) == Some(&[0x00, 0x01, 0x00, 0x00])
 }
 
-/// `.ttf` / `.otf`, the extensions a scene's `font_src` may name.
+/// `.ttf`, the file type a scene's `font_src` names.
 pub fn is_font_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.ends_with(".ttf") || lower.ends_with(".otf")
+    path.to_ascii_lowercase().ends_with(".ttf")
 }
 
-/// Whether [`bake`] can take this font: an sfnt that parses and maps at least one of the
-/// pre-filled characters. Cheap enough to gate a conversion on.
+/// Whether [`bake`] can take this font: a TrueType file within [`MAX_FONT_BYTES`] that parses and
+/// maps at least one of the pre-filled characters. Cheap enough to gate a conversion on; the
+/// outline and render limits are only known once [`bake`] measures them.
 pub fn is_supported(bytes: &[u8]) -> bool {
     is_font_file(bytes)
         && Face::parse(bytes, 0).is_ok_and(|face| {
@@ -145,8 +156,14 @@ struct Prepared {
 }
 
 pub fn bake(bytes: &[u8]) -> Result<BakedFont> {
+    if bytes.len() > MAX_FONT_BYTES {
+        bail!(
+            "font is {} bytes, over the {MAX_FONT_BYTES}-byte cap",
+            bytes.len()
+        );
+    }
     if !is_font_file(bytes) {
-        bail!("not a TrueType or OpenType font");
+        bail!("not a TrueType font");
     }
     let face = Face::parse(bytes, 0).map_err(|e| anyhow!("font does not parse: {e}"))?;
     let upem = face.units_per_em() as f64;
@@ -167,6 +184,7 @@ pub fn bake(bytes: &[u8]) -> Result<BakedFont> {
 
     let mut characters = Vec::new();
     let mut prepared: Vec<Prepared> = Vec::new();
+    let mut segments = 0usize;
     for c in priority_characters() {
         let Some(gid) = face.glyph_index(c) else {
             continue;
@@ -178,7 +196,12 @@ pub fn bake(bytes: &[u8]) -> Result<BakedFont> {
         if prepared.iter().any(|p| p.glyph.index == gid.0 as u32) {
             continue;
         }
-        prepared.push(prepare_glyph(&face, gid, scale, outline_scale));
+        let p = prepare_glyph(&face, gid, scale, outline_scale)?;
+        segments += p.outline.as_ref().map_or(0, |o| o.segment_count());
+        if segments > MAX_PREFILL_SEGMENTS {
+            bail!("pre-filled outlines exceed {MAX_PREFILL_SEGMENTS} segments");
+        }
+        prepared.push(p);
     }
     if characters.is_empty() {
         bail!("font maps none of the pre-filled characters");
@@ -186,6 +209,14 @@ pub fn bake(bytes: &[u8]) -> Result<BakedFont> {
 
     let slots = pack_prefix(&prepared);
     let kept = slots.len();
+    let work: u64 = prepared[..kept]
+        .iter()
+        .filter_map(|p| p.outline.as_ref())
+        .map(|o| sdf::render_cost(o, ATLAS_PADDING, GRADIENT_SCALE as f64))
+        .sum();
+    if work > MAX_RENDER_WORK {
+        bail!("pre-filled glyphs would take {work} distance evaluations, over {MAX_RENDER_WORK}");
+    }
     let mut atlas = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE) as usize];
     let mut glyphs = Vec::with_capacity(kept);
     let mut used_rects = Vec::new();
@@ -304,12 +335,24 @@ fn best_name(face: &Face<'_>, preferred: u16, fallback: u16) -> String {
         .unwrap_or_default()
 }
 
-fn prepare_glyph(face: &Face<'_>, gid: GlyphId, scale: f64, outline_scale: i64) -> Prepared {
+fn prepare_glyph(
+    face: &Face<'_>,
+    gid: GlyphId,
+    scale: f64,
+    outline_scale: i64,
+) -> Result<Prepared> {
     let advance = face.glyph_hor_advance(gid).unwrap_or(0) as f64 * scale;
     let mut outline = sdf::Outline::new(outline_scale);
     let drawn = face.outline_glyph(gid, &mut outline).is_some() && !outline.is_empty();
+    if outline.points > MAX_GLYPH_POINTS {
+        bail!(
+            "glyph {} has {} outline points, over {MAX_GLYPH_POINTS}",
+            gid.0,
+            outline.points
+        );
+    }
     if !drawn {
-        return Prepared {
+        return Ok(Prepared {
             glyph: Glyph {
                 index: gid.0 as u32,
                 width: 0.0,
@@ -320,10 +363,10 @@ fn prepare_glyph(face: &Face<'_>, gid: GlyphId, scale: f64, outline_scale: i64) 
                 rect: GlyphRect::default(),
             },
             outline: None,
-        };
+        });
     }
     let (_, _, w, h) = sdf::bitmap_box(&outline);
-    Prepared {
+    Ok(Prepared {
         glyph: Glyph {
             index: gid.0 as u32,
             width: outline.x_max - outline.x_min,
@@ -339,7 +382,7 @@ fn prepare_glyph(face: &Face<'_>, gid: GlyphId, scale: f64, outline_scale: i64) 
             },
         },
         outline: Some(outline),
-    }
+    })
 }
 
 /// A glyph's slot: its bitmap plus the padding on both sides and TextCore's one-texel gap.
@@ -497,9 +540,24 @@ mod tests {
     #[test]
     fn font_magic() {
         assert!(is_font_file(&[0, 1, 0, 0, 9]));
-        assert!(is_font_file(b"OTTO...."));
+        assert!(!is_font_file(b"OTTO...."));
+        assert!(!is_font_file(b"true...."));
         assert!(!is_font_file(b"wOF2...."));
         assert!(!is_font_file(b"glTF"));
+    }
+
+    #[test]
+    fn oversized_files_are_not_fonts() {
+        let mut big = vec![0u8; MAX_FONT_BYTES + 1];
+        big[..4].copy_from_slice(&[0, 1, 0, 0]);
+        assert!(!is_font_file(&big));
+        assert!(bake(&big).is_err());
+    }
+
+    #[test]
+    fn font_paths_are_ttf_only() {
+        assert!(is_font_path("fonts/A.TTF"));
+        assert!(!is_font_path("fonts/a.otf"));
     }
 
     #[test]

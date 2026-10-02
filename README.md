@@ -115,7 +115,7 @@ verifies the sha256 of both sets and, when a payload is missing, prints the git-
 restore it - it never fetches or re-downloads:
 - `template/*.windows.bundle` - 4 typetree-donor bundles read by `builder.rs::load_template()`
 - `template/font-types.mac.bundle` - the font lane's donor (Unity 6000.5 `Font`, `TMP_FontAsset` and UI Toolkit
-  `FontAsset`), built by `template/src/FontTypesTemplate.cs`; scene `.ttf`/`.otf` files convert to font bundles
+  `FontAsset`), built by `template/src/FontTypesTemplate.cs`; scene `.ttf` files convert to font bundles
   whose atlases come pre-filled with ASCII and common Latin-1 glyphs (`crate/src/fontgen`)
 - `crate/shader/scene_ignore_{windows,mac}` - the compiled per-platform `DCL/Scene` shader bundles (the canonical ab-cdn URLs 404; the vendored copies are the source of truth, provenance in [PROVENANCE.md](PROVENANCE.md)). The server self-primes them on first request - no bucket pre-seeding step; the `lit_ignore_*`/texarray/linux shader names 404 by design (absent upstream too)
 ## Environment variables
