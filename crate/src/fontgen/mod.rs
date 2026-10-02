@@ -11,7 +11,13 @@
 //! 6000.5 created itself: [`FaceInfo`] follows FreeType's face metrics, glyph metrics are the
 //! 26.6 control box, glyph rects and packing slots use TextCore's padding convention, and the
 //! atlas holds the [`sdf`] field TextCore's `SDFAA` mode renders.
+//!
+//! The font a bundle carries is never the uploaded file: [`rebuild`] rewrites it from validated
+//! values, with the kerning [`kerning`] read from the original, and the bake works from that
+//! rebuilt file so the atlas and the font FreeType later reads agree.
 
+pub mod kerning;
+pub mod rebuild;
 pub mod sdf;
 
 use anyhow::{anyhow, bail, Result};
@@ -115,6 +121,10 @@ pub struct Character {
 
 /// A font asset's dynamic data after pre-filling its first atlas.
 pub struct BakedFont {
+    /// The rebuilt font the bundle embeds in place of the uploaded file.
+    pub font_data: Vec<u8>,
+    /// Kerning between pre-filled glyphs, in font units, for the assets' pair records.
+    pub kerning: Vec<kerning::KernPair>,
     pub face: FaceInfo,
     pub legacy: LegacyMetrics,
     pub glyphs: Vec<Glyph>,
@@ -165,15 +175,30 @@ pub fn bake(bytes: &[u8]) -> Result<BakedFont> {
     if !is_font_file(bytes) {
         bail!("not a TrueType font");
     }
-    let face = Face::parse(bytes, 0).map_err(|e| anyhow!("font does not parse: {e}"))?;
-    let upem = face.units_per_em() as f64;
-    if upem <= 0.0 {
+    let source = Face::parse(bytes, 0).map_err(|e| anyhow!("font does not parse: {e}"))?;
+    if source.units_per_em() == 0 {
         bail!("font declares no units per em");
     }
+    let prefill: Vec<GlyphId> = priority_characters()
+        .into_iter()
+        .filter_map(|c| source.glyph_index(c))
+        .collect();
+    let pairs = kerning::pairs(&source, &prefill);
+    let font_data = rebuild::rebuild(&source, &pairs)?;
+    let face =
+        Face::parse(&font_data, 0).map_err(|e| anyhow!("rebuilt font does not parse: {e}"))?;
+    let mut baked = bake_face(&face, pairs)?;
+    baked.font_data = font_data;
+    Ok(baked)
+}
+
+/// Pre-fills the atlas from the rebuilt font.
+fn bake_face(face: &Face<'_>, mut pairs: Vec<kerning::KernPair>) -> Result<BakedFont> {
+    let upem = face.units_per_em() as f64;
     let scale = SAMPLING_POINT_SIZE as f64 / upem;
     let outline_scale = sdf::freetype_scale(SAMPLING_POINT_SIZE, face.units_per_em());
 
-    let face_info = face_info(&face, scale, outline_scale);
+    let face_info = face_info(face, scale, outline_scale);
     let legacy = LegacyMetrics {
         ascent: face.ascender() as f64 * LEGACY_FONT_SIZE / upem,
         descent: face.descender() as f64 * LEGACY_FONT_SIZE / upem,
@@ -196,7 +221,7 @@ pub fn bake(bytes: &[u8]) -> Result<BakedFont> {
         if prepared.iter().any(|p| p.glyph.index == gid.0 as u32) {
             continue;
         }
-        let p = prepare_glyph(&face, gid, scale, outline_scale)?;
+        let p = prepare_glyph(face, gid, scale, outline_scale)?;
         segments += p.outline.as_ref().map_or(0, |o| o.segment_count());
         if segments > MAX_PREFILL_SEGMENTS {
             bail!("pre-filled outlines exceed {MAX_PREFILL_SEGMENTS} segments");
@@ -255,9 +280,14 @@ pub fn bake(bytes: &[u8]) -> Result<BakedFont> {
 
     let kept_indices: Vec<u32> = glyphs.iter().map(|g| g.index).collect();
     characters.retain(|c| kept_indices.contains(&c.glyph_index));
+    pairs.retain(|p| {
+        kept_indices.contains(&(p.first as u32)) && kept_indices.contains(&(p.second as u32))
+    });
     let free_rects = free_rects(&used_rects);
 
     Ok(BakedFont {
+        font_data: Vec::new(),
+        kerning: pairs,
         face: face_info,
         legacy,
         glyphs,

@@ -1,7 +1,8 @@
 //! Font bundles: one scene `.ttf` in, one bundle holding the explorer's two font assets
 //! for it out.
 //!
-//! The bundle carries the source `Font` (with its data, so FreeType can keep adding glyphs), a
+//! The bundle carries a `Font` holding the rebuilt font (`fontgen::rebuild`, never the uploaded
+//! file; FreeType keeps adding glyphs from it at runtime), a
 //! dynamic `TMP_FontAsset` for `TextShape`, and a dynamic UI Toolkit `FontAsset` for scene UI,
 //! each with its own [`fontgen`]-baked atlas. Type trees, the `TMP_FontAsset` `MonoScript` and
 //! the built-in shader and script references come from [`FONT_TYPES_TEMPLATE`], a bundle Unity
@@ -251,7 +252,8 @@ impl FontBuilder {
 
         let mut font = types.font.clone();
         font.insert("m_Name", FONT_ASSET_NAME);
-        font.insert("m_FontData", Value::Bytes(bytes.to_vec()));
+        // The rebuilt font, never the uploaded bytes: FreeType parses this at runtime.
+        font.insert("m_FontData", Value::Bytes(baked.font_data.clone()));
         let family = if baked.face.family_name.is_empty() {
             FONT_ASSET_NAME.to_string()
         } else {
@@ -516,7 +518,42 @@ fn font_asset(base: &Value, baked: &BakedFont, name: &str, pids: &Pids, atlas_pi
         "m_FreeGlyphRects",
         Value::Array(baked.free_rects.iter().map(rect_value).collect()),
     );
+    if let Some(features) = a.get_mut("m_FontFeatureTable") {
+        features.insert("m_GlyphPairAdjustmentRecords", pair_records(baked));
+    }
     a
+}
+
+/// The kerning between pre-filled glyphs as TextCore stores what it reads from GPOS: the
+/// first glyph's advance scaled to the sampling point size, every other value as read.
+fn pair_records(baked: &BakedFont) -> Value {
+    let em_scale = fontgen::SAMPLING_POINT_SIZE as f64 / baked.face.units_per_em as f64;
+    let value = |x_advance: f64| {
+        map! {
+            "m_XPlacement" => 0.0,
+            "m_YPlacement" => 0.0,
+            "m_XAdvance" => x_advance,
+            "m_YAdvance" => 0.0,
+        }
+    };
+    let records = baked
+        .kerning
+        .iter()
+        .map(|p| {
+            map! {
+                "m_FirstAdjustmentRecord" => map! {
+                    "m_GlyphIndex" => p.first as i64,
+                    "m_GlyphValueRecord" => value(p.x_advance as f64 * em_scale),
+                },
+                "m_SecondAdjustmentRecord" => map! {
+                    "m_GlyphIndex" => p.second as i64,
+                    "m_GlyphValueRecord" => value(0.0),
+                },
+                "m_FeatureLookupFlags" => 0,
+            }
+        })
+        .collect();
+    Value::Array(records)
 }
 
 /// Builds one font bundle per name in `bundle_names`, baking the font once.
@@ -597,7 +634,7 @@ mod tests {
             "bafkreifonttest_mac".to_string(),
         ];
         let opts = BuildOpts {
-            source_file: Some("fonts/Azeret.TTF"),
+            source_file: Some("fonts/Azeret.ttf"),
             ..BuildOpts::default()
         };
         let out = build_font_bundles(&template_font(), &names, "bafkreifonttest", &opts).unwrap();
@@ -671,6 +708,138 @@ mod tests {
             assert!(keys.contains(&"bafkreifonttest.ttf"));
             assert!(keys.contains(&"bafkreifonttest_tmp.asset"));
         }
+    }
+
+    /// Every point `ttf-parser` emits for a glyph, in order.
+    #[derive(Default, PartialEq, Debug)]
+    struct Points(Vec<(char, f32, f32)>);
+
+    impl ttf_parser::OutlineBuilder for Points {
+        fn move_to(&mut self, x: f32, y: f32) {
+            self.0.push(('M', x, y));
+        }
+        fn line_to(&mut self, x: f32, y: f32) {
+            self.0.push(('L', x, y));
+        }
+        fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+            self.0.push(('q', x1, y1));
+            self.0.push(('Q', x, y));
+        }
+        fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, x: f32, y: f32) {
+            self.0.push(('C', x, y));
+        }
+        fn close(&mut self) {
+            self.0.push(('Z', 0.0, 0.0));
+        }
+    }
+
+    #[test]
+    fn the_rebuilt_font_draws_and_measures_like_the_original() {
+        use ttf_parser::{Face, GlyphId};
+        let original_bytes = template_font();
+        let original = Face::parse(&original_bytes, 0).unwrap();
+        let rebuilt_bytes = fontgen::rebuild::rebuild(&original, &[]).unwrap();
+        let rebuilt = Face::parse(&rebuilt_bytes, 0).unwrap();
+
+        assert_eq!(rebuilt.number_of_glyphs(), original.number_of_glyphs());
+        assert_eq!(rebuilt.units_per_em(), original.units_per_em());
+        assert_eq!(
+            (rebuilt.ascender(), rebuilt.descender(), rebuilt.line_gap()),
+            (
+                original.ascender(),
+                original.descender(),
+                original.line_gap()
+            )
+        );
+        assert_eq!(rebuilt.underline_metrics(), original.underline_metrics());
+        assert_eq!(rebuilt.capital_height(), original.capital_height());
+        assert_eq!(rebuilt.x_height(), original.x_height());
+        for c in fontgen::priority_characters() {
+            assert_eq!(rebuilt.glyph_index(c), original.glyph_index(c), "{c:?}");
+        }
+        for gid in 0..original.number_of_glyphs() {
+            let gid = GlyphId(gid);
+            assert_eq!(
+                rebuilt.glyph_hor_advance(gid),
+                original.glyph_hor_advance(gid)
+            );
+            let (mut a, mut b) = (Points::default(), Points::default());
+            original.outline_glyph(gid, &mut a);
+            rebuilt.outline_glyph(gid, &mut b);
+            // The same path; scaled composites land on whole units, as TrueType stores them.
+            let ops = |p: &Points| p.0.iter().map(|q| q.0).collect::<Vec<_>>();
+            assert_eq!(ops(&b), ops(&a), "glyph {}", gid.0);
+            for (o, r) in a.0.iter().zip(&b.0) {
+                assert!(
+                    (o.1 - r.1).abs() <= 0.5 && (o.2 - r.2).abs() <= 0.5,
+                    "glyph {}: {o:?} became {r:?}",
+                    gid.0
+                );
+            }
+        }
+        // Nothing the rebuild does not write survives it.
+        for tag in [
+            b"fpgm", b"prep", b"cvt ", b"gasp", b"GSUB", b"GDEF", b"DSIG",
+        ] {
+            let tag = ttf_parser::Tag::from_bytes(tag);
+            assert!(rebuilt.raw_face().table(tag).is_none(), "{tag:?}");
+        }
+    }
+
+    #[test]
+    fn kerning_survives_the_rebuild() {
+        use fontgen::kerning::{self, KernPair};
+        use ttf_parser::Face;
+        let original_bytes = template_font();
+        let original = Face::parse(&original_bytes, 0).unwrap();
+        let gid = |c| original.glyph_index(c).unwrap();
+        let mut pairs = vec![
+            KernPair {
+                first: gid('A').0,
+                second: gid('V').0,
+                x_advance: -60,
+            },
+            KernPair {
+                first: gid('T').0,
+                second: gid('o').0,
+                x_advance: -40,
+            },
+            KernPair {
+                first: gid('V').0,
+                second: gid('A').0,
+                x_advance: -55,
+            },
+        ];
+        pairs.sort_by_key(|p| (p.first, p.second));
+        let rebuilt_bytes = fontgen::rebuild::rebuild(&original, &pairs).unwrap();
+        let rebuilt = Face::parse(&rebuilt_bytes, 0).unwrap();
+        let glyphs = ['A', 'V', 'T', 'o'].map(gid);
+        let mut read = kerning::pairs(&rebuilt, &glyphs);
+        read.sort_by_key(|p| (p.first, p.second));
+        assert_eq!(read, pairs);
+    }
+
+    #[test]
+    fn a_bundle_embeds_the_rebuilt_font_not_the_upload() {
+        let upload = template_font();
+        let opts = BuildOpts::default();
+        let names = vec!["bafkreifonttest_mac".to_string()];
+        let out = build_font_bundles(&upload, &names, "bafkreifonttest", &opts).unwrap();
+        let bundle = ReadBundle::load_bytes(&out[0].data).unwrap();
+        let sf = bundle.serialized().unwrap();
+        let embedded = sf
+            .objects
+            .iter()
+            .find(|o| o.class_id == 128)
+            .map(|o| sf.read_typetree(o).unwrap())
+            .and_then(|v| {
+                v.get("m_FontData")
+                    .and_then(|d| d.as_bytes())
+                    .map(<[u8]>::to_vec)
+            })
+            .unwrap();
+        assert_ne!(embedded, upload);
+        assert!(fontgen::is_supported(&embedded));
     }
 
     #[test]

@@ -1423,6 +1423,17 @@ impl Proxy {
                         tolerated_a.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+                // A font the lane refuses (over a limit, or not rebuildable) is untrusted input
+                // turned away, not a conversion failure: the explorer keeps its built-in font.
+                Err(e) if it.is_font => {
+                    tracing::warn!(
+                        entity = %cid,
+                        bundle = %name,
+                        file = %it.file,
+                        error = %format!("{e:#}"),
+                        "font refused by the font lane — no bundle"
+                    );
+                }
                 Err(e) => {
                     tracing::error!(
                         entity = %cid,

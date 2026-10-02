@@ -45,6 +45,12 @@ fn main() {
                         t.script_type_index,
                         t.script_id.map(hex)
                     );
+                    // SFDUMP_NODES=<field> prints the type tree under that field.
+                    if let (Ok(field), Some(node)) =
+                        (std::env::var("SFDUMP_NODES"), t.node.as_ref())
+                    {
+                        print_nodes(node, &field, false, 0);
+                    }
                 }
                 for obj in &sf.objects {
                     println!(
@@ -58,6 +64,21 @@ fn main() {
                 }
             }
         }
+    }
+}
+
+fn print_nodes(
+    n: &abgen::unity::typetree_node::TypeTreeNode,
+    field: &str,
+    inside: bool,
+    depth: usize,
+) {
+    let inside = inside || n.m_Name == field;
+    if inside {
+        println!("{}{} {}", "  ".repeat(depth), n.m_Type, n.m_Name);
+    }
+    for c in &n.m_Children {
+        print_nodes(c, field, inside, if inside { depth + 1 } else { 0 });
     }
 }
 

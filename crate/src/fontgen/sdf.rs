@@ -191,7 +191,7 @@ fn segment_distance2(&[x0, y0, x1, y1]: &[f64; 4], px: f64, py: f64) -> f64 {
 fn texel_span(lo: f64, hi: f64, spread: f64, origin: f64, len: u32) -> Option<(u32, u32)> {
     let first = (lo - spread - origin - 0.5).ceil().max(0.0);
     let last = (hi + spread - origin - 0.5).floor().min(len as f64 - 1.0);
-    (first <= last).then(|| (first as u32, last as u32))
+    (first <= last).then_some((first as u32, last as u32))
 }
 
 /// The field a glyph renders into: its bitmap box grown by `padding` on every side.
