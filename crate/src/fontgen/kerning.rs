@@ -51,7 +51,12 @@ fn gpos_pairs(face: &Face<'_>, glyphs: &[GlyphId]) -> Option<Vec<KernPair>> {
     let mut named = 0usize;
     for feature in gpos.features.into_iter().filter(|f| f.tag == kern) {
         any = true;
-        for index in feature.lookup_indices {
+        // Indexed, not iterated: ttf-parser's array iterator keeps a u16 position that
+        // overflows when a 65535-entry list is walked to its end.
+        for i in 0..feature.lookup_indices.len() {
+            let Some(index) = feature.lookup_indices.get(i) else {
+                break;
+            };
             named += 1;
             if named > MAX_KERN_FEATURE_INDICES {
                 return Some(Vec::new());
@@ -160,16 +165,16 @@ mod tests {
     use super::super::rebuild::tests::{cmap_format12, fixture, simple_glyph};
     use super::*;
 
-    /// A GPOS whose `kern` feature list holds `records` entries all pointing at one feature of
-    /// 65535 lookup indices, over an empty pair lookup.
+    /// A GPOS whose `kern` feature list holds `records` entries all pointing at one feature
+    /// naming lookup 0 65535 times, over one pair lookup kerning glyph 1 before glyph 2 by -50.
     fn gpos_feature_overlay(records: usize) -> Vec<u8> {
         let mut w: Vec<u8> = Vec::new();
         let u16 = |w: &mut Vec<u8>, v: u16| w.extend_from_slice(&v.to_be_bytes());
-        // Header: ScriptList at 10, LookupList at 30, FeatureList at 40.
+        // Header: ScriptList at 10, LookupList at 30, FeatureList after it.
         u16(&mut w, 1);
         u16(&mut w, 0);
         u16(&mut w, 10);
-        u16(&mut w, 40);
+        u16(&mut w, 0); // FeatureList, patched
         u16(&mut w, 30);
         // ScriptList: DFLT -> Script -> default LangSys running feature 0.
         u16(&mut w, 1);
@@ -182,13 +187,28 @@ mod tests {
         u16(&mut w, 1);
         u16(&mut w, 0);
         assert_eq!(w.len(), 30);
-        // LookupList: one pair lookup with no subtables.
+        // LookupList: one pair lookup with a PairPosFormat1 subtable for glyph 1 -> glyph 2.
         u16(&mut w, 1);
         u16(&mut w, 4);
+        u16(&mut w, 2); // Lookup: pair adjustment
+        u16(&mut w, 0);
+        u16(&mut w, 1);
+        u16(&mut w, 8);
+        // PairPosFormat1, offsets relative to its start.
+        u16(&mut w, 1);
+        u16(&mut w, 18); // coverage, after the 12-byte header and the 6-byte pair set
+        u16(&mut w, 0x0004); // valueFormat1: XAdvance
+        u16(&mut w, 0);
+        u16(&mut w, 1);
+        u16(&mut w, 12); // pair set
+        u16(&mut w, 1); // pair set: one record
         u16(&mut w, 2);
-        u16(&mut w, 0);
-        u16(&mut w, 0);
-        assert_eq!(w.len(), 40);
+        w.extend_from_slice(&(-50i16).to_be_bytes());
+        u16(&mut w, 1); // coverage format 1: glyph 1
+        u16(&mut w, 1);
+        u16(&mut w, 1);
+        let feature_list = w.len();
+        w[6..8].copy_from_slice(&(feature_list as u16).to_be_bytes());
         // FeatureList: every record is `kern` at the same feature.
         u16(&mut w, records as u16);
         let feature = 2 + 6 * records;
@@ -198,20 +218,41 @@ mod tests {
         }
         u16(&mut w, 0);
         u16(&mut w, 65535);
-        for i in 0..65535u16 {
-            u16(&mut w, i);
+        for _ in 0..65535 {
+            u16(&mut w, 0);
         }
         w
     }
 
-    #[test]
-    fn a_feature_overlay_ships_without_kerning_instead_of_being_walked() {
+    fn overlay_font(records: usize) -> Vec<u8> {
         let glyphs = vec![Vec::new(), simple_glyph(4), simple_glyph(4)];
-        let font = fixture(
+        fixture(
             &glyphs,
             cmap_format12(&[(0x41, 0x42, 1)]),
-            vec![(*b"GPOS", gpos_feature_overlay(2000))],
+            vec![(*b"GPOS", gpos_feature_overlay(records))],
+        )
+    }
+
+    #[test]
+    fn one_feature_of_every_index_is_read_and_kerns() {
+        // 65535 indices named once stays under the budget, and the pair lookup is applied.
+        let font = overlay_font(1);
+        let face = Face::parse(&font, 0).unwrap();
+        let read = pairs(&face, &[GlyphId(1), GlyphId(2)]);
+        assert_eq!(
+            read,
+            vec![KernPair {
+                first: 1,
+                second: 2,
+                x_advance: -50
+            }]
         );
+    }
+
+    #[test]
+    fn a_feature_overlay_ships_without_kerning_instead_of_being_walked() {
+        // The same lookup, named 2000 × 65535 times: past the budget, so no kerning at all.
+        let font = overlay_font(2000);
         let face = Face::parse(&font, 0).unwrap();
         assert!(face.tables().gpos.is_some());
         assert!(pairs(&face, &[GlyphId(1), GlyphId(2)]).is_empty());

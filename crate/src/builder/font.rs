@@ -876,6 +876,29 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_reaches_the_caller_typed_through_build_bundle() {
+        use crate::fontgen::rebuild::tests::{cmap_format12, composite_glyph, fixture};
+        // A composite cycle: refused by the rebuild, and the error keeps its type through the
+        // builder so the conversion can tolerate it.
+        let bomb = fixture(
+            &[composite_glyph(&[1]), composite_glyph(&[0])],
+            cmap_format12(&[(0x41, 0x41, 0)]),
+            Vec::new(),
+        );
+        let opts = BuildOpts {
+            source_file: Some("fonts/bomb.ttf"),
+            ..BuildOpts::default()
+        };
+        let err = build_bundle(&bomb, "bafkreibomb_mac", "bafkreibomb", &opts).unwrap_err();
+        assert!(err.downcast_ref::<fontgen::Refused>().is_some(), "{err:#}");
+
+        // Not a font at all under a .ttf path: refused, never a texture bundle.
+        let err =
+            build_bundle(b"wOF2 not a font", "bafkreiwoff_mac", "bafkreiwoff", &opts).unwrap_err();
+        assert!(err.downcast_ref::<fontgen::Refused>().is_some(), "{err:#}");
+    }
+
+    #[test]
     fn only_sfnt_fonts_take_the_font_lane() {
         assert!(fontgen::is_supported(&template_font()));
         assert!(!fontgen::is_supported(b"wOF2 not an sfnt"));

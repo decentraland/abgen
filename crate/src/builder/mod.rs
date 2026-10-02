@@ -636,9 +636,20 @@ impl<'a> Default for BuildOpts<'a> {
     }
 }
 
-fn is_font_input(bytes: &[u8], opts: &BuildOpts<'_>) -> bool {
-    crate::fontgen::is_font_file(bytes)
-        && opts.source_file.is_some_and(crate::fontgen::is_font_path)
+/// Whether `bytes` take the font lane: a `.ttf` path holding a TrueType file. A `.ttf` path
+/// holding anything else is refused outright rather than handed to the texture builder, which
+/// would ship an image bundle under the font's name.
+fn is_font_input(bytes: &[u8], opts: &BuildOpts<'_>) -> Result<bool> {
+    if !opts.source_file.is_some_and(crate::fontgen::is_font_path) {
+        return Ok(false);
+    }
+    if !crate::fontgen::is_font_file(bytes) {
+        return Err(crate::fontgen::Refused(
+            "a .ttf that is not a TrueType file within the size cap".into(),
+        )
+        .into());
+    }
+    Ok(true)
 }
 
 pub fn build_bundle(
@@ -661,7 +672,7 @@ pub fn build_bundle(
 
     // By path and by content: font bytes under an image name stay on the image lane, where
     // the decode gate and the manifest treat them as the image they claim to be.
-    if is_font_input(bytes, opts) {
+    if is_font_input(bytes, opts)? {
         let mut out = font::build_font_bundles(bytes, &[bundle_name.to_string()], root_hash, opts)?;
         return Ok(out.remove(0));
     }
@@ -844,7 +855,7 @@ pub fn build_bundle_multi(
         ".glb"
     };
 
-    if is_font_input(bytes, opts) {
+    if is_font_input(bytes, opts)? {
         return font::build_font_bundles(bytes, bundle_names, root_hash, opts);
     }
 

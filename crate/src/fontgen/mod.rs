@@ -180,17 +180,18 @@ pub fn is_font_path(path: &str) -> bool {
 }
 
 /// Whether [`bake`] can take this font: a TrueType file within [`MAX_FONT_BYTES`] that parses,
-/// keeps its `cmap` small enough to query, and maps at least one of the pre-filled characters.
+/// has a `cmap` within the lane's bounds, and maps at least one of the pre-filled characters.
 /// Cheap enough to gate a conversion on; the outline and render limits are only known once
 /// [`bake`] measures them.
 pub fn is_supported(bytes: &[u8]) -> bool {
     is_font_file(bytes)
         && Face::parse(bytes, 0).is_ok_and(|face| {
             face.units_per_em() > 0
-                && rebuild::cmap_records_bounded(&face)
-                && priority_characters()
-                    .into_iter()
-                    .any(|c| face.glyph_index(c).is_some())
+                && rebuild::unicode_map(&face).is_ok_and(|map| {
+                    priority_characters()
+                        .into_iter()
+                        .any(|c| map.contains_key(&(c as u32)))
+                })
         })
 }
 
@@ -218,15 +219,11 @@ pub fn bake(bytes: &[u8]) -> Result<BakedFont> {
     if source.units_per_em() == 0 {
         refuse!("font declares no units per em");
     }
-    if !rebuild::cmap_records_bounded(&source) {
-        refuse!(
-            "cmap has over {} encoding records",
-            rebuild::MAX_CMAP_SUBTABLES
-        );
-    }
+    // Read raw and bounded; `Face::glyph_index` would try every encoding record per lookup.
+    let map = rebuild::unicode_map(&source)?;
     let prefill: Vec<GlyphId> = priority_characters()
         .into_iter()
-        .filter_map(|c| source.glyph_index(c))
+        .filter_map(|c| map.get(&(c as u32)).map(|&g| GlyphId(g)))
         .collect();
     let pairs = kerning::pairs(&source, &prefill);
     let (font_data, pairs) = rebuild::rebuild(&source, &pairs)?;
