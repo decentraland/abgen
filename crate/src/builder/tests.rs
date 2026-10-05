@@ -66,6 +66,7 @@ fn templates_missing_reports_every_absent_required_template() {
             "animated-types.windows.bundle".to_string(),
             "emote-types.windows.bundle".to_string(),
             "skinned-types.windows.bundle".to_string(),
+            "font-types.mac.bundle".to_string(),
         ]
     );
 

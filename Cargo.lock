@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "abgen"
-version = "0.19.3"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -47,6 +47,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "ttf-parser",
  "ureq",
  "webpki-roots",
  "wgpu",
@@ -54,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "abgen-lambda"
-version = "0.19.3"
+version = "0.20.0"
 dependencies = [
  "abgen",
  "anyhow",
@@ -67,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "abgen-native"
-version = "0.19.3"
+version = "0.20.0"
 dependencies = [
  "abgen",
  "libc",
@@ -856,7 +857,7 @@ dependencies = [
 
 [[package]]
 name = "dcl-contents"
-version = "0.19.3"
+version = "0.20.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -4038,6 +4039,12 @@ dependencies = [
  "tracing-log",
  "tracing-serde",
 ]
+
+[[package]]
+name = "ttf-parser"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "typenum"

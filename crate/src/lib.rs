@@ -68,6 +68,7 @@ pub mod dates;
 pub mod decode_cache;
 pub mod detmath;
 pub mod draco;
+pub mod fontgen;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod glbscan;
 pub mod gltf;

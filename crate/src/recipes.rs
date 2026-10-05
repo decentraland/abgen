@@ -81,14 +81,18 @@ pub enum Recipe {
     /// Animation clips: curve sampling, interpolation, and the Mecanim tracks built from
     /// them. Applies to a glTF that carries clips.
     Animation,
+    /// Scene font bundles: the baked atlas, the glyph and face metrics, and the font asset
+    /// layout the explorer loads (`builder::font`, `fontgen`).
+    Font,
 }
 
 impl Recipe {
-    pub const ALL: [Recipe; 4] = [
+    pub const ALL: [Recipe; 5] = [
         Recipe::Glb,
         Recipe::Texture,
         Recipe::Skin,
         Recipe::Animation,
+        Recipe::Font,
     ];
 
     /// Stable key this recipe is recorded under, in digests and in manifests. Renaming one
@@ -99,6 +103,7 @@ impl Recipe {
             Recipe::Texture => "texture",
             Recipe::Skin => "skin",
             Recipe::Animation => "animation",
+            Recipe::Font => "font",
         }
     }
 
@@ -137,6 +142,7 @@ impl Recipe {
             Recipe::Texture => 0,
             Recipe::Skin => 1,
             Recipe::Animation => 0,
+            Recipe::Font => 0,
         }
     }
 
@@ -226,6 +232,11 @@ pub fn gltf_recipes(doc: &serde_json::Value) -> Vec<Recipe> {
 /// normal-only?" is exactly the ambiguous question a recipe must not ask.
 pub fn image_recipes() -> Vec<Recipe> {
     vec![Recipe::Texture]
+}
+
+/// The recipes a font bundle's bytes are a function of.
+pub fn font_recipes() -> Vec<Recipe> {
+    vec![Recipe::Font]
 }
 
 /// Fold `recipes` into the per-entity set a manifest records.
