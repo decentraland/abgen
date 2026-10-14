@@ -155,9 +155,15 @@ SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json
   - `parcels`: the entity's pointers, normalized to `x,y`.
   - `deployedAt`: the catalyst `timestamp`, `null` when the entity document has none.
   - `rebuiltAt`: when the record was written, in ms.
-- **Keys.** `rebuiltAt` is zero-padded to 13 digits, so keys list in rebuild order. A consumer
-  can keep the last key it processed and list from there. Each record is written once and never
-  overwritten, so the default immutable one-year `Cache-Control` applies.
+- **Keys.** `rebuiltAt` is zero-padded to 13 digits, so keys list in rebuild order. Each record
+  is written once and never overwritten, so the default immutable one-year `Cache-Control`
+  applies.
+- **Consuming.** The prefix is a queue. The capture machine lists `SatelliteMaps/rebuild/`,
+  re-captures the parcels each record names, then deletes the records it handled. Writers and
+  the consumer never touch the same key, so there is nothing to coordinate: a record written
+  during a run is simply picked up by the next listing. The consumer talks to the bucket
+  directly (list, get, delete), not through the CDN, whose cached copy of a deleted record is
+  harmless but stale.
 - **Failure handling.** The put is fail-soft, like the scene sources: a failure is logged and
   never fails the job. The key written is reported under the job summary's
   `lods.satelliteRebuildRecord`.
