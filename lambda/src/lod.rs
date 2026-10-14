@@ -993,6 +993,7 @@ mod tests {
             lods_enabled: true,
             max_receive_count: 3,
             lod_levels: crate::config::default_levels(),
+            satellite_rebuild_records: false,
         }
     }
 

@@ -326,6 +326,7 @@ mod tests {
             lods_enabled: false,
             max_receive_count: 3,
             lod_levels: vec![1],
+            satellite_rebuild_records: false,
         }
     }
 

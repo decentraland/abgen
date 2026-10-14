@@ -8,6 +8,7 @@ mod lod;
 mod notify;
 mod output;
 mod runtime;
+mod satellite;
 
 use anyhow::{Context, Result};
 
@@ -61,7 +62,10 @@ fn main() {
                  \x20    ENABLE_LODS (off: LOD jobs are acked and skipped; on: LOD_LEVELS\n\
                  \x20    are regenerated from the scene and written to LOD/<level>/ and\n\
                  \x20    lods-unity/manifests/ — the deployment's FBX sources are unused),\n\
-                 \x20    LOD_LEVELS (default 1; 0,1 for both levels)"
+                 \x20    LOD_LEVELS (default 1; 0,1 for both levels),\n\
+                 \x20    ENABLE_SATELLITE_REBUILD_RECORDS (off; on: each Genesis City\n\
+                 \x20    scene converted on every platform writes satellite/rebuild/\n\
+                 \x20    <convertedAt>-<entityId>.json naming its parcels)"
             );
         }
         Some(other) => {
@@ -330,7 +334,20 @@ fn convert_asset_bundles(
     }
 
     let published = publish_forget_notify(
-        || output::publish(cfg, &agent, proxy, &entity_doc, &outcome),
+        // The satellite record follows the upload it describes and precedes notify: a failed
+        // notify is redelivered as already converted, which never writes it.
+        || {
+            let upload = output::publish(cfg, &agent, proxy, &entity_doc, &outcome)?;
+            let record = satellite::publish(
+                cfg,
+                proxy,
+                &entity_doc,
+                &job.entity_id,
+                content_server,
+                outcome.exit_code(),
+            );
+            Ok((upload, record))
+        },
         || {
             if job.force {
                 for platform in &cfg.platforms {
@@ -363,7 +380,7 @@ fn convert_asset_bundles(
     if !cfg.keep_output {
         let _ = std::fs::remove_dir_all(&outcome.cid_dir);
     }
-    let (upload, notified) = published?;
+    let ((upload, satellite_rebuild), notified) = published?;
 
     eprintln!(
         "done: {} platforms={} exitCode={} texcache hits={} misses={}",
@@ -391,6 +408,7 @@ fn convert_asset_bundles(
         "texEncodeCache": { "hits": outcome.cache_hits, "misses": outcome.cache_misses },
         "upload": upload,
         "notified": notified,
+        "satelliteRebuildRecord": satellite_rebuild,
     }))
 }
 
@@ -507,6 +525,7 @@ mod tests {
             lods_enabled: false,
             max_receive_count: 3,
             lod_levels: vec![1],
+            satellite_rebuild_records: false,
         }
     }
 
