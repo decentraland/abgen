@@ -1,7 +1,7 @@
-//! Satellite map rebuild records. After a Genesis City scene converts, one immutable JSON object
-//! under [`PREFIX`] names the parcels the deployment covers, whose satellite map images may be
-//! stale. The map capture machine lists the prefix to know what to re-capture (see the
-//! "Satellite rebuild records" section of `lambda/README.md`).
+//! Satellite map rebuild records. After the LOD lane rebuilds a Genesis City scene's LODs, one
+//! immutable JSON object under [`PREFIX`] names the parcels the deployment covers, whose
+//! satellite map images are now stale. The map capture machine lists the prefix to know what to
+//! re-capture (see the "Satellite rebuild records" section of `lambda/README.md`).
 
 use serde_json::{json, Value};
 
@@ -14,7 +14,7 @@ pub fn record(
     entity_doc: &Value,
     entity_id: &str,
     content_server: &str,
-    converted_at_ms: u64,
+    rebuilt_at_ms: u64,
 ) -> Option<Value> {
     if crate::output::entity_type(entity_doc) != "scene"
         || content_server.contains("worlds-content-server")
@@ -38,40 +38,39 @@ pub fn record(
         "entityId": entity_id,
         "contentServer": content_server,
         "deployedAt": entity_doc.get("timestamp").and_then(Value::as_u64),
-        "convertedAt": converted_at_ms,
+        "rebuiltAt": rebuilt_at_ms,
         "parcels": parcels,
     }))
 }
 
-/// `satellite/rebuild/{convertedAt}-{entityId}.json`, the time zero-padded to 13 digits so the
-/// keys list in conversion order. Each conversion writes a new key; none is ever overwritten.
-pub fn key(converted_at_ms: u64, entity_id: &str) -> String {
-    format!("{PREFIX}{converted_at_ms:013}-{entity_id}.json")
+/// `satellite/rebuild/{rebuiltAt}-{entityId}.json`, the time zero-padded to 13 digits so the
+/// keys list in rebuild order. Each rebuild writes a new key; none is ever overwritten.
+pub fn key(rebuilt_at_ms: u64, entity_id: &str) -> String {
+    format!("{PREFIX}{rebuilt_at_ms:013}-{entity_id}.json")
 }
 
-/// Writes the record of a conversion that succeeded on every platform and returns its key.
-/// `None` when the records are disabled, nothing is published, the conversion failed, or the
-/// entity is not a Genesis City scene. Fail-soft like the scene sources: a failed put is logged
-/// and never fails the job.
+/// Writes the record of a LOD rebuild and returns its key. The caller has established that the
+/// LOD lane built and uploaded fresh LODs (`lod::rebuilt`); `None` when the records are
+/// disabled, nothing is published, or the entity is not a Genesis City scene. Fail-soft like
+/// the scene sources: a failed put is logged and never fails the job.
 pub fn publish(
     cfg: &crate::config::Config,
     proxy: &abgen::live::Proxy,
     entity_doc: &Value,
     entity_id: &str,
     content_server: &str,
-    exit_code: i32,
 ) -> Option<String> {
-    if !cfg.satellite_rebuild_records || exit_code != 0 || !proxy.space_configured() {
+    if !cfg.satellite_rebuild_records || !proxy.space_configured() {
         return None;
     }
 
-    let converted_at_ms = std::time::SystemTime::now()
+    let rebuilt_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    let record = record(entity_doc, entity_id, content_server, converted_at_ms)?;
-    let key = key(converted_at_ms, entity_id);
+    let record = record(entity_doc, entity_id, content_server, rebuilt_at_ms)?;
+    let key = key(rebuilt_at_ms, entity_id);
     proxy.space_put_key(&key, record.to_string().as_bytes());
     Some(key)
 }
@@ -104,7 +103,7 @@ mod tests {
         assert_eq!(
             record.to_string(),
             "{\"entityId\":\"bafkreia1b2c3\",\"contentServer\":\"https://peer.decentraland.org/content\",\
-             \"deployedAt\":1724000000000,\"convertedAt\":1724000000123,\"parcels\":[\"0,0\",\"-1,0\"]}"
+             \"deployedAt\":1724000000000,\"rebuiltAt\":1724000000123,\"parcels\":[\"0,0\",\"-1,0\"]}"
         );
     }
 
@@ -157,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_list_in_conversion_order() {
+    fn keys_list_in_rebuild_order() {
         assert_eq!(
             key(1_724_000_000_123, "bafkrei"),
             "satellite/rebuild/1724000000123-bafkrei.json"

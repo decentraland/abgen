@@ -182,7 +182,7 @@ pub fn follow_up(
     if let Err(e) = &result {
         eprintln!("lods: {entity_id}: LOD generation failed ({e:#}); the conversion stands");
     }
-    let summary = follow_up_summary(result);
+    let mut summary = follow_up_summary(result);
     let outcome = if summary.get("error").is_some() {
         "error"
     } else if summary.get("skipped").is_some() {
@@ -193,7 +193,42 @@ pub fn follow_up(
         "converted"
     };
     metrics::counter!("abgen_lambda_lod_followup_total", "outcome" => outcome).increment(1);
+    record_rebuild(cfg, proxy, &mut summary, &entity, entity_id, content_server);
     Some(summary)
+}
+
+/// Write the satellite rebuild record when `summary` says this job built and uploaded fresh
+/// LODs, and report its key under `satelliteRebuildRecord`. A rebuilt LOD is the signal the
+/// satellite map is stale: the reuse index only misses when the scene's placements or their
+/// content changed, which is what the map shows. A reuse, a skip or a failure leaves the
+/// summary untouched.
+fn record_rebuild(
+    cfg: &Config,
+    proxy: &Arc<Proxy>,
+    summary: &mut serde_json::Value,
+    entity: &serde_json::Value,
+    entity_id: &str,
+    content_server: &str,
+) {
+    if !rebuilt(summary) {
+        return;
+    }
+    summary["satelliteRebuildRecord"] = serde_json::json!(crate::satellite::publish(
+        cfg,
+        proxy,
+        entity,
+        entity_id,
+        content_server
+    ));
+}
+
+/// Whether a follow-up summary describes LODs built and uploaded by this job, as opposed to
+/// a previous build's republished under this entity, a skip or a failure.
+pub fn rebuilt(summary: &serde_json::Value) -> bool {
+    summary.get("error").is_none()
+        && summary.get("skipped").is_none()
+        && summary.get("reusedBy").is_none()
+        && summary.get("uploaded").and_then(serde_json::Value::as_bool) == Some(true)
 }
 
 pub fn is_scene(entity: &serde_json::Value) -> bool {
@@ -972,6 +1007,98 @@ mod follow_up_tests {
         );
         let err = follow_up_summary(Err(anyhow::anyhow!("gate failed")));
         assert_eq!(err["error"], "gate failed");
+    }
+
+    #[test]
+    fn only_a_fresh_upload_counts_as_rebuilt() {
+        let built = |uploaded| {
+            follow_up_summary(Ok(success_summary(
+                "bafkE",
+                "bafke",
+                &["windows".to_string()],
+                &[(1, 9)],
+                4,
+                uploaded,
+            )))
+        };
+        assert!(rebuilt(&built(true)));
+        assert!(!rebuilt(&built(false)), "nothing published");
+
+        let mut reused = built(true);
+        reused["reusedBy"] = serde_json::json!("state");
+        assert!(!rebuilt(&reused), "a republished build changed nothing");
+
+        assert!(!rebuilt(&serde_json::json!({"skipped": "lods-no-supported-platform"})));
+        assert!(!rebuilt(&serde_json::json!({"error": "gate failed"})));
+    }
+
+    /// The idea end to end against a fake space: a build that uploaded writes one record
+    /// and names it in the summary; a reuse of a previous build, the same job with the
+    /// records off, and a world write nothing.
+    #[test]
+    fn only_a_rebuilt_lod_writes_a_satellite_record() {
+        let (host, seen) = crate::output::tests::serve(vec![]);
+        let _space = crate::output::tests::point_space_at(&host);
+        let cfg = Config {
+            satellite_rebuild_records: true,
+            ..tests::cfg()
+        };
+        let proxy = crate::convert::make_proxy(&cfg, "https://c/content");
+        let catalyst = "https://peer.decentraland.org/content";
+        let scene = serde_json::json!({
+            "type": "scene", "pointers": ["0,0", "-1,0"], "timestamp": 1_724_000_000_000u64
+        });
+        let built = || {
+            follow_up_summary(Ok(success_summary(
+                "bafkE",
+                "bafke",
+                &["windows".to_string()],
+                &[(1, 9)],
+                4,
+                true,
+            )))
+        };
+
+        let mut summary = built();
+        record_rebuild(&cfg, &proxy, &mut summary, &scene, "bafkE", catalyst);
+        let key = summary["satelliteRebuildRecord"]
+            .as_str()
+            .expect("the summary names the record")
+            .to_string();
+        assert!(
+            key.starts_with("satellite/rebuild/") && key.ends_with("-bafkE.json"),
+            "{key}"
+        );
+        assert_eq!(seen.lock().unwrap().clone(), vec![format!("PUT /{key}")]);
+
+        let mut reused = built();
+        reused["reusedBy"] = serde_json::json!("inputs");
+        record_rebuild(&cfg, &proxy, &mut reused, &scene, "bafkE", catalyst);
+        assert!(
+            reused.get("satelliteRebuildRecord").is_none(),
+            "a reuse changed nothing visible: {reused}"
+        );
+
+        let off = Config {
+            satellite_rebuild_records: false,
+            ..tests::cfg()
+        };
+        let mut summary = built();
+        record_rebuild(&off, &proxy, &mut summary, &scene, "bafkE", catalyst);
+        assert_eq!(summary["satelliteRebuildRecord"], serde_json::Value::Null);
+
+        let mut summary = built();
+        record_rebuild(
+            &cfg,
+            &proxy,
+            &mut summary,
+            &scene,
+            "bafkE",
+            "https://worlds-content-server.decentraland.org",
+        );
+        assert_eq!(summary["satelliteRebuildRecord"], serde_json::Value::Null);
+
+        assert_eq!(seen.lock().unwrap().len(), 1, "only the rebuild reached the space");
     }
 }
 
