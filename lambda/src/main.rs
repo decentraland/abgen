@@ -64,7 +64,7 @@ fn main() {
                  \x20    lods-unity/manifests/ — the deployment's FBX sources are unused),\n\
                  \x20    LOD_LEVELS (default 1; 0,1 for both levels),\n\
                  \x20    ENABLE_SATELLITE_REBUILD_RECORDS (off; on: each Genesis City\n\
-                 \x20    scene whose LODs the LOD lane rebuilds writes satellite/rebuild/\n\
+                 \x20    scene whose LODs the LOD lane rebuilds writes SatelliteMaps/rebuild/\n\
                  \x20    <rebuiltAt>-<entityId>.json naming its parcels)"
             );
         }

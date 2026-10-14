@@ -6,7 +6,7 @@
 use serde_json::{json, Value};
 
 /// Key prefix of the rebuild records.
-pub const PREFIX: &str = "satellite/rebuild/";
+pub const PREFIX: &str = "SatelliteMaps/rebuild/";
 
 /// The record of a converted entity, or `None` when it is not a Genesis City scene: a world, a
 /// wearable or emote, or a scene whose pointers are not `x,y` parcels.
@@ -43,7 +43,7 @@ pub fn record(
     }))
 }
 
-/// `satellite/rebuild/{rebuiltAt}-{entityId}.json`, the time zero-padded to 13 digits so the
+/// `SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json`, the time zero-padded to 13 digits so the
 /// keys list in rebuild order. Each rebuild writes a new key; none is ever overwritten.
 pub fn key(rebuilt_at_ms: u64, entity_id: &str) -> String {
     format!("{PREFIX}{rebuilt_at_ms:013}-{entity_id}.json")
@@ -159,9 +159,9 @@ mod tests {
     fn keys_list_in_rebuild_order() {
         assert_eq!(
             key(1_724_000_000_123, "bafkrei"),
-            "satellite/rebuild/1724000000123-bafkrei.json"
+            "SatelliteMaps/rebuild/1724000000123-bafkrei.json"
         );
-        assert_eq!(key(42, "e"), "satellite/rebuild/0000000000042-e.json");
+        assert_eq!(key(42, "e"), "SatelliteMaps/rebuild/0000000000042-e.json");
         assert!(key(999, "z") < key(1_000, "a"));
     }
 }

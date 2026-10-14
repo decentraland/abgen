@@ -1066,7 +1066,7 @@ mod follow_up_tests {
             .expect("the summary names the record")
             .to_string();
         assert!(
-            key.starts_with("satellite/rebuild/") && key.ends_with("-bafkE.json"),
+            key.starts_with("SatelliteMaps/rebuild/") && key.ends_with("-bafkE.json"),
             "{key}"
         );
         assert_eq!(seen.lock().unwrap().clone(), vec![format!("PUT /{key}")]);

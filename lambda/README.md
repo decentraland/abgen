@@ -66,7 +66,7 @@ all hits.
 | `ABGEN_HTTP_SECRET` | — (**fail-closed**) | shared secret the Function URL POST path requires in `x-abgen-secret`; unset means every HTTP invocation is refused with `503` |
 | `ENABLE_LODS` | off | after a scene's asset bundles are published and notified, build (or reuse) its `LOD_LEVELS` in the same job (see [LOD generation](#lod-generation)) |
 | `LOD_LEVELS` | `1` | comma-separated LOD levels the LOD lane builds and publishes (`0,1` for both); level 2 is refused |
-| `ENABLE_SATELLITE_REBUILD_RECORDS` | off | each Genesis City scene whose LODs the LOD lane rebuilds writes a `satellite/rebuild/` record naming its parcels; needs `ENABLE_LODS` (see [Satellite rebuild records](#satellite-rebuild-records)) |
+| `ENABLE_SATELLITE_REBUILD_RECORDS` | off | each Genesis City scene whose LODs the LOD lane rebuilds writes a `SatelliteMaps/rebuild/` record naming its parcels; needs `ENABLE_LODS` (see [Satellite rebuild records](#satellite-rebuild-records)) |
 | `ALLOWED_CONTENT_SERVER_HOSTS` | — (**fail-open**) | comma-separated allowlist of hosts an event's `contentServerUrl` may name; **unset means any https host is accepted**, so every deployment should set it. Scheme/shape validation (https only, no userinfo) applies regardless — allowlist or not, a plaintext or internal-IP URL is rejected. The `lambdaImage` bakes in `peer.decentraland.org`; a function env var overrides it. |
 | `ABGEN_EMF_NAMESPACE` | — (off) | CloudWatch namespace for EMF metrics (e.g. `abgen/lambda`); unset means no recorder is installed and every `metrics::` call stays a no-op |
 | `ABGEN_LOG_FORMAT` | plain text | `json` for JSON log lines |
@@ -130,7 +130,7 @@ With `ENABLE_SATELLITE_REBUILD_RECORDS=1`, each Genesis City scene whose LODs th
 after those LODs:
 
 ```
-satellite/rebuild/{rebuiltAt}-{entityId}.json
+SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json
 ```
 
 ```json
@@ -288,7 +288,7 @@ extra dimensions.
 | LOD bundles, `ENABLE_LODS=1` | `LOD/{level}/{sceneId}_{level}_{platform}` |
 | ISS descriptor, `ENABLE_LODS=1` | `lods-unity/manifests/{sceneId}_InitialSceneState.json` |
 | published LOD GLB (gltfpack layout, level 1 only), `ENABLE_LODS=1` | `lods-unity/lods/{sceneId}_1.glb` |
-| satellite rebuild records, `ENABLE_SATELLITE_REBUILD_RECORDS=1` | `satellite/rebuild/{rebuiltAt}-{entityId}.json` |
+| satellite rebuild records, `ENABLE_SATELLITE_REBUILD_RECORDS=1` | `SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json` |
 | LOD reuse index, `ENABLE_LODS=1` | `lod-reuse/by-inputs/{digest}.json`, `lod-reuse/by-state/{digest}.json` (see [Reusing an unchanged build](#reusing-an-unchanged-build)) |
 
 The three LOD families are the production key set (consumer-server keys plus
