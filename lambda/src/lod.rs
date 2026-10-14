@@ -1028,7 +1028,9 @@ mod follow_up_tests {
         reused["reusedBy"] = serde_json::json!("state");
         assert!(!rebuilt(&reused), "a republished build changed nothing");
 
-        assert!(!rebuilt(&serde_json::json!({"skipped": "lods-no-supported-platform"})));
+        assert!(!rebuilt(
+            &serde_json::json!({"skipped": "lods-no-supported-platform"})
+        ));
         assert!(!rebuilt(&serde_json::json!({"error": "gate failed"})));
     }
 
@@ -1098,7 +1100,11 @@ mod follow_up_tests {
         );
         assert_eq!(summary["satelliteRebuildRecord"], serde_json::Value::Null);
 
-        assert_eq!(seen.lock().unwrap().len(), 1, "only the rebuild reached the space");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "only the rebuild reached the space"
+        );
     }
 }
 
