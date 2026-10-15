@@ -122,6 +122,91 @@ and events from this pipeline describe a different CDN bucket. The message
 attributes are what SQS filter policies match on — the body alone would be
 dropped by every filtered subscription.
 
+## Satellite rebuild records
+
+A scene whose captured image is now stale writes one JSON object to the CDN bucket, whenever a
+space is configured. For Genesis City that is each scene for which the
+[LOD lane](#lod-generation) requests a build (its reuse index missed), written just before that
+build. For Worlds it is every scene that converts, written right after its bundles:
+
+```
+SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json
+```
+
+```json
+{"entityId":"bafkrei…","contentServer":"https://peer.decentraland.org/content",
+ "deployedAt":1724000000000,"rebuiltAt":1724000000123,"parcels":["0,0","-1,0"]}
+```
+
+```json
+{"entityId":"bafkrei…","contentServer":"https://worlds-content-server.decentraland.org/content",
+ "world":"my-world.dcl.eth","deployedAt":1724000000000,"rebuiltAt":1724000000123,"parcels":["0,0"]}
+```
+
+- **What it's for.** The Explorer's satellite map is captured from the scenes. The map capture
+  machine lists this prefix to know which parcels to re-capture.
+- **Why a LOD reuse miss is the Genesis City trigger.** A deployment converts whether or not
+  anything visible changed. The LOD lane's reuse index misses only when the scene's placements
+  or their content changed (see [Reusing an unchanged build](#reusing-an-unchanged-build)),
+  which is what the map shows, so a miss is the stale-map signal and a reuse is not. The record
+  is written at the miss, before the build runs: the map is captured from the asset bundles,
+  not the LODs, so a build that then fails is no reason to skip the capture.
+- **Which Genesis City jobs write one.** A scene entity (`type` is `scene`) whose pointers are
+  all `x,y` parcels, from a content server that is not a worlds server, whose LOD follow-up
+  found no reusable build.
+  - A follow-up that reuses a previous build writes none: nothing visible changed.
+  - A LOD build that fails after the miss has already written one. LOD skips (no supported
+    platform) write none, and so does a conversion whose LOD lane is off: `ENABLE_LODS` is
+    required for city records.
+  - A forced reconversion writes one only if its reuse lookup misses too.
+  - A conversion that failed never gets this far. The converter writes only exit code 0 or the
+    tolerated 12 (some assets failed, the bundles stand); a conversion that fails for real
+    errors out of the job before anything downstream, is retried, and finally tombstones (exit
+    code 5, with a `statusCode: 5` finished event for the registry's fallback state). So it
+    gets no LODs, no reuse record and no satellite record, and because no reuse record was
+    written, the redelivery or deployment that converts cleanly finds no reusable build and
+    records its miss. An already-converted skip only ever follows a clean conversion (a
+    tombstone is never current), so its LOD lane runs and records a miss.
+  - **False positives happen; no false negatives are known.** The LOD lane also
+    runs for already-converted redeliveries, which write nothing only because the reuse index
+    hits. It misses, and so every redeployed scene writes a record, on a `LOD_LEVELS` or
+    platform change, a generation bump, a reuse-check error, and the first rollout. A
+    re-capture queue tolerates that: the cost is a capture of an unchanged parcel.
+- **Which Worlds jobs write one.** Every scene from a worlds content server (its host starts
+  with `worlds-content-server`, case-insensitively; `abgen::lods::is_worlds_host` decides for
+  every lane) that converts. Worlds are captured whole, so every deployment is a capture
+  request; the LOD lane's reuse verdict plays no part. A conversion that fails never reaches
+  the record (see above).
+  - The record is written by the conversion job, after the upload and before the finished
+    events, so a redelivery after a failed notify (which takes the already-converted path)
+    cannot lose or duplicate it.
+  - Failed conversions and already-converted skips write none. A forced reconversion writes one.
+- **Fields.**
+  - `parcels`: the entity's parcel pointers, normalized to `x,y`. A city scene must have only
+    parcels; a world's non-parcel pointers are dropped and the list may be empty.
+  - `world` (Worlds records only): `metadata.worldConfiguration.name`, `null` when the
+    deployment carries none.
+  - `deployedAt`: the catalyst `timestamp`, `null` when the entity document has none.
+  - `rebuiltAt`: when the record was written, in ms.
+- **Keys.** `rebuiltAt` is zero-padded to 13 digits, so keys list in rebuild order. Each record
+  is written once and never overwritten. The queue prefix (`SatelliteMaps/rebuild/`, not all of
+  `SatelliteMaps/`) is nevertheless served `no-cache` (`space::object_headers`): a consumed
+  record is deleted, and a cached copy of it at the edge would be a stale capture request.
+- **Consuming.** The prefix is a queue. The capture machine lists `SatelliteMaps/rebuild/`,
+  re-captures the parcels each record names, then deletes the records it handled. Writers and
+  the consumer never touch the same key, so there is nothing to coordinate: a record written
+  during a run is simply picked up by the next listing. The consumer talks to the bucket
+  directly (list, get, delete), not through the CDN, whose cached copy of a deleted record is
+  harmless but stale.
+- **Failure handling.** The put is fail-soft, like the scene sources: a failure is logged and
+  never fails the job. The key is reported in the job summary only when the put succeeded: a
+  city record under `lods.satelliteRebuildRecord`, a world record at the top-level
+  `satelliteRebuildRecord`. A summary without the field wrote no record, with one exception: a
+  city record whose LOD build then failed is in the bucket, but the LOD summary is the error,
+  and the log line `satellite: <entityId>: wrote <key>` is its only report.
+- **Out of scope.** Parcels a redeployment drops are not listed: the record names the new
+  entity's parcels only.
+
 ## Redis hit-cache (optional)
 
 The same optimization production's consumer-server runs: Redis in front of
@@ -246,6 +331,7 @@ extra dimensions.
 | LOD bundles, `ENABLE_LODS=1` | `LOD/{level}/{sceneId}_{level}_{platform}` |
 | ISS descriptor, `ENABLE_LODS=1` | `lods-unity/manifests/{sceneId}_InitialSceneState.json` |
 | published LOD GLB (gltfpack layout, level 1 only), `ENABLE_LODS=1` | `lods-unity/lods/{sceneId}_1.glb` |
+| satellite rebuild records | `SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json` |
 | LOD reuse index, `ENABLE_LODS=1` | `lod-reuse/by-inputs/{digest}.json`, `lod-reuse/by-state/{digest}.json` (see [Reusing an unchanged build](#reusing-an-unchanged-build)) |
 
 The three LOD families are the production key set (consumer-server keys plus
@@ -298,7 +384,8 @@ writer of its key family sets, derived from the key by
 `public,max-age=31536000,immutable` (cdn-uploader's comma-joined spelling),
 scene sources (`.js`/`.json`/`.crdt`) the direct-upload spelling
 `public, max-age=31536000, immutable`, manifests (`manifest/…`) are
-`application/json` + `private, max-age=0, no-cache`, and ISS descriptors
+`application/json` + `private, max-age=0, no-cache` (as are LOD reuse records and
+satellite rebuild records, `SatelliteMaps/…`), and ISS descriptors
 (`lods-unity/manifests/…`) are `public, max-age=31536000` — the
 lod-generator-unity storage adapter's `CACHE_CONTROL_ONE_YEAR`, whose keys
 these are (they embed the content-addressed entity id; they are *not*
@@ -418,6 +505,15 @@ their finished events sent, so one deployment's bundles and LODs land in one
 go. Wearables and emotes never reach it. An already-converted scene still
 gets the LOD step, which the reuse index makes a cheap `by=inputs` hit when
 nothing changed.
+
+The lane runs only after a conversion that stands, and it does not have to check: the
+converter writes only exit code 0 or the tolerated 12 (some assets failed to convert, the
+bundles stand), and a conversion that fails for real errors out of the job before the lane,
+is retried, and finally tombstones (exit code 5, written on that path alone). A failed
+conversion therefore gets no LODs, no reuse record and no
+[satellite rebuild record](#satellite-rebuild-records), the same way the registry gets no
+converted lane. A tombstone is never current, so the redelivery or deployment that converts
+cleanly runs the lane and is the next attempt.
 
 The LODs are regenerated from the scene entity through the same `lodgen`
 chain the abcdn server runs JIT (`abgen-lod generate`): resolve placements

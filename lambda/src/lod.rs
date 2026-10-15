@@ -11,6 +11,7 @@ use std::sync::Arc;
 fn convert(
     cfg: &Config,
     proxy: &Arc<Proxy>,
+    entity: &serde_json::Value,
     entity_id: &str,
     content_server: &str,
 ) -> Result<serde_json::Value> {
@@ -71,6 +72,11 @@ fn convert(
         // missing or a scene that will not execute must cost a rebuild, never a job.
         Err(e) => eprintln!("lods: {entity_id}: reuse check failed ({e}); building"),
     }
+
+    // The reuse index missed: something the map shows changed, and a build is requested.
+    // That is the capture request, written before the build so a build that then fails
+    // cannot suppress it.
+    let satellite_record = record_reuse_miss(proxy, entity, entity_id, content_server);
 
     let outcome = abgen::lodgen::generate(&params)
         .with_context(|| format!("generate LOD bundles for {entity_id}"))?;
@@ -147,12 +153,22 @@ fn convert(
     summary["lods"]["keys"] = serde_json::json!(published.keys);
     summary["lods"]["digest"] = serde_json::json!(digest);
     summary["lods"]["manifestsNamed"] = serde_json::json!(manifests_named);
+    if let Some(key) = satellite_record {
+        summary["lods"]["satelliteRebuildRecord"] = serde_json::json!(key);
+    }
     Ok(summary)
 }
 
 /// Run the LOD lane for a scene whose asset bundles a conversion job just finished with,
 /// so one deployment's bundles and LODs land in one go. This is the only way LODs are
 /// built: nothing else asks for them.
+///
+/// The conversion it follows stands: a failed one errors out of the job before this point
+/// (see `convert::exit_code_tests`), so it gets no LODs, no reuse record and no satellite
+/// record, the same way it gets no converted registry lane. The redelivery or deployment
+/// that converts cleanly finds no reusable build and is the next attempt at all three. An
+/// already-converted skip only ever follows a clean conversion, a tombstone never being
+/// current, so its lane runs too.
 ///
 /// `None` when there is nothing to do: LODs are off, or the entity is not a scene. Otherwise
 /// the LOD summary, flattened for nesting under the conversion summary's `lods` key. A LOD
@@ -178,7 +194,7 @@ pub fn follow_up(
     if !is_scene(&entity) {
         return None;
     }
-    let result = convert(cfg, proxy, entity_id, content_server);
+    let result = convert(cfg, proxy, &entity, entity_id, content_server);
     if let Err(e) = &result {
         eprintln!("lods: {entity_id}: LOD generation failed ({e:#}); the conversion stands");
     }
@@ -194,6 +210,25 @@ pub fn follow_up(
     };
     metrics::counter!("abgen_lambda_lod_followup_total", "outcome" => outcome).increment(1);
     Some(summary)
+}
+
+/// Write a Genesis City scene's satellite rebuild record at a reuse miss and return its key.
+/// The reuse index only misses when the scene's placements or their content changed, which
+/// is what the map shows, so the miss is the capture request whether or not the build that
+/// follows succeeds: the map is captured from the asset bundles, not the LODs. Worlds are
+/// not this lane's: every one of their deployments is recorded by the conversion job
+/// (`satellite::on_conversion`). A failed conversion never gets here: `follow_up` runs no
+/// lane for it.
+fn record_reuse_miss(
+    proxy: &Arc<Proxy>,
+    entity: &serde_json::Value,
+    entity_id: &str,
+    content_server: &str,
+) -> Option<String> {
+    if crate::satellite::is_world(content_server) {
+        return None;
+    }
+    crate::satellite::publish(proxy, entity, entity_id, content_server)
 }
 
 pub fn is_scene(entity: &serde_json::Value) -> bool {
@@ -973,13 +1008,68 @@ mod follow_up_tests {
         let err = follow_up_summary(Err(anyhow::anyhow!("gate failed")));
         assert_eq!(err["error"], "gate failed");
     }
+
+    /// The city trigger against a fake space: a reuse miss writes one record and returns
+    /// its key, and the key rides the build summary into the flattened follow-up; a world
+    /// at the same point writes nothing, its record being the conversion job's.
+    #[test]
+    fn a_reuse_miss_writes_a_city_record_and_not_a_world_one() {
+        let (host, seen) = crate::output::tests::serve(vec![(
+            crate::satellite::tests::PREFIX_ROUTE.to_string(),
+            200,
+            Vec::new(),
+        )]);
+        let _space = crate::output::tests::point_space_at(&host);
+        let cfg = tests::cfg();
+        let proxy = crate::convert::make_proxy(&cfg, "https://c/content");
+        let catalyst = "https://peer.decentraland.org/content";
+        let scene = serde_json::json!({
+            "type": "scene", "pointers": ["0,0", "-1,0"], "timestamp": 1_724_000_000_000u64
+        });
+
+        let key = record_reuse_miss(&proxy, &scene, "bafkE", catalyst)
+            .expect("a reuse miss is a capture request");
+        assert!(
+            key.starts_with("SatelliteMaps/rebuild/") && key.ends_with("-bafkE.json"),
+            "{key}"
+        );
+        assert_eq!(seen.lock().unwrap().clone(), vec![format!("PUT /{key}")]);
+
+        // What `convert` does with the key on a build that completes.
+        let mut built = success_summary(
+            "bafkE",
+            "bafke",
+            &["windows".to_string()],
+            &[(1, 9)],
+            4,
+            true,
+        );
+        built["lods"]["satelliteRebuildRecord"] = serde_json::json!(key);
+        assert_eq!(follow_up_summary(Ok(built))["satelliteRebuildRecord"], key);
+
+        assert!(
+            record_reuse_miss(
+                &proxy,
+                &scene,
+                "bafkE",
+                "https://worlds-content-server.decentraland.org",
+            )
+            .is_none(),
+            "a world's record is the conversion job's, not the LOD lane's"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "only the city miss reached the space"
+        );
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    pub(super) fn cfg() -> Config {
+    pub(crate) fn cfg() -> Config {
         Config {
             platforms: vec!["windows".to_string(), "mac".to_string()],
             version: "v49".to_string(),

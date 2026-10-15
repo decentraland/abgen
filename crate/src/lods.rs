@@ -334,8 +334,11 @@ fn prepare_lod_source(client: &CatalystClient, locator: &str) -> Result<(String,
     Ok((sid, level, glb))
 }
 
+/// Whether `base_url` names a Worlds content server rather than a Genesis City catalyst:
+/// the host (case-insensitively) starts with `worlds-content-server`, whatever the scheme,
+/// port or path. The one classifier for every lane that treats worlds differently.
 #[cfg(not(target_arch = "wasm32"))]
-fn is_worlds_host(base_url: &str) -> bool {
+pub fn is_worlds_host(base_url: &str) -> bool {
     let rest = base_url.split("://").nth(1).unwrap_or(base_url);
     let host = rest.split(['/', ':']).next().unwrap_or("");
     host.to_ascii_lowercase()

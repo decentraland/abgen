@@ -8,6 +8,7 @@ mod lod;
 mod notify;
 mod output;
 mod runtime;
+mod satellite;
 
 use anyhow::{Context, Result};
 
@@ -264,7 +265,10 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
     let mut summary = convert_asset_bundles(cfg, &proxy, job, content_server)?;
     // A scene's LODs follow its asset bundles in the same job, once those are published
     // and notified. The conversion's result stands whatever the LOD lane says: a LOD
-    // failure is logged and reported in the summary, never redelivered.
+    // failure is logged and reported in the summary, never redelivered. A conversion that
+    // reaches this line stands (its exit codes are 0 or the tolerated 12, see
+    // `convert::exit_code_tests`); one that failed errored out above, so the lane never runs
+    // for it and the redelivery or deployment that converts cleanly is the next attempt.
     if let Some(lods) = lod::follow_up(cfg, &proxy, &job.entity_id, content_server) {
         summary["lods"] = lods;
     }
@@ -330,7 +334,15 @@ fn convert_asset_bundles(
     }
 
     let published = publish_forget_notify(
-        || output::publish(cfg, &agent, proxy, &entity_doc, &outcome),
+        // A Worlds deployment's satellite record follows the upload it describes and
+        // precedes notify: a failed notify is redelivered as already converted, which would
+        // never write it. Genesis City records are the LOD lane's (`lod::record_reuse_miss`).
+        || {
+            let upload = output::publish(cfg, &agent, proxy, &entity_doc, &outcome)?;
+            let record =
+                satellite::on_conversion(proxy, &entity_doc, &job.entity_id, content_server);
+            Ok((upload, record))
+        },
         || {
             if job.force {
                 for platform in &cfg.platforms {
@@ -363,7 +375,7 @@ fn convert_asset_bundles(
     if !cfg.keep_output {
         let _ = std::fs::remove_dir_all(&outcome.cid_dir);
     }
-    let (upload, notified) = published?;
+    let ((upload, satellite_rebuild), notified) = published?;
 
     eprintln!(
         "done: {} platforms={} exitCode={} texcache hits={} misses={}",
@@ -379,7 +391,7 @@ fn convert_asset_bundles(
         outcome.cache_misses,
     );
 
-    Ok(serde_json::json!({
+    let mut summary = serde_json::json!({
         "entityId": outcome.entity_id,
         "contentServer": outcome.content_server,
         "exitCode": outcome.exit_code(),
@@ -391,7 +403,13 @@ fn convert_asset_bundles(
         "texEncodeCache": { "hits": outcome.cache_hits, "misses": outcome.cache_misses },
         "upload": upload,
         "notified": notified,
-    }))
+    });
+    // Only a record that exists is named: a city scene's comes from the LOD lane, and a
+    // world's put may have failed.
+    if let Some(key) = satellite_rebuild {
+        summary["satelliteRebuildRecord"] = serde_json::json!(key);
+    }
+    Ok(summary)
 }
 
 /// Converted platforms re-notify 13 with the lane their manifest names: if notify

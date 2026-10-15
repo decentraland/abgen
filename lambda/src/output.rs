@@ -303,7 +303,7 @@ fn upload_scene_sources(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::valid_key_component;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
@@ -331,7 +331,7 @@ mod tests {
 
     /// Points the S3 space at a fake server for the duration of the returned guard, which
     /// also holds the process-wide env lock so tests do not race on the variables.
-    fn point_space_at(host: &str) -> (std::sync::MutexGuard<'static, ()>, EnvGuard) {
+    pub(crate) fn point_space_at(host: &str) -> (std::sync::MutexGuard<'static, ()>, EnvGuard) {
         let lock = crate::convert::TEST_SPACE_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -341,7 +341,7 @@ mod tests {
         (lock, EnvGuard)
     }
 
-    struct EnvGuard;
+    pub(crate) struct EnvGuard;
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             for k in [
@@ -355,8 +355,9 @@ mod tests {
     }
 
     /// Trimmed copy of `abgen::live::stub::serve` (that one is `cfg(test)`
-    /// and invisible to this crate).
-    fn serve(routes: Vec<(String, u16, Vec<u8>)>) -> (String, Arc<Mutex<Vec<String>>>) {
+    /// and invisible to this crate). A route ending in `/` matches every path under it,
+    /// for keys whose exact spelling a test cannot know (the timestamped satellite records).
+    pub(crate) fn serve(routes: Vec<(String, u16, Vec<u8>)>) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -396,7 +397,9 @@ mod tests {
                 seen2.lock().unwrap().push(format!("{method} {path}"));
                 let (code, body) = routes
                     .iter()
-                    .find(|(p, _, _)| path == *p)
+                    .find(|(p, _, _)| {
+                        path == *p || (p.ends_with('/') && path.starts_with(p.as_str()))
+                    })
                     .map(|(_, c, b)| (*c, b.clone()))
                     .unwrap_or((404, Vec::new()));
                 let _ = write!(
