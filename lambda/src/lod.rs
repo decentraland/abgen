@@ -163,12 +163,13 @@ fn convert(
 /// so one deployment's bundles and LODs land in one go. This is the only way LODs are
 /// built: nothing else asks for them.
 ///
-/// `conversion_exit_code` is the asset-bundle half's, `None` when that half was skipped as
-/// already converted (which only ever follows a clean conversion: a tombstone is never
-/// current). A failed conversion runs no LOD lane at all, the same way it updates no
-/// registry lane and writes no Worlds satellite record: no LODs, no reuse record, no city
-/// satellite record. The redelivery or deployment that converts cleanly finds no reusable
-/// build and is the next attempt at all three.
+/// `conversion_failed` says a platform's bundles do not stand (`convert::succeeded`: exit
+/// code 0 or the tolerated 12 are fine). It is `false` for an already-converted skip, which
+/// only ever follows a clean conversion: a tombstone is never current. A failed conversion
+/// runs no LOD lane at all, the same way it gets no converted registry lane and writes no
+/// Worlds satellite record: no LODs, no reuse record, no city satellite record. The
+/// redelivery or deployment that converts cleanly finds no reusable build and is the next
+/// attempt at all three.
 ///
 /// `None` when there is nothing to do: LODs are off, or the entity is not a scene. Otherwise
 /// the LOD summary, flattened for nesting under the conversion summary's `lods` key. A LOD
@@ -179,13 +180,15 @@ pub fn follow_up(
     proxy: &Arc<Proxy>,
     entity_id: &str,
     content_server: &str,
-    conversion_exit_code: Option<i64>,
+    conversion_failed: bool,
 ) -> Option<serde_json::Value> {
     if !cfg.lods_enabled {
         return None;
     }
-    if let Some(code) = conversion_exit_code.filter(|&code| code != 0) {
-        eprintln!("lods: {entity_id}: conversion exited {code}; LODs wait for a clean conversion");
+    if conversion_failed {
+        eprintln!(
+            "lods: {entity_id}: a platform failed to convert; LODs wait for a clean conversion"
+        );
         metrics::counter!("abgen_lambda_lod_followup_total", "outcome" => "skipped").increment(1);
         return Some(serde_json::json!({ "skipped": "conversion-failed" }));
     }
@@ -979,7 +982,7 @@ mod follow_up_tests {
             ..tests::cfg()
         };
         let proxy = crate::convert::make_proxy(&cfg, "https://c/content");
-        assert!(follow_up(&cfg, &proxy, "bafk", "https://c/content", Some(0)).is_none());
+        assert!(follow_up(&cfg, &proxy, "bafk", "https://c/content", false).is_none());
     }
 
     /// Decided before the entity is even fetched (the catalyst here is unreachable): a failed
@@ -990,8 +993,15 @@ mod follow_up_tests {
         let cfg = tests::cfg();
         let proxy = crate::convert::make_proxy(&cfg, "http://127.0.0.1:9/content");
         assert_eq!(
-            follow_up(&cfg, &proxy, "bafk", "http://127.0.0.1:9/content", Some(5)),
+            follow_up(&cfg, &proxy, "bafk", "http://127.0.0.1:9/content", true),
             Some(serde_json::json!({ "skipped": "conversion-failed" }))
+        );
+        // A conversion that stands gets past the gate: here as far as the unreachable
+        // catalyst, which is an error, not a skip.
+        let ran = follow_up(&cfg, &proxy, "bafk", "http://127.0.0.1:9/content", false).unwrap();
+        assert!(
+            ran.get("error").is_some() && ran.get("skipped").is_none(),
+            "{ran}"
         );
     }
 

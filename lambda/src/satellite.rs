@@ -83,16 +83,17 @@ pub fn key(rebuilt_at_ms: u64, entity_id: &str) -> String {
 }
 
 /// The Worlds half of the trigger: a record for every Worlds conversion that succeeded on
-/// every platform, written by the conversion job itself. Genesis City scenes return `None`
-/// here; theirs follow the LOD lane (`lod::record_reuse_miss`).
+/// every platform (`converted`, from `EntityOutcome::succeeded`: exit code 0 or the tolerated
+/// 12 on each), written by the conversion job itself. Genesis City scenes return `None` here;
+/// theirs follow the LOD lane (`lod::record_reuse_miss`).
 pub fn on_conversion(
     proxy: &abgen::live::Proxy,
     entity_doc: &Value,
     entity_id: &str,
     content_server: &str,
-    exit_code: i32,
+    converted: bool,
 ) -> Option<String> {
-    if !is_world(content_server) || exit_code != 0 {
+    if !is_world(content_server) || !converted {
         return None;
     }
     publish(proxy, entity_doc, entity_id, content_server)
@@ -282,7 +283,7 @@ pub(crate) mod tests {
         let proxy = crate::convert::make_proxy(&cfg, "https://c/content");
         let doc = world("my-world.dcl.eth");
 
-        let key = on_conversion(&proxy, &doc, "bafkreiw0r1d", WORLDS, 0)
+        let key = on_conversion(&proxy, &doc, "bafkreiw0r1d", WORLDS, true)
             .expect("a converted world is a capture request");
         assert!(
             key.starts_with(PREFIX) && key.ends_with("-bafkreiw0r1d.json"),
@@ -291,11 +292,11 @@ pub(crate) mod tests {
         assert_eq!(seen.lock().unwrap().clone(), vec![format!("PUT /{key}")]);
 
         assert!(
-            on_conversion(&proxy, &doc, "bafkreiw0r1d", WORLDS, 1).is_none(),
+            on_conversion(&proxy, &doc, "bafkreiw0r1d", WORLDS, false).is_none(),
             "a failed conversion has nothing to capture"
         );
         assert!(
-            on_conversion(&proxy, &scene(&["0,0"]), "bafkcity", CATALYST, 0).is_none(),
+            on_conversion(&proxy, &scene(&["0,0"]), "bafkcity", CATALYST, true).is_none(),
             "a city scene waits for its LOD rebuild"
         );
         assert_eq!(
@@ -313,7 +314,7 @@ pub(crate) mod tests {
         let _space = crate::output::tests::point_space_at(&host);
         let proxy = crate::convert::make_proxy(&crate::lod::tests::cfg(), "https://c/content");
 
-        let key = on_conversion(&proxy, &world("w.dcl.eth"), "bafkreiw0r1d", WORLDS, 0);
+        let key = on_conversion(&proxy, &world("w.dcl.eth"), "bafkreiw0r1d", WORLDS, true);
         assert_eq!(key, None);
         assert_eq!(seen.lock().unwrap().len(), 1, "the put was attempted");
     }

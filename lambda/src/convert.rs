@@ -25,6 +25,64 @@ impl EntityOutcome {
             .max()
             .unwrap_or(0)
     }
+
+    /// Whether every platform produced bundles (see [`succeeded`]). Checked per platform,
+    /// not on [`EntityOutcome::exit_code`]: that is the maximum, and a tolerated 12 on one
+    /// platform would hide a 5 on another.
+    pub fn succeeded(&self) -> bool {
+        self.platforms.iter().all(|p| succeeded(p.exit_code))
+    }
+}
+
+/// Whether a platform's exit code means its bundles stand: 0, or upstream's "conversion
+/// errors tolerated" 12 (some assets failed to convert, the rest were bundled and
+/// published). Anything else is a failure: nothing downstream of the conversion should run.
+pub fn succeeded(exit_code: i32) -> bool {
+    exit_code == 0 || exit_code == abgen::manifest::EXIT_CONVERSION_ERRORS_TOLERATED
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::*;
+
+    fn outcome(codes: &[i32]) -> EntityOutcome {
+        EntityOutcome {
+            entity_id: "e".to_string(),
+            content_server: "cs".to_string(),
+            cid_dir: std::path::PathBuf::new(),
+            platforms: codes
+                .iter()
+                .enumerate()
+                .map(|(i, &exit_code)| PlatformOutcome {
+                    platform: format!("p{i}"),
+                    built: Vec::new(),
+                    exit_code,
+                })
+                .collect(),
+            cache_hits: 0,
+            cache_misses: 0,
+        }
+    }
+
+    #[test]
+    fn tolerated_errors_are_a_success_and_everything_else_is_not() {
+        assert!(succeeded(0));
+        assert!(succeeded(12));
+        for code in [1, 2, 5, 13] {
+            assert!(!succeeded(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn every_platform_must_have_produced_bundles() {
+        assert!(outcome(&[0, 0]).succeeded());
+        assert!(outcome(&[0, 12]).succeeded());
+        assert!(!outcome(&[0, 5]).succeeded());
+        // The maximum would say 12 and hide the failure.
+        assert_eq!(outcome(&[12, 5]).exit_code(), 12);
+        assert!(!outcome(&[12, 5]).succeeded());
+        assert!(outcome(&[]).succeeded(), "nothing pending, nothing failed");
+    }
 }
 
 pub fn make_proxy(cfg: &Config, content_server: &str) -> std::sync::Arc<abgen::live::Proxy> {

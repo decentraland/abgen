@@ -266,19 +266,34 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
     // A scene's LODs follow its asset bundles in the same job, once those are published
     // and notified. The conversion's result stands whatever the LOD lane says: a LOD
     // failure is logged and reported in the summary, never redelivered. A failed conversion
-    // (nonzero exit code; an already-converted skip has none) runs no LOD lane at all: the
-    // redelivery or deployment that converts cleanly is the next attempt.
-    let conversion_exit_code = summary.get("exitCode").and_then(serde_json::Value::as_i64);
+    // runs no LOD lane at all: the redelivery or deployment that converts cleanly is the next
+    // attempt.
     if let Some(lods) = lod::follow_up(
         cfg,
         &proxy,
         &job.entity_id,
         content_server,
-        conversion_exit_code,
+        conversion_failed(&summary),
     ) {
         summary["lods"] = lods;
     }
     Ok(summary)
+}
+
+/// Whether the conversion summary reports a platform whose bundles do not stand
+/// (`convert::succeeded`). Judged per platform, since the summary's top-level `exitCode` is
+/// the maximum and a tolerated 12 would hide a 5. An already-converted skip lists no
+/// platforms and only ever follows a clean conversion, so it never counts as failed.
+fn conversion_failed(summary: &serde_json::Value) -> bool {
+    summary
+        .get("platforms")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|platforms| {
+            platforms.iter().any(|p| {
+                let code = p.get("exitCode").and_then(serde_json::Value::as_i64);
+                !convert::succeeded(code.unwrap_or(0) as i32)
+            })
+        })
 }
 
 /// The asset-bundle half of a conversion job: skip platforms already converted at this
@@ -350,7 +365,7 @@ fn convert_asset_bundles(
                 &entity_doc,
                 &job.entity_id,
                 content_server,
-                outcome.exit_code(),
+                outcome.succeeded(),
             );
             Ok((upload, record))
         },
@@ -517,6 +532,28 @@ fn publish_forget_notify<U>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_conversion_failed_when_any_platform_did() {
+        let with = |codes: &[i64]| {
+            serde_json::json!({
+                "exitCode": codes.iter().max().copied().unwrap_or(0),
+                "platforms": codes.iter().map(|c| serde_json::json!({"exitCode": c})).collect::<Vec<_>>(),
+            })
+        };
+        assert!(!super::conversion_failed(&with(&[0, 0])));
+        assert!(
+            !super::conversion_failed(&with(&[0, 12])),
+            "12 is tolerated"
+        );
+        assert!(super::conversion_failed(&with(&[0, 5])));
+        assert!(
+            super::conversion_failed(&with(&[12, 5])),
+            "the top-level maximum says 12 and would hide the 5"
+        );
+        let skipped = serde_json::json!({"skipped": "already-converted", "notified": true});
+        assert!(!super::conversion_failed(&skipped));
+    }
+
     use super::*;
     use serde_json::json;
 
