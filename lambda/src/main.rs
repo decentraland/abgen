@@ -265,9 +265,9 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
     let mut summary = convert_asset_bundles(cfg, &proxy, job, content_server)?;
     // A scene's LODs follow its asset bundles in the same job, once those are published
     // and notified. The conversion's result stands whatever the LOD lane says: a LOD
-    // failure is logged and reported in the summary, never redelivered. The conversion's
-    // exit code (absent on an already-converted skip) tells the lane whether a satellite
-    // record would capture a failed state.
+    // failure is logged and reported in the summary, never redelivered. A failed conversion
+    // (nonzero exit code; an already-converted skip has none) runs no LOD lane at all: the
+    // redelivery or deployment that converts cleanly is the next attempt.
     let conversion_exit_code = summary.get("exitCode").and_then(serde_json::Value::as_i64);
     if let Some(lods) = lod::follow_up(
         cfg,

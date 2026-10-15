@@ -14,7 +14,6 @@ fn convert(
     entity: &serde_json::Value,
     entity_id: &str,
     content_server: &str,
-    conversion_exit_code: Option<i64>,
 ) -> Result<serde_json::Value> {
     let (platforms, rejected) = supported_platforms(&cfg.platforms);
     if !rejected.is_empty() {
@@ -77,13 +76,7 @@ fn convert(
     // The reuse index missed: something the map shows changed, and a build is requested.
     // That is the capture request, written before the build so a build that then fails
     // cannot suppress it.
-    let satellite_record = record_reuse_miss(
-        proxy,
-        entity,
-        entity_id,
-        content_server,
-        conversion_exit_code,
-    );
+    let satellite_record = record_reuse_miss(proxy, entity, entity_id, content_server);
 
     let outcome = abgen::lodgen::generate(&params)
         .with_context(|| format!("generate LOD bundles for {entity_id}"))?;
@@ -171,7 +164,11 @@ fn convert(
 /// built: nothing else asks for them.
 ///
 /// `conversion_exit_code` is the asset-bundle half's, `None` when that half was skipped as
-/// already converted; only the satellite record reads it.
+/// already converted (which only ever follows a clean conversion: a tombstone is never
+/// current). A failed conversion runs no LOD lane at all, the same way it updates no
+/// registry lane and writes no Worlds satellite record: no LODs, no reuse record, no city
+/// satellite record. The redelivery or deployment that converts cleanly finds no reusable
+/// build and is the next attempt at all three.
 ///
 /// `None` when there is nothing to do: LODs are off, or the entity is not a scene. Otherwise
 /// the LOD summary, flattened for nesting under the conversion summary's `lods` key. A LOD
@@ -187,6 +184,11 @@ pub fn follow_up(
     if !cfg.lods_enabled {
         return None;
     }
+    if let Some(code) = conversion_exit_code.filter(|&code| code != 0) {
+        eprintln!("lods: {entity_id}: conversion exited {code}; LODs wait for a clean conversion");
+        metrics::counter!("abgen_lambda_lod_followup_total", "outcome" => "skipped").increment(1);
+        return Some(serde_json::json!({ "skipped": "conversion-failed" }));
+    }
     let agent = crate::catalyst::agent();
     let entity = match crate::catalyst::fetch_entity(&agent, content_server, entity_id) {
         Ok(entity) => entity,
@@ -198,14 +200,7 @@ pub fn follow_up(
     if !is_scene(&entity) {
         return None;
     }
-    let result = convert(
-        cfg,
-        proxy,
-        &entity,
-        entity_id,
-        content_server,
-        conversion_exit_code,
-    );
+    let result = convert(cfg, proxy, &entity, entity_id, content_server);
     if let Err(e) = &result {
         eprintln!("lods: {entity_id}: LOD generation failed ({e:#}); the conversion stands");
     }
@@ -226,24 +221,17 @@ pub fn follow_up(
 /// Write a Genesis City scene's satellite rebuild record at a reuse miss and return its key.
 /// The reuse index only misses when the scene's placements or their content changed, which
 /// is what the map shows, so the miss is the capture request whether or not the build that
-/// follows succeeds: the map is captured from the asset bundles, not the LODs. Two things
-/// hold it back. Worlds are not this lane's: every one of their deployments is recorded by
-/// the conversion job (`satellite::on_conversion`). And a conversion that failed on any
-/// platform (`Some(nonzero)`) writes none: the capture would show the failed state, and the
-/// reconversion that follows usually reuses this build and so could not schedule another.
-/// An already-converted redelivery has no exit code (`None`) and records its miss.
+/// follows succeeds: the map is captured from the asset bundles, not the LODs. Worlds are
+/// not this lane's: every one of their deployments is recorded by the conversion job
+/// (`satellite::on_conversion`). A failed conversion never gets here: `follow_up` runs no
+/// lane for it.
 fn record_reuse_miss(
     proxy: &Arc<Proxy>,
     entity: &serde_json::Value,
     entity_id: &str,
     content_server: &str,
-    conversion_exit_code: Option<i64>,
 ) -> Option<String> {
     if crate::satellite::is_world(content_server) {
-        return None;
-    }
-    if let Some(code) = conversion_exit_code.filter(|&code| code != 0) {
-        eprintln!("satellite: {entity_id}: conversion exited {code}; no capture of a failed state");
         return None;
     }
     crate::satellite::publish(proxy, entity, entity_id, content_server)
@@ -994,6 +982,19 @@ mod follow_up_tests {
         assert!(follow_up(&cfg, &proxy, "bafk", "https://c/content", Some(0)).is_none());
     }
 
+    /// Decided before the entity is even fetched (the catalyst here is unreachable): a failed
+    /// conversion gets a skipped LOD summary, so no LODs, no reuse record and no satellite
+    /// record come of it, and the next clean conversion finds no reusable build.
+    #[test]
+    fn a_failed_conversion_runs_no_lod_lane() {
+        let cfg = tests::cfg();
+        let proxy = crate::convert::make_proxy(&cfg, "http://127.0.0.1:9/content");
+        assert_eq!(
+            follow_up(&cfg, &proxy, "bafk", "http://127.0.0.1:9/content", Some(5)),
+            Some(serde_json::json!({ "skipped": "conversion-failed" }))
+        );
+    }
+
     #[test]
     fn follow_up_summary_flattens_the_lod_block_and_keeps_skips_and_errors_small() {
         let converted = success_summary(
@@ -1027,13 +1028,11 @@ mod follow_up_tests {
         assert_eq!(err["error"], "gate failed");
     }
 
-    /// The city trigger against a fake space: a reuse miss after a clean conversion, or after
-    /// an already-converted skip (no exit code), writes one record and returns its key, and
-    /// the key rides the build summary into the flattened follow-up. A miss after a failed
-    /// conversion writes nothing, and so does a world at the same point, its record being the
-    /// conversion job's.
+    /// The city trigger against a fake space: a reuse miss writes one record and returns
+    /// its key, and the key rides the build summary into the flattened follow-up; a world
+    /// at the same point writes nothing, its record being the conversion job's.
     #[test]
-    fn a_reuse_miss_writes_a_city_record_unless_the_conversion_failed() {
+    fn a_reuse_miss_writes_a_city_record_and_not_a_world_one() {
         let (host, seen) = crate::output::tests::serve(vec![(
             crate::satellite::tests::PREFIX_ROUTE.to_string(),
             200,
@@ -1047,8 +1046,8 @@ mod follow_up_tests {
             "type": "scene", "pointers": ["0,0", "-1,0"], "timestamp": 1_724_000_000_000u64
         });
 
-        let key = record_reuse_miss(&proxy, &scene, "bafkE", catalyst, Some(0))
-            .expect("a reuse miss after a clean conversion is a capture request");
+        let key = record_reuse_miss(&proxy, &scene, "bafkE", catalyst)
+            .expect("a reuse miss is a capture request");
         assert!(
             key.starts_with("SatelliteMaps/rebuild/") && key.ends_with("-bafkE.json"),
             "{key}"
@@ -1068,28 +1067,19 @@ mod follow_up_tests {
         assert_eq!(follow_up_summary(Ok(built))["satelliteRebuildRecord"], key);
 
         assert!(
-            record_reuse_miss(&proxy, &scene, "bafkE", catalyst, None).is_some(),
-            "an already-converted redelivery has no exit code and still records its miss"
-        );
-        assert!(
-            record_reuse_miss(&proxy, &scene, "bafkE", catalyst, Some(1)).is_none(),
-            "a failed conversion is not captured"
-        );
-        assert!(
             record_reuse_miss(
                 &proxy,
                 &scene,
                 "bafkE",
                 "https://worlds-content-server.decentraland.org",
-                Some(0),
             )
             .is_none(),
             "a world's record is the conversion job's, not the LOD lane's"
         );
         assert_eq!(
             seen.lock().unwrap().len(),
-            2,
-            "only the clean and the redelivered misses reached the space"
+            1,
+            "only the city miss reached the space"
         );
     }
 }

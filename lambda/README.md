@@ -159,10 +159,12 @@ SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json
     platform) write none, and so does a conversion whose LOD lane is off: `ENABLE_LODS` is
     required for city records.
   - A forced reconversion writes one only if its reuse lookup misses too.
-  - A conversion that failed on any platform writes none, even at a miss: the capture would
-    show the failed state, and the reconversion that follows usually reuses this build and so
-    could not schedule another. An already-converted redelivery carries no exit code and does
-    record its miss.
+  - A conversion that failed on any platform runs no LOD lane at all (see
+    [LOD generation](#lod-generation)): no LODs, no reuse record, no satellite record, the same
+    way it updates no registry lane. Because no reuse record was written, the redelivery or
+    deployment that converts cleanly finds no reusable build and records its miss. An
+    already-converted skip only ever follows a clean conversion (a tombstone is never current),
+    so its LOD lane runs and records a miss.
   - **False positives happen; no false negatives are known.** The LOD lane also
     runs for already-converted redeliveries, which write nothing only because the reuse index
     hits. It misses, and so every redeployed scene writes a record, on a `LOD_LEVELS` or
@@ -500,6 +502,13 @@ their finished events sent, so one deployment's bundles and LODs land in one
 go. Wearables and emotes never reach it. An already-converted scene still
 gets the LOD step, which the reuse index makes a cheap `by=inputs` hit when
 nothing changed.
+
+The lane runs only after a conversion that succeeded on every platform. A failed one (nonzero
+`exitCode`, which is what a tombstone records) skips it with `lods: {"skipped":
+"conversion-failed"}`, counted as `abgen_lambda_lod_followup_total{outcome="skipped"}`: no LODs,
+no reuse record, and no [satellite rebuild record](#satellite-rebuild-records), the same way the
+registry gets no converted lane. A tombstone is never current, so the redelivery or deployment
+that converts cleanly runs the lane and is the next attempt.
 
 The LODs are regenerated from the scene entity through the same `lodgen`
 chain the abcdn server runs JIT (`abgen-lod generate`): resolve placements
