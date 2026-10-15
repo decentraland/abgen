@@ -11,6 +11,7 @@ use std::sync::Arc;
 fn convert(
     cfg: &Config,
     proxy: &Arc<Proxy>,
+    entity: &serde_json::Value,
     entity_id: &str,
     content_server: &str,
 ) -> Result<serde_json::Value> {
@@ -71,6 +72,11 @@ fn convert(
         // missing or a scene that will not execute must cost a rebuild, never a job.
         Err(e) => eprintln!("lods: {entity_id}: reuse check failed ({e}); building"),
     }
+
+    // The reuse index missed: something the map shows changed, and a build is requested.
+    // That is the capture request, written before the build so a build that then fails
+    // cannot suppress it.
+    let satellite_record = record_reuse_miss(proxy, entity, entity_id, content_server);
 
     let outcome = abgen::lodgen::generate(&params)
         .with_context(|| format!("generate LOD bundles for {entity_id}"))?;
@@ -147,6 +153,9 @@ fn convert(
     summary["lods"]["keys"] = serde_json::json!(published.keys);
     summary["lods"]["digest"] = serde_json::json!(digest);
     summary["lods"]["manifestsNamed"] = serde_json::json!(manifests_named);
+    if let Some(key) = satellite_record {
+        summary["lods"]["satelliteRebuildRecord"] = serde_json::json!(key);
+    }
     Ok(summary)
 }
 
@@ -178,11 +187,11 @@ pub fn follow_up(
     if !is_scene(&entity) {
         return None;
     }
-    let result = convert(cfg, proxy, entity_id, content_server);
+    let result = convert(cfg, proxy, &entity, entity_id, content_server);
     if let Err(e) = &result {
         eprintln!("lods: {entity_id}: LOD generation failed ({e:#}); the conversion stands");
     }
-    let mut summary = follow_up_summary(result);
+    let summary = follow_up_summary(result);
     let outcome = if summary.get("error").is_some() {
         "error"
     } else if summary.get("skipped").is_some() {
@@ -193,38 +202,25 @@ pub fn follow_up(
         "converted"
     };
     metrics::counter!("abgen_lambda_lod_followup_total", "outcome" => outcome).increment(1);
-    record_rebuild(proxy, &mut summary, &entity, entity_id, content_server);
     Some(summary)
 }
 
-/// Write a Genesis City scene's satellite rebuild record when `summary` says this job built
-/// and uploaded fresh LODs, and report its key under `satelliteRebuildRecord`. A rebuilt LOD
-/// is the signal the satellite map is stale: the reuse index only misses when the scene's
-/// placements or their content changed, which is what the map shows. A reuse, a skip or a
-/// failure leaves the summary untouched. Worlds are not this lane's: every one of their
-/// deployments is recorded by the conversion job (`satellite::on_conversion`).
-fn record_rebuild(
+/// Write a Genesis City scene's satellite rebuild record at a reuse miss and return its key.
+/// The reuse index only misses when the scene's placements or their content changed, which
+/// is what the map shows, so the miss is the capture request whether or not the build that
+/// follows succeeds: the map is captured from the asset bundles, not the LODs. Worlds are
+/// not this lane's: every one of their deployments is recorded by the conversion job
+/// (`satellite::on_conversion`).
+fn record_reuse_miss(
     proxy: &Arc<Proxy>,
-    summary: &mut serde_json::Value,
     entity: &serde_json::Value,
     entity_id: &str,
     content_server: &str,
-) {
-    if crate::satellite::is_world(content_server) || !rebuilt(summary) {
-        return;
+) -> Option<String> {
+    if crate::satellite::is_world(content_server) {
+        return None;
     }
-    if let Some(key) = crate::satellite::publish(proxy, entity, entity_id, content_server) {
-        summary["satelliteRebuildRecord"] = serde_json::json!(key);
-    }
-}
-
-/// Whether a follow-up summary describes LODs built and uploaded by this job, as opposed to
-/// a previous build's republished under this entity, a skip or a failure.
-pub fn rebuilt(summary: &serde_json::Value) -> bool {
-    summary.get("error").is_none()
-        && summary.get("skipped").is_none()
-        && summary.get("reusedBy").is_none()
-        && summary.get("uploaded").and_then(serde_json::Value::as_bool) == Some(true)
+    crate::satellite::publish(proxy, entity, entity_id, content_server)
 }
 
 pub fn is_scene(entity: &serde_json::Value) -> bool {
@@ -1005,36 +1001,11 @@ mod follow_up_tests {
         assert_eq!(err["error"], "gate failed");
     }
 
+    /// The city trigger against a fake space: a reuse miss writes one record and returns
+    /// its key, and the key rides the build summary into the flattened follow-up; a world
+    /// at the same point writes nothing, its record being the conversion job's.
     #[test]
-    fn only_a_fresh_upload_counts_as_rebuilt() {
-        let built = |uploaded| {
-            follow_up_summary(Ok(success_summary(
-                "bafkE",
-                "bafke",
-                &["windows".to_string()],
-                &[(1, 9)],
-                4,
-                uploaded,
-            )))
-        };
-        assert!(rebuilt(&built(true)));
-        assert!(!rebuilt(&built(false)), "nothing published");
-
-        let mut reused = built(true);
-        reused["reusedBy"] = serde_json::json!("state");
-        assert!(!rebuilt(&reused), "a republished build changed nothing");
-
-        assert!(!rebuilt(
-            &serde_json::json!({"skipped": "lods-no-supported-platform"})
-        ));
-        assert!(!rebuilt(&serde_json::json!({"error": "gate failed"})));
-    }
-
-    /// The idea end to end against a fake space: a build that uploaded writes one record
-    /// and names it in the summary; a reuse of a previous build and a world (recorded by
-    /// the conversion job instead) write nothing.
-    #[test]
-    fn only_a_rebuilt_lod_writes_a_satellite_record() {
+    fn a_reuse_miss_writes_a_city_record_and_not_a_world_one() {
         let (host, seen) = crate::output::tests::serve(vec![(
             crate::satellite::tests::PREFIX_ROUTE.to_string(),
             200,
@@ -1047,54 +1018,41 @@ mod follow_up_tests {
         let scene = serde_json::json!({
             "type": "scene", "pointers": ["0,0", "-1,0"], "timestamp": 1_724_000_000_000u64
         });
-        let built = || {
-            follow_up_summary(Ok(success_summary(
-                "bafkE",
-                "bafke",
-                &["windows".to_string()],
-                &[(1, 9)],
-                4,
-                true,
-            )))
-        };
 
-        let mut summary = built();
-        record_rebuild(&proxy, &mut summary, &scene, "bafkE", catalyst);
-        let key = summary["satelliteRebuildRecord"]
-            .as_str()
-            .expect("the summary names the record")
-            .to_string();
+        let key = record_reuse_miss(&proxy, &scene, "bafkE", catalyst)
+            .expect("a reuse miss is a capture request");
         assert!(
             key.starts_with("SatelliteMaps/rebuild/") && key.ends_with("-bafkE.json"),
             "{key}"
         );
         assert_eq!(seen.lock().unwrap().clone(), vec![format!("PUT /{key}")]);
 
-        let mut reused = built();
-        reused["reusedBy"] = serde_json::json!("inputs");
-        record_rebuild(&proxy, &mut reused, &scene, "bafkE", catalyst);
-        assert!(
-            reused.get("satelliteRebuildRecord").is_none(),
-            "a reuse changed nothing visible: {reused}"
-        );
-
-        let mut summary = built();
-        record_rebuild(
-            &proxy,
-            &mut summary,
-            &scene,
+        // What `convert` does with the key on a build that completes.
+        let mut built = success_summary(
             "bafkE",
-            "https://worlds-content-server.decentraland.org",
+            "bafke",
+            &["windows".to_string()],
+            &[(1, 9)],
+            4,
+            true,
         );
-        assert!(
-            summary.get("satelliteRebuildRecord").is_none(),
-            "a world's record is the conversion job's, not the LOD lane's: {summary}"
-        );
+        built["lods"]["satelliteRebuildRecord"] = serde_json::json!(key);
+        assert_eq!(follow_up_summary(Ok(built))["satelliteRebuildRecord"], key);
 
+        assert!(
+            record_reuse_miss(
+                &proxy,
+                &scene,
+                "bafkE",
+                "https://worlds-content-server.decentraland.org",
+            )
+            .is_none(),
+            "a world's record is the conversion job's, not the LOD lane's"
+        );
         assert_eq!(
             seen.lock().unwrap().len(),
             1,
-            "only the rebuild reached the space"
+            "only the city miss reached the space"
         );
     }
 }

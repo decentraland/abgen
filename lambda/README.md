@@ -125,9 +125,9 @@ dropped by every filtered subscription.
 ## Satellite rebuild records
 
 A scene whose captured image is now stale writes one JSON object to the CDN bucket, whenever a
-space is configured. For Genesis City that is each scene whose LODs the
-[LOD lane](#lod-generation) builds and uploads, written right after those LODs. For Worlds it is
-every scene that converts, written right after its bundles:
+space is configured. For Genesis City that is each scene for which the
+[LOD lane](#lod-generation) requests a build (its reuse index missed), written just before that
+build. For Worlds it is every scene that converts, written right after its bundles:
 
 ```
 SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json
@@ -145,18 +145,21 @@ SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json
 
 - **What it's for.** The Explorer's satellite map is captured from the scenes. The map capture
   machine lists this prefix to know which parcels to re-capture.
-- **Why a LOD rebuild is the Genesis City trigger.** A deployment converts whether or not
+- **Why a LOD reuse miss is the Genesis City trigger.** A deployment converts whether or not
   anything visible changed. The LOD lane's reuse index misses only when the scene's placements
   or their content changed (see [Reusing an unchanged build](#reusing-an-unchanged-build)),
-  which is what the map shows, so a rebuilt LOD is the stale-map signal and a reused one is not.
+  which is what the map shows, so a miss is the stale-map signal and a reuse is not. The record
+  is written at the miss, before the build runs: the map is captured from the asset bundles,
+  not the LODs, so a build that then fails is no reason to skip the capture.
 - **Which Genesis City jobs write one.** A scene entity (`type` is `scene`) whose pointers are
   all `x,y` parcels, from a content server that is not a worlds server, whose LOD follow-up
-  built fresh LODs and uploaded them.
+  found no reusable build.
   - A follow-up that reuses a previous build writes none: nothing visible changed.
-  - LOD failures and skips write none. A conversion whose LOD lane is off writes none, so
-    `ENABLE_LODS` is required for city records.
-  - A forced reconversion writes one only if its LODs rebuild too.
-  - **False positives happen; false negatives are the LOD failures above.** The LOD lane also
+  - A LOD build that fails after the miss has already written one. LOD skips (no supported
+    platform) write none, and so does a conversion whose LOD lane is off: `ENABLE_LODS` is
+    required for city records.
+  - A forced reconversion writes one only if its reuse lookup misses too.
+  - **False positives happen; no false negatives are known.** The LOD lane also
     runs for already-converted redeliveries, which write nothing only because the reuse index
     hits. It misses, and so every redeployed scene writes a record, on a `LOD_LEVELS` or
     platform change, a generation bump, a reuse-check error, and the first rollout. A
@@ -188,7 +191,9 @@ SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json
 - **Failure handling.** The put is fail-soft, like the scene sources: a failure is logged and
   never fails the job. The key is reported in the job summary only when the put succeeded: a
   city record under `lods.satelliteRebuildRecord`, a world record at the top-level
-  `satelliteRebuildRecord`. A summary without the field wrote no record.
+  `satelliteRebuildRecord`. A summary without the field wrote no record, with one exception: a
+  city record whose LOD build then failed is in the bucket, but the LOD summary is the error,
+  and the log line `satellite: <entityId>: wrote <key>` is its only report.
 - **Out of scope.** Parcels a redeployment drops are not listed: the record names the new
   entity's parcels only.
 

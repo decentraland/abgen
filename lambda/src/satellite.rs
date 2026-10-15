@@ -3,8 +3,8 @@
 //! what each record names and deletes it (see the "Satellite rebuild records" section of
 //! `lambda/README.md`).
 //!
-//! Two kinds of deployment write one. A Genesis City scene writes one when the LOD lane
-//! rebuilds its LODs, which is when something the map shows changed (`lod::record_rebuild`).
+//! Two kinds of deployment write one. A Genesis City scene writes one when the LOD lane's
+//! reuse index misses, which is when something the map shows changed (`lod::record_reuse_miss`).
 //! A Worlds scene writes one on every successful conversion (`on_conversion`): worlds are
 //! captured whole, so every deployment is a capture request.
 
@@ -82,7 +82,7 @@ pub fn key(rebuilt_at_ms: u64, entity_id: &str) -> String {
 
 /// The Worlds half of the trigger: a record for every Worlds conversion that succeeded on
 /// every platform, written by the conversion job itself. Genesis City scenes return `None`
-/// here; theirs follow the LOD lane (`lod::record_rebuild`).
+/// here; theirs follow the LOD lane (`lod::record_reuse_miss`).
 pub fn on_conversion(
     proxy: &abgen::live::Proxy,
     entity_doc: &Value,
@@ -118,7 +118,12 @@ pub fn publish(
     let record = record(entity_doc, entity_id, content_server, rebuilt_at_ms)?;
     let key = key(rebuilt_at_ms, entity_id);
     match proxy.space_put_key_strict(&key, record.to_string().as_bytes()) {
-        Ok(()) => Some(key),
+        // Logged because a city record precedes its LOD build: when that build then fails,
+        // the LOD summary is the error and this line is the only report of the key.
+        Ok(()) => {
+            eprintln!("satellite: {entity_id}: wrote {key}");
+            Some(key)
+        }
         Err(e) => {
             eprintln!("satellite: {entity_id}: could not write {key} ({e:#})");
             None

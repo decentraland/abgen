@@ -333,7 +333,7 @@ fn convert_asset_bundles(
     let published = publish_forget_notify(
         // A Worlds deployment's satellite record follows the upload it describes and
         // precedes notify: a failed notify is redelivered as already converted, which would
-        // never write it. Genesis City records are the LOD lane's (`lod::record_rebuild`).
+        // never write it. Genesis City records are the LOD lane's (`lod::record_reuse_miss`).
         || {
             let upload = output::publish(cfg, &agent, proxy, &entity_doc, &outcome)?;
             let record = satellite::on_conversion(
