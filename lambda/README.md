@@ -153,9 +153,14 @@ SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json
   all `x,y` parcels, from a content server that is not a worlds server, whose LOD follow-up
   built fresh LODs and uploaded them.
   - A follow-up that reuses a previous build writes none: nothing visible changed.
-  - Already-converted skips, LOD failures and skips write none. A conversion whose LOD lane is
-    off writes none, so `ENABLE_LODS` is required for city records.
+  - LOD failures and skips write none. A conversion whose LOD lane is off writes none, so
+    `ENABLE_LODS` is required for city records.
   - A forced reconversion writes one only if its LODs rebuild too.
+  - **False positives happen; false negatives are the LOD failures above.** The LOD lane also
+    runs for already-converted redeliveries, which write nothing only because the reuse index
+    hits. It misses, and so every redeployed scene writes a record, on a `LOD_LEVELS` or
+    platform change, a generation bump, a reuse-check error, and the first rollout. A
+    re-capture queue tolerates that: the cost is a capture of an unchanged parcel.
 - **Which Worlds jobs write one.** Every scene from a worlds content server (its URL names
   `worlds-content-server`) whose conversion succeeded on every platform. Worlds are captured
   whole, so every deployment is a capture request; the LOD lane's reuse verdict plays no part.
@@ -171,8 +176,9 @@ SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json
   - `deployedAt`: the catalyst `timestamp`, `null` when the entity document has none.
   - `rebuiltAt`: when the record was written, in ms.
 - **Keys.** `rebuiltAt` is zero-padded to 13 digits, so keys list in rebuild order. Each record
-  is written once and never overwritten, so the default immutable one-year `Cache-Control`
-  applies.
+  is written once and never overwritten. The prefix is nevertheless served `no-cache`
+  (`space::object_headers`): a consumed record is deleted, and a cached copy of it at the edge
+  would be a stale capture request.
 - **Consuming.** The prefix is a queue. The capture machine lists `SatelliteMaps/rebuild/`,
   re-captures the parcels each record names, then deletes the records it handled. Writers and
   the consumer never touch the same key, so there is nothing to coordinate: a record written
@@ -180,8 +186,9 @@ SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json
   directly (list, get, delete), not through the CDN, whose cached copy of a deleted record is
   harmless but stale.
 - **Failure handling.** The put is fail-soft, like the scene sources: a failure is logged and
-  never fails the job. The key written is reported in the job summary: a city record under
-  `lods.satelliteRebuildRecord`, a world record at the top-level `satelliteRebuildRecord`.
+  never fails the job. The key is reported in the job summary only when the put succeeded: a
+  city record under `lods.satelliteRebuildRecord`, a world record at the top-level
+  `satelliteRebuildRecord`. A summary without the field wrote no record.
 - **Out of scope.** Parcels a redeployment drops are not listed: the record names the new
   entity's parcels only.
 
@@ -362,7 +369,8 @@ writer of its key family sets, derived from the key by
 `public,max-age=31536000,immutable` (cdn-uploader's comma-joined spelling),
 scene sources (`.js`/`.json`/`.crdt`) the direct-upload spelling
 `public, max-age=31536000, immutable`, manifests (`manifest/…`) are
-`application/json` + `private, max-age=0, no-cache`, and ISS descriptors
+`application/json` + `private, max-age=0, no-cache` (as are LOD reuse records and
+satellite rebuild records, `SatelliteMaps/…`), and ISS descriptors
 (`lods-unity/manifests/…`) are `public, max-age=31536000` — the
 lod-generator-unity storage adapter's `CACHE_CONTROL_ONE_YEAR`, whose keys
 these are (they embed the content-addressed entity id; they are *not*

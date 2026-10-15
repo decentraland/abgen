@@ -393,7 +393,7 @@ fn convert_asset_bundles(
         outcome.cache_misses,
     );
 
-    Ok(serde_json::json!({
+    let mut summary = serde_json::json!({
         "entityId": outcome.entity_id,
         "contentServer": outcome.content_server,
         "exitCode": outcome.exit_code(),
@@ -405,8 +405,13 @@ fn convert_asset_bundles(
         "texEncodeCache": { "hits": outcome.cache_hits, "misses": outcome.cache_misses },
         "upload": upload,
         "notified": notified,
-        "satelliteRebuildRecord": satellite_rebuild,
-    }))
+    });
+    // Only a record that exists is named: a city scene's comes from the LOD lane, and a
+    // world's put may have failed.
+    if let Some(key) = satellite_rebuild {
+        summary["satelliteRebuildRecord"] = serde_json::json!(key);
+    }
+    Ok(summary)
 }
 
 /// Converted platforms re-notify 13 with the lane their manifest names: if notify

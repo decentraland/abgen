@@ -213,12 +213,9 @@ fn record_rebuild(
     if crate::satellite::is_world(content_server) || !rebuilt(summary) {
         return;
     }
-    summary["satelliteRebuildRecord"] = serde_json::json!(crate::satellite::publish(
-        proxy,
-        entity,
-        entity_id,
-        content_server
-    ));
+    if let Some(key) = crate::satellite::publish(proxy, entity, entity_id, content_server) {
+        summary["satelliteRebuildRecord"] = serde_json::json!(key);
+    }
 }
 
 /// Whether a follow-up summary describes LODs built and uploaded by this job, as opposed to
@@ -1038,7 +1035,11 @@ mod follow_up_tests {
     /// the conversion job instead) write nothing.
     #[test]
     fn only_a_rebuilt_lod_writes_a_satellite_record() {
-        let (host, seen) = crate::output::tests::serve(vec![]);
+        let (host, seen) = crate::output::tests::serve(vec![(
+            crate::satellite::tests::PREFIX_ROUTE.to_string(),
+            200,
+            Vec::new(),
+        )]);
         let _space = crate::output::tests::point_space_at(&host);
         let cfg = tests::cfg();
         let proxy = crate::convert::make_proxy(&cfg, "https://c/content");

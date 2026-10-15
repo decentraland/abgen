@@ -96,9 +96,10 @@ pub fn on_conversion(
     publish(proxy, entity_doc, entity_id, content_server)
 }
 
-/// Writes the record and returns its key. The caller has decided the deployment needs a
-/// capture; `None` when nothing is published (no space configured) or `record` has nothing
-/// to say. Fail-soft like the scene sources: a failed put is logged and never fails the job.
+/// Writes the record and returns its key, or `None` when no record was written: no space is
+/// configured, `record` has nothing to say, or the put failed. Fail-soft like the scene
+/// sources: a failed put is logged and never fails the job, but the summary only names a key
+/// that exists.
 pub fn publish(
     proxy: &abgen::live::Proxy,
     entity_doc: &Value,
@@ -116,8 +117,13 @@ pub fn publish(
 
     let record = record(entity_doc, entity_id, content_server, rebuilt_at_ms)?;
     let key = key(rebuilt_at_ms, entity_id);
-    proxy.space_put_key(&key, record.to_string().as_bytes());
-    Some(key)
+    match proxy.space_put_key_strict(&key, record.to_string().as_bytes()) {
+        Ok(()) => Some(key),
+        Err(e) => {
+            eprintln!("satellite: {entity_id}: could not write {key} ({e:#})");
+            None
+        }
+    }
 }
 
 fn parse_parcel(pointer: &str) -> Option<(i32, i32)> {
@@ -126,11 +132,13 @@ fn parse_parcel(pointer: &str) -> Option<(i32, i32)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const CATALYST: &str = "https://peer.decentraland.org/content";
     const WORLDS: &str = "https://worlds-content-server.decentraland.org/content";
+    /// The fake space route that accepts every record put (see `output::tests::serve`).
+    pub(crate) const PREFIX_ROUTE: &str = "/SatelliteMaps/rebuild/";
 
     fn scene(pointers: &[&str]) -> Value {
         json!({ "type": "scene", "pointers": pointers, "timestamp": 1_724_000_000_000u64 })
@@ -241,7 +249,8 @@ mod tests {
     /// one and a Genesis City one write none there (the city's comes from the LOD lane).
     #[test]
     fn every_world_deployment_writes_a_record_on_conversion() {
-        let (host, seen) = crate::output::tests::serve(vec![]);
+        let (host, seen) =
+            crate::output::tests::serve(vec![(PREFIX_ROUTE.to_string(), 200, Vec::new())]);
         let _space = crate::output::tests::point_space_at(&host);
         let cfg = crate::lod::tests::cfg();
         let proxy = crate::convert::make_proxy(&cfg, "https://c/content");
@@ -268,5 +277,18 @@ mod tests {
             1,
             "only the world reached the space"
         );
+    }
+
+    /// A rejected put is no record: the summary must not name a key that does not exist.
+    #[test]
+    fn a_failed_put_reports_no_record() {
+        // No routes: the fake space answers every PUT with 404.
+        let (host, seen) = crate::output::tests::serve(vec![]);
+        let _space = crate::output::tests::point_space_at(&host);
+        let proxy = crate::convert::make_proxy(&crate::lod::tests::cfg(), "https://c/content");
+
+        let key = on_conversion(&proxy, &world("w.dcl.eth"), "bafkreiw0r1d", WORLDS, 0);
+        assert_eq!(key, None);
+        assert_eq!(seen.lock().unwrap().len(), 1, "the put was attempted");
     }
 }

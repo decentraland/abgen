@@ -1122,6 +1122,18 @@ impl Proxy {
         space.put_timed(&key, bytes)
     }
 
+    /// Hard-failing `space_put_key` for writes whose caller reports the key as written (the
+    /// lambda's satellite rebuild records): errors propagate, not logged away.
+    pub fn space_put_key_strict(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        let Some(space) = self.space.as_ref() else {
+            bail!("no space configured");
+        };
+        if space.read_only {
+            bail!("space is read-only (ABGEN_S3_READ_ONLY)");
+        }
+        space.put_timed(key, bytes)
+    }
+
     pub fn date(&self) -> &str {
         &self.date
     }

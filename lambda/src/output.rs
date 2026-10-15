@@ -355,7 +355,8 @@ pub(crate) mod tests {
     }
 
     /// Trimmed copy of `abgen::live::stub::serve` (that one is `cfg(test)`
-    /// and invisible to this crate).
+    /// and invisible to this crate). A route ending in `/` matches every path under it,
+    /// for keys whose exact spelling a test cannot know (the timestamped satellite records).
     pub(crate) fn serve(routes: Vec<(String, u16, Vec<u8>)>) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -396,7 +397,9 @@ pub(crate) mod tests {
                 seen2.lock().unwrap().push(format!("{method} {path}"));
                 let (code, body) = routes
                     .iter()
-                    .find(|(p, _, _)| path == *p)
+                    .find(|(p, _, _)| {
+                        path == *p || (p.ends_with('/') && path.starts_with(p.as_str()))
+                    })
                     .map(|(_, c, b)| (*c, b.clone()))
                     .unwrap_or((404, Vec::new()));
                 let _ = write!(
