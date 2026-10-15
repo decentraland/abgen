@@ -27,27 +27,6 @@ impl EntityOutcome {
     }
 }
 
-/// What a platform's exit code can be once a conversion has produced an outcome: 0, or
-/// upstream's "conversion errors tolerated" 12 (some assets failed to convert, the rest were
-/// bundled and published; `abgen::manifest::exit_code_for_failures` writes nothing else). A
-/// conversion that fails for real never produces an outcome: it errors out of the job, which
-/// retries and finally tombstones (exit code 5, written on that path alone). So everything
-/// downstream of a conversion, the finished events aside, runs only for bundles that stand,
-/// and nothing downstream needs to look at this code to know it.
-#[cfg(test)]
-mod exit_code_tests {
-    #[test]
-    fn the_converter_only_ever_writes_a_standing_code() {
-        for failures in [0, 1, 352] {
-            let code = abgen::manifest::exit_code_for_failures(failures);
-            assert!(
-                code == 0 || code == abgen::manifest::EXIT_CONVERSION_ERRORS_TOLERATED,
-                "{failures} failures -> {code}"
-            );
-        }
-    }
-}
-
 pub fn make_proxy(cfg: &Config, content_server: &str) -> std::sync::Arc<abgen::live::Proxy> {
     abgen::live::Proxy::new(abgen::live::ProxyConfig {
         catalyst_url: content_server.to_string(),
@@ -140,3 +119,24 @@ fn read_exit_code(manifest_path: &std::path::Path) -> Option<i32> {
 /// against tests whose assertions depend on the space being unconfigured.
 #[cfg(test)]
 pub(crate) static TEST_SPACE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// What a platform's exit code can be once a conversion has produced an outcome: 0, or
+/// upstream's "conversion errors tolerated" 12 (some assets failed to convert, the rest were
+/// bundled and published; `abgen::manifest::exit_code_for_failures` writes nothing else). A
+/// conversion that fails for real never produces an outcome: it errors out of the job, which
+/// retries and finally tombstones (exit code 5, written on that path alone). So everything
+/// downstream of a conversion, the finished events aside, runs only for bundles that stand,
+/// and nothing downstream needs to look at this code to know it.
+#[cfg(test)]
+mod exit_code_tests {
+    #[test]
+    fn the_converter_only_ever_writes_a_standing_code() {
+        for failures in [0, 1, 352] {
+            let code = abgen::manifest::exit_code_for_failures(failures);
+            assert!(
+                code == 0 || code == abgen::manifest::EXIT_CONVERSION_ERRORS_TOLERATED,
+                "{failures} failures -> {code}"
+            );
+        }
+    }
+}
