@@ -197,11 +197,12 @@ pub fn follow_up(
     Some(summary)
 }
 
-/// Write the satellite rebuild record when `summary` says this job built and uploaded fresh
-/// LODs, and report its key under `satelliteRebuildRecord`. A rebuilt LOD is the signal the
-/// satellite map is stale: the reuse index only misses when the scene's placements or their
-/// content changed, which is what the map shows. A reuse, a skip or a failure leaves the
-/// summary untouched.
+/// Write a Genesis City scene's satellite rebuild record when `summary` says this job built
+/// and uploaded fresh LODs, and report its key under `satelliteRebuildRecord`. A rebuilt LOD
+/// is the signal the satellite map is stale: the reuse index only misses when the scene's
+/// placements or their content changed, which is what the map shows. A reuse, a skip or a
+/// failure leaves the summary untouched. Worlds are not this lane's: every one of their
+/// deployments is recorded by the conversion job (`satellite::on_conversion`).
 fn record_rebuild(
     cfg: &Config,
     proxy: &Arc<Proxy>,
@@ -210,7 +211,7 @@ fn record_rebuild(
     entity_id: &str,
     content_server: &str,
 ) {
-    if !rebuilt(summary) {
+    if crate::satellite::is_world(content_server) || !rebuilt(summary) {
         return;
     }
     summary["satelliteRebuildRecord"] = serde_json::json!(crate::satellite::publish(
@@ -1036,7 +1037,7 @@ mod follow_up_tests {
 
     /// The idea end to end against a fake space: a build that uploaded writes one record
     /// and names it in the summary; a reuse of a previous build, the same job with the
-    /// records off, and a world write nothing.
+    /// records off, and a world (recorded by the conversion job instead) write nothing.
     #[test]
     fn only_a_rebuilt_lod_writes_a_satellite_record() {
         let (host, seen) = crate::output::tests::serve(vec![]);
@@ -1098,7 +1099,10 @@ mod follow_up_tests {
             "bafkE",
             "https://worlds-content-server.decentraland.org",
         );
-        assert_eq!(summary["satelliteRebuildRecord"], serde_json::Value::Null);
+        assert!(
+            summary.get("satelliteRebuildRecord").is_none(),
+            "a world's record is the conversion job's, not the LOD lane's: {summary}"
+        );
 
         assert_eq!(
             seen.lock().unwrap().len(),
@@ -1109,10 +1113,10 @@ mod follow_up_tests {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    pub(super) fn cfg() -> Config {
+    pub(crate) fn cfg() -> Config {
         Config {
             platforms: vec!["windows".to_string(), "mac".to_string()],
             version: "v49".to_string(),

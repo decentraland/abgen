@@ -66,7 +66,7 @@ all hits.
 | `ABGEN_HTTP_SECRET` | — (**fail-closed**) | shared secret the Function URL POST path requires in `x-abgen-secret`; unset means every HTTP invocation is refused with `503` |
 | `ENABLE_LODS` | off | after a scene's asset bundles are published and notified, build (or reuse) its `LOD_LEVELS` in the same job (see [LOD generation](#lod-generation)) |
 | `LOD_LEVELS` | `1` | comma-separated LOD levels the LOD lane builds and publishes (`0,1` for both); level 2 is refused |
-| `ENABLE_SATELLITE_REBUILD_RECORDS` | off | each Genesis City scene whose LODs the LOD lane rebuilds writes a `SatelliteMaps/rebuild/` record naming its parcels; needs `ENABLE_LODS` (see [Satellite rebuild records](#satellite-rebuild-records)) |
+| `ENABLE_SATELLITE_REBUILD_RECORDS` | off | each Genesis City scene whose LODs the LOD lane rebuilds, and every converted Worlds scene, writes a `SatelliteMaps/rebuild/` record (see [Satellite rebuild records](#satellite-rebuild-records)) |
 | `ALLOWED_CONTENT_SERVER_HOSTS` | — (**fail-open**) | comma-separated allowlist of hosts an event's `contentServerUrl` may name; **unset means any https host is accepted**, so every deployment should set it. Scheme/shape validation (https only, no userinfo) applies regardless — allowlist or not, a plaintext or internal-IP URL is rejected. The `lambdaImage` bakes in `peer.decentraland.org`; a function env var overrides it. |
 | `ABGEN_EMF_NAMESPACE` | — (off) | CloudWatch namespace for EMF metrics (e.g. `abgen/lambda`); unset means no recorder is installed and every `metrics::` call stays a no-op |
 | `ABGEN_LOG_FORMAT` | plain text | `json` for JSON log lines |
@@ -125,9 +125,10 @@ dropped by every filtered subscription.
 
 ## Satellite rebuild records
 
-With `ENABLE_SATELLITE_REBUILD_RECORDS=1`, each Genesis City scene whose LODs the
-[LOD lane](#lod-generation) builds and uploads writes one JSON object to the CDN bucket, right
-after those LODs:
+With `ENABLE_SATELLITE_REBUILD_RECORDS=1`, a scene whose captured image is now stale writes one
+JSON object to the CDN bucket. For Genesis City that is each scene whose LODs the
+[LOD lane](#lod-generation) builds and uploads, written right after those LODs. For Worlds it is
+every scene that converts, written right after its bundles:
 
 ```
 SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json
@@ -138,21 +139,36 @@ SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json
  "deployedAt":1724000000000,"rebuiltAt":1724000000123,"parcels":["0,0","-1,0"]}
 ```
 
+```json
+{"entityId":"bafkrei…","contentServer":"https://worlds-content-server.decentraland.org/content",
+ "world":"my-world.dcl.eth","deployedAt":1724000000000,"rebuiltAt":1724000000123,"parcels":["0,0"]}
+```
+
 - **What it's for.** The Explorer's satellite map is captured from the scenes. The map capture
   machine lists this prefix to know which parcels to re-capture.
-- **Why a LOD rebuild is the trigger.** A deployment converts whether or not anything visible
-  changed. The LOD lane's reuse index misses only when the scene's placements or their content
-  changed (see [Reusing an unchanged build](#reusing-an-unchanged-build)), which is what the map
-  shows, so a rebuilt LOD is the stale-map signal and a reused one is not.
-- **Which jobs write one.** A scene entity (`type` is `scene`) whose pointers are all `x,y`
-  parcels, from a content server that is not a worlds server, whose LOD follow-up built fresh
-  LODs and uploaded them.
+- **Why a LOD rebuild is the Genesis City trigger.** A deployment converts whether or not
+  anything visible changed. The LOD lane's reuse index misses only when the scene's placements
+  or their content changed (see [Reusing an unchanged build](#reusing-an-unchanged-build)),
+  which is what the map shows, so a rebuilt LOD is the stale-map signal and a reused one is not.
+- **Which Genesis City jobs write one.** A scene entity (`type` is `scene`) whose pointers are
+  all `x,y` parcels, from a content server that is not a worlds server, whose LOD follow-up
+  built fresh LODs and uploaded them.
   - A follow-up that reuses a previous build writes none: nothing visible changed.
   - Already-converted skips, LOD failures and skips write none. A conversion whose LOD lane is
-    off writes none, so `ENABLE_LODS` is required.
+    off writes none, so `ENABLE_LODS` is required for city records.
   - A forced reconversion writes one only if its LODs rebuild too.
+- **Which Worlds jobs write one.** Every scene from a worlds content server (its URL names
+  `worlds-content-server`) whose conversion succeeded on every platform. Worlds are captured
+  whole, so every deployment is a capture request; the LOD lane's reuse verdict plays no part.
+  - The record is written by the conversion job, after the upload and before the finished
+    events, so a redelivery after a failed notify (which takes the already-converted path)
+    cannot lose or duplicate it.
+  - Failed conversions and already-converted skips write none. A forced reconversion writes one.
 - **Fields.**
-  - `parcels`: the entity's pointers, normalized to `x,y`.
+  - `parcels`: the entity's parcel pointers, normalized to `x,y`. A city scene must have only
+    parcels; a world's non-parcel pointers are dropped and the list may be empty.
+  - `world` (Worlds records only): `metadata.worldConfiguration.name`, `null` when the
+    deployment carries none.
   - `deployedAt`: the catalyst `timestamp`, `null` when the entity document has none.
   - `rebuiltAt`: when the record was written, in ms.
 - **Keys.** `rebuiltAt` is zero-padded to 13 digits, so keys list in rebuild order. Each record
@@ -165,8 +181,8 @@ SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json
   directly (list, get, delete), not through the CDN, whose cached copy of a deleted record is
   harmless but stale.
 - **Failure handling.** The put is fail-soft, like the scene sources: a failure is logged and
-  never fails the job. The key written is reported under the job summary's
-  `lods.satelliteRebuildRecord`.
+  never fails the job. The key written is reported in the job summary: a city record under
+  `lods.satelliteRebuildRecord`, a world record at the top-level `satelliteRebuildRecord`.
 - **Out of scope.** Parcels a redeployment drops are not listed: the record names the new
   entity's parcels only.
 

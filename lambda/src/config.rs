@@ -20,8 +20,8 @@ pub struct Config {
     pub max_receive_count: u32,
     /// LOD levels the LOD lane builds and publishes (`LOD_LEVELS`).
     pub lod_levels: Vec<u32>,
-    /// Write a `SatelliteMaps/rebuild/` record per converted Genesis City scene
-    /// (`ENABLE_SATELLITE_REBUILD_RECORDS`).
+    /// Write a `SatelliteMaps/rebuild/` record per rebuilt Genesis City LOD and per converted
+    /// Worlds scene (`ENABLE_SATELLITE_REBUILD_RECORDS`).
     pub satellite_rebuild_records: bool,
 }
 
