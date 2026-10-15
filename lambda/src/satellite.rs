@@ -13,9 +13,11 @@ use serde_json::{json, Value};
 /// Key prefix of the rebuild records.
 pub const PREFIX: &str = "SatelliteMaps/rebuild/";
 
-/// Whether `content_server` is a Worlds server rather than a Genesis City catalyst.
+/// Whether `content_server` is a Worlds server rather than a Genesis City catalyst: the host
+/// decides (`abgen::lods::is_worlds_host`), not the whole URL, so an uppercase Worlds host is
+/// still a world and a catalyst URL carrying the words in its path is still a city.
 pub fn is_world(content_server: &str) -> bool {
-    content_server.contains("worlds-content-server")
+    abgen::lods::is_worlds_host(content_server)
 }
 
 /// The record of a scene entity, or `None` when there is nothing to capture: a wearable or
@@ -237,6 +239,25 @@ pub(crate) mod tests {
             let doc = json!({ "type": kind, "pointers": ["0,0"] });
             assert!(record(&doc, "e", CATALYST, 1).is_none(), "{kind}");
             assert!(record(&doc, "e", WORLDS, 1).is_none(), "{kind} on worlds");
+        }
+    }
+
+    #[test]
+    fn the_host_decides_what_is_a_world() {
+        for url in [
+            WORLDS,
+            "https://worlds-content-server.decentraland.org",
+            "https://WORLDS-CONTENT-SERVER.decentraland.org/content",
+            "https://worlds-content-server.decentraland.zone:8443/content",
+        ] {
+            assert!(is_world(url), "{url}");
+        }
+        for url in [
+            CATALYST,
+            "https://peer.decentraland.org/content?via=worlds-content-server",
+            "https://peer.decentraland.org/worlds-content-server/content",
+        ] {
+            assert!(!is_world(url), "{url}");
         }
     }
 

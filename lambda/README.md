@@ -159,13 +159,18 @@ SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json
     platform) write none, and so does a conversion whose LOD lane is off: `ENABLE_LODS` is
     required for city records.
   - A forced reconversion writes one only if its reuse lookup misses too.
+  - A conversion that failed on any platform writes none, even at a miss: the capture would
+    show the failed state, and the reconversion that follows usually reuses this build and so
+    could not schedule another. An already-converted redelivery carries no exit code and does
+    record its miss.
   - **False positives happen; no false negatives are known.** The LOD lane also
     runs for already-converted redeliveries, which write nothing only because the reuse index
     hits. It misses, and so every redeployed scene writes a record, on a `LOD_LEVELS` or
     platform change, a generation bump, a reuse-check error, and the first rollout. A
     re-capture queue tolerates that: the cost is a capture of an unchanged parcel.
-- **Which Worlds jobs write one.** Every scene from a worlds content server (its URL names
-  `worlds-content-server`) whose conversion succeeded on every platform. Worlds are captured
+- **Which Worlds jobs write one.** Every scene from a worlds content server (its host starts
+  with `worlds-content-server`, case-insensitively; `abgen::lods::is_worlds_host` decides for
+  every lane) whose conversion succeeded on every platform. Worlds are captured
   whole, so every deployment is a capture request; the LOD lane's reuse verdict plays no part.
   - The record is written by the conversion job, after the upload and before the finished
     events, so a redelivery after a failed notify (which takes the already-converted path)
@@ -179,9 +184,9 @@ SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json
   - `deployedAt`: the catalyst `timestamp`, `null` when the entity document has none.
   - `rebuiltAt`: when the record was written, in ms.
 - **Keys.** `rebuiltAt` is zero-padded to 13 digits, so keys list in rebuild order. Each record
-  is written once and never overwritten. The prefix is nevertheless served `no-cache`
-  (`space::object_headers`): a consumed record is deleted, and a cached copy of it at the edge
-  would be a stale capture request.
+  is written once and never overwritten. The queue prefix (`SatelliteMaps/rebuild/`, not all of
+  `SatelliteMaps/`) is nevertheless served `no-cache` (`space::object_headers`): a consumed
+  record is deleted, and a cached copy of it at the edge would be a stale capture request.
 - **Consuming.** The prefix is a queue. The capture machine lists `SatelliteMaps/rebuild/`,
   re-captures the parcels each record names, then deletes the records it handled. Writers and
   the consumer never touch the same key, so there is nothing to coordinate: a record written

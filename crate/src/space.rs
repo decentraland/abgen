@@ -165,12 +165,13 @@ pub fn object_headers(key: &str) -> ObjectHeaders {
     let uploader_lane = matches!(content_type, "application/wasm" | "text/cache-manifest");
     let cache_control = if key.starts_with("manifest/")
         || key.starts_with("LOD/lod-reuse/")
-        || key.starts_with("SatelliteMaps/")
+        || key.starts_with("SatelliteMaps/rebuild/")
     {
         // Manifests and LOD reuse records are rewritten in place (consumer-server manifests
         // on every rebuild, reuse records whenever a later deployment republishes a build);
-        // satellite rebuild records are a queue the consumer deletes from, and a deleted
-        // record must not outlive itself at the edge.
+        // satellite rebuild records (only the queue prefix, not whatever else may live under
+        // SatelliteMaps/) are deleted by their consumer, and a deleted record must not
+        // outlive itself at the edge.
         NO_CACHE
     } else if key.starts_with("LOD/lods-unity/") {
         PUBLIC_ONE_YEAR
