@@ -185,12 +185,12 @@ mod tests {
     #[test]
     fn a_world_records_without_a_name_or_parcels() {
         let nameless = json!({ "type": "scene", "pointers": ["0,0"] });
-        let record = record(&nameless, "e", WORLDS, 1).unwrap();
-        assert_eq!(record["world"], Value::Null);
+        let unnamed = record(&nameless, "e", WORLDS, 1).unwrap();
+        assert_eq!(unnamed["world"], Value::Null);
 
         let odd_pointers = json!({ "type": "scene", "pointers": ["my-world.dcl.eth"] });
-        let record = record(&odd_pointers, "e", WORLDS, 1).unwrap();
-        assert_eq!(record["parcels"], json!([]));
+        let unparcelled = record(&odd_pointers, "e", WORLDS, 1).unwrap();
+        assert_eq!(unparcelled["parcels"], json!([]));
     }
 
     #[test]
