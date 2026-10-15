@@ -62,10 +62,7 @@ fn main() {
                  \x20    ENABLE_LODS (off: LOD jobs are acked and skipped; on: LOD_LEVELS\n\
                  \x20    are regenerated from the scene and written to LOD/<level>/ and\n\
                  \x20    lods-unity/manifests/ — the deployment's FBX sources are unused),\n\
-                 \x20    LOD_LEVELS (default 1; 0,1 for both levels),\n\
-                 \x20    ENABLE_SATELLITE_REBUILD_RECORDS (off; on: each Genesis City\n\
-                 \x20    scene whose LODs the LOD lane rebuilds, and every converted Worlds\n\
-                 \x20    scene, writes SatelliteMaps/rebuild/<rebuiltAt>-<entityId>.json)"
+                 \x20    LOD_LEVELS (default 1; 0,1 for both levels)"
             );
         }
         Some(other) => {
@@ -340,7 +337,6 @@ fn convert_asset_bundles(
         || {
             let upload = output::publish(cfg, &agent, proxy, &entity_doc, &outcome)?;
             let record = satellite::on_conversion(
-                cfg,
                 proxy,
                 &entity_doc,
                 &job.entity_id,
@@ -526,7 +522,6 @@ mod tests {
             lods_enabled: false,
             max_receive_count: 3,
             lod_levels: vec![1],
-            satellite_rebuild_records: false,
         }
     }
 
