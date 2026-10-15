@@ -159,12 +159,14 @@ SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json
     platform) write none, and so does a conversion whose LOD lane is off: `ENABLE_LODS` is
     required for city records.
   - A forced reconversion writes one only if its reuse lookup misses too.
-  - A conversion that failed on any platform runs no LOD lane at all (see
-    [LOD generation](#lod-generation)): no LODs, no reuse record, no satellite record, the same
-    way it updates no registry lane. Because no reuse record was written, the redelivery or
-    deployment that converts cleanly finds no reusable build and records its miss. An
-    already-converted skip only ever follows a clean conversion (a tombstone is never current),
-    so its LOD lane runs and records a miss.
+  - A conversion that failed never gets this far. The converter writes only exit code 0 or the
+    tolerated 12 (some assets failed, the bundles stand); a conversion that fails for real
+    errors out of the job before anything downstream, is retried, and finally tombstones (exit
+    code 5, with a `statusCode: 5` finished event for the registry's fallback state). So it
+    gets no LODs, no reuse record and no satellite record, and because no reuse record was
+    written, the redelivery or deployment that converts cleanly finds no reusable build and
+    records its miss. An already-converted skip only ever follows a clean conversion (a
+    tombstone is never current), so its LOD lane runs and records a miss.
   - **False positives happen; no false negatives are known.** The LOD lane also
     runs for already-converted redeliveries, which write nothing only because the reuse index
     hits. It misses, and so every redeployed scene writes a record, on a `LOD_LEVELS` or
@@ -172,9 +174,9 @@ SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json
     re-capture queue tolerates that: the cost is a capture of an unchanged parcel.
 - **Which Worlds jobs write one.** Every scene from a worlds content server (its host starts
   with `worlds-content-server`, case-insensitively; `abgen::lods::is_worlds_host` decides for
-  every lane) whose conversion succeeded on every platform (exit code 0, or the tolerated 12:
-  some assets failed, the bundles stand). Worlds are captured
-  whole, so every deployment is a capture request; the LOD lane's reuse verdict plays no part.
+  every lane) that converts. Worlds are captured whole, so every deployment is a capture
+  request; the LOD lane's reuse verdict plays no part. A conversion that fails never reaches
+  the record (see above).
   - The record is written by the conversion job, after the upload and before the finished
     events, so a redelivery after a failed notify (which takes the already-converted path)
     cannot lose or duplicate it.
@@ -504,14 +506,14 @@ go. Wearables and emotes never reach it. An already-converted scene still
 gets the LOD step, which the reuse index makes a cheap `by=inputs` hit when
 nothing changed.
 
-The lane runs only after a conversion that succeeded on every platform: each platform's
-`exitCode` is 0 or the tolerated 12 (some assets failed to convert, the bundles stand). Judged
-per platform, since the summary's top-level `exitCode` is the maximum and a 12 would hide a 5.
-Any other code (5 is what a tombstone records) skips the lane with `lods: {"skipped":
-"conversion-failed"}`, counted as `abgen_lambda_lod_followup_total{outcome="skipped"}`: no LODs,
-no reuse record, and no [satellite rebuild record](#satellite-rebuild-records), the same way the
-registry gets no converted lane. A tombstone is never current, so the redelivery or deployment
-that converts cleanly runs the lane and is the next attempt.
+The lane runs only after a conversion that stands, and it does not have to check: the
+converter writes only exit code 0 or the tolerated 12 (some assets failed to convert, the
+bundles stand), and a conversion that fails for real errors out of the job before the lane,
+is retried, and finally tombstones (exit code 5, written on that path alone). A failed
+conversion therefore gets no LODs, no reuse record and no
+[satellite rebuild record](#satellite-rebuild-records), the same way the registry gets no
+converted lane. A tombstone is never current, so the redelivery or deployment that converts
+cleanly runs the lane and is the next attempt.
 
 The LODs are regenerated from the scene entity through the same `lodgen`
 chain the abcdn server runs JIT (`abgen-lod generate`): resolve placements

@@ -82,18 +82,18 @@ pub fn key(rebuilt_at_ms: u64, entity_id: &str) -> String {
     format!("{PREFIX}{rebuilt_at_ms:013}-{entity_id}.json")
 }
 
-/// The Worlds half of the trigger: a record for every Worlds conversion that succeeded on
-/// every platform (`converted`, from `EntityOutcome::succeeded`: exit code 0 or the tolerated
-/// 12 on each), written by the conversion job itself. Genesis City scenes return `None` here;
-/// theirs follow the LOD lane (`lod::record_reuse_miss`).
+/// The Worlds half of the trigger: a record for every Worlds conversion, written by the
+/// conversion job itself once the bundles are published. The conversion stands by then: one
+/// that failed errored out of the job before publishing (see `convert::exit_code_tests`).
+/// Genesis City scenes return `None` here; theirs follow the LOD lane
+/// (`lod::record_reuse_miss`).
 pub fn on_conversion(
     proxy: &abgen::live::Proxy,
     entity_doc: &Value,
     entity_id: &str,
     content_server: &str,
-    converted: bool,
 ) -> Option<String> {
-    if !is_world(content_server) || !converted {
+    if !is_world(content_server) {
         return None;
     }
     publish(proxy, entity_doc, entity_id, content_server)
@@ -272,8 +272,8 @@ pub(crate) mod tests {
         assert!(key(999, "z") < key(1_000, "a"));
     }
 
-    /// Every successful Worlds conversion writes one record from the conversion job; a failed
-    /// one and a Genesis City one write none there (the city's comes from the LOD lane).
+    /// Every Worlds conversion writes one record from the conversion job; a Genesis City one
+    /// writes none there (the city's comes from the LOD lane).
     #[test]
     fn every_world_deployment_writes_a_record_on_conversion() {
         let (host, seen) =
@@ -283,7 +283,7 @@ pub(crate) mod tests {
         let proxy = crate::convert::make_proxy(&cfg, "https://c/content");
         let doc = world("my-world.dcl.eth");
 
-        let key = on_conversion(&proxy, &doc, "bafkreiw0r1d", WORLDS, true)
+        let key = on_conversion(&proxy, &doc, "bafkreiw0r1d", WORLDS)
             .expect("a converted world is a capture request");
         assert!(
             key.starts_with(PREFIX) && key.ends_with("-bafkreiw0r1d.json"),
@@ -292,11 +292,7 @@ pub(crate) mod tests {
         assert_eq!(seen.lock().unwrap().clone(), vec![format!("PUT /{key}")]);
 
         assert!(
-            on_conversion(&proxy, &doc, "bafkreiw0r1d", WORLDS, false).is_none(),
-            "a failed conversion has nothing to capture"
-        );
-        assert!(
-            on_conversion(&proxy, &scene(&["0,0"]), "bafkcity", CATALYST, true).is_none(),
+            on_conversion(&proxy, &scene(&["0,0"]), "bafkcity", CATALYST).is_none(),
             "a city scene waits for its LOD rebuild"
         );
         assert_eq!(
@@ -314,7 +310,7 @@ pub(crate) mod tests {
         let _space = crate::output::tests::point_space_at(&host);
         let proxy = crate::convert::make_proxy(&crate::lod::tests::cfg(), "https://c/content");
 
-        let key = on_conversion(&proxy, &world("w.dcl.eth"), "bafkreiw0r1d", WORLDS, true);
+        let key = on_conversion(&proxy, &world("w.dcl.eth"), "bafkreiw0r1d", WORLDS);
         assert_eq!(key, None);
         assert_eq!(seen.lock().unwrap().len(), 1, "the put was attempted");
     }
