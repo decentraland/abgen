@@ -128,6 +128,11 @@
 
           packages.abgen-corpus = build.abgenCorpusPkg;
 
+          # The lambda binary on its own, for the palkia e2e (ci/e2e-palkia.sh): that check
+          # needs the network, so it cannot be a nix check, and loading lambdaImage into
+          # docker just to run one command is a lot of ceremony for the same binary.
+          packages.abgen-lambda = abgenConsumersPkg;
+
           packages.dockerImage = pkgs.dockerTools.buildLayeredImage {
             name = "abgen";
             tag = repoVersion;
