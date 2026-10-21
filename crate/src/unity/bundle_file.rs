@@ -716,12 +716,7 @@ mod tests {
     fn template() -> std::path::PathBuf {
         let root = std::env::var("ABGEN_ROOT")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .parent()
-                    .unwrap()
-                    .to_path_buf()
-            });
+            .unwrap_or_else(|_| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf());
         root.join("template").join("all-types.windows.bundle")
     }
 
