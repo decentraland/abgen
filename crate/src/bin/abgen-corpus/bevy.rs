@@ -26,8 +26,14 @@ pub(crate) fn run_bevy_variants(
     for id in ids {
         let built = (|| -> Result<abgen::bevyvariants::BuildOutput> {
             let raw = store.fetch(id).with_context(|| format!("entity {id} not in the store"))?;
-            let ent: serde_json::Value =
+            let mut ent: serde_json::Value =
                 serde_json::from_slice(&raw).with_context(|| format!("parse entity {id}"))?;
+            // The stored entity file is the deployed JSON, addressed by its hash: it carries no
+            // `id` of its own, so the id it is stored under is the entity id.
+            if let Some(obj) = ent.as_object_mut() {
+                obj.entry("id")
+                    .or_insert_with(|| serde_json::Value::String(id.clone()));
+            }
             let scene = abgen::catalyst::CatalystClient::parse_entity(&ent)?;
             let fetch = |hash: &str| store.fetch(hash).ok();
             abgen::bevyvariants::build_entity_variants(&scene, &fetch, out_root, opts)
