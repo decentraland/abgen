@@ -6,10 +6,12 @@
 //!   (powers of two). BC5 for images the entity's models use only as normal maps, BC1 for fully
 //!   opaque images, BC7 otherwise.
 //! - Creator UASTC KTX2 textures (standalone or embedded in a GLB) are only ever transcoded block
-//!   for block to BC7, level by level at the file's own sizes, so the variant's texels equal what
-//!   the explorer's own transcoder makes of the file; anything that would need a resize or
-//!   re-encode gets no variant, and neither does a variant larger than its original.
-//! - Models become a GLB with Draco decoded, `KHR_texture_basisu` resolved and every embedded
+//!   for block to BC7, and only the single level the explorer's local path picks (the first
+//!   level at most 1024 on a side, no mips), so remote equals localhost; anything that would
+//!   need a resize or re-encode gets no variant, and neither does a variant larger than its
+//!   original. Keeping the file's lower mips needs the explorer's local path to keep them too.
+//! - Models (opt-in: `ABGEN_BEVY_GLB_VARIANTS=1` or `abgen-corpus --bevy-glb-variants`; off by
+//!   default because Bevy's glTF loader does not take them yet) become a GLB with Draco decoded, `KHR_texture_basisu` resolved and every embedded
 //!   image replaced by its KTX2 variant (`image/ktx2`). External image URIs are left as they are:
 //!   they resolve to their own original CID, which has its own texture variant.
 //! - Nothing else gets a variant (scene code, audio, video, source maps, unknown files).
@@ -34,7 +36,7 @@ pub mod model;
 pub mod texture;
 
 #[cfg(feature = "bevy-variants")]
-pub use build::{build_entity_variants, BuildOutput};
+pub use build::{build_entity_variants, BuildOptions, BuildOutput};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -162,7 +164,7 @@ impl crate::live::Proxy {
                 }
             }
         };
-        let out = build_entity_variants(&ctx.scene, &fetch, out_root)?;
+        let out = build_entity_variants(&ctx.scene, &fetch, out_root, BuildOptions::from_env())?;
         if self.space_configured() {
             for (vcid, path) in &out.variants {
                 match std::fs::read(path) {

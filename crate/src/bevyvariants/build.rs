@@ -16,6 +16,25 @@ use crate::catalyst::Scene;
 /// One original's outcome: its hash, and its variant entry and file when it got one.
 type Row = (String, Option<VariantEntry>, Option<PathBuf>);
 
+/// What a build produces besides texture variants.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BuildOptions {
+    /// Also build GLB model variants. Off by default: Bevy's glTF loader does not take them yet
+    /// (it rejects `KHR_texture_basisu` in `extensionsRequired`, so a GLB embedding KTX2 cannot
+    /// load), so the manifest lists texture variants only. Images embedded in GLBs never get a
+    /// texture variant of their own either way.
+    pub glb_variants: bool,
+}
+
+impl BuildOptions {
+    /// `ABGEN_BEVY_GLB_VARIANTS=1` turns GLB variants on (default off).
+    pub fn from_env() -> Self {
+        BuildOptions {
+            glb_variants: crate::clihelp::env_bool("ABGEN_BEVY_GLB_VARIANTS", false),
+        }
+    }
+}
+
 pub struct BuildOutput {
     pub manifest: Manifest,
     /// The manifest exactly as written to `bevy/manifest/{entity}.json`.
@@ -83,6 +102,7 @@ pub fn build_entity_variants(
     scene: &Scene,
     fetch: &(dyn Fn(&str) -> Option<Vec<u8>> + Sync),
     out_root: &Path,
+    opts: BuildOptions,
 ) -> Result<BuildOutput> {
     let entity = scene.entity_id.as_str();
     let manifest_dst = manifest_path(out_root, entity)
@@ -175,9 +195,10 @@ pub fn build_entity_variants(
         })
         .collect::<Result<_>>()?;
 
-    // Pass 3: models.
+    // Pass 3: models (opt-in, see `BuildOptions::glb_variants`).
     let model_variants: Vec<Row> = models
         .par_iter()
+        .filter(|_| opts.glb_variants)
         .map(|&(hash, file)| -> Result<Row> {
             let none = (hash.to_string(), None, None);
             let Some(bytes) = model_bytes.get(hash) else {

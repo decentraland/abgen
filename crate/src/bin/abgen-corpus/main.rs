@@ -116,7 +116,7 @@ fn usage_text() -> &'static str {
               worlds-content-server;\n               \
               fetches scene entities + content into the store, then converts)\n  \
          abgen-corpus (--world <name>[,...] | --entity-ids <ids.txt> | --pointer <p>) <out-dir> \\\n               \
-             --bevy-variants [--worlds-url <url>] [--fetch-missing] [--content-dir <dir>] [-j JOBS]\n               \
+             --bevy-variants [--bevy-glb-variants] [--worlds-url <url>] [--fetch-missing] [--content-dir <dir>] [-j JOBS]\n               \
              (PROTOTYPE: builds only the Bevy variants lane - KTX2/GLB variants addressed\n               \
               by CID plus one manifest per entity - into <out-dir>/bevy/{manifest,contents}/,\n               \
               the layout `abgen` serves at /bevy/manifest/<entity>.json and /bevy/contents/<cid>)\n  \
@@ -297,6 +297,7 @@ fn run() -> Result<()> {
     let mut pointer_target: Option<String> = None;
     let mut gpu_flag = false;
     let mut bevy_variants = false;
+    let mut bevy_glb_variants = false;
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -414,6 +415,9 @@ fn run() -> Result<()> {
             "--bevy-variants" => {
                 bevy_variants = true;
             }
+            "--bevy-glb-variants" => {
+                bevy_glb_variants = true;
+            }
             "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
             "-V" | "--version" => abgen::clihelp::print_version(BIN_NAME),
             other if other.starts_with("--") => {
@@ -445,6 +449,10 @@ fn run() -> Result<()> {
             usage();
         }
         client_mode = true;
+    }
+    if bevy_glb_variants && !bevy_variants {
+        eprintln!("error: --bevy-glb-variants requires --bevy-variants");
+        usage();
     }
     if bevy_variants
         && (live_mode.is_some()
@@ -625,7 +633,7 @@ fn run() -> Result<()> {
             if fetch_missing {
                 fetch_ids_into_store(&store, &content_server_url, &ids);
             }
-            return bevy::run_bevy_variants(&ids, &store, &out_root);
+            return bevy::run_bevy_variants(&ids, &store, &out_root, bevy_glb_variants);
         }
         if cdn_layout {
             let store = LocalContentStore::new(&cdir);
@@ -721,7 +729,7 @@ fn run() -> Result<()> {
             return Err(anyhow!("--world resolved no scene entities"));
         }
         if bevy_variants {
-            return bevy::run_bevy_variants(&ids, &store, &out_root);
+            return bevy::run_bevy_variants(&ids, &store, &out_root, bevy_glb_variants);
         }
         let m = manifest_from_ids(&ids, &cdir, &platform, cdn_layout, toggles)?;
         (m, out_root)
