@@ -29,14 +29,17 @@ fn ktx(bytes: &[u8], format: BcFormat) -> (Ktx2Header, Vec<Vec<u8>>) {
     (h, levels)
 }
 
-fn uastc_bc7_levels(raw: &[u8]) -> Vec<Vec<u8>> {
+/// What the explorer's local path transcodes: the first level at most 1024 on a side, to BC7.
+fn client_bc7_level(raw: &[u8]) -> Vec<u8> {
     let t = basisu::Transcoder::new(raw).unwrap();
-    (0..t.level_count())
-        .map(|l| {
-            t.transcode(l, basisu::TargetFormat::Bc7Rgba, basisu::DecodeFlags::NONE)
-                .unwrap()
+    let level = (0..t.level_count())
+        .find(|&l| {
+            t.image_level_info(l)
+                .is_ok_and(|i| i.width.max(i.height) <= 1024)
         })
-        .collect()
+        .unwrap();
+    t.transcode(level, basisu::TargetFormat::Bc7Rgba, basisu::DecodeFlags::NONE)
+        .unwrap()
 }
 
 fn noise_alpha_png(w: u32, h: u32) -> Vec<u8> {
@@ -263,16 +266,14 @@ fn rows_are_top_down() {
 }
 
 #[test]
-fn uastc_is_a_pure_block_transcode_of_every_level() {
+fn uastc_is_a_single_level_pure_transcode_matching_the_client() {
     let v = transcode_uastc_bc7(UASTC_8).expect("8x8 UASTC transcodes");
     assert_eq!(v.path, EncodePath::Ktx2Transcode);
-    assert_eq!((v.format, v.width, v.height), (TexFormat::Bc7, 8, 8));
-    let expected = uastc_bc7_levels(UASTC_8);
-    // Exactly the file's own levels: none generated, none re-encoded.
-    assert_eq!(v.mips as usize, expected.len());
+    assert_eq!((v.format, v.width, v.height, v.mips), (TexFormat::Bc7, 8, 8, 1));
+    // Exactly the one level the client's local path makes: no mips, nothing re-encoded.
     let (h, levels) = ktx(&v.bytes, BcFormat::Bc7);
-    assert_eq!((h.width, h.height), (8, 8));
-    assert_eq!(levels, expected);
+    assert_eq!((h.width, h.height, h.levels), (8, 8, 1));
+    assert_eq!(levels, vec![client_bc7_level(UASTC_8)]);
     // The slot never changes the creator-KTX2 path (no BC5, no BC1).
     for slot in [Slot::Srgb, Slot::Linear, Slot::Normal] {
         match encode_texture(UASTC_8, slot).unwrap() {
@@ -418,7 +419,7 @@ fn basisu_texture_resolves_to_its_ktx2_source_as_bc7() {
             assert_eq!(v.images_replaced, vec![0]);
             assert_eq!(view, &t.bytes[..]);
             let (_, levels) = image_ktx(&doc, &bin, 0, BcFormat::Bc7);
-            assert_eq!(levels, uastc_bc7_levels(UASTC_8));
+            assert_eq!(levels, vec![client_bc7_level(UASTC_8)]);
         }
         // No variant: the creator's UASTC bytes stay, under their own MIME type.
         None => {
@@ -519,33 +520,34 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
         ],
     );
     let fetch = |h: &str| blobs.get(h).cloned();
-    let run = |tag: &str| {
+    let run = |tag: &str, opts: BuildOptions| {
         let out = std::env::temp_dir().join(format!(
             "abgen-bevy-variants-{tag}-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&out);
-        let built = build_entity_variants(&scene, &fetch, &out).unwrap();
+        let built = build_entity_variants(&scene, &fetch, &out, opts).unwrap();
         (out, built)
     };
-    let (out, built) = run("a");
+    // Default: texture variants only (GLB variants are opt-in).
+    assert_eq!(BuildOptions::default(), BuildOptions { glb_variants: false });
+    let (out, built) = run("a", BuildOptions::default());
     let m = &built.manifest;
     assert_eq!(m.v, 1);
     assert_eq!(m.entity, "bafkentity");
     assert!(m.generator.starts_with("abgen "));
     let ktx_variant = encode_texture(UASTC_8, Slot::Srgb).unwrap();
     let keys: Vec<&str> = m.files.keys().map(String::as_str).collect();
-    let mut expected = vec!["bafkcolor", "bafkembed", "bafknormal"];
+    let mut expected = vec!["bafkcolor", "bafknormal"];
     if ktx_variant.is_some() {
-        expected.insert(2, "bafkktx");
+        expected.insert(1, "bafkktx");
         assert_eq!(m.files["bafkktx"][0].format, "ktx2-bc7");
     }
     assert_eq!(keys, expected);
     assert_eq!(m.files["bafkcolor"][0].format, "ktx2-bc1");
     assert_eq!(m.files["bafknormal"][0].format, "ktx2-bc5");
-    let model = &m.files["bafkembed"][0];
-    assert_eq!((model.kind.as_str(), model.format.as_str()), ("model", "glb"));
-    assert!(model.width.is_none() && model.mips.is_none());
+    // The images embedded in embed.glb get no texture variant of their own.
+    assert!(m.files.values().flatten().all(|e| e.kind == "texture"));
     let tex = &m.files["bafkcolor"][0];
     assert_eq!(
         (tex.kind.as_str(), tex.width, tex.height, tex.mips),
@@ -569,12 +571,29 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     let parsed: Manifest = serde_json::from_slice(&on_disk).unwrap();
     assert_eq!(&parsed, m);
     let raw: J = serde_json::from_slice(&on_disk).unwrap();
-    assert!(raw["files"]["bafkembed"][0].get("width").is_none());
     assert_eq!(raw["files"]["bafkcolor"][0]["width"], 16);
 
     // Same inputs, same bytes.
-    let (out2, built2) = run("b");
+    let (out2, built2) = run("b", BuildOptions::default());
     assert_eq!(built2.manifest_bytes, built.manifest_bytes);
+
+    // Opt-in: the GLB with embedded images gets a model variant (no size fields); the GLB whose
+    // only image is external still gets none; the texture entries are unchanged.
+    let (out3, built3) = run("g", BuildOptions { glb_variants: true });
+    let m3 = &built3.manifest;
+    let model = &m3.files["bafkembed"][0];
+    assert_eq!((model.kind.as_str(), model.format.as_str()), ("model", "glb"));
+    assert!(model.width.is_none() && model.mips.is_none());
+    assert!(!m3.files.contains_key("bafkext"));
+    let raw3: J = serde_json::from_slice(&built3.manifest_bytes).unwrap();
+    assert!(raw3["files"]["bafkembed"][0].get("width").is_none());
+    let mut textures_only = m3.files.clone();
+    textures_only.remove("bafkembed");
+    assert_eq!(&textures_only, &m.files);
+    let glb = std::fs::read(content_path(&out3, &model.cid).unwrap()).unwrap();
+    assert_eq!(cid_v1_raw_sha256(&glb), model.cid);
+
     let _ = std::fs::remove_dir_all(&out);
     let _ = std::fs::remove_dir_all(&out2);
+    let _ = std::fs::remove_dir_all(&out3);
 }

@@ -9,7 +9,15 @@ use anyhow::Context;
 use std::path::Path;
 
 #[cfg(feature = "bevy-variants")]
-pub(crate) fn run_bevy_variants(ids: &[String], store: &LocalContentStore, out_root: &Path) -> Result<()> {
+pub(crate) fn run_bevy_variants(
+    ids: &[String],
+    store: &LocalContentStore,
+    out_root: &Path,
+    glb_variants: bool,
+) -> Result<()> {
+    let opts = abgen::bevyvariants::BuildOptions {
+        glb_variants: glb_variants || abgen::bevyvariants::BuildOptions::from_env().glb_variants,
+    };
     std::fs::create_dir_all(out_root)
         .with_context(|| format!("mkdir {}", out_root.display()))?;
     let mut errs = 0usize;
@@ -22,7 +30,7 @@ pub(crate) fn run_bevy_variants(ids: &[String], store: &LocalContentStore, out_r
                 serde_json::from_slice(&raw).with_context(|| format!("parse entity {id}"))?;
             let scene = abgen::catalyst::CatalystClient::parse_entity(&ent)?;
             let fetch = |hash: &str| store.fetch(hash).ok();
-            abgen::bevyvariants::build_entity_variants(&scene, &fetch, out_root)
+            abgen::bevyvariants::build_entity_variants(&scene, &fetch, out_root, opts)
         })();
         match built {
             Ok(o) => {
@@ -54,6 +62,6 @@ pub(crate) fn run_bevy_variants(ids: &[String], store: &LocalContentStore, out_r
 }
 
 #[cfg(not(feature = "bevy-variants"))]
-pub(crate) fn run_bevy_variants(_: &[String], _: &LocalContentStore, _: &Path) -> Result<()> {
+pub(crate) fn run_bevy_variants(_: &[String], _: &LocalContentStore, _: &Path, _: bool) -> Result<()> {
     anyhow::bail!("--bevy-variants requires the bevy-variants feature (on by default via `server`)")
 }

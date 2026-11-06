@@ -1,6 +1,6 @@
 //! Texture variants: PNG / JPEG in, KTX2 (BC1 / BC5 / BC7 payload, Zstandard-supercompressed,
 //! full mip chain, at most [`BEVY_TEXTURE_MAX`] on a side, top-down rows) out; creator UASTC
-//! KTX2 in, a pure block transcode to BC7 KTX2 out. See the module docs of [`super`].
+//! KTX2 in, a single-level pure block transcode to BC7 KTX2 out. See the module docs of [`super`].
 
 use anyhow::{Context, Result};
 use image::RgbaImage;
@@ -92,7 +92,7 @@ pub fn choose_format(slot: Slot, opaque: bool) -> TexFormat {
 /// Which path produced a variant (exposed for tests and logs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodePath {
-    /// Creator UASTC KTX2: every kept level block-transcoded to BC7, nothing re-encoded.
+    /// Creator UASTC KTX2: the explorer's chosen level block-transcoded to BC7, nothing else.
     Ktx2Transcode,
     /// PNG/JPEG decoded to RGBA8 and encoded.
     Encode,
@@ -160,17 +160,17 @@ pub fn encode_texture(bytes: &[u8], slot: Slot) -> Result<Option<TextureVariant>
     encode_rgba(img, slot).map(Some)
 }
 
-/// The creator-KTX2 rule: a pure block-for-block UASTC -> BC7 transcode, so the variant's
-/// texels are exactly what the explorer's own transcoder makes of the same file (both vendor the
-/// same basisu sources). The slot is ignored: no BC1, no BC5, no resize, no re-encode, no
-/// generated mips.
+/// The creator-KTX2 rule: a pure block-for-block UASTC -> BC7 transcode of exactly the one level
+/// the explorer's local path transcodes (the first level no larger than [`BEVY_TEXTURE_MAX`] on
+/// a side, at its own size), and nothing else: one level, no mips, so remote and localhost
+/// produce the same texture (both vendor the same basisu sources). The slot is ignored: no BC1,
+/// no BC5, no resize, no re-encode, no generated mips. Keeping the file's own lower mips would
+/// need the explorer's local transcode to keep them too (a separate change).
 ///
-/// Levels kept: from the first level no larger than [`BEVY_TEXTURE_MAX`] on a side (the level
-/// the explorer picks) through the file's last level, each at its own size. `None` (no variant:
-/// the client loads the original) when the file is not a UASTC KTX2 the header gate takes, has
-/// no such level, that level is not whole 4x4 blocks, or any kept level fails to transcode.
-/// Levels below 4 texels on a side are single (padded) blocks, as the format defines them.
-/// The size gate against the original is applied by the caller.
+/// `None` (no variant: the client loads the original) when the file is not a UASTC KTX2 the
+/// header gate takes, has no such level, that level is not whole 4x4 blocks (the explorer
+/// would decode and re-encode it), or it fails to transcode. The size gate against the
+/// original is applied by the caller.
 pub fn transcode_uastc_bc7(raw: &[u8]) -> Option<TextureVariant> {
     use basisu::{DecodeFlags, TargetFormat, Transcoder};
     if !crate::ktx2::ktx2_header_ok(raw) {
@@ -180,39 +180,28 @@ pub fn transcode_uastc_bc7(raw: &[u8]) -> Option<TextureVariant> {
     if !t.supports(TargetFormat::Bc7Rgba) {
         return None;
     }
-    let levels = t.level_count();
-    let start = (0..levels).find(|&l| {
+    let level = (0..t.level_count()).find(|&l| {
         t.image_level_info(l)
             .is_ok_and(|i| i.width.max(i.height) <= BEVY_TEXTURE_MAX)
     })?;
-    let base = t.image_level_info(start).ok()?;
-    let (w, h) = (base.width, base.height);
+    let info = t.image_level_info(level).ok()?;
+    let (w, h) = (info.width, info.height);
     if !w.is_multiple_of(4) || !h.is_multiple_of(4) || is_tiny(w, h) {
         return None;
     }
-    let mut chain: Vec<Vec<u8>> = Vec::with_capacity((levels - start) as usize);
-    for (m, level) in (start..levels).enumerate() {
-        let info = t.image_level_info(level).ok()?;
-        let (ew, eh) = ((w >> m).max(1), (h >> m).max(1));
-        if (info.width, info.height) != (ew, eh) {
-            return None;
-        }
-        let blocks = t
-            .transcode(level, TargetFormat::Bc7Rgba, DecodeFlags::NONE)
-            .ok()?;
-        if blocks.len() != crate::ktx2_write::level_bytes(BcFormat::Bc7, ew, eh) {
-            return None;
-        }
-        chain.push(blocks);
+    let blocks = t
+        .transcode(level, TargetFormat::Bc7Rgba, DecodeFlags::NONE)
+        .ok()?;
+    if blocks.len() != crate::ktx2_write::level_bytes(BcFormat::Bc7, w, h) {
+        return None;
     }
-    let refs: Vec<&[u8]> = chain.iter().map(Vec::as_slice).collect();
-    let bytes = write_ktx2(BcFormat::Bc7, w, h, &refs).ok()?;
+    let bytes = write_ktx2(BcFormat::Bc7, w, h, &[blocks.as_slice()]).ok()?;
     Some(TextureVariant {
         bytes,
         format: TexFormat::Bc7,
         width: w,
         height: h,
-        mips: refs.len() as u32,
+        mips: 1,
         path: EncodePath::Ktx2Transcode,
     })
 }

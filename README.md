@@ -285,7 +285,7 @@ can be switched off at any time. Built by `crate/src/bevyvariants` (feature `bev
 with `server`).
 
 - `GET /bevy/manifest/{entity}.json` - `{"v":1,"entity","generator":"abgen <version>","files":{"<original cid>":[{"cid","kind","format","width","height","mips","size"}]}}`
-  (`format`: `ktx2-bc7` | `ktx2-bc1` | `ktx2-bc5` | `glb`; `width`/`height`/`mips` only on
+  (`format`: `ktx2-bc7` | `ktx2-bc1` | `ktx2-bc5`, plus `glb` only when GLB variants are on; `width`/`height`/`mips` only on
   textures). 404 while absent; a miss starts a background build
   (`X-Abgen-Reason: bevy-variants-cold`), `?wait=1` builds synchronously, failures are
   negative-cached for `ABGEN_JIT_FAIL_TTL_S`. `Cache-Control: private, max-age=0, no-cache`.
@@ -301,12 +301,17 @@ fixed level, `KTXorientation` `rd`; writer in `crate/src/ktx2_write.rs`):
   normal maps (x in R, y in G - Bevy's two-channel normal path), `ktx2-bc1` for fully opaque
   images, `ktx2-bc7` otherwise. Images 2 px or less on a side get none.
 - creator UASTC KTX2 (standalone or embedded in a GLB): a pure block-for-block UASTC -> BC7
-  transcode (`ktx2-bc7`) of the file's levels at their own sizes, starting at the first level no
-  larger than 1024 (the level the explorer picks), with the same vendored basisu sources the
-  explorer uses, so the texels match a local transcode. No resize, re-encode, BC1/BC5 or
-  generated mips: a file that would need any of them gets no variant, and so does a variant
-  larger than its original.
-- models (`.glb`/`.gltf`): a GLB with Draco decoded, `KHR_texture_basisu` resolved to a core
+  transcode (`ktx2-bc7`) of one level only - the first level no larger than 1024, at its own
+  size, exactly what the explorer's local path transcodes (same vendored basisu sources, one
+  level, no mips) - so remote and localhost give the same texture. No resize, re-encode, BC1/BC5
+  or mips: a file that would need a resize or re-encode gets no variant, and so does a variant
+  larger than its original. Shipping the file's lower mips would need the explorer's local
+  transcode to keep them too (a separate change).
+- models, **off by default** (`ABGEN_BEVY_GLB_VARIANTS=1` on the server, `--bevy-glb-variants`
+  on `abgen-corpus`): Bevy's glTF loader does not take GLB variants yet (it rejects
+  `KHR_texture_basisu` in `extensionsRequired`, so a GLB embedding KTX2 cannot load), so by
+  default manifests list texture variants only. Images embedded in GLBs never get a texture
+  variant of their own. When on, `.glb`/`.gltf` become a GLB with Draco decoded, `KHR_texture_basisu` resolved to a core
   `source` (an existing PNG/JPEG `source` wins), external buffers inlined and every embedded image
   replaced by its texture variant (`image/ktx2`, rules above). External image URIs are left as
   they are. A model nothing changes in gets no variant; `EXT_meshopt_compression` models are not
@@ -317,7 +322,7 @@ Rows are top-down (Bevy and glTF's top-left UV origin), unlike the Unity lanes, 
 Prebuild a corpus the server serves as is:
 ```bash
 abgen-corpus --world <name> --worlds-url https://worlds-content-server.decentraland.org --bevy-variants ./out
-abgen-corpus --entity-ids ids.txt --fetch-missing --bevy-variants ./out
+abgen-corpus --entity-ids ids.txt --fetch-missing --bevy-variants ./out   # add --bevy-glb-variants for GLBs
 ABGEN_OUT_ROOT=./out ./target/release/abgen   # serves /bevy/manifest/... and /bevy/contents/...
 ```
 ### LOD JIT lane
