@@ -1260,7 +1260,10 @@ mod ktx2_source_tests {
     fn ktx2_is_its_own_container_and_key_extension() {
         assert_eq!(detect_container(UASTC_8), "KTX2");
         assert_eq!(source_extension(UASTC_8), ".ktx2");
-        assert_eq!(standalone_key_extension(Some("t/Albedo.ktx2"), UASTC_8), ".ktx2");
+        assert_eq!(
+            standalone_key_extension(Some("t/Albedo.ktx2"), UASTC_8),
+            ".ktx2"
+        );
         assert_eq!(standalone_key_extension(None, UASTC_8), ".ktx2");
         // PNG and JPEG detection is untouched.
         assert_eq!(detect_container(b"\x89PNG\r\n\x1a\n...."), "PNG");

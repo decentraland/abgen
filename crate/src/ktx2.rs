@@ -44,7 +44,9 @@ pub fn is_ktx2(raw: &[u8]) -> bool {
 /// transcoder is built, so no other codec's tables are ever initialized for a rejected file.
 pub fn ktx2_header_ok(bytes: &[u8]) -> bool {
     let u32_at = |at: usize| -> Option<u32> {
-        Some(u32::from_le_bytes(bytes.get(at..at.checked_add(4)?)?.try_into().ok()?))
+        Some(u32::from_le_bytes(
+            bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
     };
     let valid = || -> Option<bool> {
         let (format, width, height) = (u32_at(12)?, u32_at(20)?, u32_at(24)?);
