@@ -632,7 +632,10 @@ mod tests {
         // ETC1S, or plain garbage behind the KTX2 magic: rejected like an unreadable PNG.
         let mut etc1s = UASTC_8.to_vec();
         etc1s[44..48].copy_from_slice(&1u32.to_le_bytes());
-        for bad in [etc1s, [crate::ktx2::KTX2_MAGIC.as_slice(), &[0u8; 64]].concat()] {
+        for bad in [
+            etc1s,
+            [crate::ktx2::KTX2_MAGIC.as_slice(), &[0u8; 64]].concat(),
+        ] {
             let json = json!({
                 "asset": {"version": "2.0"},
                 "extensionsRequired": ["KHR_texture_basisu"],
