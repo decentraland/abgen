@@ -106,7 +106,7 @@ pub fn level_index(bytes: &[u8], level: u32) -> Option<(u64, u64, u64)> {
 }
 
 /// The data format descriptor (`dfdTotalSize` included) of a file whose header reads.
-pub fn dfd(bytes: &[u8], header: &Ktx2Header) -> Option<&[u8]> {
+pub fn dfd<'a>(bytes: &'a [u8], header: &Ktx2Header) -> Option<&'a [u8]> {
     let start = usize::try_from(header.dfd_offset).ok()?;
     let len = usize::try_from(header.dfd_len).ok()?;
     bytes.get(start..start.checked_add(len)?)
