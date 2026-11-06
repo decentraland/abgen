@@ -114,6 +114,10 @@ libjpeg9c = { path = "third_party/libjpeg9c" }
 # KTX2 (KHR_texture_basisu) UASTC transcoder: pure Rust, vendored and pinned (PROVENANCE.md),
 # so native and wasm builds take the same path. Pulls ruzstd 0.9.1 for Zstandard levels.
 basisu = { path = "third_party/basisu", version = "=0.1.0" }
+# KTX2 writer (Zstandard level supercompression). The same ruzstd build basisu already pulls:
+# default features stay off, so its `hash` feature (a content checksum in every frame) stays off
+# and the written bytes do not change with feature unification.
+ruzstd = { version = "=0.9.1", default-features = false }
 tracing = "0.1"
 ttf-parser = { version = "0.25.1", default-features = false, features = ["std", "opentype-layout"] }
 

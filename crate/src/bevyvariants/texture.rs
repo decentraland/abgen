@@ -1,12 +1,13 @@
-//! Texture variants: PNG / JPEG / UASTC KTX2 in, DDS (DX10, UNORM, full mips, at most
-//! [`BEVY_TEXTURE_MAX`] on a side) out. See the module docs of [`super`] for the format rules.
+//! Texture variants: PNG / JPEG in, KTX2 (BC1 / BC5 / BC7 payload, Zstandard-supercompressed,
+//! full mip chain, at most [`BEVY_TEXTURE_MAX`] on a side, top-down rows) out; creator UASTC
+//! KTX2 in, a pure block transcode to BC7 KTX2 out. See the module docs of [`super`].
 
 use anyhow::{Context, Result};
 use image::RgbaImage;
 
 use super::BEVY_TEXTURE_MAX;
 use crate::bc7_pure::Bc7Profile;
-use crate::bvwebgpu::emit;
+use crate::ktx2_write::{split_chain, write_ktx2, BcFormat};
 
 /// How the entity's models sample an image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,34 +60,23 @@ pub enum TexFormat {
 impl TexFormat {
     pub fn manifest_name(self) -> &'static str {
         match self {
-            TexFormat::Bc7 => "dds-bc7",
-            TexFormat::Bc1 => "dds-bc1",
-            TexFormat::Bc5 => "dds-bc5",
+            TexFormat::Bc7 => "ktx2-bc7",
+            TexFormat::Bc1 => "ktx2-bc1",
+            TexFormat::Bc5 => "ktx2-bc5",
         }
     }
 
-    fn dxgi(self) -> ddsfile::DxgiFormat {
+    pub fn bc(self) -> BcFormat {
         match self {
-            TexFormat::Bc7 => ddsfile::DxgiFormat::BC7_UNorm,
-            TexFormat::Bc1 => ddsfile::DxgiFormat::BC1_UNorm,
-            TexFormat::Bc5 => ddsfile::DxgiFormat::BC5_UNorm,
-        }
-    }
-
-    fn alpha_mode(self) -> ddsfile::AlphaMode {
-        match self {
-            TexFormat::Bc7 => ddsfile::AlphaMode::Straight,
-            TexFormat::Bc1 => ddsfile::AlphaMode::Opaque,
-            TexFormat::Bc5 => ddsfile::AlphaMode::Unknown,
+            TexFormat::Bc7 => BcFormat::Bc7,
+            TexFormat::Bc1 => BcFormat::Bc1Rgb,
+            TexFormat::Bc5 => BcFormat::Bc5,
         }
     }
 
     /// Bytes per 4x4 block.
     pub fn block_bytes(self) -> usize {
-        match self {
-            TexFormat::Bc1 => 8,
-            TexFormat::Bc7 | TexFormat::Bc5 => 16,
-        }
+        self.bc().block_bytes()
     }
 }
 
@@ -102,15 +92,16 @@ pub fn choose_format(slot: Slot, opaque: bool) -> TexFormat {
 /// Which path produced a variant (exposed for tests and logs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodePath {
-    /// UASTC blocks transcoded to BC7 (levels the KTX2 lacks are re-encoded).
+    /// Creator UASTC KTX2: every kept level block-transcoded to BC7, nothing re-encoded.
     Ktx2Transcode,
-    /// Decoded to RGBA8 and encoded.
+    /// PNG/JPEG decoded to RGBA8 and encoded.
     Encode,
 }
 
 #[derive(Clone, Debug)]
 pub struct TextureVariant {
-    pub dds: Vec<u8>,
+    /// The KTX2 file.
+    pub bytes: Vec<u8>,
     pub format: TexFormat,
     pub width: u32,
     pub height: u32,
@@ -150,14 +141,14 @@ pub fn target_size(w: u32, h: u32) -> (u32, u32) {
 }
 
 /// Build the texture variant of `bytes` for `slot`. `Ok(None)` means "no variant": not a PNG,
-/// JPEG or accepted UASTC KTX2 (sniffed by bytes, never by name), or tiny. `Err` is a file that
-/// claims a supported format but does not decode.
+/// JPEG or UASTC KTX2 (sniffed by bytes, never by name), tiny, or a KTX2 the pure transcode
+/// does not take or does not make smaller. `Err` is a PNG/JPEG that does not decode.
 pub fn encode_texture(bytes: &[u8], slot: Slot) -> Result<Option<TextureVariant>> {
     let Some(source) = sniff(bytes) else {
         return Ok(None);
     };
     if source == Source::Ktx2 {
-        return encode_ktx2(bytes, slot);
+        return Ok(transcode_uastc_bc7(bytes).filter(|v| v.bytes.len() <= bytes.len()));
     }
     debug_assert!(matches!(source, Source::Png | Source::Jpeg));
     let img = image::load_from_memory(bytes)
@@ -169,55 +160,20 @@ pub fn encode_texture(bytes: &[u8], slot: Slot) -> Result<Option<TextureVariant>
     encode_rgba(img, slot).map(Some)
 }
 
-fn encode_ktx2(bytes: &[u8], slot: Slot) -> Result<Option<TextureVariant>> {
-    use basisu::Transcoder;
-    if !crate::ktx2::ktx2_header_ok(bytes) {
-        return Ok(None);
-    }
-    let Some((w, h)) = Transcoder::new(bytes)
-        .ok()
-        .and_then(|t| t.image_level_info(0).ok())
-        .map(|i| (i.width, i.height))
-    else {
-        return Ok(None);
-    };
-    if is_tiny(w, h) {
-        return Ok(None);
-    }
-    let (tw, th) = target_size(w, h);
-    if slot != Slot::Normal {
-        if let Some((data, mips)) = ktx2_bc7_chain(bytes, tw, th, slot == Slot::Srgb) {
-            let dds = emit::write_dds(
-                TexFormat::Bc7.dxgi(),
-                TexFormat::Bc7.alpha_mode(),
-                tw,
-                th,
-                data,
-                mips,
-            )?;
-            return Ok(Some(TextureVariant {
-                dds,
-                format: TexFormat::Bc7,
-                width: tw,
-                height: th,
-                mips: mips as u32,
-                path: EncodePath::Ktx2Transcode,
-            }));
-        }
-    }
-    let Some(img) = crate::ktx2::decode_ktx2_uastc(bytes) else {
-        return Ok(None);
-    };
-    encode_rgba(img, slot).map(Some)
-}
-
-/// Block-for-block UASTC -> BC7 for every KTX2 level from the one sized `tw x th` down; the
-/// levels the file does not carry are built from the last transcoded level (decoded, halved,
-/// BC7-encoded). `None` when no level has the target size, the size is not whole blocks, or
-/// the transcoder refuses: the caller then decodes and re-encodes.
-fn ktx2_bc7_chain(raw: &[u8], tw: u32, th: u32, srgb: bool) -> Option<(Vec<u8>, i32)> {
+/// The creator-KTX2 rule: a pure block-for-block UASTC -> BC7 transcode, so the variant's
+/// texels are exactly what the explorer's own transcoder makes of the same file (both vendor the
+/// same basisu sources). The slot is ignored: no BC1, no BC5, no resize, no re-encode, no
+/// generated mips.
+///
+/// Levels kept: from the first level no larger than [`BEVY_TEXTURE_MAX`] on a side (the level
+/// the explorer picks) through the file's last level, each at its own size. `None` (no variant:
+/// the client loads the original) when the file is not a UASTC KTX2 the header gate takes, has
+/// no such level, that level is not whole 4x4 blocks, or any kept level fails to transcode.
+/// Levels below 4 texels on a side are single (padded) blocks, as the format defines them.
+/// The size gate against the original is applied by the caller.
+pub fn transcode_uastc_bc7(raw: &[u8]) -> Option<TextureVariant> {
     use basisu::{DecodeFlags, TargetFormat, Transcoder};
-    if !tw.is_multiple_of(4) || !th.is_multiple_of(4) {
+    if !crate::ktx2::ktx2_header_ok(raw) {
         return None;
     }
     let t = Transcoder::new(raw).ok()?;
@@ -227,65 +183,38 @@ fn ktx2_bc7_chain(raw: &[u8], tw: u32, th: u32, srgb: bool) -> Option<(Vec<u8>, 
     let levels = t.level_count();
     let start = (0..levels).find(|&l| {
         t.image_level_info(l)
-            .is_ok_and(|i| (i.width, i.height) == (tw, th))
+            .is_ok_and(|i| i.width.max(i.height) <= BEVY_TEXTURE_MAX)
     })?;
-    let total = crate::bc7_pure::compute_default_mip_count(tw, th);
-    let mut data = Vec::with_capacity(crate::bc7_pure::compute_mip_chain_size(tw, th, total));
-    let mut mips = 0i32;
-    let mut level = start;
-    while mips < total && level < levels {
+    let base = t.image_level_info(start).ok()?;
+    let (w, h) = (base.width, base.height);
+    if !w.is_multiple_of(4) || !h.is_multiple_of(4) || is_tiny(w, h) {
+        return None;
+    }
+    let mut chain: Vec<Vec<u8>> = Vec::with_capacity((levels - start) as usize);
+    for (m, level) in (start..levels).enumerate() {
         let info = t.image_level_info(level).ok()?;
-        let (ew, eh) = ((tw >> mips).max(1), (th >> mips).max(1));
+        let (ew, eh) = ((w >> m).max(1), (h >> m).max(1));
         if (info.width, info.height) != (ew, eh) {
-            break;
+            return None;
         }
         let blocks = t
             .transcode(level, TargetFormat::Bc7Rgba, DecodeFlags::NONE)
             .ok()?;
-        if blocks.len() != (ew.div_ceil(4) * eh.div_ceil(4)) as usize * 16 {
+        if blocks.len() != crate::ktx2_write::level_bytes(BcFormat::Bc7, ew, eh) {
             return None;
         }
-        data.extend_from_slice(&blocks);
-        mips += 1;
-        level += 1;
+        chain.push(blocks);
     }
-    if mips < total {
-        let last = level - 1;
-        let info = t.image_level_info(last).ok()?;
-        let (lw, lh) = (info.width, info.height);
-        let rgba = t
-            .transcode(last, TargetFormat::Rgba32, DecodeFlags::NONE)
-            .ok()?;
-        if rgba.len() != (lw as usize) * (lh as usize) * 4 {
-            return None;
-        }
-        let (nw, nh) = ((lw / 2).max(1), (lh / 2).max(1));
-        let half = crate::resize::box_downscale_rgba(
-            &rgba,
-            lw as usize,
-            lh as usize,
-            nw as usize,
-            nh as usize,
-            srgb,
-        );
-        let want = total - mips;
-        let (rest, n) = crate::bc7_pure::encode_bc7_mip_chain_with_profile(
-            &half,
-            nw,
-            nh,
-            Some(want),
-            false,
-            srgb,
-            srgb,
-            Bc7Profile::Basic,
-        );
-        if n != want {
-            return None;
-        }
-        data.extend_from_slice(&rest);
-        mips += n;
-    }
-    Some((data, mips))
+    let refs: Vec<&[u8]> = chain.iter().map(Vec::as_slice).collect();
+    let bytes = write_ktx2(BcFormat::Bc7, w, h, &refs).ok()?;
+    Some(TextureVariant {
+        bytes,
+        format: TexFormat::Bc7,
+        width: w,
+        height: h,
+        mips: refs.len() as u32,
+        path: EncodePath::Ktx2Transcode,
+    })
 }
 
 fn encode_rgba(img: RgbaImage, slot: Slot) -> Result<TextureVariant> {
@@ -334,9 +263,10 @@ fn encode_rgba(img: RgbaImage, slot: Slot) -> Result<TextureVariant> {
             )
         }
     };
-    let dds = emit::write_dds(format.dxgi(), format.alpha_mode(), tw, th, data, mips)?;
+    let levels = split_chain(format.bc(), tw, th, mips as u32, &data)?;
+    let bytes = write_ktx2(format.bc(), tw, th, &levels)?;
     Ok(TextureVariant {
-        dds,
+        bytes,
         format,
         width: tw,
         height: th,

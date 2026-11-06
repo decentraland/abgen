@@ -117,7 +117,7 @@ fn usage_text() -> &'static str {
               fetches scene entities + content into the store, then converts)\n  \
          abgen-corpus (--world <name>[,...] | --entity-ids <ids.txt> | --pointer <p>) <out-dir> \\\n               \
              --bevy-variants [--worlds-url <url>] [--fetch-missing] [--content-dir <dir>] [-j JOBS]\n               \
-             (PROTOTYPE: builds only the Bevy variants lane - DDS/GLB variants addressed\n               \
+             (PROTOTYPE: builds only the Bevy variants lane - KTX2/GLB variants addressed\n               \
               by CID plus one manifest per entity - into <out-dir>/bevy/{manifest,contents}/,\n               \
               the layout `abgen` serves at /bevy/manifest/<entity>.json and /bevy/contents/<cid>)\n  \
          abgen-corpus --live-mode <ab-cdn-reference-dir> <out-dir> \\\n               \

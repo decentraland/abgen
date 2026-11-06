@@ -39,32 +39,96 @@ pub fn is_ktx2(raw: &[u8]) -> bool {
     raw.starts_with(KTX2_MAGIC)
 }
 
-/// The header gate: a single 2D UASTC image, supercompression none (0) or Zstandard (2),
-/// 1..=[`KTX2_MAX_SIZE`] on each side. The data format descriptor is checked before the
-/// transcoder is built, so no other codec's tables are ever initialized for a rejected file.
-pub fn ktx2_header_ok(bytes: &[u8]) -> bool {
+/// The fixed 80-byte KTX2 header, read field by field (little-endian, offsets per the KTX 2.0
+/// spec). Says nothing about whether the file decodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ktx2Header {
+    pub vk_format: u32,
+    pub type_size: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub layers: u32,
+    pub faces: u32,
+    pub levels: u32,
+    pub supercompression: u32,
+    pub dfd_offset: u32,
+    pub dfd_len: u32,
+    pub kvd_offset: u32,
+    pub kvd_len: u32,
+    pub sgd_offset: u64,
+    pub sgd_len: u64,
+}
+
+/// Read the header fields of a file that starts with the KTX2 identifier.
+pub fn read_header(bytes: &[u8]) -> Option<Ktx2Header> {
+    if !is_ktx2(bytes) {
+        return None;
+    }
     let u32_at = |at: usize| -> Option<u32> {
         Some(u32::from_le_bytes(
             bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
         ))
     };
+    let u64_at = |at: usize| -> Option<u64> {
+        Some(u64::from_le_bytes(
+            bytes.get(at..at.checked_add(8)?)?.try_into().ok()?,
+        ))
+    };
+    Some(Ktx2Header {
+        vk_format: u32_at(12)?,
+        type_size: u32_at(16)?,
+        width: u32_at(20)?,
+        height: u32_at(24)?,
+        depth: u32_at(28)?,
+        layers: u32_at(32)?,
+        faces: u32_at(36)?,
+        levels: u32_at(40)?,
+        supercompression: u32_at(44)?,
+        dfd_offset: u32_at(48)?,
+        dfd_len: u32_at(52)?,
+        kvd_offset: u32_at(56)?,
+        kvd_len: u32_at(60)?,
+        sgd_offset: u64_at(64)?,
+        sgd_len: u64_at(72)?,
+    })
+}
+
+/// Level `level`'s index entry: `(byteOffset, byteLength, uncompressedByteLength)`.
+pub fn level_index(bytes: &[u8], level: u32) -> Option<(u64, u64, u64)> {
+    let at = 80usize.checked_add((level as usize).checked_mul(24)?)?;
+    let field = |i: usize| -> Option<u64> {
+        Some(u64::from_le_bytes(
+            bytes.get(at + i * 8..at + i * 8 + 8)?.try_into().ok()?,
+        ))
+    };
+    Some((field(0)?, field(1)?, field(2)?))
+}
+
+/// The data format descriptor (`dfdTotalSize` included) of a file whose header reads.
+pub fn dfd(bytes: &[u8], header: &Ktx2Header) -> Option<&[u8]> {
+    let start = usize::try_from(header.dfd_offset).ok()?;
+    let len = usize::try_from(header.dfd_len).ok()?;
+    bytes.get(start..start.checked_add(len)?)
+}
+
+/// The header gate: a single 2D UASTC image, supercompression none (0) or Zstandard (2),
+/// 1..=[`KTX2_MAX_SIZE`] on each side. The data format descriptor is checked before the
+/// transcoder is built, so no other codec's tables are ever initialized for a rejected file.
+pub fn ktx2_header_ok(bytes: &[u8]) -> bool {
     let valid = || -> Option<bool> {
-        let (format, width, height) = (u32_at(12)?, u32_at(20)?, u32_at(24)?);
-        let (depth, layers, faces, scheme) = (u32_at(28)?, u32_at(32)?, u32_at(36)?, u32_at(44)?);
-        let dfd = usize::try_from(u32_at(48)?).ok()?;
-        let dfd_len = usize::try_from(u32_at(52)?).ok()?;
-        let descriptor = bytes.get(dfd..dfd.checked_add(dfd_len)?)?;
+        let h = read_header(bytes)?;
+        let descriptor = dfd(bytes, &h)?;
         Some(
-            is_ktx2(bytes)
-                && matches!(dfd_len, 44 | 60)
+            matches!(h.dfd_len, 44 | 60)
                 && descriptor.get(12) == Some(&KHR_DF_MODEL_UASTC)
-                && format == 0
-                && matches!(scheme, 0 | 2)
-                && (1..=KTX2_MAX_SIZE).contains(&width)
-                && (1..=KTX2_MAX_SIZE).contains(&height)
-                && depth == 0
-                && layers <= 1
-                && faces == 1,
+                && h.vk_format == 0
+                && matches!(h.supercompression, 0 | 2)
+                && (1..=KTX2_MAX_SIZE).contains(&h.width)
+                && (1..=KTX2_MAX_SIZE).contains(&h.height)
+                && h.depth == 0
+                && h.layers <= 1
+                && h.faces == 1,
         )
     };
     valid() == Some(true)

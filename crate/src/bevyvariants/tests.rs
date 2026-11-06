@@ -1,5 +1,9 @@
-use super::model::{transform_model, DDS_MIME};
-use super::texture::{choose_format, encode_texture, EncodePath, Slot, TexFormat, Uses};
+use super::model::{transform_model, KTX2_MIME};
+use super::texture::{
+    choose_format, encode_texture, transcode_uastc_bc7, EncodePath, Slot, TexFormat, Uses,
+};
+use crate::ktx2::Ktx2Header;
+use crate::ktx2_write::{read_levels, BcFormat};
 use super::*;
 use crate::bvwebgpu::emit;
 use crate::bvwebgpu::emit::tests::{mk_glb, noise_png_bytes, png_bytes, quad_bin_and_views};
@@ -10,17 +14,29 @@ use std::collections::HashMap;
 const UASTC_8: &[u8] = include_bytes!("../../testdata/uastc_8.ktx2");
 const UASTC_6: &[u8] = include_bytes!("../../testdata/uastc_6.ktx2");
 
-fn dds(bytes: &[u8]) -> ddsfile::Dds {
-    ddsfile::Dds::read(std::io::Cursor::new(bytes)).expect("valid DDS")
+/// A variant KTX2: its header and its decompressed levels (level 0 first), checked against
+/// the BC format it claims.
+fn ktx(bytes: &[u8], format: BcFormat) -> (Ktx2Header, Vec<Vec<u8>>) {
+    let h = crate::ktx2::read_header(bytes).expect("KTX2 header");
+    assert_eq!(h.vk_format, format.vk_format());
+    assert_eq!(h.supercompression, crate::ktx2_write::SUPERCOMPRESSION_ZSTD);
+    let levels = read_levels(bytes).expect("levels decode");
+    assert_eq!(levels.len() as u32, h.levels);
+    for (m, l) in levels.iter().enumerate() {
+        let (w, hh) = ((h.width >> m).max(1), (h.height >> m).max(1));
+        assert_eq!(l.len(), crate::ktx2_write::level_bytes(format, w, hh), "level {m}");
+    }
+    (h, levels)
 }
 
-fn chain_len(w: u32, h: u32, mips: u32, block: usize) -> usize {
-    (0..mips)
-        .map(|m| {
-            let (mw, mh) = ((w >> m).max(1), (h >> m).max(1));
-            (mw.div_ceil(4) * mh.div_ceil(4)) as usize * block
+fn uastc_bc7_levels(raw: &[u8]) -> Vec<Vec<u8>> {
+    let t = basisu::Transcoder::new(raw).unwrap();
+    (0..t.level_count())
+        .map(|l| {
+            t.transcode(l, basisu::TargetFormat::Bc7Rgba, basisu::DecodeFlags::NONE)
+                .unwrap()
         })
-        .sum()
+        .collect()
 }
 
 fn noise_alpha_png(w: u32, h: u32) -> Vec<u8> {
@@ -57,11 +73,14 @@ fn accessor_bytes(doc: &J, bin: &[u8], acc: usize, elem: usize) -> Vec<u8> {
     v[off..off + n * elem].to_vec()
 }
 
-fn image_dds(doc: &J, bin: &[u8], image: usize) -> ddsfile::Dds {
+fn image_ktx(doc: &J, bin: &[u8], image: usize, format: BcFormat) -> (Ktx2Header, Vec<Vec<u8>>) {
     let img = &doc["images"][image];
-    assert_eq!(img["mimeType"], DDS_MIME);
+    assert_eq!(img["mimeType"], KTX2_MIME);
     assert!(img.get("uri").is_none());
-    dds(view_bytes(doc, bin, img["bufferView"].as_u64().unwrap() as usize))
+    ktx(
+        view_bytes(doc, bin, img["bufferView"].as_u64().unwrap() as usize),
+        format,
+    )
 }
 
 fn geometry(glb: &[u8]) -> Vec<(Vec<[f64; 3]>, Vec<u32>)> {
@@ -132,9 +151,12 @@ fn format_selection() {
     assert_eq!(choose_format(Slot::Linear, true), TexFormat::Bc1);
     assert_eq!(choose_format(Slot::Srgb, false), TexFormat::Bc7);
     assert_eq!(choose_format(Slot::Linear, false), TexFormat::Bc7);
-    assert_eq!(TexFormat::Bc7.manifest_name(), "dds-bc7");
-    assert_eq!(TexFormat::Bc1.manifest_name(), "dds-bc1");
-    assert_eq!(TexFormat::Bc5.manifest_name(), "dds-bc5");
+    assert_eq!(TexFormat::Bc7.manifest_name(), "ktx2-bc7");
+    assert_eq!(TexFormat::Bc1.manifest_name(), "ktx2-bc1");
+    assert_eq!(TexFormat::Bc5.manifest_name(), "ktx2-bc5");
+    assert_eq!(TexFormat::Bc1.bc(), BcFormat::Bc1Rgb);
+    assert_eq!(TexFormat::Bc5.bc(), BcFormat::Bc5);
+    assert_eq!(TexFormat::Bc7.bc(), BcFormat::Bc7);
 }
 
 #[test]
@@ -142,23 +164,44 @@ fn opaque_png_becomes_bc1_alpha_png_bc7_normal_bc5() {
     let opaque = noise_png_bytes(16, 16);
     let v = encode_texture(&opaque, Slot::Srgb).unwrap().unwrap();
     assert_eq!((v.format, v.width, v.height, v.mips), (TexFormat::Bc1, 16, 16, 5));
-    let d = dds(&v.dds);
-    assert_eq!(d.get_dxgi_format(), Some(ddsfile::DxgiFormat::BC1_UNorm));
-    assert_eq!(d.get_num_mipmap_levels(), 5);
-    assert_eq!(d.data.len(), chain_len(16, 16, 5, 8));
+    let (h, levels) = ktx(&v.bytes, BcFormat::Bc1Rgb);
+    assert_eq!((h.width, h.height, h.levels), (16, 16, 5));
+    assert_eq!(levels[0].len(), 16 * 8);
 
     let alpha = noise_alpha_png(16, 8);
     let v = encode_texture(&alpha, Slot::Srgb).unwrap().unwrap();
     assert_eq!(v.format, TexFormat::Bc7);
-    let d = dds(&v.dds);
-    assert_eq!(d.get_dxgi_format(), Some(ddsfile::DxgiFormat::BC7_UNorm));
-    assert_eq!(d.data.len(), chain_len(16, 8, 5, 16));
+    let (h, _) = ktx(&v.bytes, BcFormat::Bc7);
+    assert_eq!((h.width, h.height, h.levels), (16, 8, 5));
 
     let v = encode_texture(&opaque, Slot::Normal).unwrap().unwrap();
     assert_eq!(v.format, TexFormat::Bc5);
-    let d = dds(&v.dds);
-    assert_eq!(d.get_dxgi_format(), Some(ddsfile::DxgiFormat::BC5_UNorm));
-    assert_eq!(d.data.len(), chain_len(16, 16, 5, 16));
+    let (h, _) = ktx(&v.bytes, BcFormat::Bc5);
+    assert_eq!(h.levels, 5);
+}
+
+#[test]
+fn encoded_levels_equal_the_encoders_chain() {
+    // The container is a lossless wrapper: its levels concatenate to the encoder's output.
+    let png = noise_alpha_png(16, 16);
+    let v = encode_texture(&png, Slot::Linear).unwrap().unwrap();
+    assert_eq!(v.format, TexFormat::Bc7);
+    let rgba = image::load_from_memory(&png).unwrap().to_rgba8().into_raw();
+    let mut bled = rgba;
+    crate::alpha_bleed::alpha_bleed_inplace(&mut bled, 16, 16);
+    let (chain, mips) = crate::bc7_pure::encode_bc7_mip_chain_with_profile(
+        &bled,
+        16,
+        16,
+        None,
+        false,
+        false,
+        false,
+        crate::bc7_pure::Bc7Profile::Basic,
+    );
+    assert_eq!(mips, 5);
+    let (_, levels) = ktx(&v.bytes, BcFormat::Bc7);
+    assert_eq!(levels.concat(), chain);
 }
 
 #[test]
@@ -193,7 +236,7 @@ fn jpeg_is_sniffed_and_encoded() {
 }
 
 #[test]
-fn dds_rows_are_top_down() {
+fn rows_are_top_down() {
     // Top half red, bottom half blue: the first block row of level 0 must be red.
     let mut img = image::RgbaImage::new(8, 8);
     for (_, y, p) in img.enumerate_pixels_mut() {
@@ -208,8 +251,9 @@ fn dds_rows_are_top_down() {
         .unwrap();
     let v = encode_texture(&png, Slot::Linear).unwrap().unwrap();
     assert_eq!(v.format, TexFormat::Bc1);
-    let d = dds(&v.dds);
-    let c0 = |block: usize| u16::from_le_bytes([d.data[block * 8], d.data[block * 8 + 1]]);
+    let (_, levels) = ktx(&v.bytes, BcFormat::Bc1Rgb);
+    let l0 = &levels[0];
+    let c0 = |block: usize| u16::from_le_bytes([l0[block * 8], l0[block * 8 + 1]]);
     let (red, blue) = (0xF800u16, 0x001Fu16);
     // Solid blocks keep the colour in endpoint 0 (endpoint 1 is one step below it).
     assert_eq!(c0(0), red);
@@ -219,30 +263,43 @@ fn dds_rows_are_top_down() {
 }
 
 #[test]
-fn uastc_at_target_size_is_block_transcoded() {
-    let v = encode_texture(UASTC_8, Slot::Srgb).unwrap().unwrap();
+fn uastc_is_a_pure_block_transcode_of_every_level() {
+    let v = transcode_uastc_bc7(UASTC_8).expect("8x8 UASTC transcodes");
     assert_eq!(v.path, EncodePath::Ktx2Transcode);
-    assert_eq!((v.format, v.width, v.height, v.mips), (TexFormat::Bc7, 8, 8, 4));
-    let d = dds(&v.dds);
-    assert_eq!(d.get_dxgi_format(), Some(ddsfile::DxgiFormat::BC7_UNorm));
-    assert_eq!(d.data.len(), chain_len(8, 8, 4, 16));
-    // Level 0 is exactly the transcoder's BC7 blocks.
-    let t = basisu::Transcoder::new(UASTC_8).unwrap();
-    let level0 = t
-        .transcode(0, basisu::TargetFormat::Bc7Rgba, basisu::DecodeFlags::NONE)
-        .unwrap();
-    assert_eq!(&d.data[..level0.len()], &level0[..]);
+    assert_eq!((v.format, v.width, v.height), (TexFormat::Bc7, 8, 8));
+    let expected = uastc_bc7_levels(UASTC_8);
+    // Exactly the file's own levels: none generated, none re-encoded.
+    assert_eq!(v.mips as usize, expected.len());
+    let (h, levels) = ktx(&v.bytes, BcFormat::Bc7);
+    assert_eq!((h.width, h.height), (8, 8));
+    assert_eq!(levels, expected);
+    // The slot never changes the creator-KTX2 path (no BC5, no BC1).
+    for slot in [Slot::Srgb, Slot::Linear, Slot::Normal] {
+        match encode_texture(UASTC_8, slot).unwrap() {
+            Some(w) => {
+                assert_eq!(w.bytes, v.bytes);
+                assert_eq!(w.format, TexFormat::Bc7);
+            }
+            None => assert!(v.bytes.len() > UASTC_8.len()),
+        }
+    }
 }
 
 #[test]
-fn uastc_needing_resize_or_bc5_is_decoded_and_reencoded() {
-    // 6x6 snaps to 8x8: no level matches, so decode + encode.
-    let v = encode_texture(UASTC_6, Slot::Srgb).unwrap().unwrap();
-    assert_eq!(v.path, EncodePath::Encode);
-    assert_eq!((v.width, v.height), (8, 8));
-    // A normal map always goes to BC5 through the decoded pixels.
-    let v = encode_texture(UASTC_8, Slot::Normal).unwrap().unwrap();
-    assert_eq!((v.path, v.format), (EncodePath::Encode, TexFormat::Bc5));
+fn uastc_variant_only_when_not_larger_than_the_original() {
+    let v = transcode_uastc_bc7(UASTC_8).unwrap();
+    let gated = encode_texture(UASTC_8, Slot::Srgb).unwrap();
+    assert_eq!(gated.is_some(), v.bytes.len() <= UASTC_8.len());
+}
+
+#[test]
+fn uastc_that_needs_more_than_a_transcode_gets_no_variant() {
+    // 6x6 is not whole 4x4 blocks: the explorer would decode and re-encode it, so no variant.
+    assert!(transcode_uastc_bc7(UASTC_6).is_none());
+    assert!(encode_texture(UASTC_6, Slot::Srgb).unwrap().is_none());
+    // Not a UASTC KTX2 the gate takes (here: a BC7 KTX2 of our own).
+    let ours = crate::ktx2_write::write_ktx2(BcFormat::Bc7, 4, 4, &[&[0u8; 16][..]]).unwrap();
+    assert!(transcode_uastc_bc7(&ours).is_none());
 }
 
 fn textured_quad_glb() -> (Vec<u8>, Vec<u8>) {
@@ -287,23 +344,17 @@ fn textured_quad_glb() -> (Vec<u8>, Vec<u8>) {
 }
 
 #[test]
-fn glb_embedded_images_become_dds_by_slot_and_geometry_is_kept() {
+fn glb_embedded_images_become_bc_ktx2_by_slot_and_geometry_is_kept() {
     let (glb, _) = textured_quad_glb();
     let v = transform_model(&glb, ".glb", None).unwrap().unwrap();
     assert!(!v.draco_decoded && !v.basisu_resolved);
     assert_eq!(v.images_replaced, vec![0, 1]);
     let (doc, bin) = split(&v.glb);
-    assert_eq!(
-        image_dds(&doc, &bin, 0).get_dxgi_format(),
-        Some(ddsfile::DxgiFormat::BC5_UNorm)
-    );
-    assert_eq!(
-        image_dds(&doc, &bin, 1).get_dxgi_format(),
-        Some(ddsfile::DxgiFormat::BC1_UNorm)
-    );
+    image_ktx(&doc, &bin, 0, BcFormat::Bc5);
+    image_ktx(&doc, &bin, 1, BcFormat::Bc1Rgb);
     // External URI untouched.
     assert_eq!(doc["images"][2], json!({"uri": "textures/ao.png"}));
-    // The PNG views are gone (6 geometry views + 2 DDS views remain).
+    // The PNG views are gone (6 geometry views + 2 KTX2 views remain).
     assert_eq!(doc["bufferViews"].as_array().unwrap().len(), 8);
     assert_eq!(doc["buffers"], json!([{"byteLength": bin.len()}]));
     // Geometry bytes identical.
@@ -359,13 +410,23 @@ fn basisu_texture_resolves_to_its_ktx2_source_as_bc7() {
     assert_eq!(doc["textures"][0], json!({"source": 0}));
     assert!(doc.get("extensionsRequired").is_none());
     assert!(doc.get("extensionsUsed").is_none());
-    let d = image_dds(&doc, &bin, 0);
-    assert_eq!(d.get_dxgi_format(), Some(ddsfile::DxgiFormat::BC7_UNorm));
-    let t = basisu::Transcoder::new(UASTC_8).unwrap();
-    let level0 = t
-        .transcode(0, basisu::TargetFormat::Bc7Rgba, basisu::DecodeFlags::NONE)
-        .unwrap();
-    assert_eq!(&d.data[..level0.len()], &level0[..]);
+    let img = &doc["images"][0];
+    let view = view_bytes(&doc, &bin, img["bufferView"].as_u64().unwrap() as usize);
+    match encode_texture(UASTC_8, Slot::Srgb).unwrap() {
+        // Same pure transcode and size gate as a standalone KTX2.
+        Some(t) => {
+            assert_eq!(v.images_replaced, vec![0]);
+            assert_eq!(view, &t.bytes[..]);
+            let (_, levels) = image_ktx(&doc, &bin, 0, BcFormat::Bc7);
+            assert_eq!(levels, uastc_bc7_levels(UASTC_8));
+        }
+        // No variant: the creator's UASTC bytes stay, under their own MIME type.
+        None => {
+            assert!(v.images_replaced.is_empty());
+            assert_eq!(img["mimeType"], "image/ktx2");
+            assert_eq!(view, UASTC_8);
+        }
+    }
 }
 
 #[test]
@@ -472,11 +533,16 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     assert_eq!(m.v, 1);
     assert_eq!(m.entity, "bafkentity");
     assert!(m.generator.starts_with("abgen "));
+    let ktx_variant = encode_texture(UASTC_8, Slot::Srgb).unwrap();
     let keys: Vec<&str> = m.files.keys().map(String::as_str).collect();
-    assert_eq!(keys, ["bafkcolor", "bafkembed", "bafkktx", "bafknormal"]);
-    assert_eq!(m.files["bafkcolor"][0].format, "dds-bc1");
-    assert_eq!(m.files["bafknormal"][0].format, "dds-bc5");
-    assert_eq!(m.files["bafkktx"][0].format, "dds-bc7");
+    let mut expected = vec!["bafkcolor", "bafkembed", "bafknormal"];
+    if ktx_variant.is_some() {
+        expected.insert(2, "bafkktx");
+        assert_eq!(m.files["bafkktx"][0].format, "ktx2-bc7");
+    }
+    assert_eq!(keys, expected);
+    assert_eq!(m.files["bafkcolor"][0].format, "ktx2-bc1");
+    assert_eq!(m.files["bafknormal"][0].format, "ktx2-bc5");
     let model = &m.files["bafkembed"][0];
     assert_eq!((model.kind.as_str(), model.format.as_str()), ("model", "glb"));
     assert!(model.width.is_none() && model.mips.is_none());
@@ -495,7 +561,7 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
             assert!(e.cid.starts_with("bafkrei"));
         }
     }
-    assert_eq!(built.variants.len(), 4);
+    assert_eq!(built.variants.len(), expected.len());
 
     // The manifest on disk is the returned bytes and parses back to the same value.
     let on_disk = std::fs::read(manifest_path(&out, "bafkentity").unwrap()).unwrap();
