@@ -81,6 +81,7 @@ The default `server` feature builds the complete service. Reusable consumers sho
 | `server` (default) | HTTP/registry stack, `gpu`, `cli`, `web-pack`, and `scene-runtime` | `abgen` server |
 | `gpu` | native wgpu/CUDA dispatch | server, build/corpus/verify CLIs, Lambda |
 | `web-pack` | BV WebGPU pack emission plus DDS/glTF JSON dependencies | server, build/corpus CLIs |
+| `bevy-variants` | **prototype** Bevy variants lane (per-entity manifest of DDS/GLB variants addressed by CID); implies `web-pack` | server |
 | `scene-runtime` | QuickJS fallback for suspicious static LOD placements; each scene runs in a short-lived child process (seccomp-confined on Linux; separate process and empty environment elsewhere). Binaries must call `scenerun::run_sandbox_child_if_requested()` first thing in `main`; `abgen --scene-sandbox-check` proves a deployment can run scenes. Where a Linux runtime refuses seccomp (AWS Lambda rejects `PR_SET_NO_NEW_PRIVS`), the default policy refuses scenes; `ABGEN_SANDBOX_SECCOMP=auto` runs them in the separate process without the filter and warns once | server, LOD CLI, Lambda |
 | `cli` | tracing subscriber and CLI logging | server and LOD CLI |
 
@@ -275,6 +276,44 @@ request waits up to the deadline, builds finish in the background. Knobs: `ABGEN
 (default on; `0`/`false`/`no` disables), `ABGEN_INDEX_BUILD_PLATFORMS` (default `windows,mac`),
 `ABGEN_INDEX_BUILD_CONCURRENCY` (default: CPU count), `ABGEN_INDEX_BUILD_DEADLINE_MS` (default
 `20000`), `ABGEN_INDEX_BUILD_MAX_QUEUE` (default `0` = unlimited; when exceeded, new builds are skipped).
+### Bevy variants lane (prototype)
+Per scene entity, a manifest mapping each original content CID to GPU-ready variants for the Bevy
+explorer, each variant stored under its own CID (CIDv1 raw sha256, `bafkrei…`, the catalyst scheme,
+so the client verifies it with its usual content-hash check). The client loads a variant when the
+manifest lists one it supports and falls back to the original file on anything else, so the lane
+can be switched off at any time. Built by `crate/src/bevyvariants` (feature `bevy-variants`, on
+with `server`).
+
+- `GET /bevy/manifest/{entity}.json` - `{"v":1,"entity","generator":"abgen <version>","files":{"<original cid>":[{"cid","kind","format","width","height","mips","size"}]}}`
+  (`width`/`height`/`mips` only on textures). 404 while absent; a miss starts a background build
+  (`X-Abgen-Reason: bevy-variants-cold`), `?wait=1` builds synchronously, failures are
+  negative-cached for `ABGEN_JIT_FAIL_TTL_S`. `Cache-Control: private, max-age=0, no-cache`.
+- `GET /bevy/contents/{variantCid}` - variant bytes, `public,max-age=31536000,immutable`, `Range`,
+  `ETag`, CORS (preflight allows `X-IPFS`). Never built on its own: it exists once its manifest does.
+- With the S3 space configured, both read through from and write back to the same keys
+  (`bevy/manifest/…`, `bevy/contents/…`). `ABGEN_BEVY_VARIANTS=0` turns the JIT side off.
+
+Variants:
+- textures (standalone PNG/JPEG/UASTC KTX2, sniffed by bytes): DDS with a DX10 header, UNORM,
+  full mip chain, longest side capped at 1024 and snapped to powers of two (whole 4x4 blocks).
+  BC5 for images the entity's models use only as normal maps (x in R, y in G - Bevy's
+  two-channel normal path), BC1 for fully opaque images, BC7 otherwise. A UASTC KTX2 with a level
+  at the target size is transcoded block for block to BC7 (levels it lacks are re-encoded);
+  anything else is decoded and re-encoded. Images 2 px or less on a side get none.
+- models (`.glb`/`.gltf`): a GLB with Draco decoded, `KHR_texture_basisu` resolved to a core
+  `source` (an existing PNG/JPEG `source` wins), external buffers inlined and every embedded image
+  replaced by its DDS (`image/vnd-ms.dds`, format by material slot). External image URIs are left
+  as they are. A model nothing changes in gets no variant; `EXT_meshopt_compression` models are
+  not handled yet.
+- nothing for scene code, source maps, audio, video or display-only thumbnails.
+
+DDS rows are top-down (Bevy and glTF's top-left UV origin), unlike the Unity lanes, which flip.
+Prebuild a corpus the server serves as is:
+```bash
+abgen-corpus --world <name> --worlds-url https://worlds-content-server.decentraland.org --bevy-variants ./out
+abgen-corpus --entity-ids ids.txt --fetch-missing --bevy-variants ./out
+ABGEN_OUT_ROOT=./out ./target/release/abgen   # serves /bevy/manifest/... and /bevy/contents/...
+```
 ### LOD JIT lane
 `ABGEN_LOD_JIT=1` enables JIT LOD builds on `GET /LOD/1/...` misses (level 1 only, the production
 shape: level 0 is the client-side ISS assembly, so `LOD/0/...` answers `lod-level-unsupported` and
