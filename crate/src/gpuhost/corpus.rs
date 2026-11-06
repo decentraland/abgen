@@ -288,6 +288,11 @@ fn bucket_params() -> [Params; 4] {
 }
 
 fn decode_image(raw: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    if crate::ktx2::is_ktx2(raw) {
+        let img = crate::ktx2::decode_ktx2_uastc(raw)?;
+        let (w, h) = img.dimensions();
+        return Some((img.into_raw(), w, h));
+    }
     if raw.len() >= 2 && raw[0] == 0xFF && raw[1] == 0xD8 {
         if let Ok((rgba, w, h)) = crate::ffi::decode_jpeg_rgba_box(raw) {
             if rgba.len() == (w as usize) * (h as usize) * 4 {
@@ -404,7 +409,12 @@ fn scan_entity_tasks(
 
     let candidates: Vec<&(String, String)> = content
         .iter()
-        .filter(|(f, _)| matches!(file_ext_lower(f).as_str(), ".png" | ".jpg" | ".jpeg"))
+        .filter(|(f, _)| {
+            matches!(
+                file_ext_lower(f).as_str(),
+                ".png" | ".jpg" | ".jpeg" | ".ktx2"
+            )
+        })
         .collect();
     m.texture_refs
         .fetch_add(candidates.len(), Ordering::Relaxed);

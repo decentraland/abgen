@@ -137,7 +137,7 @@ fn tex_filename_ext(source: &str) -> Option<String> {
     let dot = last.rfind('.')?;
     let ext = &last[dot..];
     let lo = ext.to_ascii_lowercase();
-    matches!(lo.as_str(), ".png" | ".jpg" | ".jpeg" | ".psd").then(|| ext.to_string())
+    matches!(lo.as_str(), ".png" | ".jpg" | ".jpeg" | ".psd" | ".ktx2").then(|| ext.to_string())
 }
 
 fn tex_magic_ext(data: &[u8]) -> &'static str {
@@ -147,6 +147,8 @@ fn tex_magic_ext(data: &[u8]) -> &'static str {
         ".jpg"
     } else if data.len() >= 4 && &data[0..4] == b"8BPS" {
         ".psd"
+    } else if abgen::ktx2::is_ktx2(data) {
+        ".ktx2"
     } else {
         ".png"
     }

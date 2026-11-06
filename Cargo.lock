@@ -4,10 +4,11 @@ version = 4
 
 [[package]]
 name = "abgen"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "axum",
+ "basisu",
  "bevy_mikktspace",
  "cc",
  "chrono",
@@ -55,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "abgen-lambda"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "abgen",
  "anyhow",
@@ -68,7 +69,7 @@ dependencies = [
 
 [[package]]
 name = "abgen-native"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "abgen",
  "libc",
@@ -269,6 +270,15 @@ name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
+
+[[package]]
+name = "basisu"
+version = "0.1.0"
+dependencies = [
+ "libm",
+ "portable-atomic",
+ "ruzstd",
+]
 
 [[package]]
 name = "bevy_mikktspace"
@@ -857,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "dcl-contents"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3121,6 +3131,12 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "ruzstd"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
 
 [[package]]
 name = "ryu"
