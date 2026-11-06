@@ -1,6 +1,8 @@
 //! Model variants: a GLB with Draco decoded, `KHR_texture_basisu` resolved and every embedded
-//! image replaced by its DDS texture variant (format by material slot). External image URIs and
-//! everything else in the JSON are left as they are; external buffers are inlined.
+//! image replaced by its KTX2 texture variant (`image/ktx2`; BC format by material slot, or the
+//! pure UASTC -> BC7 transcode for an embedded creator KTX2). External image URIs and everything
+//! else in the JSON are left as they are; external buffers are inlined. An embedded image that
+//! gets no texture variant keeps its original bytes and MIME type.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value as J};
@@ -9,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::texture::{encode_texture, Slot, TextureVariant, Uses};
 use crate::bvwebgpu::emit;
 
-pub const DDS_MIME: &str = "image/vnd-ms.dds";
+pub const KTX2_MIME: &str = "image/ktx2";
 const DRACO: &str = "KHR_draco_mesh_compression";
 const BASISU: &str = "KHR_texture_basisu";
 
@@ -18,7 +20,7 @@ pub struct ModelVariant {
     pub glb: Vec<u8>,
     pub draco_decoded: bool,
     pub basisu_resolved: bool,
-    /// Indices of the glTF images now carried as DDS.
+    /// Indices of the glTF images now carried as BC KTX2 variants.
     pub images_replaced: Vec<usize>,
 }
 
@@ -323,18 +325,18 @@ pub fn transform_model(
             Some(v) => {
                 emit::pad4(&mut bin, 0);
                 let off = bin.len();
-                bin.extend_from_slice(&v.dds);
+                bin.extend_from_slice(&v.bytes);
                 let vidx = new_views.len();
                 new_views.push(json!({
                     "buffer": 0,
                     "byteOffset": off,
-                    "byteLength": v.dds.len(),
+                    "byteLength": v.bytes.len(),
                     "name": v.format.manifest_name(),
                 }));
                 if let Some(o) = img.as_object_mut() {
                     o.remove("uri");
                     o.insert("bufferView".into(), json!(vidx));
-                    o.insert("mimeType".into(), json!(DDS_MIME));
+                    o.insert("mimeType".into(), json!(KTX2_MIME));
                 }
             }
         }

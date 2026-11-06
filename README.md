@@ -81,7 +81,7 @@ The default `server` feature builds the complete service. Reusable consumers sho
 | `server` (default) | HTTP/registry stack, `gpu`, `cli`, `web-pack`, and `scene-runtime` | `abgen` server |
 | `gpu` | native wgpu/CUDA dispatch | server, build/corpus/verify CLIs, Lambda |
 | `web-pack` | BV WebGPU pack emission plus DDS/glTF JSON dependencies | server, build/corpus CLIs |
-| `bevy-variants` | **prototype** Bevy variants lane (per-entity manifest of DDS/GLB variants addressed by CID); implies `web-pack` | server |
+| `bevy-variants` | **prototype** Bevy variants lane (per-entity manifest of BC KTX2 / GLB variants addressed by CID); implies `web-pack` | server |
 | `scene-runtime` | embedded QuickJS fallback for suspicious static LOD placements | server, LOD CLI, Lambda |
 | `cli` | tracing subscriber and CLI logging | server and LOD CLI |
 
@@ -285,7 +285,8 @@ can be switched off at any time. Built by `crate/src/bevyvariants` (feature `bev
 with `server`).
 
 - `GET /bevy/manifest/{entity}.json` - `{"v":1,"entity","generator":"abgen <version>","files":{"<original cid>":[{"cid","kind","format","width","height","mips","size"}]}}`
-  (`width`/`height`/`mips` only on textures). 404 while absent; a miss starts a background build
+  (`format`: `ktx2-bc7` | `ktx2-bc1` | `ktx2-bc5` | `glb`; `width`/`height`/`mips` only on
+  textures). 404 while absent; a miss starts a background build
   (`X-Abgen-Reason: bevy-variants-cold`), `?wait=1` builds synchronously, failures are
   negative-cached for `ABGEN_JIT_FAIL_TTL_S`. `Cache-Control: private, max-age=0, no-cache`.
 - `GET /bevy/contents/{variantCid}` - variant bytes, `public,max-age=31536000,immutable`, `Range`,
@@ -293,21 +294,26 @@ with `server`).
 - With the S3 space configured, both read through from and write back to the same keys
   (`bevy/manifest/…`, `bevy/contents/…`). `ABGEN_BEVY_VARIANTS=0` turns the JIT side off.
 
-Variants:
-- textures (standalone PNG/JPEG/UASTC KTX2, sniffed by bytes): DDS with a DX10 header, UNORM,
-  full mip chain, longest side capped at 1024 and snapped to powers of two (whole 4x4 blocks).
-  BC5 for images the entity's models use only as normal maps (x in R, y in G - Bevy's
-  two-channel normal path), BC1 for fully opaque images, BC7 otherwise. A UASTC KTX2 with a level
-  at the target size is transcoded block for block to BC7 (levels it lacks are re-encoded);
-  anything else is decoded and re-encoded. Images 2 px or less on a side get none.
+Variants (all textures are KTX2 with UNORM BC blocks, each level Zstandard-supercompressed at a
+fixed level, `KTXorientation` `rd`; writer in `crate/src/ktx2_write.rs`):
+- PNG/JPEG textures (sniffed by bytes): full mip chain, longest side capped at 1024 and snapped
+  to powers of two (whole 4x4 blocks). `ktx2-bc5` for images the entity's models use only as
+  normal maps (x in R, y in G - Bevy's two-channel normal path), `ktx2-bc1` for fully opaque
+  images, `ktx2-bc7` otherwise. Images 2 px or less on a side get none.
+- creator UASTC KTX2 (standalone or embedded in a GLB): a pure block-for-block UASTC -> BC7
+  transcode (`ktx2-bc7`) of the file's levels at their own sizes, starting at the first level no
+  larger than 1024 (the level the explorer picks), with the same vendored basisu sources the
+  explorer uses, so the texels match a local transcode. No resize, re-encode, BC1/BC5 or
+  generated mips: a file that would need any of them gets no variant, and so does a variant
+  larger than its original.
 - models (`.glb`/`.gltf`): a GLB with Draco decoded, `KHR_texture_basisu` resolved to a core
   `source` (an existing PNG/JPEG `source` wins), external buffers inlined and every embedded image
-  replaced by its DDS (`image/vnd-ms.dds`, format by material slot). External image URIs are left
-  as they are. A model nothing changes in gets no variant; `EXT_meshopt_compression` models are
-  not handled yet.
+  replaced by its texture variant (`image/ktx2`, rules above). External image URIs are left as
+  they are. A model nothing changes in gets no variant; `EXT_meshopt_compression` models are not
+  handled yet.
 - nothing for scene code, source maps, audio, video or display-only thumbnails.
 
-DDS rows are top-down (Bevy and glTF's top-left UV origin), unlike the Unity lanes, which flip.
+Rows are top-down (Bevy and glTF's top-left UV origin), unlike the Unity lanes, which flip.
 Prebuild a corpus the server serves as is:
 ```bash
 abgen-corpus --world <name> --worlds-url https://worlds-content-server.decentraland.org --bevy-variants ./out

@@ -36,6 +36,7 @@ dependencies = [
  "rayon",
  "rquickjs",
  "rustls",
+ "ruzstd",
  "serde",
  "serde_json",
  "sha1",

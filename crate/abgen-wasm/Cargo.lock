@@ -26,6 +26,7 @@ dependencies = [
  "psd",
  "rayon",
  "rustls",
+ "ruzstd",
  "serde",
  "serde_json",
  "sha1",

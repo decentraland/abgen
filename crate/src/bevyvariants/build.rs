@@ -158,7 +158,7 @@ pub fn build_entity_variants(
                     return Ok(none);
                 }
             };
-            let (cid, path) = store_variant(out_root, &v.dds)?;
+            let (cid, path) = store_variant(out_root, &v.bytes)?;
             Ok((
                 hash.to_string(),
                 Some(VariantEntry {
@@ -168,7 +168,7 @@ pub fn build_entity_variants(
                     width: Some(v.width),
                     height: Some(v.height),
                     mips: Some(v.mips),
-                    size: v.dds.len() as u64,
+                    size: v.bytes.len() as u64,
                 }),
                 Some(path),
             ))

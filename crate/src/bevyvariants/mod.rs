@@ -1,23 +1,27 @@
 //! **Prototype.** The Bevy variants lane: per scene entity, a manifest that maps each original
 //! content CID to GPU-ready variants for the Bevy explorer, each stored under its own CID.
 //!
-//! - Textures become DDS (DX10 header, UNORM, full mip chain, longest side at most
-//!   [`BEVY_TEXTURE_MAX`]): BC5 for images the entity's models use only as normal maps, BC1 for
-//!   fully opaque images, BC7 otherwise. A UASTC KTX2 whose level matches the target size is
-//!   transcoded block for block to BC7 instead of decoded and re-encoded.
+//! - PNG/JPEG textures become KTX2 (`crate::ktx2_write`): BC1 / BC5 / BC7 UNORM blocks, each
+//!   level Zstandard-supercompressed, full mip chain, longest side at most [`BEVY_TEXTURE_MAX`]
+//!   (powers of two). BC5 for images the entity's models use only as normal maps, BC1 for fully
+//!   opaque images, BC7 otherwise.
+//! - Creator UASTC KTX2 textures (standalone or embedded in a GLB) are only ever transcoded block
+//!   for block to BC7, level by level at the file's own sizes, so the variant's texels equal what
+//!   the explorer's own transcoder makes of the file; anything that would need a resize or
+//!   re-encode gets no variant, and neither does a variant larger than its original.
 //! - Models become a GLB with Draco decoded, `KHR_texture_basisu` resolved and every embedded
-//!   image replaced by its DDS. External image URIs are left as they are: they resolve to their
-//!   own original CID, which has its own texture variant.
+//!   image replaced by its KTX2 variant (`image/ktx2`). External image URIs are left as they are:
+//!   they resolve to their own original CID, which has its own texture variant.
 //! - Nothing else gets a variant (scene code, audio, video, source maps, unknown files).
 //!
 //! The client contract: no manifest, no entry, or any failure means the client loads the
 //! original file. Variants are content-addressed, so there is no version: a new encoder gives
 //! new variant CIDs and a regenerated manifest.
 //!
-//! **Orientation.** DDS rows are stored top row first, which is what Bevy's DDS loader and
-//! glTF's top-left UV origin expect. Decoded PNG/JPEG buffers and KTX2 (`KTXorientation` "rd",
-//! required by `KHR_texture_basisu`) are already top-down, so every encoder here runs with
-//! `flip = false`. This differs from the Unity bundle lanes, which flip vertically.
+//! **Orientation.** Rows are stored top row first (`KTXorientation` = `rd`), which is what
+//! Bevy's loaders and glTF's top-left UV origin expect. Decoded PNG/JPEG buffers and UASTC KTX2
+//! (`"rd"`, required by `KHR_texture_basisu`) are already top-down, so every encoder here runs
+//! with `flip = false`. This differs from the Unity bundle lanes, which flip vertically.
 //!
 //! On-disk (and object-storage) layout mirrors the served routes:
 //! `bevy/manifest/{entity}.json` and `bevy/contents/{variantCid}`.
@@ -112,7 +116,7 @@ pub struct VariantEntry {
     pub cid: String,
     /// `"texture"` or `"model"`.
     pub kind: String,
-    /// `"dds-bc7"`, `"dds-bc1"`, `"dds-bc5"` or `"glb"`.
+    /// `"ktx2-bc7"`, `"ktx2-bc1"`, `"ktx2-bc5"` or `"glb"`.
     pub format: String,
     /// Texture variants only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
