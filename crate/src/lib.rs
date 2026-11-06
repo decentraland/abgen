@@ -75,6 +75,7 @@ pub mod gltf;
 pub mod hashes;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod jitcache;
+pub mod ktx2;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod lambda_invoke;
 #[cfg(not(target_arch = "wasm32"))]

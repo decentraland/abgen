@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 
 pub fn file_ext_lower(name: &str) -> String {
     let l = name.to_lowercase();
-    for e in [".gltf", ".glb", ".png", ".jpg", ".jpeg"] {
+    for e in [".gltf", ".glb", ".png", ".jpg", ".jpeg", ".ktx2"] {
         if l.ends_with(e) {
             return e.to_string();
         }
