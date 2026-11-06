@@ -1,0 +1,97 @@
+{
+  "registry": "https://crates.io",
+  "package": "basisu",
+  "version": "0.1.0",
+  "crate_sha256": "36056503b9996959defdfcf058811637fdf68a2e35a48ee8e39c89a787fe9cdc",
+  "repository": "https://github.com/marcogomez/basisu",
+  "revision": "cca5a1c8f90147a5f2b74bcabbc6329d30c9d6f2",
+  "path_in_vcs": "basisu",
+  "license": {
+    "spdx": "Apache-2.0",
+    "path": "LICENSE",
+    "sha256": "572b4c25d595b65d6d18c1a1102bb00239df23c3d0db20dd7aa98e6c8f4a9d67"
+  },
+  "normalization": "Exact bytes of the published crates.io package (the .crate whose SHA256 is crate_sha256, as Cargo.lock recorded it), with the listed patches applied. Repository .gitattributes disables newline conversion for this subtree. SHA256 manifests are UTF-8 with LF lines and lexicographically sorted package-relative paths. No Cargo cache marker is imported.",
+  "manifests": {
+    "upstream-files.sha256": "b0cc1f6baf8c6a380ab0782354f23dd1f9c0600091b708ad7d8c33af561f352a",
+    "checksums.sha256": "c9ddc81c40293bb074c1d7b56e7a5a50bcc9effe47a0161be3588adca3b4fef8"
+  },
+  "patches": [
+    {
+      "path": "patches/0001-bound-untrusted-sizes.patch",
+      "sha256": "5cf44c6ac293952f55eb1ce40076fc4b6b5e9bbbd54b2f0cce601de76045692b",
+      "changes": [
+        "Reject KTX2 width or height above 16384, and more levels than the base level's full mip chain",
+        "Checked arithmetic for every offset, length and image index taken from the KTX2 header and supercompression global data, so no sum wraps where usize is 32 bits",
+        "Bound a Zstandard level's declared uncompressed length by its block data before sizing the inflate buffer",
+        "Checked output sizes, and fallible allocation of output and inflate buffers: an oversized file is an error, not a process abort",
+        "Keep the key/value scan within its range when entry alignment steps past the end",
+        "Notice of modification at the top of each changed file, as Apache-2.0 section 4(b) requires"
+      ]
+    },
+    {
+      "path": "patches/0002-bound-zstd-decoding.patch",
+      "sha256": "f9e7b700e94607223003ca5f134707b47acb5ed37f49a30fe195a48938bc7d0b",
+      "changes": [
+        "Depend on ruzstd 0.9.1 from crates.io, which checks a frame's window when the decoder is created and bounds a block's sequences, and cap a level's window at the greater of its length and 8 MiB.",
+        "Use ruzstd 0.9's decoder path in the XUASTC stream decoder.",
+        "Add deterministic compressed-stream boundary tests."
+      ]
+    },
+    {
+      "path": "patches/0003-remove-etc1s-transcoders.patch",
+      "sha256": "4592f0366dce38ea94c57350428fe32244492706d08b5a748dafad1d4994ab40",
+      "changes": [
+        "ETC1S (BasisLZ) images are no longer transcoded: transcode_etc1s returns None for every target, as for an unsupported one. KTX2 and .basis containers holding ETC1S are still parsed.",
+        "Drop the module declarations of the removed ETC1S per-format transcoders and their precomputed tables, and the two helpers only they used (mathf::fabs, VideoState::slots)."
+      ]
+    },
+    {
+      "path": "patches/0004-drop-dev-dependencies.patch",
+      "sha256": "dc19ee5665a557dd220febe8397c4e73c819185b2a21393517e81ad0a2726d90",
+      "changes": [
+        "Drop the dev-dependencies (criterion, sha2 0.10, and the wasm32-only wasm-bindgen-test pinned to =0.3.68). Cargo resolves a path dependency's dev-dependencies into the consumer's lockfile, and that exact pin would hold abgen's wasm-bindgen, js-sys and web-sys back to the versions it was built against. The published package excludes tests/ and benches/, and abgen never builds this crate's own tests.",
+        "abgen-only: the dcl-one copy this was imported from ships patches 0001-0003 alone."
+      ]
+    }
+  ],
+  "omitted": {
+    "reason": "The ETC1S per-format transcoders and the precomputed tables only they use (about 640,000 lines). The Explorer takes UASTC only and rejects ETC1S before this crate runs. Each path stays in upstream-files.sha256 with its published digest; verify.py requires it absent here and skips it in the offline replay, so these files are checked only against the published .crate.",
+    "paths": [
+      "src/basislz/astc_pack.rs",
+      "src/basislz/astc_tables.rs",
+      "src/basislz/bc7_chroma.rs",
+      "src/basislz/etc1s_astc.rs",
+      "src/basislz/etc1s_atc.rs",
+      "src/basislz/etc1s_bc1.rs",
+      "src/basislz/etc1s_bc3_bc5.rs",
+      "src/basislz/etc1s_bc4.rs",
+      "src/basislz/etc1s_bc7.rs",
+      "src/basislz/etc1s_eac.rs",
+      "src/basislz/etc1s_etc2.rs",
+      "src/basislz/etc1s_fxt1.rs",
+      "src/basislz/etc1s_pvrtc2.rs",
+      "src/tables/astc.rs",
+      "src/tables/astc_0_255.rs",
+      "src/tables/atc_55.rs",
+      "src/tables/atc_56.rs",
+      "src/tables/bc7_m5_alpha.rs",
+      "src/tables/bc7_m5_color.rs",
+      "src/tables/bc7_m5_equals_1.rs",
+      "src/tables/dxt1_5.rs",
+      "src/tables/dxt1_6.rs",
+      "src/tables/dxt5a.rs",
+      "src/tables/etc2_eac_a8.rs",
+      "src/tables/etc2_eac_r11.rs",
+      "src/tables/pvrtc2_45.rs",
+      "src/tables/solution.rs"
+    ]
+  },
+  "update_instructions": [
+    "Import an exact reviewed crates.io release: extract the .crate whose SHA256 Cargo would record, without .cargo-ok; record its SHA256, the .cargo_vcs_info.json revision and the LICENSE digest here.",
+    "Regenerate upstream-files.sha256 from the pristine package bytes. Apply the reviewed patches in listed order, regenerating any that no longer apply, then delete the omitted paths (revising the list against the new release).",
+    "Regenerate checksums.sha256 for every shipped file, verify.py and each patch; update the manifest and patch hashes here. Do not normalize imported files.",
+    "Run python3 crate/third_party/basisu/verify.py and the abgen ktx2 tests (crate/src/ktx2.rs, and the KHR_texture_basisu tests in crate/src/gltf/mod.rs).",
+    "Review the patches against the new release, the root, crate/abgen-wasm and crate/abgen-node Cargo.lock files and the crate/src/ktx2.rs caller before updating the pin."
+  ]
+}

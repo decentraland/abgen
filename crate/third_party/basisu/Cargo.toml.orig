@@ -1,0 +1,58 @@
+[package]
+name = "basisu"
+description = "A bit-exact pure-Rust Basis Universal texture transcoder (.ktx2 and .basis)."
+version = "0.1.0"
+rust-version = "1.73"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/marcogomez/basisu"
+readme = "../README.md"
+categories = ["multimedia::images", "rendering::data-formats"]
+keywords = ["basis", "ktx2", "texture", "transcode", "gpu"]
+# The tests and benches depend on repo-level files outside this package
+# (corpus/, goldens/), so they cannot run from the published crate; they run
+# from the repository checkout instead.
+exclude = ["tests/", "benches/"]
+
+# The ergonomic crate path: `use basisu::...`.
+[lib]
+name = "basisu"
+path = "src/lib.rs"
+
+[features]
+default = ["std", "zstd"]
+# Disabling `std` makes the crate `#![no_std]` (it still requires `alloc`).
+std = []
+# `ss=2` (Zstandard-supercompressed) KTX2 levels. Pure-Rust inflate; drop it for
+# a leaner build (such levels then error with `Error::ZstdRequired`). It uses
+# `ruzstd`'s `std::io::Read`, so it implies `std`.
+zstd = ["dep:ruzstd", "std"]
+# Float sqrt/round for no_std builds (in std, not core). Enable for `no_std`:
+# `--no-default-features --features libm`.
+libm = ["dep:libm"]
+# The crate does not split target-format families (bc / astc / etc / pvrtc /
+# ...) behind separate features; every convert module and dispatch arm is
+# always compiled in.
+
+[dependencies]
+ruzstd = { version = "0.7", optional = true, default-features = false }
+libm = { version = "0.2", optional = true }
+
+# Only no-native-atomic targets (Cortex-M0/M0+, AVR) need portable-atomic; every
+# other target uses core atomics in `once` and this is not pulled in.
+[target.'cfg(not(target_has_atomic = "ptr"))'.dependencies]
+portable-atomic = { version = "1", default-features = false }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+sha2 = "0.10"
+
+# Runtime wasm tests (tests/wasm.rs). Its bundled wasm-bindgen must match the
+# installed `wasm-bindgen-test-runner`: 0.3.68 pairs with wasm-bindgen 0.2.118.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "=0.3.68"
+
+[[bench]]
+name = "transcode"
+harness = false

@@ -11,6 +11,7 @@ crate/src/gpu/shaders/*.wgsl text eol=lf
 # Vendored third-party build, checked byte-for-byte against its provenance sha256:
 # never converted, on any platform.
 crate/src/lodgen/scenerun/sdk6/** -text
+crate/third_party/basisu/** -text -whitespace
 
 # A CRLF shell script is not executable on Linux.
 *.sh text eol=lf
