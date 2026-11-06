@@ -9,6 +9,7 @@ use super::serve;
 use super::state::AppState;
 use crate::resolver;
 
+mod bevy;
 mod bvpk;
 mod dispatch;
 mod entities;
@@ -17,6 +18,7 @@ mod jit;
 mod status;
 mod upstream;
 
+use bevy::*;
 use bvpk::*;
 use dispatch::*;
 #[cfg(test)]

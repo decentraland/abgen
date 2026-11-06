@@ -149,7 +149,9 @@ const PUBLIC_ONE_YEAR: &str = "public, max-age=31536000";
 /// Single source of truth for the metadata every upload carries.
 pub fn object_headers(key: &str) -> ObjectHeaders {
     let lower = key.to_ascii_lowercase();
-    let content_type = if lower.ends_with(".json") {
+    let content_type = if lower.starts_with("bevy/contents/") {
+        "application/octet-stream"
+    } else if lower.ends_with(".json") {
         "application/json"
     } else if lower.ends_with(".js") {
         "application/javascript"
@@ -164,6 +166,7 @@ pub fn object_headers(key: &str) -> ObjectHeaders {
     };
     let uploader_lane = matches!(content_type, "application/wasm" | "text/cache-manifest");
     let cache_control = if key.starts_with("manifest/")
+        || key.starts_with("bevy/manifest/")
         || key.starts_with("LOD/lod-reuse/")
         || key.starts_with("SatelliteMaps/rebuild/")
     {

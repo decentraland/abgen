@@ -17,7 +17,7 @@ pub(crate) fn transform_img(bytes: &[u8]) -> Result<Vec<u8>> {
 
 const DDS_HEADER_LEN: usize = 148;
 
-fn pad4(v: &mut Vec<u8>, fill: u8) {
+pub(crate) fn pad4(v: &mut Vec<u8>, fill: u8) {
     while !v.len().is_multiple_of(4) {
         v.push(fill);
     }
@@ -56,17 +56,36 @@ fn prepare_dds_bc7(rgba: &RgbaImage, srgb: bool, is_normal: bool) -> (Vec<u8>, u
 }
 
 fn finish_dds_bc7(tw: u32, th: u32, data: Vec<u8>, mips: i32) -> Result<Vec<u8>> {
+    write_dds(
+        ddsfile::DxgiFormat::BC7_UNorm,
+        ddsfile::AlphaMode::PreMultiplied,
+        tw,
+        th,
+        data,
+        mips,
+    )
+}
+
+/// A DX10-header DDS of one 2D texture with `mips` levels of block data, top row first.
+pub(crate) fn write_dds(
+    format: ddsfile::DxgiFormat,
+    alpha_mode: ddsfile::AlphaMode,
+    tw: u32,
+    th: u32,
+    data: Vec<u8>,
+    mips: i32,
+) -> Result<Vec<u8>> {
     let mut dds = ddsfile::Dds::new_dxgi(ddsfile::NewDxgiParams {
         height: th,
         width: tw,
         depth: None,
-        format: ddsfile::DxgiFormat::BC7_UNorm,
+        format,
         mipmap_levels: Some(mips as u32),
         array_layers: None,
         caps2: Some(ddsfile::Caps2::empty()),
         is_cubemap: false,
         resource_dimension: ddsfile::D3D10ResourceDimension::Texture2D,
-        alpha_mode: ddsfile::AlphaMode::PreMultiplied,
+        alpha_mode,
     })
     .map_err(|e| anyhow!("dds header: {e}"))?;
     dds.data = data;
@@ -111,13 +130,22 @@ enum Tc {
     Normal,
 }
 
-fn classify(bytes: &[u8], ext: &str, resolve: ResolveUri, n_images: usize) -> Vec<Tc> {
-    let mut out = vec![Tc::Srgb; n_images];
+/// How a glTF's materials sample each image: the colour-space slots that bind it, plus the
+/// external `uri` it names (if any), indexed like the glTF's `images`. `None` when the glTF
+/// does not classify. `KHR_texture_basisu` textures resolve to their KTX2 image.
+pub(crate) struct ImageUses {
+    pub srgb: HashSet<usize>,
+    pub normal: HashSet<usize>,
+    pub linear: HashSet<usize>,
+    pub uris: Vec<Option<String>>,
+}
+
+pub(crate) fn image_uses(bytes: &[u8], ext: &str, resolve: ResolveUri) -> Option<ImageUses> {
     let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::gltf::parse_classify(bytes, ext, resolve)
     }));
     let Ok(Ok(scene)) = parsed else {
-        return out;
+        return None;
     };
     let mut srgb: HashSet<usize> = HashSet::new();
     let mut normal: HashSet<usize> = HashSet::new();
@@ -149,6 +177,25 @@ fn classify(bytes: &[u8], ext: &str, resolve: ResolveUri, n_images: usize) -> Ve
             linear.insert(t.image);
         }
     }
+    Some(ImageUses {
+        srgb,
+        normal,
+        linear,
+        uris: scene.image_uri.clone(),
+    })
+}
+
+fn classify(bytes: &[u8], ext: &str, resolve: ResolveUri, n_images: usize) -> Vec<Tc> {
+    let mut out = vec![Tc::Srgb; n_images];
+    let Some(ImageUses {
+        srgb,
+        normal,
+        linear,
+        ..
+    }) = image_uses(bytes, ext, resolve)
+    else {
+        return out;
+    };
     for (i, tc) in out.iter_mut().enumerate() {
         *tc = if srgb.contains(&i) {
             Tc::Srgb
@@ -163,7 +210,7 @@ fn classify(bytes: &[u8], ext: &str, resolve: ResolveUri, n_images: usize) -> Ve
     out
 }
 
-fn split_container(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn split_container(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     if bytes.starts_with(b"glTF") {
         if bytes.len() < 12 {
             bail!("glb too short");
@@ -473,7 +520,7 @@ fn extract_image_bytes(
     (end <= bin.len()).then(|| bin[start..end].to_vec())
 }
 
-fn glb_frame(mut json_bytes: Vec<u8>, bin: &[u8]) -> Vec<u8> {
+pub(crate) fn glb_frame(mut json_bytes: Vec<u8>, bin: &[u8]) -> Vec<u8> {
     pad4(&mut json_bytes, 0x20);
     let mut bin_data = bin.to_vec();
     pad4(&mut bin_data, 0x00);

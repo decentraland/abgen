@@ -1161,6 +1161,15 @@ impl Proxy {
         platform: &str,
         content_server_url: &str,
     ) -> Result<Vec<String>> {
+        if platform == crate::bevyvariants::BEVY_PLATFORM {
+            #[cfg(feature = "bevy-variants")]
+            {
+                self.build_bevy_variants(out_root, cid)?;
+                return Ok(vec![crate::bevyvariants::manifest_key(cid)]);
+            }
+            #[cfg(not(feature = "bevy-variants"))]
+            bail!("bevy variants generation requires the bevy-variants feature");
+        }
         if platform == crate::bvwebgpu::BVW_PLATFORM {
             #[cfg(feature = "web-pack")]
             {

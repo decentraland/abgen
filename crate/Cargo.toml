@@ -14,10 +14,13 @@ autobenches = false
 default = ["server"]
 gpu = ["dep:wgpu"]
 web-pack = ["dep:ddsfile", "dep:gltf-json"]
+# Prototype: the Bevy variants manifest lane (GPU-ready DDS/GLB variants addressed by CID).
+bevy-variants = ["web-pack"]
 scene-runtime = ["dep:rquickjs"]
 cli = ["dep:tracing-subscriber"]
 server = [
     "web-pack",
+    "bevy-variants",
     "scene-runtime",
     "gpu",
     "cli",
