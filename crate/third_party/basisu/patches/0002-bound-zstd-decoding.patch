@@ -1,0 +1,118 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -62,7 +62,7 @@
+ optional = true
+ 
+ [dependencies.ruzstd]
+-version = "0.7"
++version = "0.9.1"
+ optional = true
+ default-features = false
+ 
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -437,9 +437,9 @@
+ 
+ [[package]]
+ name = "ruzstd"
+-version = "0.7.3"
++version = "0.9.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "fad02996bfc73da3e301efe90b1837be9ed8f4a462b6ed410aa35d00381de89f"
++checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
+ 
+ [[package]]
+ name = "same-file"
+--- a/src/transcoder.rs
++++ b/src/transcoder.rs
+@@ -59,7 +59,12 @@
+ #[cfg(feature = "zstd")]
+ fn zstd_inflate(comp: &[u8], want: usize) -> Option<Vec<u8>> {
+     use ruzstd::io::Read;
+-    let mut dec = ruzstd::StreamingDecoder::new(comp).ok()?;
++    // The decoder holds a frame's whole window before it returns a byte, and the file declares
++    // the window. No level needs a window larger than itself (8 MiB covers encoders that declare
++    // their default window for small inputs), so a larger one is rejected when the frame opens.
++    let max_window = (want as u64).max(8 << 20);
++    let mut dec =
++        ruzstd::decoding::StreamingDecoder::new_with_max_window_size(comp, max_window).ok()?;
+     // `want` comes from the file: a failed allocation must fail the level, not abort.
+     let mut out = Vec::new();
+     out.try_reserve_exact(want).ok()?;
+@@ -472,3 +477,59 @@
+         }
+     }
+ }
++
++#[cfg(all(test, feature = "zstd"))]
++mod bounded_zstd_tests {
++    use super::zstd_inflate;
++
++    // A non-single-segment frame without content size; the first block is RLE.
++    fn rle_frame(window: u8, lengths: &[u32]) -> Vec<u8> {
++        let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0, window];
++        for (i, &length) in lengths.iter().enumerate() {
++            let header = (length << 3) | 2 | u32::from(i + 1 == lengths.len());
++            frame.extend_from_slice(&header.to_le_bytes()[..3]);
++            frame.push(42);
++        }
++        frame
++    }
++
++    #[test]
++    fn exact_output_and_truncation() {
++        assert_eq!(
++            zstd_inflate(&rle_frame(0, &[16, 16]), 32),
++            Some(vec![42; 32])
++        );
++        assert!(zstd_inflate(&rle_frame(0, &[16]), 32).is_none());
++        let mut truncated = rle_frame(0, &[32]);
++        truncated.pop();
++        assert!(zstd_inflate(&truncated, 32).is_none());
++    }
++
++    #[test]
++    fn rejects_large_window_and_excess_output() {
++        // 128 MiB window rejected at initialization, including a tiny otherwise valid frame.
++        assert!(zstd_inflate(&rle_frame(17 << 3, &[32]), 32).is_none());
++        // Output beyond the level's length fails the level.
++        assert!(zstd_inflate(&rle_frame(0, &[32, 32]), 32).is_none());
++        assert!(zstd_inflate(&rle_frame(0, &[128 * 1024]), 32).is_none());
++    }
++    #[test]
++    fn raw_and_compressed_literal_blocks_obey_output_budget() {
++        for compressed in [false, true] {
++            let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0, 0];
++            let mut body = Vec::new();
++            if compressed {
++                body.push(16 << 3);
++            } // raw literals header
++            body.extend_from_slice(&[7; 16]);
++            if compressed {
++                body.push(0);
++            } // no sequences
++            let header = ((body.len() as u32) << 3) | 1 | if compressed { 4 } else { 0 };
++            frame.extend_from_slice(&header.to_le_bytes()[..3]);
++            frame.extend_from_slice(&body);
++            assert_eq!(zstd_inflate(&frame, 16), Some(vec![7; 16]));
++            assert!(zstd_inflate(&frame, 15).is_none());
++        }
++    }
++}
+--- a/src/xuastc/decode.rs
++++ b/src/xuastc/decode.rs
+@@ -1,3 +1,5 @@
++// Modified in dcl-one: ruzstd 0.9's decoder path; see patches/0002-bound-zstd-decoding.patch
++// beside this crate.
+ //! The XUASTC LDR stream decompressor: all three stream syntaxes decoded block
+ //! by block into logical ASTC blocks and handed to a caller callback in raster
+ //! order. The init callback validates the header (aborting before any
+@@ -143,7 +145,7 @@
+     // The frame may legitimately decode to fewer bytes than its declared
+     // content size, so the output is truncated to what actually decoded;
+     // decoding more than the declared size is an error.
+-    let mut dec = ruzstd::StreamingDecoder::new(comp).ok()?;
++    let mut dec = ruzstd::decoding::StreamingDecoder::new(comp).ok()?;
+     let mut out = vec![0u8; want];
+     let mut total = 0usize;
+     loop {

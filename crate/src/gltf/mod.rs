@@ -481,4 +481,171 @@ mod tests {
         super::load_gltf_inputs(bytes, ".gltf", None)
             .expect_err("a geometry build must still fail without the buffer");
     }
+
+    // 8x8 and 6x6 UASTC KTX2 gradients, zstd-supercompressed. Copied from decentraland/dcl-one,
+    // `rendering/bevy-explorer/source/crates/image_processing/testdata/`.
+    const UASTC_8: &[u8] = include_bytes!("../../testdata/uastc_8.ktx2");
+    const UASTC_6: &[u8] = include_bytes!("../../testdata/uastc_6.ktx2");
+
+    /// A binary glTF of `json` with `bin` as its BIN chunk, both padded to 4 bytes.
+    fn glb(json: &serde_json::Value, bin: &[u8]) -> Vec<u8> {
+        let mut j = serde_json::to_vec(json).unwrap();
+        while !j.len().is_multiple_of(4) {
+            j.push(b' ');
+        }
+        let mut b = bin.to_vec();
+        while !b.len().is_multiple_of(4) {
+            b.push(0);
+        }
+        let total = 12 + 8 + j.len() + 8 + b.len();
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(b"glTF");
+        out.extend_from_slice(&2u32.to_le_bytes());
+        out.extend_from_slice(&(total as u32).to_le_bytes());
+        out.extend_from_slice(&(j.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0x4E4F_534Au32.to_le_bytes());
+        out.extend_from_slice(&j);
+        out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0x004E_4942u32.to_le_bytes());
+        out.extend_from_slice(&b);
+        out
+    }
+
+    fn base_color(scene: &crate::scene::Scene) -> usize {
+        scene.materials[0]
+            .base_color_image
+            .expect("base colour slot bound")
+            .image
+    }
+
+    fn decoded_dims(scene: &crate::scene::Scene, idx: usize) -> (u32, u32) {
+        scene.images[idx]
+            .as_ref()
+            .expect("image decoded")
+            .dimensions()
+    }
+
+    #[test]
+    fn required_basisu_texture_with_an_embedded_ktx2_is_textured() {
+        // `source` omitted, as the spec allows once the extension is required.
+        let json = json!({
+            "asset": {"version": "2.0"},
+            "extensionsUsed": ["KHR_texture_basisu"],
+            "extensionsRequired": ["KHR_texture_basisu"],
+            "buffers": [{"byteLength": UASTC_8.len()}],
+            "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": UASTC_8.len()}],
+            "images": [{"bufferView": 0, "mimeType": "image/ktx2"}],
+            "textures": [{"extensions": {"KHR_texture_basisu": {"source": 0}}}],
+            "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}],
+            "nodes": [{"name": "n"}],
+            "scene": 0,
+            "scenes": [{"nodes": [0]}]
+        });
+        let scene = super::parse(&glb(&json, UASTC_8), ".glb", None, false, false)
+            .expect("a KHR_texture_basisu glb parses");
+        assert_eq!(base_color(&scene), 0);
+        assert_eq!(scene.texture_refs.len(), 1);
+        assert_eq!(scene.texture_refs[0].image, 0);
+        assert_eq!(decoded_dims(&scene, 0), (8, 8));
+        assert!(scene.image_embedded[0]);
+        assert_eq!(scene.image_bytes[0].as_deref(), Some(UASTC_8));
+    }
+
+    #[test]
+    fn required_basisu_texture_with_an_external_ktx2_is_textured() {
+        let gltf = json!({
+            "asset": {"version": "2.0"},
+            "extensionsUsed": ["KHR_texture_basisu"],
+            "extensionsRequired": ["KHR_texture_basisu"],
+            "images": [{"uri": "tex/albedo.ktx2"}],
+            "samplers": [{"wrapS": 33071, "wrapT": 33071}],
+            "textures": [{"sampler": 0, "extensions": {"KHR_texture_basisu": {"source": 0}}}],
+            "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}],
+            "nodes": [{"name": "n"}],
+            "scene": 0,
+            "scenes": [{"nodes": [0]}]
+        });
+        let bytes = serde_json::to_vec(&gltf).unwrap();
+        let resolve =
+            |uri: &str| -> Option<Vec<u8>> { (uri == "tex/albedo.ktx2").then(|| UASTC_6.to_vec()) };
+        let scene = super::parse(&bytes, ".gltf", Some(&resolve), false, false)
+            .expect("a gltf with an external ktx2 parses");
+        assert_eq!(base_color(&scene), 0);
+        assert_eq!(decoded_dims(&scene, 0), (6, 6));
+        assert_eq!(scene.image_uri[0].as_deref(), Some("tex/albedo.ktx2"));
+        // The texture's sampler reaches the KTX2 image like it would a `source` one.
+        assert_eq!(scene.image_wrap[0], (Some(33071), Some(33071)));
+
+        // Classification reads the same mapping without any bytes.
+        let classified = super::parse_classify(&bytes, ".gltf", None).expect("classifies");
+        assert_eq!(base_color(&classified), 0);
+        assert_eq!(classified.image_uri[0].as_deref(), Some("tex/albedo.ktx2"));
+    }
+
+    #[test]
+    fn a_png_fallback_source_still_wins_over_the_ktx2() {
+        // Files that ship a fallback must keep building from exactly the bytes they did
+        // before KTX2 was read: the core `source` is taken whenever it is present.
+        let png_img = image::RgbaImage::from_fn(2, 2, |x, y| {
+            image::Rgba([(x * 200) as u8, (y * 200) as u8, 7, 255])
+        });
+        let mut png = Vec::new();
+        png_img
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let mut bin = png.clone();
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
+        let ktx_off = bin.len();
+        bin.extend_from_slice(UASTC_8);
+        let json = json!({
+            "asset": {"version": "2.0"},
+            "extensionsUsed": ["KHR_texture_basisu"],
+            "buffers": [{"byteLength": bin.len()}],
+            "bufferViews": [
+                {"buffer": 0, "byteOffset": 0, "byteLength": png.len()},
+                {"buffer": 0, "byteOffset": ktx_off, "byteLength": UASTC_8.len()}
+            ],
+            "images": [
+                {"bufferView": 0, "mimeType": "image/png"},
+                {"bufferView": 1, "mimeType": "image/ktx2"}
+            ],
+            "textures": [{"source": 0, "extensions": {"KHR_texture_basisu": {"source": 1}}}],
+            "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}],
+            "nodes": [{"name": "n"}],
+            "scene": 0,
+            "scenes": [{"nodes": [0]}]
+        });
+        let scene = super::parse(&glb(&json, &bin), ".glb", None, false, false).expect("parses");
+        assert_eq!(base_color(&scene), 0);
+        assert_eq!(scene.texture_refs[0].image, 0);
+        assert_eq!(scene.image_bytes[0].as_deref(), Some(png.as_slice()));
+        assert_eq!(decoded_dims(&scene, 0), (2, 2));
+        assert_eq!(scene.images[0].as_ref().unwrap().as_raw(), png_img.as_raw());
+    }
+
+    #[test]
+    fn an_undecodable_ktx2_leaves_the_slot_empty_without_panicking() {
+        // ETC1S, or plain garbage behind the KTX2 magic: rejected like an unreadable PNG.
+        let mut etc1s = UASTC_8.to_vec();
+        etc1s[44..48].copy_from_slice(&1u32.to_le_bytes());
+        for bad in [
+            etc1s,
+            [crate::ktx2::KTX2_MAGIC.as_slice(), &[0u8; 64]].concat(),
+        ] {
+            let json = json!({
+                "asset": {"version": "2.0"},
+                "extensionsRequired": ["KHR_texture_basisu"],
+                "buffers": [{"byteLength": bad.len()}],
+                "bufferViews": [{"buffer": 0, "byteLength": bad.len()}],
+                "images": [{"bufferView": 0, "mimeType": "image/ktx2"}],
+                "textures": [{"extensions": {"KHR_texture_basisu": {"source": 0}}}],
+                "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}]
+            });
+            let scene = super::parse(&glb(&json, &bad), ".glb", None, false, false)
+                .expect("an unreadable texture is not a parse failure");
+            assert!(scene.images[0].is_none());
+        }
+    }
 }

@@ -48,7 +48,11 @@ pub fn kind_for(file: &str) -> &'static str {
     let f = file.to_lowercase();
     if f.ends_with(".glb") || f.ends_with(".gltf") {
         "glb"
-    } else if f.ends_with(".png") || f.ends_with(".jpg") || f.ends_with(".jpeg") {
+    } else if f.ends_with(".png")
+        || f.ends_with(".jpg")
+        || f.ends_with(".jpeg")
+        || f.ends_with(".ktx2")
+    {
         "img"
     } else {
         "raw"

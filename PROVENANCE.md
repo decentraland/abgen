@@ -41,3 +41,17 @@ subsets with local build shims, each under its upstream license: **crunch** (CRN
 Zlib), **draco** (mesh decoder, MIT / Apache-2.0), **libjpeg9c** (baseline JPEG, IJG license). Only the
 decode paths `abgen` needs are included, plus thin C/C++ glue to build them in this tree; full
 unmodified license texts live under [`crate/third_party/`](crate/third_party/).
+
+**basisu** (Basis Universal KTX2 transcoder, Apache-2.0) is vendored differently: it is pure Rust and
+pinned to an exact crates.io release rather than reduced by hand. `crate/third_party/basisu/` holds
+`basisu` 0.1.0 byte-for-byte as published (crate sha256 and upstream revision in its
+`upstream.lock.json`, every imported file's digest in `upstream-files.sha256`), with four reviewed
+patches applied: bounded sizes and offsets for untrusted headers, bounded Zstandard decoding on
+`ruzstd` 0.9.1 from crates.io, the ETC1S transcoders removed (abgen takes UASTC only), and the
+crate's dev-dependencies dropped so their exact `wasm-bindgen-test` pin cannot reach abgen's
+lockfiles. The first three, and the import itself, are the copy `decentraland/dcl-one` ships for the
+explorer's KTX2 path; the fourth is abgen's. `checksums.sha256` pins every shipped file and patch,
+and `python3 crate/third_party/basisu/verify.py` checks them and replays the patches offline
+against the published digests. The test fixtures `crate/testdata/uastc_8.ktx2` and
+`uastc_6.ktx2` (8x8 and 6x6 UASTC gradients, `basisu -uastc -ktx2`) come from the same dcl-one
+change.

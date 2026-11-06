@@ -56,8 +56,12 @@ pub fn max_texture_size_for(target: &str) -> u32 {
     }
 }
 
+/// `KTX2` is a policy choice, not an observation: the legacy Unity converter never decoded
+/// KTX2 (`LoadImage` takes PNG and JPEG only), so it has no behaviour to match. A UASTC KTX2
+/// that abgen decodes gets the platform cap a PNG of the same picture would, not the 2048
+/// importer default the fork reserves for sources `LoadImage` rejects.
 pub fn unity_load_image_would_succeed(src: &SourceImage) -> bool {
-    let container_ok = matches!(src.container.as_str(), "PNG" | "JPEG");
+    let container_ok = matches!(src.container.as_str(), "PNG" | "JPEG" | "KTX2");
     let within_dim =
         src.width <= LOAD_IMAGE_MAX_DIMENSION && src.height <= LOAD_IMAGE_MAX_DIMENSION;
     container_ok && within_dim
@@ -124,7 +128,8 @@ pub fn sampler_filter_mode(mag_filter: Option<i64>, min_filter: Option<i64>) -> 
 }
 
 pub fn uncompressed_profile(src: &SourceImage, color_space: i64, filter_mode: i64) -> Profile {
-    let fmt = if src.container == "PNG" {
+    // KTX2 carries alpha like PNG; only JPEG (and containers `LoadImage` rejects) lose it.
+    let fmt = if matches!(src.container.as_str(), "PNG" | "KTX2") {
         TF_RGBA32
     } else {
         TF_RGB24
@@ -402,6 +407,21 @@ mod tests {
             has_real_alpha: false,
         };
         assert!(!unity_load_image_would_succeed(&odd_container));
+
+        // A decoded KTX2 takes the platform cap like a PNG (policy: the legacy converter
+        // never read KTX2), within the same dimension bound.
+        let ktx2 = SourceImage {
+            width: 4096,
+            height: 4096,
+            container: "KTX2".into(),
+            has_real_alpha: false,
+        };
+        assert!(unity_load_image_would_succeed(&ktx2));
+        let ktx2_big = SourceImage {
+            width: LOAD_IMAGE_MAX_DIMENSION + 1,
+            ..ktx2
+        };
+        assert!(!unity_load_image_would_succeed(&ktx2_big));
     }
 
     /// The fork's per-target caps: `DESKTOP_MAX_TEXTURE_SIZE` (1024) for

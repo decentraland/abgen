@@ -90,7 +90,7 @@ fn bundle_resolves(
     }
 }
 
-const CONVERTIBLE_EXTS: [&str; 5] = [".glb", ".gltf", ".png", ".jpg", ".jpeg"];
+const CONVERTIBLE_EXTS: [&str; 6] = [".glb", ".gltf", ".png", ".jpg", ".jpeg", ".ktx2"];
 
 pub fn is_convertible(file: &str) -> bool {
     let f = file.to_ascii_lowercase();

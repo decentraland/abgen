@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-const CONVERTIBLE_EXTS: [&str; 5] = [".glb", ".gltf", ".png", ".jpg", ".jpeg"];
+const CONVERTIBLE_EXTS: [&str; 6] = [".glb", ".gltf", ".png", ".jpg", ".jpeg", ".ktx2"];
 
 const DEPENDENCY_EXTS: [&str; 1] = [".bin"];
 
@@ -45,7 +45,10 @@ fn emit_build_telemetry(t: &BuildTelemetry) {
 fn is_convertible(file: &str) -> (bool, bool) {
     let fl = file.to_lowercase();
     let is_glb = fl.ends_with(".glb") || fl.ends_with(".gltf");
-    let is_image = fl.ends_with(".png") || fl.ends_with(".jpg") || fl.ends_with(".jpeg");
+    let is_image = fl.ends_with(".png")
+        || fl.ends_with(".jpg")
+        || fl.ends_with(".jpeg")
+        || fl.ends_with(".ktx2");
     (is_glb, is_image)
 }
 
