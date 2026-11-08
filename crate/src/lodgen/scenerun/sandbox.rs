@@ -18,7 +18,8 @@
 //! jobs fail instead of running. A self-test that could not run at all (spawn failure) is
 //! retried on the next job rather than cached. Non-Linux hosts get the separate process
 //! and empty environment without seccomp, parent-death kill or resource limits, with a
-//! warning logged once: there "sandbox" means fault isolation, not confinement.
+//! warning logged once: there "sandbox" means fault isolation, not confinement. "Empty"
+//! allows for the variables the platform injects on its own ([`PLATFORM_INJECTED_ENV`]).
 //!
 //! Concurrent children are capped at `default_file_concurrency()`, as the in-process pool
 //! was; callers' LOD limits already keep them below that today.
@@ -763,24 +764,44 @@ impl tracing::field::Visit for MessageVisitor<'_> {
 }
 
 fn install_child_sandbox() -> Result<()> {
-    if std::env::vars_os().next().is_some() {
-        bail!("scene sandbox child started with a non-empty environment");
+    let foreign = foreign_env_vars();
+    if !foreign.is_empty() {
+        bail!(
+            "scene sandbox child started with a non-empty environment ({})",
+            foreign.join(", ")
+        );
     }
     #[cfg(target_os = "linux")]
     linux::install_seccomp()?;
     Ok(())
 }
 
+/// Variables the platform itself puts into every process, even one started with an empty
+/// `envp`. They carry nothing from the parent, so the empty-environment check ignores
+/// them. On macOS, CoreFoundation sets `__CF_USER_TEXT_ENCODING` at load time when it is
+/// missing, which any binary linking a system framework does.
+#[cfg(target_os = "macos")]
+const PLATFORM_INJECTED_ENV: &[&str] = &["__CF_USER_TEXT_ENCODING"];
+#[cfg(not(target_os = "macos"))]
+const PLATFORM_INJECTED_ENV: &[&str] = &[];
+
+/// Names of environment variables the child has that the platform did not inject. Empty
+/// when the parent's `env_clear()` took effect.
+fn foreign_env_vars() -> Vec<String> {
+    std::env::vars_os()
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .filter(|name| !PLATFORM_INJECTED_ENV.contains(&name.as_str()))
+        .collect()
+}
+
 /// Each probe must be refused by the sandbox; reported as `name=ok` or `name=FAIL(..)`.
 fn probe_confinement() -> String {
-    let empty_env = format!(
-        "empty_env={}",
-        if std::env::vars_os().next().is_none() {
-            "ok"
-        } else {
-            "FAIL(env present)"
-        }
-    );
+    let foreign = foreign_env_vars();
+    let empty_env = if foreign.is_empty() {
+        "empty_env=ok".to_string()
+    } else {
+        format!("empty_env=FAIL(env present: {})", foreign.join(", "))
+    };
     #[cfg(target_os = "linux")]
     let lines: Vec<String> = std::iter::once(empty_env).chain(linux::probes()).collect();
     #[cfg(not(target_os = "linux"))]
@@ -1344,6 +1365,19 @@ mod tests {
         assert!(crdt.is_none());
         assert!(got.deadline.is_none());
         assert!(level_from_wire(level).is_none());
+    }
+
+    #[test]
+    fn platform_injected_env_is_not_foreign() {
+        // The test process has an environment, so this only checks the filter itself.
+        for name in PLATFORM_INJECTED_ENV {
+            assert!(!foreign_env_vars().iter().any(|n| n == name));
+        }
+        std::env::set_var("ABGEN_SANDBOX_FOREIGN_PROBE", "1");
+        assert!(foreign_env_vars()
+            .iter()
+            .any(|n| n == "ABGEN_SANDBOX_FOREIGN_PROBE"));
+        std::env::remove_var("ABGEN_SANDBOX_FOREIGN_PROBE");
     }
 
     #[test]
