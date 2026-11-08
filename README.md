@@ -81,7 +81,7 @@ The default `server` feature builds the complete service. Reusable consumers sho
 | `server` (default) | HTTP/registry stack, `gpu`, `cli`, `web-pack`, and `scene-runtime` | `abgen` server |
 | `gpu` | native wgpu/CUDA dispatch | server, build/corpus/verify CLIs, Lambda |
 | `web-pack` | BV WebGPU pack emission plus DDS/glTF JSON dependencies | server, build/corpus CLIs |
-| `scene-runtime` | embedded QuickJS fallback for suspicious static LOD placements | server, LOD CLI, Lambda |
+| `scene-runtime` | QuickJS fallback for suspicious static LOD placements; each scene runs in a short-lived child process (seccomp-confined on Linux; separate process and empty environment elsewhere). Binaries must call `scenerun::run_sandbox_child_if_requested()` first thing in `main`; `abgen --scene-sandbox-check` proves a deployment can run scenes | server, LOD CLI, Lambda |
 | `cli` | tracing subscriber and CLI logging | server and LOD CLI |
 
 `crate/abgen-native`, `crate/abgen-node`, and converter WASM use no default features. The standalone `crate/wasm-gpu` package compiles the shared BC7/WebGPU source directly and does not depend on the full `abgen` graph; its worker ships only `gpu_init` and `gpu_encode`. Static CRDT placement interpretation remains available without `scene-runtime`; if that result is empty or suspicious, the minimal build fails explicitly instead of publishing an empty LOD.

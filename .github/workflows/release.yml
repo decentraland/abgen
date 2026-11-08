@@ -429,9 +429,16 @@ jobs:
             # way to fail. A user who genuinely wants to override still can —
             # the binary reads both, and an unreadable one is a loud error
             # rather than a silent fallback.
+            # The scene sandbox re-executes the binary per scene. Under this
+            # loader current_exe() is ld.so, so the wrapper names the real
+            # binary, the loader and the library path for it.
             cat > "$dist/abgen" <<'EOF'
           #!/bin/sh
           here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+          ABGEN_SANDBOX_LOADER="$here/lib/ld.so"
+          ABGEN_SANDBOX_LIBPATH="$here/lib"
+          ABGEN_SANDBOX_BIN="$here/bin/abgen.bin"
+          export ABGEN_SANDBOX_LOADER ABGEN_SANDBOX_LIBPATH ABGEN_SANDBOX_BIN
           exec "$here/lib/ld.so" --library-path "$here/lib" "$here/bin/abgen.bin" "$@"
           EOF
             chmod 755 "$dist/abgen"
@@ -478,6 +485,9 @@ jobs:
             (
               cd "/tmp/sanity/$dist"
               ./abgen --version
+              # One scene through the packaged binary's sandbox child: catches a
+              # wrapper that cannot re-exec itself or a host that refuses seccomp.
+              ./abgen --scene-sandbox-check
               HTTP_SERVER_PORT=5199 ./abgen &
               server=$!
               for _ in $(seq 1 40); do

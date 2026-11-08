@@ -13,6 +13,7 @@ mod satellite;
 use anyhow::{Context, Result};
 
 fn main() {
+    abgen::lodgen::scenerun::run_sandbox_child_if_requested();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match argv.first().map(String::as_str) {
         Some("--once") => {

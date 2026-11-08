@@ -349,6 +349,7 @@ generate: the full sync chain: resolve scene -> independently derive placements
 }
 
 fn main() {
+    abgen::lodgen::scenerun::run_sandbox_child_if_requested();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
