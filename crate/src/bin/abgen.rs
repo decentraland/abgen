@@ -53,6 +53,9 @@ ENV:
                             (denylist + spawn overrides; migrations run on boot)
   API_ADMIN_TOKEN           optional bearer token guarding the queue/admin routes
   DENYLIST_MODERATORS       comma-separated addresses allowed to manage the denylist
+  ABGEN_SANDBOX_SECCOMP     scene sandbox seccomp policy on Linux: required (default)
+                            refuses to run scenes where the child cannot install its
+                            filter; auto runs them in the separate process without it
   ABGEN_LOG_FORMAT          json for JSON logs (default plain text)
   RUST_LOG                  tracing filter (default abgen=info,tower_http=info)
 

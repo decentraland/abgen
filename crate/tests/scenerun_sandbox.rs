@@ -55,8 +55,11 @@ fn enforces_the_deadline() {
 fn child_is_confined() {
     let report = sandbox::self_test().unwrap();
     assert!(report.contains("empty_env=ok"), "{report}");
+    // The default policy is `required`, so on Linux a passing self-test means the filter
+    // is on; a runtime that refuses seccomp would have failed `self_test()` above.
     #[cfg(target_os = "linux")]
     for probe in [
+        "seccomp",
         "open",
         "openat",
         "socket",

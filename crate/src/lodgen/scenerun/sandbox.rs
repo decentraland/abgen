@@ -21,6 +21,14 @@
 //! warning logged once: there "sandbox" means fault isolation, not confinement. "Empty"
 //! allows for the variables the platform injects on its own ([`PLATFORM_INJECTED_ENV`]).
 //!
+//! Some Linux runtimes refuse seccomp to the processes they host: AWS Lambda returns
+//! `EPERM` from `prctl(PR_SET_NO_NEW_PRIVS)`. By default that refuses every scene
+//! (`seccomp=unavailable` in the self-test report). [`SANDBOX_SECCOMP_ENV`]`=auto` accepts
+//! it: scenes run in the separate process with the empty environment, resource limits and
+//! parent-death kill, without the syscall filter, and the parent logs a warning once. Only
+//! the runtime's refusal (`EPERM`, `EACCES`, `ENOSYS`) is tolerated; a filter the kernel
+//! rejects for any other reason still fails closed. The Lambda image sets `auto`.
+//!
 //! Concurrent children are capped at `default_file_concurrency()`, as the in-process pool
 //! was; callers' LOD limits already keep them below that today.
 //!
@@ -49,6 +57,64 @@ pub const CHILD_ARG: &str = "__abgen-scenerun-sandbox-child";
 pub const SANDBOX_BIN_ENV: &str = "ABGEN_SANDBOX_BIN";
 pub const SANDBOX_LOADER_ENV: &str = "ABGEN_SANDBOX_LOADER";
 pub const SANDBOX_LIBPATH_ENV: &str = "ABGEN_SANDBOX_LIBPATH";
+
+/// Read by the parent: `required` (the default) refuses to run scenes on Linux when the
+/// child cannot install its seccomp filter; `auto` runs them anyway in the separate process
+/// (empty environment, resource limits, parent-death kill) and warns once. The policy
+/// reaches the child as argv[2], since the child's environment is empty.
+pub const SANDBOX_SECCOMP_ENV: &str = "ABGEN_SANDBOX_SECCOMP";
+const CHILD_SECCOMP_AUTO_ARG: &str = "seccomp=auto";
+const CHILD_SECCOMP_REQUIRED_ARG: &str = "seccomp=required";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SeccompPolicy {
+    Required,
+    Auto,
+}
+
+impl SeccompPolicy {
+    fn child_arg(self) -> &'static str {
+        match self {
+            SeccompPolicy::Required => CHILD_SECCOMP_REQUIRED_ARG,
+            SeccompPolicy::Auto => CHILD_SECCOMP_AUTO_ARG,
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("auto") {
+            Some(SeccompPolicy::Auto)
+        } else if value.is_empty() || value.eq_ignore_ascii_case("required") {
+            Some(SeccompPolicy::Required)
+        } else {
+            None
+        }
+    }
+}
+
+/// The parent's policy, read once. An unrecognised value is `required` with a warning.
+fn seccomp_policy() -> SeccompPolicy {
+    static POLICY: OnceLock<SeccompPolicy> = OnceLock::new();
+    *POLICY.get_or_init(|| match std::env::var(SANDBOX_SECCOMP_ENV) {
+        Err(_) => SeccompPolicy::Required,
+        Ok(value) => SeccompPolicy::parse(&value).unwrap_or_else(|| {
+            tracing::warn!(
+                "scene sandbox: {SANDBOX_SECCOMP_ENV}={value:?} is neither `required` nor \
+                 `auto`; using `required`"
+            );
+            SeccompPolicy::Required
+        }),
+    })
+}
+
+/// Whether the child's seccomp filter is on. Reported as `seccomp=ok` or
+/// `seccomp=unavailable(reason)` in the self-test report.
+enum SeccompState {
+    /// Only Linux has a filter to install; elsewhere the state is always `Unavailable`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Installed,
+    Unavailable(String),
+}
 
 const MAGIC: &[u8; 8] = b"ABSRUN01";
 
@@ -193,7 +259,8 @@ enum SelfTestError {
 }
 
 /// Starts a child, has it probe its own confinement and returns its report
-/// (`name=ok|FAIL(...)` per line). Errors if any probe was not refused.
+/// (`name=ok|FAIL(...)` per line, plus `seccomp=ok|unavailable(...)`). Errors if any probe
+/// was not refused, or if seccomp is unavailable and the policy requires it.
 pub fn self_test() -> Result<String> {
     self_test_report().map_err(|e| match e {
         SelfTestError::Definitive(e) => anyhow!("{e}"),
@@ -210,19 +277,75 @@ fn self_test_report() -> std::result::Result<String, SelfTestError> {
             )))
         }
     };
-    let failed: Vec<&str> = report.lines().filter(|l| !l.ends_with("=ok")).collect();
-    if !failed.is_empty() {
-        return Err(SelfTestError::Definitive(format!(
-            "sandbox probes not refused: {}",
-            failed.join(", ")
-        )));
+    match evaluate_report(&report, seccomp_policy(), parent_is_non_dumpable()) {
+        Ok(warnings) => {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                for warning in &warnings {
+                    tracing::warn!("scene sandbox: {warning}");
+                }
+            });
+            Ok(report)
+        }
+        Err(e) => Err(SelfTestError::Definitive(e)),
     }
-    if !parent_is_non_dumpable() {
-        return Err(SelfTestError::Definitive(
-            "parent process is still dumpable".into(),
+}
+
+/// What a self-test report means under `policy`. `Ok(warnings)`: scenes may run, each
+/// warning worth logging once; `Err`: the sandbox is not in effect and scenes must not run.
+///
+/// A probe line that is not `=ok` is a failure whatever the policy: it means a filter is
+/// on and does not refuse what it should. `seccomp=unavailable(..)` is a failure under
+/// `required` on Linux only; elsewhere seccomp never exists. A parent that could not make
+/// itself non-dumpable fails under `required` and warns under `auto`, since a runtime that
+/// refuses `PR_SET_NO_NEW_PRIVS` may refuse `PR_SET_DUMPABLE` too.
+fn evaluate_report(
+    report: &str,
+    policy: SeccompPolicy,
+    parent_non_dumpable: bool,
+) -> std::result::Result<Vec<String>, String> {
+    let mut failed = Vec::new();
+    let mut seccomp_unavailable = None;
+    for line in report.lines() {
+        if line.ends_with("=ok") {
+            continue;
+        }
+        match line
+            .strip_prefix("seccomp=unavailable(")
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
+            Some(reason) => seccomp_unavailable = Some(reason.to_string()),
+            None => failed.push(line),
+        }
+    }
+    if !failed.is_empty() {
+        return Err(format!("sandbox probes not refused: {}", failed.join(", ")));
+    }
+    let mut warnings = Vec::new();
+    if let Some(reason) = seccomp_unavailable {
+        if cfg!(target_os = "linux") && policy == SeccompPolicy::Required {
+            return Err(format!(
+                "seccomp is unavailable here ({reason}); set {SANDBOX_SECCOMP_ENV}=auto to run \
+                 scenes in a separate process without it"
+            ));
+        }
+        warnings.push(format!(
+            "no seccomp ({reason}); scenes run in a separate process with an empty \
+             environment{} only",
+            if cfg!(target_os = "linux") {
+                ", resource limits and parent-death kill"
+            } else {
+                ""
+            }
         ));
     }
-    Ok(report)
+    if !parent_non_dumpable {
+        if policy == SeccompPolicy::Required {
+            return Err("parent process is still dumpable".into());
+        }
+        warnings.push("parent process is still dumpable (PR_SET_DUMPABLE refused)".into());
+    }
+    Ok(warnings)
 }
 
 /// The self-test plus one trivial scene through the full job path. Backs
@@ -268,7 +391,7 @@ fn child_command() -> Result<Command> {
         }
         None => Command::new(&bin),
     };
-    cmd.arg(CHILD_ARG);
+    cmd.arg(CHILD_ARG).arg(seccomp_policy().child_arg());
     Ok(cmd)
 }
 
@@ -528,17 +651,14 @@ fn emit_child_log(level: u8, msg: &str) {
     }
 }
 
+/// Marks the parent non-dumpable (Linux). Whether that took, and whether the child has
+/// seccomp, is judged by the self-test ([`evaluate_report`]), which also logs the warnings.
 fn harden_parent() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        #[cfg(target_os = "linux")]
-        linux::make_non_dumpable();
-        #[cfg(not(target_os = "linux"))]
-        tracing::warn!(
-            "scene sandbox: no seccomp on this OS; scenes run in a separate process with an \
-             empty environment only"
-        );
-    });
+    #[cfg(target_os = "linux")]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(linux::make_non_dumpable);
+    }
 }
 
 fn parent_is_non_dumpable() -> bool {
@@ -588,11 +708,14 @@ fn child_main() -> Result<()> {
     let (input, output) = child_stdio();
     let io = Arc::new(Mutex::new((input, output)));
 
-    if let Err(e) = install_child_sandbox() {
-        let mut guard = lock(&io);
-        let _ = write_frame(&mut guard.1, T_FAILED, format!("{e:#}").as_bytes());
-        return Err(e);
-    }
+    let seccomp = match install_child_sandbox(child_seccomp_policy()) {
+        Ok(state) => state,
+        Err(e) => {
+            let mut guard = lock(&io);
+            let _ = write_frame(&mut guard.1, T_FAILED, format!("{e:#}").as_bytes());
+            return Err(e);
+        }
+    };
     {
         let mut guard = lock(&io);
         write_frame(&mut guard.1, T_READY, MAGIC)?;
@@ -604,7 +727,7 @@ fn child_main() -> Result<()> {
     };
     match tag {
         T_SELF_TEST => {
-            let report = probe_confinement();
+            let report = probe_confinement(&seccomp);
             let mut guard = lock(&io);
             write_frame(&mut guard.1, T_SELF_TEST_REPORT, report.as_bytes())
         }
@@ -763,7 +886,16 @@ impl tracing::field::Visit for MessageVisitor<'_> {
     }
 }
 
-fn install_child_sandbox() -> Result<()> {
+/// The policy the parent passed as argv[2]. Absent or unknown reads as `required`: a child
+/// started some other way must not run unconfined.
+fn child_seccomp_policy() -> SeccompPolicy {
+    match std::env::args_os().nth(2) {
+        Some(arg) if arg == OsStr::new(CHILD_SECCOMP_AUTO_ARG) => SeccompPolicy::Auto,
+        _ => SeccompPolicy::Required,
+    }
+}
+
+fn install_child_sandbox(policy: SeccompPolicy) -> Result<SeccompState> {
     let foreign = foreign_env_vars();
     if !foreign.is_empty() {
         bail!(
@@ -772,8 +904,22 @@ fn install_child_sandbox() -> Result<()> {
         );
     }
     #[cfg(target_os = "linux")]
-    linux::install_seccomp()?;
-    Ok(())
+    return match linux::install_seccomp() {
+        Ok(()) => Ok(SeccompState::Installed),
+        Err(linux::SeccompError::Refused(reason)) => match policy {
+            SeccompPolicy::Auto => Ok(SeccompState::Unavailable(reason)),
+            SeccompPolicy::Required => bail!(
+                "{reason}; this runtime does not allow seccomp (set {SANDBOX_SECCOMP_ENV}=auto \
+                 to run scenes in a separate process without it)"
+            ),
+        },
+        Err(linux::SeccompError::Other(e)) => Err(e),
+    };
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = policy;
+        Ok(SeccompState::Unavailable("no seccomp on this OS".into()))
+    }
 }
 
 /// Variables the platform itself puts into every process, even one started with an empty
@@ -795,17 +941,31 @@ fn foreign_env_vars() -> Vec<String> {
 }
 
 /// Each probe must be refused by the sandbox; reported as `name=ok` or `name=FAIL(..)`.
-fn probe_confinement() -> String {
+/// The syscall probes run only with the filter on: without it they would all "fail", and
+/// `seccomp=unavailable(..)` already says why.
+fn probe_confinement(seccomp: &SeccompState) -> String {
     let foreign = foreign_env_vars();
     let empty_env = if foreign.is_empty() {
         "empty_env=ok".to_string()
     } else {
         format!("empty_env=FAIL(env present: {})", foreign.join(", "))
     };
-    #[cfg(target_os = "linux")]
-    let lines: Vec<String> = std::iter::once(empty_env).chain(linux::probes()).collect();
-    #[cfg(not(target_os = "linux"))]
-    let lines = vec![empty_env];
+    let mut lines = vec![empty_env];
+    match seccomp {
+        SeccompState::Installed => {
+            lines.push("seccomp=ok".to_string());
+            #[cfg(target_os = "linux")]
+            lines.extend(linux::probes());
+        }
+        SeccompState::Unavailable(reason) => {
+            // One line per probe; the parent strips only the final `)`, so parentheses
+            // inside the reason are fine.
+            lines.push(format!(
+                "seccomp=unavailable({})",
+                reason.replace('\n', " ")
+            ));
+        }
+    }
     lines.join("\n")
 }
 
@@ -1001,7 +1161,6 @@ fn bounded(s: &str) -> String {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use anyhow::{bail, Result};
     use libc::{c_long, c_ulong, sock_filter, sock_fprog};
 
     pub(super) fn make_non_dumpable() {
@@ -1192,8 +1351,27 @@ mod linux {
     /// so the self-test can prove a signal to it is refused.
     static PARENT_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+    /// Why the filter did not go on.
+    pub(super) enum SeccompError {
+        /// The runtime does not let this process use seccomp at all (`EPERM`, `EACCES`,
+        /// `ENOSYS` from `prctl(PR_SET_NO_NEW_PRIVS)` or `seccomp(2)`): AWS Lambda does
+        /// this. The policy decides whether to go on without it.
+        Refused(String),
+        /// Anything else, including a filter the kernel rejected: never tolerated.
+        Other(anyhow::Error),
+    }
+
+    fn classify(what: &str, err: std::io::Error) -> SeccompError {
+        match err.raw_os_error() {
+            Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::ENOSYS) => {
+                SeccompError::Refused(format!("{what}: {err}"))
+            }
+            _ => SeccompError::Other(anyhow::anyhow!("{what}: {err}")),
+        }
+    }
+
     /// Installs the filter on every thread of the child (TSYNC), after no_new_privs.
-    pub(super) fn install_seccomp() -> Result<()> {
+    pub(super) fn install_seccomp() -> std::result::Result<(), SeccompError> {
         // SAFETY: plain pid lookups on the current process.
         let (own_pid, parent_pid) = unsafe { (libc::getpid(), libc::getppid()) };
         PARENT_PID.store(parent_pid, std::sync::atomic::Ordering::Relaxed);
@@ -1212,7 +1390,10 @@ mod linux {
                 0 as c_ulong,
             ) != 0
             {
-                bail!("PR_SET_NO_NEW_PRIVS: {}", std::io::Error::last_os_error());
+                return Err(classify(
+                    "PR_SET_NO_NEW_PRIVS",
+                    std::io::Error::last_os_error(),
+                ));
             }
             let rc = libc::syscall(
                 libc::SYS_seccomp,
@@ -1222,9 +1403,11 @@ mod linux {
             );
             if rc != 0 {
                 if rc > 0 {
-                    bail!("seccomp TSYNC failed on thread {rc}");
+                    return Err(SeccompError::Other(anyhow::anyhow!(
+                        "seccomp TSYNC failed on thread {rc}"
+                    )));
                 }
-                bail!("seccomp: {}", std::io::Error::last_os_error());
+                return Err(classify("seccomp", std::io::Error::last_os_error()));
             }
         }
         Ok(())
@@ -1365,6 +1548,65 @@ mod tests {
         assert!(crdt.is_none());
         assert!(got.deadline.is_none());
         assert!(level_from_wire(level).is_none());
+    }
+
+    #[test]
+    fn seccomp_policy_parses() {
+        assert_eq!(SeccompPolicy::parse("auto"), Some(SeccompPolicy::Auto));
+        assert_eq!(SeccompPolicy::parse(" AUTO "), Some(SeccompPolicy::Auto));
+        assert_eq!(
+            SeccompPolicy::parse("required"),
+            Some(SeccompPolicy::Required)
+        );
+        assert_eq!(SeccompPolicy::parse(""), Some(SeccompPolicy::Required));
+        assert_eq!(SeccompPolicy::parse("off"), None);
+        assert_eq!(
+            SeccompPolicy::Auto.child_arg(),
+            CHILD_SECCOMP_AUTO_ARG,
+            "the child reads this exact argv[2]"
+        );
+    }
+
+    #[test]
+    fn report_evaluation_follows_the_policy() {
+        let confined = "empty_env=ok\nseccomp=ok\nopen=ok\nsocket=ok";
+        assert_eq!(
+            evaluate_report(confined, SeccompPolicy::Required, true),
+            Ok(vec![])
+        );
+        assert_eq!(
+            evaluate_report(confined, SeccompPolicy::Auto, true),
+            Ok(vec![])
+        );
+
+        // A filter that is on but does not refuse is a failure under any policy.
+        let leaky = "empty_env=ok\nseccomp=ok\nopen=FAIL(rc=3 errno=None)";
+        for policy in [SeccompPolicy::Required, SeccompPolicy::Auto] {
+            let err = evaluate_report(leaky, policy, true).unwrap_err();
+            assert!(err.contains("open=FAIL"), "{err}");
+        }
+
+        let unavailable =
+            "empty_env=ok\nseccomp=unavailable(PR_SET_NO_NEW_PRIVS: Operation not permitted)";
+        let auto = evaluate_report(unavailable, SeccompPolicy::Auto, true).unwrap();
+        assert_eq!(auto.len(), 1, "{auto:?}");
+        assert!(auto[0].contains("PR_SET_NO_NEW_PRIVS"), "{auto:?}");
+        let required = evaluate_report(unavailable, SeccompPolicy::Required, true);
+        if cfg!(target_os = "linux") {
+            let err = required.unwrap_err();
+            assert!(err.contains(SANDBOX_SECCOMP_ENV), "{err}");
+        } else {
+            assert_eq!(required.unwrap().len(), 1);
+        }
+
+        // An environment the parent did not clear fails whatever the policy.
+        let env = "empty_env=FAIL(env present: HOME)\nseccomp=unavailable(x)";
+        assert!(evaluate_report(env, SeccompPolicy::Auto, true).is_err());
+
+        // A dumpable parent: fatal under `required`, a warning under `auto`.
+        assert!(evaluate_report(confined, SeccompPolicy::Required, false).is_err());
+        let warned = evaluate_report(confined, SeccompPolicy::Auto, false).unwrap();
+        assert!(warned.iter().any(|w| w.contains("dumpable")), "{warned:?}");
     }
 
     #[test]
