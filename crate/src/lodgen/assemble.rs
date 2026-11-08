@@ -58,6 +58,12 @@ pub fn fetch_cached_url(
     cache_dir: Option<&Path>,
     url: &str,
 ) -> Result<Vec<u8>> {
+    if !url
+        .get(..8)
+        .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
+    {
+        anyhow::bail!("texture URL must use https: {url}");
+    }
     let key = format!("url_{}", &crate::hashes::sha256_hex(url.as_bytes())[..32]);
     let cache_path = cache_dir.map(|dir| dir.join(&key));
     if let Some(path) = &cache_path {
@@ -1060,6 +1066,27 @@ mod tests {
 
     fn dummy_client() -> crate::catalyst::CatalystClient {
         crate::catalyst::CatalystClient::new("http://127.0.0.1:9")
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn texture_urls_are_fetched_over_https_only() {
+        let client = dummy_client();
+        for url in [
+            "http://127.0.0.1:9/t.png",
+            "HTTP://127.0.0.1:9/t.png",
+            "ftp://x/t.png",
+            "",
+        ] {
+            let err = fetch_cached_url(&client, None, url).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("must use https"),
+                "{url}: {err:#}"
+            );
+        }
+        // An https URL passes the check and fails later, on the unreachable host.
+        let err = fetch_cached_url(&client, None, "https://127.0.0.1:9/t.png").unwrap_err();
+        assert!(!format!("{err:#}").contains("must use https"), "{err:#}");
     }
 
     fn entity(content: &[(&str, &str)]) -> crate::catalyst::Scene {

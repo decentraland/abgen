@@ -228,11 +228,15 @@ pub fn resolve_material(
         if !tex.src.is_empty() {
             let wrap = wrap_mode(tex.wrap_mode);
             let lower = tex.src.to_ascii_lowercase();
-            if lower.starts_with("http://") || lower.starts_with("https://") {
+            if lower.starts_with("https://") {
                 out.texture = Some(PrimitiveTexture {
                     source: TextureSource::Url(tex.src.clone()),
                     wrap,
                 });
+            } else if lower.starts_with("http://") {
+                // External textures are fetched over https only; a plain-http source is
+                // reported as unresolved, like a file missing from the scene content.
+                missing = true;
             } else {
                 let mut key = lower.as_str();
                 loop {
@@ -1482,6 +1486,11 @@ mod tests {
                 wrap: WrapMode::Clamp,
             })
         );
+        for plain in ["http://cdn.test/t.jpg", "HTTP://cdn.test/t.jpg"] {
+            let (m, missing) = resolve_material(Some(&with(plain, None)), &lowered);
+            assert!(missing, "{plain}");
+            assert!(m.texture.is_none(), "{plain}");
+        }
         let (m, missing) = resolve_material(Some(&with("images/missing.png", Some(2))), &lowered);
         assert!(missing);
         assert!(m.texture.is_none());
