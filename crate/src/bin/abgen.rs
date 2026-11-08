@@ -18,6 +18,8 @@ USAGE:
   abgen                 boot the server
   abgen --help | -h     print this help (does not boot or bind)
   abgen --version | -V  print the version
+  abgen --scene-sandbox-check
+                        run the scene sandbox self-test and one scene, then exit
 
 ENV:
   ABGEN_HTTP_HOST           bind host (default 127.0.0.1; legacy alias HTTP_SERVER_HOST)
@@ -70,6 +72,16 @@ fn handle_argv() {
         None => {}
         Some("--help") | Some("-h") => abgen::clihelp::print_help(USAGE),
         Some("--version") | Some("-V") => abgen::clihelp::print_version(BIN_NAME),
+        Some("--scene-sandbox-check") => match abgen::lodgen::scenerun::sandbox::check() {
+            Ok(report) => {
+                println!("scene sandbox ok\n{report}");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("abgen: scene sandbox check failed: {e:#}");
+                std::process::exit(1);
+            }
+        },
         Some(other) => {
             eprintln!("abgen: unrecognized argument: {other}");
             abgen::clihelp::usage_error(USAGE);
@@ -102,10 +114,19 @@ async fn registry_state(out_root: &str) -> Option<abgen::registry::AppState> {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Before the runtime exists: a scene sandbox child must not carry tokio's worker
+    // threads into its seccomp filter, and must not pay for starting them.
     abgen::lodgen::scenerun::run_sandbox_child_if_requested();
     handle_argv();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("build tokio runtime: {e}"))?
+        .block_on(serve())
+}
+
+async fn serve() -> Result<()> {
     abgen::maybe_enable_gpu_from_env();
     abgen::abcdn::metrics::init();
     let json_logs = std::env::var("ABGEN_LOG_FORMAT")
