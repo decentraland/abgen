@@ -57,6 +57,12 @@ impl SceneEngine for QuickJsEngine {
     }
 }
 
+/// Runs a job on the calling thread, which must have `SCENE_THREAD_STACK` of stack.
+/// Used by the sandbox child, which cannot spawn threads once its filter is on.
+pub(super) fn run_capture_here(job: SceneJob) -> Result<CaptureOutcome> {
+    run_on_thread(job)
+}
+
 fn run_on_thread(job: SceneJob) -> Result<CaptureOutcome> {
     let SceneJob {
         code,

@@ -104,6 +104,7 @@ async fn registry_state(out_root: &str) -> Option<abgen::registry::AppState> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    abgen::lodgen::scenerun::run_sandbox_child_if_requested();
     handle_argv();
     abgen::maybe_enable_gpu_from_env();
     abgen::abcdn::metrics::init();

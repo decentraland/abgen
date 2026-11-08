@@ -9,6 +9,21 @@ mod engine;
 #[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
 pub use engine::QuickJsEngine;
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
+pub mod sandbox;
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
+pub use sandbox::SandboxedEngine;
+
+/// Call first thing in `main` of every binary that can run scenes: when the process was
+/// started as a scene sandbox child it runs the scene and exits, otherwise it returns.
+/// See [`sandbox`].
+#[cfg(not(target_arch = "wasm32"))]
+pub fn run_sandbox_child_if_requested() {
+    #[cfg(feature = "scene-runtime")]
+    sandbox::run_child_if_requested();
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub struct EngineLimits {
     pub memory_bytes: usize,
@@ -102,7 +117,15 @@ fn sdk6_adaption_layer() -> anyhow::Result<String> {
     std::fs::read_to_string(&path).with_context(|| format!("read sdk6 adaption layer from {path}"))
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
+/// Binaries run scenes in a child process ([`sandbox`]). Unit tests run inside the libtest
+/// harness, which cannot act as the child, so they use the engine in-process;
+/// `tests/scenerun_sandbox.rs` covers the child-process path.
+#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime", not(test)))]
+fn default_engine() -> impl SceneEngine {
+    SandboxedEngine
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime", test))]
 fn default_engine() -> impl SceneEngine {
     QuickJsEngine
 }

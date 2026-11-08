@@ -191,3 +191,8 @@ harness = true
 name = "lod_handedness"
 path = "tests/lod_handedness.rs"
 harness = true
+[[test]]
+name = "scenerun_sandbox"
+path = "tests/scenerun_sandbox.rs"
+harness = false
+required-features = ["scene-runtime"]
