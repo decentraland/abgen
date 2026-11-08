@@ -116,7 +116,7 @@ fn usage_text() -> &'static str {
               worlds-content-server;\n               \
               fetches scene entities + content into the store, then converts)\n  \
          abgen-corpus (--world <name>[,...] | --entity-ids <ids.txt> | --pointer <p>) <out-dir> \\\n               \
-             --bevy-variants [--bevy-glb-variants] [--worlds-url <url>] [--fetch-missing] [--content-dir <dir>] [-j JOBS]\n               \
+             --bevy-variants [--bevy-glb-variants] [--bevy-zstd-level 1..19] [--worlds-url <url>] [--fetch-missing] [--content-dir <dir>] [-j JOBS]\n               \
              (PROTOTYPE: builds only the Bevy variants lane - KTX2/GLB variants addressed\n               \
               by CID plus one manifest per entity - into <out-dir>/bevy/{manifest,contents}/,\n               \
               the layout `abgen` serves at /bevy/manifest/<entity>.json and /bevy/contents/<cid>)\n  \
@@ -298,6 +298,7 @@ fn run() -> Result<()> {
     let mut gpu_flag = false;
     let mut bevy_variants = false;
     let mut bevy_glb_variants = false;
+    let mut bevy_zstd_level: Option<i32> = None;
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -415,6 +416,14 @@ fn run() -> Result<()> {
             "--bevy-variants" => {
                 bevy_variants = true;
             }
+            "--bevy-zstd-level" => {
+                i += 1;
+                bevy_zstd_level = Some(
+                    argv.get(i)
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| usage()),
+                );
+            }
             "--bevy-glb-variants" => {
                 bevy_glb_variants = true;
             }
@@ -450,8 +459,8 @@ fn run() -> Result<()> {
         }
         client_mode = true;
     }
-    if bevy_glb_variants && !bevy_variants {
-        eprintln!("error: --bevy-glb-variants requires --bevy-variants");
+    if (bevy_glb_variants || bevy_zstd_level.is_some()) && !bevy_variants {
+        eprintln!("error: --bevy-glb-variants and --bevy-zstd-level require --bevy-variants");
         usage();
     }
     if bevy_variants
@@ -633,7 +642,13 @@ fn run() -> Result<()> {
             if fetch_missing {
                 fetch_ids_into_store(&store, &content_server_url, &ids);
             }
-            return bevy::run_bevy_variants(&ids, &store, &out_root, bevy_glb_variants);
+            return bevy::run_bevy_variants(
+                &ids,
+                &store,
+                &out_root,
+                bevy_glb_variants,
+                bevy_zstd_level,
+            );
         }
         if cdn_layout {
             let store = LocalContentStore::new(&cdir);
@@ -729,7 +744,13 @@ fn run() -> Result<()> {
             return Err(anyhow!("--world resolved no scene entities"));
         }
         if bevy_variants {
-            return bevy::run_bevy_variants(&ids, &store, &out_root, bevy_glb_variants);
+            return bevy::run_bevy_variants(
+                &ids,
+                &store,
+                &out_root,
+                bevy_glb_variants,
+                bevy_zstd_level,
+            );
         }
         let m = manifest_from_ids(&ids, &cdir, &platform, cdn_layout, toggles)?;
         (m, out_root)

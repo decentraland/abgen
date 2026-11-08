@@ -34,6 +34,8 @@ mod build;
 pub mod model;
 #[cfg(feature = "bevy-variants")]
 pub mod texture;
+#[cfg(feature = "bevy-variants")]
+pub mod stats;
 
 #[cfg(feature = "bevy-variants")]
 pub use build::{build_entity_variants, BuildOptions, BuildOutput};

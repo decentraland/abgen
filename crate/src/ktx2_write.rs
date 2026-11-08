@@ -2,10 +2,12 @@
 //! BC5 or BC7 payloads, each level Zstandard-supercompressed (`supercompressionScheme` 2).
 //!
 //! Output is a function of the input blocks alone:
-//! - Zstandard at [`ZSTD_LEVEL`] (ruzstd's `Fastest`, a fixed pure-Rust algorithm, no
-//!   threads, no dictionary). ruzstd writes a content checksum only when its `hash` feature is
-//!   on; nothing in this workspace enables it, and enabling it would change every variant's
-//!   bytes (and so its CID), not its pixels.
+//! - Zstandard through libzstd (the `zstd` crate; `zstd-sys` is pinned exactly in
+//!   `crate/Cargo.toml`, which pins the bundled libzstd, [`LIBZSTD_VERSION`]) at the level the
+//!   caller passes ([`DEFAULT_ZSTD_LEVEL`] unless configured): one single-threaded frame per
+//!   level, no dictionary, no content checksum, no dictionary id, content size in the frame
+//!   header. The same input, level and libzstd release always give the same bytes; a different
+//!   level or libzstd release may give different bytes (so different CIDs) for the same pixels.
 //! - Fixed key/value data: `KTXorientation` = `rd` (rows top-down, the first row is the top of
 //!   the picture) and `KTXwriter` = [`WRITER`], with no version in it, so a release that does not
 //!   change the bytes does not change any CID.
@@ -16,9 +18,13 @@ use anyhow::{bail, Result};
 
 /// `KTXwriter` value.
 pub const WRITER: &str = "abgen bevy-variants";
-/// The Zstandard level used for every level's data.
-pub const ZSTD_LEVEL: ruzstd::encoding::CompressionLevel =
-    ruzstd::encoding::CompressionLevel::Fastest;
+/// The Zstandard level when none is configured (`ABGEN_BEVY_ZSTD_LEVEL`,
+/// `abgen-corpus --bevy-zstd-level`). 19 trades ~10 MB/s single-core compression for the
+/// smallest files short of the `--ultra` levels; decompression speed does not depend on it.
+pub const DEFAULT_ZSTD_LEVEL: i32 = 19;
+/// The libzstd release the pinned `zstd-sys` bundles. Checked by a test against the linked
+/// library, so a dependency bump that changes it fails loudly.
+pub const LIBZSTD_VERSION: &str = "1.5.7";
 /// `KTX_SS_ZSTD`.
 pub const SUPERCOMPRESSION_ZSTD: u32 = 2;
 
@@ -141,13 +147,36 @@ fn key_value_data() -> Vec<u8> {
     kvd
 }
 
-pub fn zstd(data: &[u8]) -> Vec<u8> {
-    ruzstd::encoding::compress_to_vec(data, ZSTD_LEVEL)
+/// A Zstandard level this writer takes: libzstd's regular range, 1..=19 (`--ultra` levels
+/// 20..=22 need far more memory for no gain on texture-sized inputs; 0 and negative levels
+/// are aliases or fast modes nobody needs here).
+pub fn check_zstd_level(level: i32) -> Result<i32> {
+    if !(1..=19).contains(&level) {
+        bail!("zstd level {level} is outside 1..=19");
+    }
+    Ok(level)
+}
+
+/// One Zstandard frame of `data` at `level` (see the module docs for the fixed parameters).
+pub fn zstd(data: &[u8], level: i32) -> Result<Vec<u8>> {
+    use zstd::zstd_safe::CParameter;
+    check_zstd_level(level)?;
+    let mut c = zstd::bulk::Compressor::new(level)?;
+    c.set_parameter(CParameter::ChecksumFlag(false))?;
+    c.set_parameter(CParameter::DictIdFlag(false))?;
+    c.set_parameter(CParameter::ContentSizeFlag(true))?;
+    Ok(c.compress(data)?)
 }
 
 /// Write a KTX2 of `levels` (level 0 first, each exactly [`level_bytes`] long, rows top-down)
-/// of a `width x height` texture.
-pub fn write_ktx2(format: BcFormat, width: u32, height: u32, levels: &[&[u8]]) -> Result<Vec<u8>> {
+/// of a `width x height` texture, each level compressed at Zstandard `zstd_level`.
+pub fn write_ktx2(
+    format: BcFormat,
+    width: u32,
+    height: u32,
+    levels: &[&[u8]],
+    zstd_level: i32,
+) -> Result<Vec<u8>> {
     if levels.is_empty() || width == 0 || height == 0 {
         bail!("ktx2: empty texture");
     }
@@ -165,7 +194,10 @@ pub fn write_ktx2(format: BcFormat, width: u32, height: u32, levels: &[&[u8]]) -
     let kvd_offset = dfd_offset + dfd.len();
     let data_start = kvd_offset + kvd.len();
 
-    let compressed: Vec<Vec<u8>> = levels.iter().map(|l| zstd(l)).collect::<Vec<_>>();
+    let compressed: Vec<Vec<u8>> = levels
+        .iter()
+        .map(|l| zstd(l, zstd_level))
+        .collect::<Result<_>>()?;
     // Smallest level first in the file.
     let mut offsets = vec![0u64; n];
     let mut at = data_start;
@@ -212,7 +244,6 @@ pub fn write_ktx2(format: BcFormat, width: u32, height: u32, levels: &[&[u8]]) -
 /// Read back every level of a file this module wrote (or any Zstandard-supercompressed KTX2),
 /// level 0 first, decompressed. For tests and checks; `None` on anything malformed.
 pub fn read_levels(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
-    use ruzstd::io::Read;
     let h = crate::ktx2::read_header(bytes)?;
     let mut out = Vec::with_capacity(h.levels as usize);
     for m in 0..h.levels.max(1) {
@@ -222,12 +253,7 @@ pub fn read_levels(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
         let raw = usize::try_from(raw).ok()?;
         let level = match h.supercompression {
             0 => comp.to_vec(),
-            SUPERCOMPRESSION_ZSTD => {
-                let mut dec = ruzstd::decoding::StreamingDecoder::new(comp).ok()?;
-                let mut buf = vec![0u8; raw];
-                dec.read_exact(&mut buf).ok()?;
-                buf
-            }
+            SUPERCOMPRESSION_ZSTD => zstd::bulk::decompress(comp, raw).ok()?,
             _ => return None,
         };
         if level.len() != raw {
@@ -261,8 +287,12 @@ mod tests {
             let mips = 32 - w.max(h).leading_zeros();
             let levels = chain(format, w, h, mips);
             let refs: Vec<&[u8]> = levels.iter().map(Vec::as_slice).collect();
-            let bytes = write_ktx2(format, w, h, &refs).unwrap();
-            assert_eq!(bytes, write_ktx2(format, w, h, &refs).unwrap(), "deterministic");
+            let bytes = write_ktx2(format, w, h, &refs, DEFAULT_ZSTD_LEVEL).unwrap();
+            assert_eq!(
+                bytes,
+                write_ktx2(format, w, h, &refs, DEFAULT_ZSTD_LEVEL).unwrap(),
+                "deterministic"
+            );
 
             assert!(crate::ktx2::is_ktx2(&bytes));
             let hd = crate::ktx2::read_header(&bytes).unwrap();
@@ -307,6 +337,39 @@ mod tests {
             [64, 16, 16, 16]
         );
         assert!(split_chain(BcFormat::Bc7, 8, 8, 3, &data).is_err());
-        assert!(write_ktx2(BcFormat::Bc7, 8, 8, &[&[0u8; 63][..]]).is_err());
+        assert!(write_ktx2(BcFormat::Bc7, 8, 8, &[&[0u8; 63][..]], DEFAULT_ZSTD_LEVEL).is_err());
+    }
+
+    #[test]
+    fn libzstd_is_the_pinned_release() {
+        let v = zstd::zstd_safe::version_number();
+        let got = format!("{}.{}.{}", v / 10000, v / 100 % 100, v % 100);
+        assert_eq!(got, LIBZSTD_VERSION);
+    }
+
+    #[test]
+    fn every_level_round_trips_deterministically_and_19_is_smallest() {
+        // A compressible chain: BC-sized levels with structure, not noise.
+        let levels: Vec<Vec<u8>> = chain(BcFormat::Bc7, 64, 64, 7)
+            .into_iter()
+            .map(|l| l.iter().map(|b| b / 16).collect())
+            .collect();
+        let refs: Vec<&[u8]> = levels.iter().map(Vec::as_slice).collect();
+        let mut sizes = Vec::new();
+        for level in [1, 3, 9, 19] {
+            let a = write_ktx2(BcFormat::Bc7, 64, 64, &refs, level).unwrap();
+            let b = write_ktx2(BcFormat::Bc7, 64, 64, &refs, level).unwrap();
+            assert_eq!(a, b, "level {level} deterministic");
+            assert_eq!(read_levels(&a).unwrap(), levels, "level {level} round trip");
+            sizes.push(a.len());
+        }
+        assert!(sizes[3] <= sizes[0], "level 19 not larger than level 1: {sizes:?}");
+        // No checksum, no dictionary id: frame header descriptor bit 2 and bits 0-1 clear.
+        let frame = zstd(&levels[0], 19).unwrap();
+        assert_eq!(&frame[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+        assert_eq!(frame[4] & 0b0000_0111, 0, "checksum or dict id flag set");
+        assert!(check_zstd_level(0).is_err());
+        assert!(check_zstd_level(20).is_err());
+        assert!(write_ktx2(BcFormat::Bc7, 4, 4, &[&[0u8; 16][..]], 22).is_err());
     }
 }

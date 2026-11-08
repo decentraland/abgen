@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value as J};
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::texture::{encode_texture, Slot, TextureVariant, Uses};
+use super::texture::{encode_texture_with, Slot, TexOptions, TextureVariant, Uses};
 use crate::bvwebgpu::emit;
 
 pub const KTX2_MIME: &str = "image/ktx2";
@@ -161,6 +161,16 @@ pub fn transform_model(
     ext: &str,
     resolve: crate::gltf::Resolve,
 ) -> Result<Option<ModelVariant>> {
+    transform_model_with(bytes, ext, resolve, TexOptions::default())
+}
+
+/// [`transform_model`] with explicit texture settings for the embedded images.
+pub fn transform_model_with(
+    bytes: &[u8],
+    ext: &str,
+    resolve: crate::gltf::Resolve,
+    opts: TexOptions,
+) -> Result<Option<ModelVariant>> {
     let pre = crate::naming::parse_gltf_doc(bytes, ext).context("gltf json parse")?;
     if uses_extension(&pre, "EXT_meshopt_compression") {
         bail!("EXT_meshopt_compression is not handled by the prototype");
@@ -235,11 +245,12 @@ pub fn transform_model(
             .as_ref()
             .and_then(|u| u.get(i).copied())
             .map_or(Slot::Srgb, Uses::slot);
-        match encode_texture(&src, slot) {
-            Ok(Some(v)) => {
+        let mut times = super::stats::StageTimes::default();
+        match encode_texture_with(&src, slot, opts, &mut times) {
+            Ok(Ok(v)) => {
                 replaced.insert(i, v);
             }
-            Ok(None) => {}
+            Ok(Err(_)) => {}
             Err(e) => tracing::warn!(image = i, error = %format!("{e:#}"), "bevy model variant: embedded image kept as is"),
         }
     }
