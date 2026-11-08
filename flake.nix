@@ -165,6 +165,10 @@
                 "ABGEN_CACHE_DIR=/tmp/abgen-cache"
                 "OUT_ROOT=/tmp/abgen-out"
                 "ALLOWED_CONTENT_SERVER_HOSTS=peer.decentraland.org"
+                # Lambda's runtime refuses prctl(PR_SET_NO_NEW_PRIVS), so the scene
+                # sandbox child cannot install its seccomp filter there; run scenes in
+                # the separate process without it instead of refusing every LOD.
+                "ABGEN_SANDBOX_SECCOMP=auto"
                 "TURBOJPEG_LIB=${pkgs.libjpeg_turbo.out}/lib/libturbojpeg${sharedLibExt}"
                 "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
               ];
