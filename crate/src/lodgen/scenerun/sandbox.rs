@@ -7,8 +7,8 @@
 //!   the descriptors it already has, memory management without `PROT_EXEC`, futexes,
 //!   clocks and exit. Other syscalls return `EPERM`.
 //! * `readFile` is served by the parent over the pipe through the same content-listed
-//!   closure as the in-process engine; the child does no network or filesystem access.
-//!   The parent accepts only bounded, typed frames back.
+//!   closure as the in-process engine; with the filter on, the child cannot reach the
+//!   network or the filesystem at all. The parent accepts only bounded, typed frames back.
 //! * The child has no tracing subscriber of its own: engine and driver events (scene logs,
 //!   eval failures) travel to the parent as bounded log frames, which the parent re-emits
 //!   at their level, so `RUST_LOG` keeps working as it did in-process.
@@ -24,10 +24,16 @@
 //! Some Linux runtimes refuse seccomp to the processes they host: AWS Lambda returns
 //! `EPERM` from `prctl(PR_SET_NO_NEW_PRIVS)`. By default that refuses every scene
 //! (`seccomp=unavailable` in the self-test report). [`SANDBOX_SECCOMP_ENV`]`=auto` accepts
-//! it: scenes run in the separate process with the empty environment, resource limits and
-//! parent-death kill, without the syscall filter, and the parent logs a warning once. Only
-//! the runtime's refusal (`EPERM`, `EACCES`, `ENOSYS`) is tolerated; a filter the kernel
-//! rejects for any other reason still fails closed. The Lambda image sets `auto`.
+//! it: scenes run in the separate process with the empty environment, `RLIMIT_DATA`,
+//! `RLIMIT_NPROC=0`, its own process group and parent-death kill, without the syscall
+//! filter, and the parent logs a warning once and counts it in
+//! `abgen_scene_sandbox_seccomp_total{state="unavailable"}`. Only the runtime's refusal
+//! (`EPERM`, `EACCES`, `ENOSYS`) is tolerated; a filter the kernel rejects for any other
+//! reason still fails closed, and so does a parent that `PR_SET_DUMPABLE` could not make
+//! non-dumpable, under either policy: without the filter it is what keeps an escaped
+//! scene out of `/proc/<ppid>/environ`. Only the Lambda image sets `auto`. Under it, a
+//! QuickJS escape has the uid's ordinary access (files, sockets, `execve`); what it does
+//! not get is a second process, the parent's memory, or a life after the parent's.
 //!
 //! Concurrent children are capped at `default_file_concurrency()`, as the in-process pool
 //! was; callers' LOD limits already keep them below that today.
@@ -277,7 +283,14 @@ fn self_test_report() -> std::result::Result<String, SelfTestError> {
             )))
         }
     };
-    match evaluate_report(&report, seccomp_policy(), parent_is_non_dumpable()) {
+    let seccomp_state = if report.contains("\nseccomp=ok") {
+        "installed"
+    } else {
+        "unavailable"
+    };
+    metrics::counter!("abgen_scene_sandbox_seccomp_total", "state" => seccomp_state).increment(1);
+    let dumpable = parent_dumpable_error();
+    match evaluate_report(&report, seccomp_policy(), dumpable.as_deref()) {
         Ok(warnings) => {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
@@ -296,13 +309,14 @@ fn self_test_report() -> std::result::Result<String, SelfTestError> {
 ///
 /// A probe line that is not `=ok` is a failure whatever the policy: it means a filter is
 /// on and does not refuse what it should. `seccomp=unavailable(..)` is a failure under
-/// `required` on Linux only; elsewhere seccomp never exists. A parent that could not make
-/// itself non-dumpable fails under `required` and warns under `auto`, since a runtime that
-/// refuses `PR_SET_NO_NEW_PRIVS` may refuse `PR_SET_DUMPABLE` too.
+/// `required` on Linux only; elsewhere seccomp never exists. A parent that is still
+/// dumpable (`parent_dumpable` names why) is a failure under either policy: without the
+/// filter, non-dumpability is what keeps an escaped scene out of `/proc/<ppid>/environ`
+/// and `/proc/<ppid>/mem`, which on Lambda hold the function's credentials.
 fn evaluate_report(
     report: &str,
     policy: SeccompPolicy,
-    parent_non_dumpable: bool,
+    parent_dumpable: Option<&str>,
 ) -> std::result::Result<Vec<String>, String> {
     let mut failed = Vec::new();
     let mut seccomp_unavailable = None;
@@ -321,6 +335,9 @@ fn evaluate_report(
     if !failed.is_empty() {
         return Err(format!("sandbox probes not refused: {}", failed.join(", ")));
     }
+    if let Some(why) = parent_dumpable {
+        return Err(format!("parent process is still dumpable ({why})"));
+    }
     let mut warnings = Vec::new();
     if let Some(reason) = seccomp_unavailable {
         if cfg!(target_os = "linux") && policy == SeccompPolicy::Required {
@@ -331,19 +348,14 @@ fn evaluate_report(
         }
         warnings.push(format!(
             "no seccomp ({reason}); scenes run in a separate process with an empty \
-             environment{} only",
+             environment{} only: an escaped scene would have this user's file, network and \
+             exec access",
             if cfg!(target_os = "linux") {
-                ", resource limits and parent-death kill"
+                ", RLIMIT_DATA, RLIMIT_NPROC=0 and parent-death kill"
             } else {
                 ""
             }
         ));
-    }
-    if !parent_non_dumpable {
-        if policy == SeccompPolicy::Required {
-            return Err("parent process is still dumpable".into());
-        }
-        warnings.push("parent process is still dumpable (PR_SET_DUMPABLE refused)".into());
     }
     Ok(warnings)
 }
@@ -436,7 +448,7 @@ fn run_in_child(request: Request) -> Result<Response> {
     if result.is_err() {
         let mut guard = lock(&child);
         if matches!(guard.try_wait(), Ok(None)) {
-            killed_on_error = guard.kill().is_ok();
+            killed_on_error = kill_child(&mut guard);
         }
     }
     // The watchdog stays armed until the child is gone, and it kills through the same
@@ -583,7 +595,7 @@ impl Watchdog {
             .name("abgen-scenerun-watchdog".into())
             .spawn(move || match stopped.recv_timeout(after) {
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let _ = lock(&child).kill();
+                    kill_child(&mut lock(&child));
                     true
                 }
                 _ => false,
@@ -651,21 +663,49 @@ fn emit_child_log(level: u8, msg: &str) {
     }
 }
 
+/// Kills a child that is still running (or not yet reaped): on Linux its whole process
+/// group, which it leads, so anything it forked without a filter goes with it. The
+/// group id is the child's pid, which stays reserved until the child is reaped, so the
+/// group kill cannot hit an unrelated process.
+fn kill_child(child: &mut Child) -> bool {
+    #[cfg(target_os = "linux")]
+    linux::kill_group(child.id());
+    child.kill().is_ok()
+}
+
+/// `PR_SET_DUMPABLE` failures, kept for the self-test's verdict.
+#[cfg(target_os = "linux")]
+static PARENT_DUMPABLE_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
 /// Marks the parent non-dumpable (Linux). Whether that took, and whether the child has
 /// seccomp, is judged by the self-test ([`evaluate_report`]), which also logs the warnings.
 fn harden_parent() {
     #[cfg(target_os = "linux")]
     {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(linux::make_non_dumpable);
+        ONCE.call_once(|| {
+            if let Err(e) = linux::make_non_dumpable() {
+                *lock(&PARENT_DUMPABLE_ERROR) = Some(format!("PR_SET_DUMPABLE: {e}"));
+            }
+        });
     }
 }
 
-fn parent_is_non_dumpable() -> bool {
+/// `None` when the parent is non-dumpable (always, off Linux); otherwise why it is not.
+fn parent_dumpable_error() -> Option<String> {
     #[cfg(target_os = "linux")]
-    return linux::is_non_dumpable();
+    {
+        if linux::is_non_dumpable() {
+            return None;
+        }
+        return Some(
+            lock(&PARENT_DUMPABLE_ERROR)
+                .clone()
+                .unwrap_or_else(|| "PR_GET_DUMPABLE reports dumpable".into()),
+        );
+    }
     #[cfg(not(target_os = "linux"))]
-    return true;
+    None
 }
 
 // ---------------------------------------------------------------------------------------
@@ -708,7 +748,8 @@ fn child_main() -> Result<()> {
     let (input, output) = child_stdio();
     let io = Arc::new(Mutex::new((input, output)));
 
-    let seccomp = match install_child_sandbox(child_seccomp_policy()) {
+    let policy = child_seccomp_policy();
+    let seccomp = match install_child_sandbox() {
         Ok(state) => state,
         Err(e) => {
             let mut guard = lock(&io);
@@ -731,37 +772,51 @@ fn child_main() -> Result<()> {
             let mut guard = lock(&io);
             write_frame(&mut guard.1, T_SELF_TEST_REPORT, report.as_bytes())
         }
-        T_JOB => {
-            let (code, main_crdt, limits, log_level) = decode_job(&body)?;
-            if let Some(max) = level_from_wire(log_level) {
-                // Only fails if a subscriber is already set, which the child never does.
-                let _ = tracing::subscriber::set_global_default(PipeLogger {
-                    io: io.clone(),
-                    max,
-                    sent: AtomicUsize::new(0),
-                });
+        // The parent never sends a job before a passing self-test; this is the child's
+        // own refusal in case one arrives anyway.
+        T_JOB if policy == SeccompPolicy::Required && cfg!(target_os = "linux") => {
+            if let SeccompState::Unavailable(reason) = &seccomp {
+                let msg = format!(
+                    "scene refused: no seccomp filter ({reason}) and the policy is required"
+                );
+                let mut guard = lock(&io);
+                write_frame(&mut guard.1, T_FAILED, bounded(&msg).as_bytes())?;
+                bail!("{msg}");
             }
-            let read_io = io.clone();
-            let read_file: super::ReadFileFn =
-                Box::new(move |name: &str| child_read_file(&read_io, name));
-            let job = SceneJob {
-                code,
-                main_crdt,
-                read_file,
-                limits,
-            };
-            let result = super::engine::run_capture_here(job);
-            let mut guard = lock(&io);
-            match result {
-                Ok(outcome) => write_frame(&mut guard.1, T_DONE, &encode_outcome(&outcome)),
-                Err(e) => write_frame(
-                    &mut guard.1,
-                    T_FAILED,
-                    bounded(&format!("{e:#}")).as_bytes(),
-                ),
-            }
+            run_child_job(&io, &body)
         }
+        T_JOB => run_child_job(&io, &body),
         other => bail!("parent sent unexpected tag {other}"),
+    }
+}
+
+fn run_child_job(io: &Arc<Mutex<ChildIo>>, body: &[u8]) -> Result<()> {
+    let (code, main_crdt, limits, log_level) = decode_job(body)?;
+    if let Some(max) = level_from_wire(log_level) {
+        // Only fails if a subscriber is already set, which the child never does.
+        let _ = tracing::subscriber::set_global_default(PipeLogger {
+            io: io.clone(),
+            max,
+            sent: AtomicUsize::new(0),
+        });
+    }
+    let read_io = io.clone();
+    let read_file: super::ReadFileFn = Box::new(move |name: &str| child_read_file(&read_io, name));
+    let job = SceneJob {
+        code,
+        main_crdt,
+        read_file,
+        limits,
+    };
+    let result = super::engine::run_capture_here(job);
+    let mut guard = lock(io);
+    match result {
+        Ok(outcome) => write_frame(&mut guard.1, T_DONE, &encode_outcome(&outcome)),
+        Err(e) => write_frame(
+            &mut guard.1,
+            T_FAILED,
+            bounded(&format!("{e:#}")).as_bytes(),
+        ),
     }
 }
 
@@ -889,13 +944,22 @@ impl tracing::field::Visit for MessageVisitor<'_> {
 /// The policy the parent passed as argv[2]. Absent or unknown reads as `required`: a child
 /// started some other way must not run unconfined.
 fn child_seccomp_policy() -> SeccompPolicy {
-    match std::env::args_os().nth(2) {
+    child_seccomp_policy_from(std::env::args_os().nth(2).as_deref())
+}
+
+fn child_seccomp_policy_from(arg: Option<&OsStr>) -> SeccompPolicy {
+    match arg {
         Some(arg) if arg == OsStr::new(CHILD_SECCOMP_AUTO_ARG) => SeccompPolicy::Auto,
         _ => SeccompPolicy::Required,
     }
 }
 
-fn install_child_sandbox(policy: SeccompPolicy) -> Result<SeccompState> {
+/// Confines the child as far as this host allows. A runtime that refuses seccomp yields
+/// `Unavailable` whatever the policy: the self-test reports it and the parent applies the
+/// policy (`evaluate_report`), so under `required` the verdict is definitive and cached
+/// rather than a start failure retried on every scene. The child itself still refuses a
+/// job under `required` without the filter (`child_main`).
+fn install_child_sandbox() -> Result<SeccompState> {
     let foreign = foreign_env_vars();
     if !foreign.is_empty() {
         bail!(
@@ -904,22 +968,18 @@ fn install_child_sandbox(policy: SeccompPolicy) -> Result<SeccompState> {
         );
     }
     #[cfg(target_os = "linux")]
-    return match linux::install_seccomp() {
-        Ok(()) => Ok(SeccompState::Installed),
-        Err(linux::SeccompError::Refused(reason)) => match policy {
-            SeccompPolicy::Auto => Ok(SeccompState::Unavailable(reason)),
-            SeccompPolicy::Required => bail!(
-                "{reason}; this runtime does not allow seccomp (set {SANDBOX_SECCOMP_ENV}=auto \
-                 to run scenes in a separate process without it)"
-            ),
-        },
-        Err(linux::SeccompError::Other(e)) => Err(e),
-    };
-    #[cfg(not(target_os = "linux"))]
     {
-        let _ = policy;
-        Ok(SeccompState::Unavailable("no seccomp on this OS".into()))
+        // No further processes or threads from here on, whether or not the filter goes
+        // on (which would deny clone anyway). Root is exempt from RLIMIT_NPROC.
+        linux::forbid_new_processes();
+        match linux::install_seccomp() {
+            Ok(()) => Ok(SeccompState::Installed),
+            Err(linux::SeccompError::Refused(reason)) => Ok(SeccompState::Unavailable(reason)),
+            Err(linux::SeccompError::Other(e)) => Err(e),
+        }
     }
+    #[cfg(not(target_os = "linux"))]
+    Ok(SeccompState::Unavailable("no seccomp on this OS".into()))
 }
 
 /// Variables the platform itself puts into every process, even one started with an empty
@@ -1163,16 +1223,43 @@ fn bounded(s: &str) -> String {
 mod linux {
     use libc::{c_long, c_ulong, sock_filter, sock_fprog};
 
-    pub(super) fn make_non_dumpable() {
+    pub(super) fn make_non_dumpable() -> std::io::Result<()> {
         // SAFETY: plain prctl on the current process.
-        unsafe {
+        let rc = unsafe {
             libc::prctl(
                 libc::PR_SET_DUMPABLE,
                 0 as c_ulong,
                 0 as c_ulong,
                 0 as c_ulong,
                 0 as c_ulong,
-            );
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// `SIGKILL` to the process group `pid` leads. Errors (no such group, already gone) are
+    /// irrelevant to the caller, which kills the child itself next.
+    pub(super) fn kill_group(pid: u32) {
+        // SAFETY: plain signal to a group id derived from a live or unreaped child.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+    }
+
+    /// `RLIMIT_NPROC = 0`: every later `fork`/`clone` by this user from this process fails
+    /// with `EAGAIN` (root excepted). Called in the child after its worker thread exists.
+    pub(super) fn forbid_new_processes() {
+        let none = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: setrlimit on the current process with a valid struct.
+        unsafe {
+            libc::setrlimit(libc::RLIMIT_NPROC, &none);
         }
     }
 
@@ -1200,6 +1287,8 @@ mod linux {
                 0 as c_ulong,
                 0 as c_ulong,
             );
+            // Its own process group, so a kill reaches anything it manages to fork.
+            libc::setpgid(0, 0);
             let core = libc::rlimit {
                 rlim_cur: 0,
                 rlim_max: 0,
@@ -1361,7 +1450,7 @@ mod linux {
         Other(anyhow::Error),
     }
 
-    fn classify(what: &str, err: std::io::Error) -> SeccompError {
+    pub(super) fn classify(what: &str, err: std::io::Error) -> SeccompError {
         match err.raw_os_error() {
             Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::ENOSYS) => {
                 SeccompError::Refused(format!("{what}: {err}"))
@@ -1571,27 +1660,27 @@ mod tests {
     fn report_evaluation_follows_the_policy() {
         let confined = "empty_env=ok\nseccomp=ok\nopen=ok\nsocket=ok";
         assert_eq!(
-            evaluate_report(confined, SeccompPolicy::Required, true),
+            evaluate_report(confined, SeccompPolicy::Required, None),
             Ok(vec![])
         );
         assert_eq!(
-            evaluate_report(confined, SeccompPolicy::Auto, true),
+            evaluate_report(confined, SeccompPolicy::Auto, None),
             Ok(vec![])
         );
 
         // A filter that is on but does not refuse is a failure under any policy.
         let leaky = "empty_env=ok\nseccomp=ok\nopen=FAIL(rc=3 errno=None)";
         for policy in [SeccompPolicy::Required, SeccompPolicy::Auto] {
-            let err = evaluate_report(leaky, policy, true).unwrap_err();
+            let err = evaluate_report(leaky, policy, None).unwrap_err();
             assert!(err.contains("open=FAIL"), "{err}");
         }
 
         let unavailable =
             "empty_env=ok\nseccomp=unavailable(PR_SET_NO_NEW_PRIVS: Operation not permitted)";
-        let auto = evaluate_report(unavailable, SeccompPolicy::Auto, true).unwrap();
+        let auto = evaluate_report(unavailable, SeccompPolicy::Auto, None).unwrap();
         assert_eq!(auto.len(), 1, "{auto:?}");
         assert!(auto[0].contains("PR_SET_NO_NEW_PRIVS"), "{auto:?}");
-        let required = evaluate_report(unavailable, SeccompPolicy::Required, true);
+        let required = evaluate_report(unavailable, SeccompPolicy::Required, None);
         if cfg!(target_os = "linux") {
             let err = required.unwrap_err();
             assert!(err.contains(SANDBOX_SECCOMP_ENV), "{err}");
@@ -1601,12 +1690,50 @@ mod tests {
 
         // An environment the parent did not clear fails whatever the policy.
         let env = "empty_env=FAIL(env present: HOME)\nseccomp=unavailable(x)";
-        assert!(evaluate_report(env, SeccompPolicy::Auto, true).is_err());
+        assert!(evaluate_report(env, SeccompPolicy::Auto, None).is_err());
 
-        // A dumpable parent: fatal under `required`, a warning under `auto`.
-        assert!(evaluate_report(confined, SeccompPolicy::Required, false).is_err());
-        let warned = evaluate_report(confined, SeccompPolicy::Auto, false).unwrap();
-        assert!(warned.iter().any(|w| w.contains("dumpable")), "{warned:?}");
+        // A dumpable parent is fatal under either policy, with the prctl error in the text.
+        for policy in [SeccompPolicy::Required, SeccompPolicy::Auto] {
+            let err =
+                evaluate_report(confined, policy, Some("PR_SET_DUMPABLE: EPERM")).unwrap_err();
+            assert!(err.contains("dumpable") && err.contains("EPERM"), "{err}");
+            let err = evaluate_report(unavailable, policy, Some("x")).unwrap_err();
+            assert!(err.contains("dumpable"), "{err}");
+        }
+    }
+
+    #[test]
+    fn child_policy_defaults_to_required() {
+        assert_eq!(child_seccomp_policy_from(None), SeccompPolicy::Required);
+        assert_eq!(
+            child_seccomp_policy_from(Some(OsStr::new("seccomp=off"))),
+            SeccompPolicy::Required
+        );
+        assert_eq!(
+            child_seccomp_policy_from(Some(OsStr::new(CHILD_SECCOMP_REQUIRED_ARG))),
+            SeccompPolicy::Required
+        );
+        assert_eq!(
+            child_seccomp_policy_from(Some(OsStr::new(CHILD_SECCOMP_AUTO_ARG))),
+            SeccompPolicy::Auto
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_refusal_is_tolerated() {
+        for errno in [libc::EPERM, libc::EACCES, libc::ENOSYS] {
+            match linux::classify("seccomp", std::io::Error::from_raw_os_error(errno)) {
+                linux::SeccompError::Refused(reason) => assert!(reason.starts_with("seccomp: ")),
+                linux::SeccompError::Other(e) => panic!("errno {errno} classified as other: {e}"),
+            }
+        }
+        for errno in [libc::EINVAL, libc::EFAULT, libc::ESRCH] {
+            assert!(matches!(
+                linux::classify("seccomp", std::io::Error::from_raw_os_error(errno)),
+                linux::SeccompError::Other(_)
+            ));
+        }
     }
 
     #[test]

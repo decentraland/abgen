@@ -162,11 +162,157 @@ impl tracing::Subscriber for Recorder {
     fn exit(&self, _: &tracing::span::Id) {}
 }
 
+/// Set by the two "runtime refuses seccomp" tests on the process they spawn: that process
+/// installs a filter that fails `prctl(PR_SET_NO_NEW_PRIVS)` with `EPERM`, which every
+/// sandbox child it then starts inherits, exactly as on AWS Lambda.
+#[cfg(target_os = "linux")]
+const SCENARIO_ENV: &str = "ABGEN_SANDBOX_TEST_SCENARIO";
+
+#[cfg(target_os = "linux")]
+fn deny_no_new_privs_in_this_process() {
+    // Classic BPF over `seccomp_data`: nr at 0, args at 16 (low word on little-endian).
+    const LD_W_ABS: u16 = 0x20;
+    const JEQ_K: u16 = 0x15;
+    const RET_K: u16 = 0x06;
+    const RET_ALLOW: u32 = 0x7fff_0000;
+    const RET_ERRNO: u32 = 0x0005_0000;
+    let stmt = |code: u16, k: u32| libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let jump = |code: u16, k: u32, jt: u8, jf: u8| libc::sock_filter { code, jt, jf, k };
+    let prog = [
+        stmt(LD_W_ABS, 0),
+        jump(JEQ_K, libc::SYS_prctl as u32, 0, 3),
+        stmt(LD_W_ABS, 16),
+        jump(JEQ_K, libc::PR_SET_NO_NEW_PRIVS as u32, 0, 1),
+        stmt(RET_K, RET_ERRNO | libc::EPERM as u32),
+        stmt(RET_K, RET_ALLOW),
+    ];
+    let fprog = libc::sock_fprog {
+        len: prog.len() as u16,
+        filter: prog.as_ptr() as *mut libc::sock_filter,
+    };
+    // SAFETY: prctl and seccomp with a valid, live program; this process is a throwaway.
+    unsafe {
+        assert_eq!(
+            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0),
+            0,
+            "no_new_privs: {}",
+            std::io::Error::last_os_error()
+        );
+        // SECCOMP_SET_MODE_FILTER = 1, SECCOMP_FILTER_FLAG_TSYNC = 1.
+        assert_eq!(
+            libc::syscall(libc::SYS_seccomp, 1, 1, &fprog as *const libc::sock_fprog),
+            0,
+            "seccomp: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Runs one scenario in this (throwaway) process; exits 0 when it behaved as expected.
+#[cfg(target_os = "linux")]
+fn run_scenario(scenario: &str) -> ! {
+    deny_no_new_privs_in_this_process();
+    let code = match scenario {
+        "no-seccomp-auto" => {
+            std::env::set_var(sandbox::SANDBOX_SECCOMP_ENV, "auto");
+            match sandbox::check() {
+                Ok(report)
+                    if report.contains("seccomp=unavailable(PR_SET_NO_NEW_PRIVS")
+                        && !report.contains("open=") =>
+                {
+                    println!("{report}");
+                    0
+                }
+                Ok(report) => {
+                    eprintln!("unexpected report:\n{report}");
+                    1
+                }
+                Err(e) => {
+                    eprintln!("check failed under auto: {e:#}");
+                    1
+                }
+            }
+        }
+        "no-seccomp-required" => match sandbox::check() {
+            Err(e) if format!("{e:#}").contains("ABGEN_SANDBOX_SECCOMP=auto") => {
+                println!("{e:#}");
+                0
+            }
+            Err(e) => {
+                eprintln!("wrong error under required: {e:#}");
+                1
+            }
+            Ok(report) => {
+                eprintln!("check passed without seccomp under required:\n{report}");
+                1
+            }
+        },
+        other => {
+            eprintln!("unknown scenario {other}");
+            2
+        }
+    };
+    std::process::exit(code);
+}
+
+#[cfg(target_os = "linux")]
+fn scenario(name: &str) -> String {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .env(SCENARIO_ENV, name)
+        .env_remove(sandbox::SANDBOX_SECCOMP_ENV)
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .expect("spawn scenario process");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "scenario {name} failed ({}):\n{stdout}",
+        out.status
+    );
+    stdout
+}
+
+/// Where the runtime refuses `PR_SET_NO_NEW_PRIVS` (Lambda), `auto` still runs a scene and
+/// reports the missing filter instead of probing for it.
+fn auto_runs_scenes_where_seccomp_is_refused() {
+    #[cfg(target_os = "linux")]
+    {
+        let report = scenario("no-seccomp-auto");
+        assert!(report.contains("empty_env=ok"), "{report}");
+    }
+}
+
+/// Same host, default policy: refused, with the hint, as a definitive verdict.
+fn required_refuses_scenes_where_seccomp_is_refused() {
+    #[cfg(target_os = "linux")]
+    {
+        let err = scenario("no-seccomp-required");
+        assert!(err.contains("seccomp is unavailable here"), "{err}");
+    }
+}
+
 fn main() {
     abgen::lodgen::scenerun::run_sandbox_child_if_requested();
+    #[cfg(target_os = "linux")]
+    if let Ok(name) = std::env::var(SCENARIO_ENV) {
+        run_scenario(&name);
+    }
 
-    let tests: [(&str, fn()); 7] = [
+    let tests: [(&str, fn()); 9] = [
         ("child_is_confined", child_is_confined),
+        (
+            "auto_runs_scenes_where_seccomp_is_refused",
+            auto_runs_scenes_where_seccomp_is_refused,
+        ),
+        (
+            "required_refuses_scenes_where_seccomp_is_refused",
+            required_refuses_scenes_where_seccomp_is_refused,
+        ),
         (
             "captures_renderer_stream_and_serves_listed_files",
             captures_renderer_stream_and_serves_listed_files,
