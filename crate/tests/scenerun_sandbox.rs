@@ -64,6 +64,7 @@ fn child_is_confined() {
         "ptrace",
         "clone",
         "execve",
+        "tgkill_other",
     ] {
         assert!(
             report.contains(&format!("{probe}=ok")),

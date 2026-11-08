@@ -315,10 +315,17 @@ fn run_in_child(request: Request) -> Result<Response> {
             killed_on_error = guard.kill().is_ok();
         }
     }
-    // The watchdog stays armed until the child is gone.
-    let status = lock(&child)
-        .wait()
-        .context("wait for scene sandbox child")?;
+    // The watchdog stays armed until the child is gone, and it kills through the same
+    // mutex, so this must not sit in `wait()` holding the lock: poll instead.
+    let status = loop {
+        let polled = lock(&child)
+            .try_wait()
+            .context("wait for scene sandbox child")?;
+        if let Some(status) = polled {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     let timed_out = watchdog.stop();
 
     match result {
@@ -766,16 +773,18 @@ fn install_child_sandbox() -> Result<()> {
 
 /// Each probe must be refused by the sandbox; reported as `name=ok` or `name=FAIL(..)`.
 fn probe_confinement() -> String {
-    let mut lines = vec![format!(
+    let empty_env = format!(
         "empty_env={}",
         if std::env::vars_os().next().is_none() {
             "ok"
         } else {
             "FAIL(env present)"
         }
-    )];
+    );
     #[cfg(target_os = "linux")]
-    lines.extend(linux::probes());
+    let lines: Vec<String> = std::iter::once(empty_env).chain(linux::probes()).collect();
+    #[cfg(not(target_os = "linux"))]
+    let lines = vec![empty_env];
     lines.join("\n")
 }
 
@@ -1059,6 +1068,8 @@ mod linux {
     const FLAG_TSYNC: c_ulong = 1;
     const OFF_NR: u32 = 0;
     const OFF_ARCH: u32 = 4;
+    /// Low 32 bits of args[0].
+    const OFF_ARG0: u32 = 16;
     /// Low 32 bits of args[2] (both supported targets are little-endian).
     const OFF_ARG2: u32 = 16 + 2 * 8;
     #[cfg(target_arch = "x86_64")]
@@ -1068,8 +1079,9 @@ mod linux {
 
     /// What a scene child needs once its thread exists and its pipes are open. The
     /// signal calls let a native fault die: Rust's SIGSEGV handler resets to `SIG_DFL`
-    /// (`rt_sigaction`) and `abort()` raises SIGABRT (`getpid` + `tgkill`); refusing
-    /// them would leave a crashed child spinning until the watchdog.
+    /// (`rt_sigaction`) and `abort()` raises SIGABRT (`getpid` + `tgkill`, the latter
+    /// allowed only towards the child's own thread group in [`program`]); refusing them
+    /// would leave a crashed child spinning until the watchdog.
     fn allowed() -> Vec<c_long> {
         let mut v = vec![
             libc::SYS_read,
@@ -1095,7 +1107,6 @@ mod linux {
             libc::SYS_sigaltstack,
             libc::SYS_gettid,
             libc::SYS_getpid,
-            libc::SYS_tgkill,
             libc::SYS_exit,
             libc::SYS_exit_group,
         ];
@@ -1117,7 +1128,7 @@ mod linux {
         sock_filter { code, jt, jf, k }
     }
 
-    fn program() -> Vec<sock_filter> {
+    fn program(own_pid: u32) -> Vec<sock_filter> {
         let deny = RET_ERRNO | libc::EPERM as u32;
         let mut p = vec![
             stmt(LD_W_ABS, OFF_ARCH),
@@ -1145,13 +1156,27 @@ mod linux {
             p.push(stmt(RET_K, RET_ALLOW));
             p.push(stmt(RET_K, deny));
         }
+        // tgkill only towards this process (args[0] is the tgid): enough for abort() and
+        // raise(), never a signal to the parent or anything else running as this user.
+        p.push(jump(JEQ_K, libc::SYS_tgkill as u32, 0, 4));
+        p.push(stmt(LD_W_ABS, OFF_ARG0));
+        p.push(jump(JEQ_K, own_pid, 0, 1));
+        p.push(stmt(RET_K, RET_ALLOW));
+        p.push(stmt(RET_K, deny));
         p.push(stmt(RET_K, deny));
         p
     }
 
+    /// The parent's pid, taken before the filter goes on (`getppid` is not allowed after)
+    /// so the self-test can prove a signal to it is refused.
+    static PARENT_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
     /// Installs the filter on every thread of the child (TSYNC), after no_new_privs.
     pub(super) fn install_seccomp() -> Result<()> {
-        let filter = program();
+        // SAFETY: plain pid lookups on the current process.
+        let (own_pid, parent_pid) = unsafe { (libc::getpid(), libc::getppid()) };
+        PARENT_PID.store(parent_pid, std::sync::atomic::Ordering::Relaxed);
+        let filter = program(own_pid as u32);
         let prog = sock_fprog {
             len: filter.len() as u16,
             filter: filter.as_ptr() as *mut sock_filter,
@@ -1200,13 +1225,20 @@ mod linux {
 
     /// Syscalls outside the child's allowlist, each expected to fail with EPERM.
     pub(super) fn probes() -> Vec<String> {
+        let parent_pid = PARENT_PID.load(std::sync::atomic::Ordering::Relaxed) as c_ulong;
         // SAFETY: each probe either fails (expected) or its result is released by the
-        // matching cleanup; arguments are valid for the calls made.
+        // matching cleanup; arguments are valid for the calls made. The tgkill probe sends
+        // signal 0 (existence check only), so even unfiltered it would not harm the parent.
         unsafe {
             let close = |fd: c_long| {
                 libc::close(fd as libc::c_int);
             };
             vec![
+                refused(
+                    "tgkill_other",
+                    || libc::syscall(libc::SYS_tgkill, parent_pid, parent_pid, 0 as c_ulong),
+                    |_| {},
+                ),
                 refused(
                     "open",
                     || libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) as c_long,
