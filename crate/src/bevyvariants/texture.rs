@@ -5,9 +5,41 @@
 use anyhow::{Context, Result};
 use image::RgbaImage;
 
+use super::stats::{timed, NoVariant, SourceKind, StageTimes};
 use super::BEVY_TEXTURE_MAX;
 use crate::bc7_pure::Bc7Profile;
-use crate::ktx2_write::{split_chain, write_ktx2, BcFormat};
+use crate::ktx2_write::{split_chain, write_ktx2, BcFormat, DEFAULT_ZSTD_LEVEL};
+
+/// Encoder settings that change variant bytes (and so CIDs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TexOptions {
+    /// Zstandard level of every KTX2 level (`crate::ktx2_write::check_zstd_level`).
+    pub zstd_level: i32,
+}
+
+impl Default for TexOptions {
+    fn default() -> Self {
+        TexOptions {
+            zstd_level: DEFAULT_ZSTD_LEVEL,
+        }
+    }
+}
+
+/// No variant, and why. `gated_size` is the BC7 transcode's size when the size gate dropped it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Miss {
+    pub reason: NoVariant,
+    pub gated_size: Option<u64>,
+}
+
+impl From<NoVariant> for Miss {
+    fn from(reason: NoVariant) -> Self {
+        Miss {
+            reason,
+            gated_size: None,
+        }
+    }
+}
 
 /// How the entity's models sample an image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +148,16 @@ enum Source {
     Ktx2,
 }
 
+/// The source type by bytes, for stats.
+pub fn source_kind(bytes: &[u8]) -> SourceKind {
+    match sniff(bytes) {
+        Some(Source::Png) => SourceKind::Png,
+        Some(Source::Jpeg) => SourceKind::Jpeg,
+        Some(Source::Ktx2) => SourceKind::Ktx2,
+        None => SourceKind::Other,
+    }
+}
+
 fn sniff(bytes: &[u8]) -> Option<Source> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some(Source::Png)
@@ -144,20 +186,39 @@ pub fn target_size(w: u32, h: u32) -> (u32, u32) {
 /// JPEG or UASTC KTX2 (sniffed by bytes, never by name), tiny, or a KTX2 the pure transcode
 /// does not take or does not make smaller. `Err` is a PNG/JPEG that does not decode.
 pub fn encode_texture(bytes: &[u8], slot: Slot) -> Result<Option<TextureVariant>> {
+    encode_texture_with(bytes, slot, TexOptions::default(), &mut StageTimes::default())
+        .map(Result::ok)
+}
+
+/// [`encode_texture`] with explicit settings, adding each stage's time to `times` and saying
+/// why there is no variant.
+pub fn encode_texture_with(
+    bytes: &[u8],
+    slot: Slot,
+    opts: TexOptions,
+    times: &mut StageTimes,
+) -> Result<std::result::Result<TextureVariant, Miss>> {
     let Some(source) = sniff(bytes) else {
-        return Ok(None);
+        return Ok(Err(NoVariant::NotAnImage.into()));
     };
     if source == Source::Ktx2 {
-        return Ok(transcode_uastc_bc7(bytes).filter(|v| v.bytes.len() <= bytes.len()));
+        return Ok(match transcode_uastc_bc7_with(bytes, opts, times) {
+            Ok(v) if v.bytes.len() <= bytes.len() => Ok(v),
+            Ok(v) => Err(Miss {
+                reason: NoVariant::Ktx2SizeGate,
+                gated_size: Some(v.bytes.len() as u64),
+            }),
+            Err(r) => Err(r.into()),
+        });
     }
     debug_assert!(matches!(source, Source::Png | Source::Jpeg));
-    let img = image::load_from_memory(bytes)
-        .context("decode image")?
-        .to_rgba8();
+    let img = timed(&mut times.decode_ns, || image::load_from_memory(bytes))
+        .context("decode image")?;
+    let img = timed(&mut times.decode_ns, || img.to_rgba8());
     if is_tiny(img.width(), img.height()) {
-        return Ok(None);
+        return Ok(Err(NoVariant::Tiny.into()));
     }
-    encode_rgba(img, slot).map(Some)
+    encode_rgba(img, slot, opts, times).map(Ok)
 }
 
 /// The creator-KTX2 rule: a pure block-for-block UASTC -> BC7 transcode of exactly the one level
@@ -172,31 +233,49 @@ pub fn encode_texture(bytes: &[u8], slot: Slot) -> Result<Option<TextureVariant>
 /// would decode and re-encode it), or it fails to transcode. The size gate against the
 /// original is applied by the caller.
 pub fn transcode_uastc_bc7(raw: &[u8]) -> Option<TextureVariant> {
+    transcode_uastc_bc7_with(raw, TexOptions::default(), &mut StageTimes::default()).ok()
+}
+
+/// [`transcode_uastc_bc7`] with explicit settings, stage times and the reason for no variant.
+pub fn transcode_uastc_bc7_with(
+    raw: &[u8],
+    opts: TexOptions,
+    times: &mut StageTimes,
+) -> std::result::Result<TextureVariant, NoVariant> {
     use basisu::{DecodeFlags, TargetFormat, Transcoder};
     if !crate::ktx2::ktx2_header_ok(raw) {
-        return None;
+        return Err(NoVariant::Ktx2HeaderGate);
     }
-    let t = Transcoder::new(raw).ok()?;
+    let t = timed(&mut times.transcode_ns, || Transcoder::new(raw))
+        .map_err(|_| NoVariant::Ktx2TranscodeFailed)?;
     if !t.supports(TargetFormat::Bc7Rgba) {
-        return None;
+        return Err(NoVariant::Ktx2TranscodeFailed);
     }
-    let level = (0..t.level_count()).find(|&l| {
-        t.image_level_info(l)
-            .is_ok_and(|i| i.width.max(i.height) <= BEVY_TEXTURE_MAX)
-    })?;
-    let info = t.image_level_info(level).ok()?;
+    let level = (0..t.level_count())
+        .find(|&l| {
+            t.image_level_info(l)
+                .is_ok_and(|i| i.width.max(i.height) <= BEVY_TEXTURE_MAX)
+        })
+        .ok_or(NoVariant::Ktx2NoLevelInRange)?;
+    let info = t
+        .image_level_info(level)
+        .map_err(|_| NoVariant::Ktx2TranscodeFailed)?;
     let (w, h) = (info.width, info.height);
     if !w.is_multiple_of(4) || !h.is_multiple_of(4) || is_tiny(w, h) {
-        return None;
+        return Err(NoVariant::Ktx2NotWholeBlocks);
     }
-    let blocks = t
-        .transcode(level, TargetFormat::Bc7Rgba, DecodeFlags::NONE)
-        .ok()?;
+    let blocks = timed(&mut times.transcode_ns, || {
+        t.transcode(level, TargetFormat::Bc7Rgba, DecodeFlags::NONE)
+    })
+    .map_err(|_| NoVariant::Ktx2TranscodeFailed)?;
     if blocks.len() != crate::ktx2_write::level_bytes(BcFormat::Bc7, w, h) {
-        return None;
+        return Err(NoVariant::Ktx2TranscodeFailed);
     }
-    let bytes = write_ktx2(BcFormat::Bc7, w, h, &[blocks.as_slice()]).ok()?;
-    Some(TextureVariant {
+    let bytes = timed(&mut times.zstd_ns, || {
+        write_ktx2(BcFormat::Bc7, w, h, &[blocks.as_slice()], opts.zstd_level)
+    })
+    .map_err(|_| NoVariant::EncodeError)?;
+    Ok(TextureVariant {
         bytes,
         format: TexFormat::Bc7,
         width: w,
@@ -206,24 +285,37 @@ pub fn transcode_uastc_bc7(raw: &[u8]) -> Option<TextureVariant> {
     })
 }
 
-fn encode_rgba(img: RgbaImage, slot: Slot) -> Result<TextureVariant> {
+fn encode_rgba(
+    img: RgbaImage,
+    slot: Slot,
+    opts: TexOptions,
+    times: &mut StageTimes,
+) -> Result<TextureVariant> {
     let (w, h) = img.dimensions();
     let (tw, th) = target_size(w, h);
     let srgb = slot == Slot::Srgb;
     let mut buf = if (tw, th) != (w, h) {
-        crate::resize::box_downscale_rgba(
-            img.as_raw(),
-            w as usize,
-            h as usize,
-            tw as usize,
-            th as usize,
-            srgb,
-        )
+        timed(&mut times.resize_ns, || {
+            crate::resize::box_downscale_rgba(
+                img.as_raw(),
+                w as usize,
+                h as usize,
+                tw as usize,
+                th as usize,
+                srgb,
+            )
+        })
     } else {
         img.into_raw()
     };
     let opaque = buf.iter().skip(3).step_by(4).all(|&a| a == 255);
     let format = choose_format(slot, opaque);
+    let slot_ns = match format {
+        TexFormat::Bc1 => &mut times.bc1_ns,
+        TexFormat::Bc5 => &mut times.bc5_ns,
+        TexFormat::Bc7 => &mut times.bc7_ns,
+    };
+    let encode_started = std::time::Instant::now();
     let (data, mips) = match format {
         // Opaque blocks only: the encoder always orders endpoints c0 > c1 (four-colour mode),
         // so no texel decodes as BC1's transparent black.
@@ -252,8 +344,11 @@ fn encode_rgba(img: RgbaImage, slot: Slot) -> Result<TextureVariant> {
             )
         }
     };
+    *slot_ns += super::stats::elapsed_ns(encode_started);
     let levels = split_chain(format.bc(), tw, th, mips as u32, &data)?;
-    let bytes = write_ktx2(format.bc(), tw, th, &levels)?;
+    let bytes = timed(&mut times.zstd_ns, || {
+        write_ktx2(format.bc(), tw, th, &levels, opts.zstd_level)
+    })?;
     Ok(TextureVariant {
         bytes,
         format,

@@ -299,7 +299,14 @@ fn uastc_that_needs_more_than_a_transcode_gets_no_variant() {
     assert!(transcode_uastc_bc7(UASTC_6).is_none());
     assert!(encode_texture(UASTC_6, Slot::Srgb).unwrap().is_none());
     // Not a UASTC KTX2 the gate takes (here: a BC7 KTX2 of our own).
-    let ours = crate::ktx2_write::write_ktx2(BcFormat::Bc7, 4, 4, &[&[0u8; 16][..]]).unwrap();
+    let ours = crate::ktx2_write::write_ktx2(
+        BcFormat::Bc7,
+        4,
+        4,
+        &[&[0u8; 16][..]],
+        crate::ktx2_write::DEFAULT_ZSTD_LEVEL,
+    )
+    .unwrap();
     assert!(transcode_uastc_bc7(&ours).is_none());
 }
 
@@ -530,7 +537,13 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
         (out, built)
     };
     // Default: texture variants only (GLB variants are opt-in).
-    assert_eq!(BuildOptions::default(), BuildOptions { glb_variants: false });
+    assert_eq!(
+        BuildOptions::default(),
+        BuildOptions {
+            glb_variants: false,
+            zstd_level: crate::ktx2_write::DEFAULT_ZSTD_LEVEL,
+        }
+    );
     let (out, built) = run("a", BuildOptions::default());
     let m = &built.manifest;
     assert_eq!(m.v, 1);
@@ -573,13 +586,61 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     let raw: J = serde_json::from_slice(&on_disk).unwrap();
     assert_eq!(raw["files"]["bafkcolor"][0]["width"], 16);
 
+    // Stats: one row per standalone image, with the reason for each miss.
+    let st = &built.stats;
+    let reason = |hash: &str| {
+        st.files
+            .iter()
+            .find(|f| f.hash == hash)
+            .and_then(|f| f.reason)
+    };
+    assert_eq!(st.zstd_level, crate::ktx2_write::DEFAULT_ZSTD_LEVEL);
+    assert_eq!(st.textures, 5); // color, normal, tiny, creator.ktx2, missing
+    assert_eq!(reason("bafktiny"), Some(super::stats::NoVariant::Tiny));
+    assert_eq!(reason("bafkmissing"), Some(super::stats::NoVariant::Missing));
+    assert_eq!(
+        reason("bafkktx"),
+        ktx_variant
+            .is_none()
+            .then_some(super::stats::NoVariant::Ktx2SizeGate)
+    );
+    assert_eq!(st.variants["ktx2-bc1 from png"].count, 1);
+    assert_eq!(st.variants["ktx2-bc5 from png"].count, 1);
+    assert_eq!(st.unique_variants as usize, built.variants.len());
+    assert!(st.stages.bc1_ns > 0 && st.stages.bc5_ns > 0 && st.stages.zstd_ns > 0);
+    assert!(st.summary_json().get("files").is_none());
+
     // Same inputs, same bytes.
     let (out2, built2) = run("b", BuildOptions::default());
     assert_eq!(built2.manifest_bytes, built.manifest_bytes);
 
+    // Another zstd level: same pixels, different variant bytes (so different CIDs), same
+    // manifest shape.
+    let (out4, built4) = run(
+        "z3",
+        BuildOptions {
+            zstd_level: 3,
+            ..BuildOptions::default()
+        },
+    );
+    let m4 = &built4.manifest;
+    assert_eq!(m4.files.keys().collect::<Vec<_>>(), m.files.keys().collect::<Vec<_>>());
+    for (k, e) in &m4.files {
+        let a = std::fs::read(content_path(&out4, &e[0].cid).unwrap()).unwrap();
+        let b = std::fs::read(content_path(&out, &m.files[k][0].cid).unwrap()).unwrap();
+        assert_eq!(read_levels(&a).unwrap(), read_levels(&b).unwrap(), "{k}: same blocks");
+    }
+    let _ = std::fs::remove_dir_all(&out4);
+
     // Opt-in: the GLB with embedded images gets a model variant (no size fields); the GLB whose
     // only image is external still gets none; the texture entries are unchanged.
-    let (out3, built3) = run("g", BuildOptions { glb_variants: true });
+    let (out3, built3) = run(
+        "g",
+        BuildOptions {
+            glb_variants: true,
+            ..BuildOptions::default()
+        },
+    );
     let m3 = &built3.manifest;
     let model = &m3.files["bafkembed"][0];
     assert_eq!((model.kind.as_str(), model.format.as_str()), ("model", "glb"));

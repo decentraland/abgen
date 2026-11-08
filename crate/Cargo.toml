@@ -114,14 +114,17 @@ libjpeg9c = { path = "third_party/libjpeg9c" }
 # KTX2 (KHR_texture_basisu) UASTC transcoder: pure Rust, vendored and pinned (PROVENANCE.md),
 # so native and wasm builds take the same path. Pulls ruzstd 0.9.1 for Zstandard levels.
 basisu = { path = "third_party/basisu", version = "=0.1.0" }
-# KTX2 writer (Zstandard level supercompression). The same ruzstd build basisu already pulls:
-# default features stay off, so its `hash` feature (a content checksum in every frame) stays off
-# and the written bytes do not change with feature unification.
-ruzstd = { version = "=0.9.1", default-features = false }
 tracing = "0.1"
 ttf-parser = { version = "0.25.1", default-features = false, features = ["std", "opentype-layout"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# KTX2 writer (`ktx2_write`, Bevy variants lane): libzstd, bundled and built by zstd-sys. Variant
+# bytes are CIDs, so both are pinned exactly: `zstd-sys =2.0.16` bundles libzstd 1.5.7, and a
+# different libzstd release may compress the same input to different bytes at the same level.
+# No `zstdmt` (single-threaded frames), no dictionary; checksum and dict id are set off
+# explicitly in the writer.
+zstd = { version = "=0.13.3", default-features = false }
+zstd-sys = { version = "=2.0.16", default-features = false }
 chrono = { version = "0.4", optional = true }
 hmac = "0.13"
 libc = "0.2"

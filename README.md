@@ -294,8 +294,12 @@ with `server`).
 - With the S3 space configured, both read through from and write back to the same keys
   (`bevy/manifest/…`, `bevy/contents/…`). `ABGEN_BEVY_VARIANTS=0` turns the JIT side off.
 
-Variants (all textures are KTX2 with UNORM BC blocks, each level Zstandard-supercompressed at a
-fixed level, `KTXorientation` `rd`; writer in `crate/src/ktx2_write.rs`):
+Variants (all textures are KTX2 with UNORM BC blocks, each level Zstandard-supercompressed,
+`KTXorientation` `rd`; writer in `crate/src/ktx2_write.rs`). Zstandard is libzstd 1.5.7, bundled by
+the exactly pinned `zstd-sys` (`=2.0.16`): one single-threaded frame per level, no dictionary, no
+checksum. The level is 19 unless set (`ABGEN_BEVY_ZSTD_LEVEL` on the server, `--bevy-zstd-level`
+on `abgen-corpus`, 1..=19). Variant bytes, and so CIDs, depend on the level and the libzstd
+release, never on the machine or thread count; changing either means new CIDs and new manifests.
 - PNG/JPEG textures (sniffed by bytes): full mip chain, longest side capped at 1024 and snapped
   to powers of two (whole 4x4 blocks). `ktx2-bc5` for images the entity's models use only as
   normal maps (x in R, y in G - Bevy's two-channel normal path), `ktx2-bc1` for fully opaque
@@ -325,6 +329,10 @@ abgen-corpus --world <name> --worlds-url https://worlds-content-server.decentral
 abgen-corpus --entity-ids ids.txt --fetch-missing --bevy-variants ./out   # add --bevy-glb-variants for GLBs
 ABGEN_OUT_ROOT=./out ./target/release/abgen   # serves /bevy/manifest/... and /bevy/contents/...
 ```
+`abgen-corpus --bevy-variants` prints one `BEVY_STATS {json}` line per entity (stage times summed
+over files - fetch, decode, resize, BC1/BC5/BC7 encode with mips, UASTC->BC7 transcode, zstd,
+hash+write - counts and bytes by format and source, no-variant reasons such as the UASTC size gate)
+and writes the full stats, per-file rows included, to `./out/bevy-variants-stats.json`.
 ### LOD JIT lane
 `ABGEN_LOD_JIT=1` enables JIT LOD builds on `GET /LOD/1/...` misses (level 1 only, the production
 shape: level 0 is the client-side ISS assembly, so `LOD/0/...` answers `lod-level-unsupported` and
