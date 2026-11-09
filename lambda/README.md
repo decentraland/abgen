@@ -71,7 +71,7 @@ all hits.
 | `ABGEN_SCENERUN_FUNCTION` | unset | name of a function running this image with `ABGEN_LAMBDA_MODE=scenerun`. Set: the LOD lane runs every scene there with a synchronous `Invoke` instead of in a local child process, and the local sandbox self-test is not used (see [Running scenes in a separate function](#running-scenes-in-a-separate-function)). Needs `lambda:InvokeFunction` on it |
 | `ABGEN_SCENERUN_TIMEOUT_S` | `300` | how long the LOD lane waits for one scene in `ABGEN_SCENERUN_FUNCTION`, cold start and retries included, capped by the invocation's own deadline less 30 s. The scene function's timeout must not be longer |
 | `ABGEN_SANDBOX_PARENT_MEMORY` | `refuse` | scene runner only. `accept`: run scenes even where the sandbox child can access the runner's memory, as on AWS Lambda (see [Running scenes in a separate function](#running-scenes-in-a-separate-function)) |
-| `ABGEN_LAMBDA_MODE` | `convert` | `scenerun`: the function only runs scenes for another function's LOD lane, one per process, and needs `ALLOWED_CONTENT_SERVER_HOSTS` (see [Running scenes in a separate function](#running-scenes-in-a-separate-function)) |
+| `ABGEN_LAMBDA_MODE` | `convert` | `scenerun`: the function only runs scenes for another function's LOD lane, each in a fresh sandbox child, and needs `ALLOWED_CONTENT_SERVER_HOSTS` (see [Running scenes in a separate function](#running-scenes-in-a-separate-function)) |
 | `ABGEN_EMF_NAMESPACE` | — (off) | CloudWatch namespace for EMF metrics (e.g. `abgen/lambda`); unset means no recorder is installed and every `metrics::` call stays a no-op |
 | `ABGEN_LOG_FORMAT` | plain text | `json` for JSON log lines |
 | `ABGEN_MAX_RECEIVE_COUNT` | `3` | must match the SQS redrive `maxReceiveCount`: a conversion failing on this receive publishes an `exitCode: 5` tombstone manifest per unconverted platform (+ a `statusCode: 5` finished event) and acks, instead of erroring into the DLQ. A tombstone never blocks reconversion — the already-converted check requires `exitCode: 0` — and if the tombstone itself cannot be published the original error propagates, so the message still reaches the DLQ. |
@@ -607,7 +607,8 @@ second function built from the same image with `ABGEN_LAMBDA_MODE=scenerun`:
   forged answer can only reach the entity whose own scene escaped. An isolated function
   refuses an invoke without a tenant id, and the converter always sends one. The
   converter's credentials, bucket, queue and VPC stay out of reach either way. The runner
-  answers with the folded state and exits; exiting is hygiene, not the isolation boundary.
+  answers with the folded state and waits for the next invocation; each scene runs in its
+  own sandbox child, and the execution environment is never shared across entities.
 
 Create the scene runner with tenant isolation (it can only be set at creation), and give it
 its own role with no permissions beyond writing its own logs, no VPC access and none of the

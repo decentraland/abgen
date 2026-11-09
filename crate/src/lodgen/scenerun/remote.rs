@@ -24,7 +24,7 @@
 //!   scene. Where the runtime also lets the child reach the runner's memory (AWS Lambda),
 //!   scenes run only with `ABGEN_SANDBOX_PARENT_MEMORY=accept`: an escaped scene can then take
 //!   over the runner's execution environment, and tenant isolation per entity is what keeps
-//!   it from answering for any other entity. Exiting after each answer is hygiene on top.
+//!   it from answering for any other entity.
 //!
 //! Lambda caps a synchronous response at 6 MB. The function sends the folded state rather
 //! than every frame, and fails with a clear error when even that does not fit.
