@@ -15,9 +15,10 @@
 //! - **worker** (`ABGEN_LAMBDA_MODE=worker`) converts one entity per request into a
 //!   **scratch** bucket, under a prefix the publisher chose for this job, and answers
 //!   with the objects it wrote. Its view of the CDN is read-only (the per-file reuse
-//!   probes); it needs no write access to the CDN, no Redis and no SNS. One request per
-//!   process: the function exits after each answer, so nothing carries over between
-//!   entities but the container's disk caches.
+//!   probes); it needs no write access to the CDN, no Redis and no SNS. The publisher
+//!   invokes it with the entity id as the Lambda tenant, and the function is created with
+//!   tenant isolation, so an execution environment that converted one entity never
+//!   converts another: nothing carries over between entities, disk caches included.
 //!
 //! The publisher checks the answer before it copies anything ([`KeyPolicy`]): a key is
 //! copied only when it is one this entity's conversion may produce — a bundle named after
@@ -596,6 +597,9 @@ impl KeyPolicy {
             Some((hash, digest)) => (hash, Some(digest)),
             None => (stem, None),
         };
+        // Content hashes are CIDs, alphanumeric. The `b64-` content-versioned ids of a local
+        // preview build (`naming::is_content_versioned_id`) are not: they never appear in
+        // an entity a content server deploys, so they never reach the publisher.
         if hash.is_empty() || !hash.bytes().all(|b| b.is_ascii_alphanumeric()) {
             return None;
         }
@@ -688,7 +692,10 @@ impl Publisher {
                     payload
                 },
                 budget,
-                None,
+                // One tenant per entity: the worker function is created with tenant
+                // isolation, so an execution environment that converted this entity never
+                // converts another one, disk caches included.
+                Some(entity_id),
             )
             .with_context(|| format!("convert {entity_id} in {}", self.invoker.function()))?;
         let staging = staging.ok_or_else(|| anyhow!("no attempt was made"))?;
@@ -1757,9 +1764,11 @@ pub(crate) mod tests {
                 .unwrap_err();
             assert!(format!("{err:#}").contains("not a key"), "{err:#}");
         }
+        // The entity is the invoke's tenant: on a worker created with tenant isolation, the
+        // execution environment that converts it never converts another entity.
         assert_eq!(
             seen.lock().unwrap().clone(),
-            vec![format!("POST {invoke_path}")]
+            vec![format!("POST {invoke_path}"), format!("TENANT {ENTITY}")]
         );
 
         let (host, _) = serve(vec![(

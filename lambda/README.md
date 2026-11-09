@@ -72,7 +72,7 @@ all hits.
 | `ABGEN_SCENERUN_FUNCTION` | unset | name of a function running this image with `ABGEN_LAMBDA_MODE=scenerun`. Set: the LOD lane runs every scene there with a synchronous `Invoke` instead of in a local child process, and the local sandbox self-test is not used (see [Running scenes in a separate function](#running-scenes-in-a-separate-function)). Needs `lambda:InvokeFunction` on it |
 | `ABGEN_SCENERUN_TIMEOUT_S` | `300` | how long the LOD lane waits for one scene in `ABGEN_SCENERUN_FUNCTION`, cold start and retries included, capped by the invocation's own deadline less 30 s. The scene function's timeout must not be longer |
 | `ABGEN_SANDBOX_PARENT_MEMORY` | `refuse` | scene runner only. `accept`: run scenes even where the sandbox child can access the runner's memory, as on AWS Lambda (see [Running scenes in a separate function](#running-scenes-in-a-separate-function)) |
-| `ABGEN_LAMBDA_MODE` | `convert` | `publisher` / `worker`: the two halves of the [publisher/worker split](#publisher-and-worker-functions). `scenerun`: the function only runs scenes for another function's LOD lane, one per process, and needs `ALLOWED_CONTENT_SERVER_HOSTS` (see [Running scenes in a separate function](#running-scenes-in-a-separate-function)) |
+| `ABGEN_LAMBDA_MODE` | `convert` | `publisher` / `worker`: the two halves of the [publisher/worker split](#publisher-and-worker-functions). `scenerun`: the function only runs scenes for another function's LOD lane, each in a fresh sandbox child, and needs `ALLOWED_CONTENT_SERVER_HOSTS` (see [Running scenes in a separate function](#running-scenes-in-a-separate-function)) |
 | `ABGEN_WORKER_FUNCTION` | — | publisher mode: name of the function running this image with `ABGEN_LAMBDA_MODE=worker`. Needs `lambda:InvokeFunction` on it |
 | `ABGEN_WORKER_TIMEOUT_S` | `810` | publisher mode: how long one conversion may take in the worker, cold start and retries included, capped by the invocation's own deadline less 90 s. The worker function's timeout must not be longer |
 | `ABGEN_WORKER_ENDPOINT` | `lambda.{region}.amazonaws.com` | Lambda endpoint override (tests, local stacks; plain http only for loopback) |
@@ -612,7 +612,8 @@ second function built from the same image with `ABGEN_LAMBDA_MODE=scenerun`:
   forged answer can only reach the entity whose own scene escaped. An isolated function
   refuses an invoke without a tenant id, and the converter always sends one. The
   converter's credentials, bucket, queue and VPC stay out of reach either way. The runner
-  answers with the folded state and exits; exiting is hygiene, not the isolation boundary.
+  answers with the folded state and waits for the next invocation; each scene runs in its
+  own sandbox child, and the execution environment is never shared across entities.
 
 Create the scene runner with tenant isolation (it can only be set at creation), and give it
 its own role with no permissions beyond writing its own logs, no VPC access and none of the
@@ -665,8 +666,14 @@ nothing:
   the request, so a failed attempt never leaves files a later attempt would take as
   already uploaded. It answers with the per-platform exit codes and bundle counts and
   the list of objects it wrote (`{"key", "size"}`, the CDN key each would have), fails
-  the request when a platform's manifest is not among them, and exits after each answer,
-  so one request never shares a process with the next.
+  the request when a platform's manifest is not among them. The publisher invokes it with
+  the entity id as the Lambda tenant (`X-Amz-Tenant-Id`), and the function is **created
+  with tenant isolation** (`TenancyConfig: TenantIsolationMode=PER_TENANT`): Lambda never
+  reuses an execution environment across tenants, so a worker taken over through a
+  decoder bug in one entity's assets can stage nothing for any other entity, and its disk
+  caches never reach another entity's build. An isolated function refuses an invoke
+  without a tenant id, and the publisher always sends one, so the two cannot drift apart
+  unnoticed.
 
 The publisher checks the answer before it copies anything, against the entity document it
 fetched itself: a key is copied only when it is one this entity's conversion may produce —
@@ -678,9 +685,13 @@ selects (`{lane}/assets/` for scenes, `{lane}/{entityId}/` for everything else),
 anything else, on an unrequested platform, a non-standing exit code (anything but `0` and
 `12`), a missing manifest, more than 10 000 objects, an object over the 5 GB a single copy
 allows or more than 16 GB in all. Digest-named shared bundles are copied conditionally
-(`If-None-Match: *`): one already on the CDN is left as it is, which is what `convert`
-mode does too, where the build reuses those off the CDN and never rewrites them; every
-other object is copied over whatever is there, as a rebuild would. Copies stop, and the
+(`If-None-Match: *`, which S3 honours on `CopyObject` since October 2025: a destination
+that exists answers `412`, a concurrent conflicting write `409`, which the copy's retries
+absorb): one already on the CDN is left as it is, which is what `convert` mode does too,
+where the build reuses those off the CDN and never rewrites them; every other object is
+copied over whatever is there, as a rebuild would. A shared bundle is thus trusted from
+its first writer: whichever entity's conversion stages a digest-named shared bundle first
+fixes it for every later entity whose content hash it carries. Copies stop, and the
 job fails whole so it is retried, when the invocation has under 20 s left.
 
 Failure semantics are `convert` mode's: a worker that errors, times out or answers badly
@@ -688,10 +699,14 @@ fails the job, SQS redelivers it, and the final receive tombstones. A publisher 
 that does not have 30 s to spare for the worker fails the job without calling it. Every
 attempt names a fresh nonce, the invoke client's own retries of throttling and 5xx answers
 included, so a retry never shares staged objects with a run still writing. The LOD lane
-does not run split yet: it decodes creator assets too, so publisher mode refuses to start
-with `ENABLE_LODS` on.
+does not run split yet: it assembles and simplifies the same creator assets, so publisher
+mode refuses to start with `ENABLE_LODS` on, and a deployment chooses between the split
+and LODs until the lane's decoding moves into the worker (a tracked follow-up).
 
-The worker needs a role that can write its own logs, `s3:GetObject` and `s3:ListBucket` on
+Create the worker with tenant isolation (it can only be set at creation; in ops-lambdas
+that is the one-resource CloudFormation stack the scene runner uses, since `@pulumi/aws`
+6.x does not expose `TenancyConfig`). It needs a role that can write its own logs,
+`s3:GetObject` and `s3:ListBucket` on
 the CDN bucket (the reuse probes) and `s3:PutObject` under `jobs/*` of the scratch bucket,
 and nothing of the publisher's environment (no `ABGEN_SNS_TOPIC_ARN`, no
 `ABGEN_REDIS_URL`, no `ABGEN_HTTP_SECRET`); it needs no VPC attachment. The publisher's

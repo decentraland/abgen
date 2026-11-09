@@ -383,6 +383,7 @@ pub(crate) mod tests {
                 let method = parts.next().unwrap_or("").to_string();
                 let path = parts.next().unwrap_or("").to_string();
                 let mut content_len = 0usize;
+                let mut tenant: Option<String> = None;
                 loop {
                     let mut h = String::new();
                     if reader.read_line(&mut h).is_err() {
@@ -392,15 +393,27 @@ pub(crate) mod tests {
                     if ht.is_empty() {
                         break;
                     }
-                    if let Some(v) = ht.to_ascii_lowercase().strip_prefix("content-length:") {
+                    let lower = ht.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
                         content_len = v.trim().parse().unwrap_or(0);
+                    }
+                    // A Lambda invoke's tenant id is recorded as its own `TENANT <id>` line,
+                    // right after the request, so a test can assert who the call was for.
+                    if lower.starts_with("x-amz-tenant-id:") {
+                        tenant = Some(ht[ht.find(':').unwrap_or(0) + 1..].trim().to_string());
                     }
                 }
                 if content_len > 0 {
                     let mut body = vec![0u8; content_len];
                     let _ = reader.read_exact(&mut body);
                 }
-                seen2.lock().unwrap().push(format!("{method} {path}"));
+                {
+                    let mut seen = seen2.lock().unwrap();
+                    seen.push(format!("{method} {path}"));
+                    if let Some(tenant) = tenant {
+                        seen.push(format!("TENANT {tenant}"));
+                    }
+                }
                 let (code, body) = routes
                     .iter()
                     .find(|(p, _, _)| {

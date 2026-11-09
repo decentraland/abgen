@@ -79,7 +79,7 @@ fn main() {
                  \x20    default | publisher: convert through ABGEN_WORKER_FUNCTION and\n\
                  \x20    publish what it stages | worker: convert requests into\n\
                  \x20    ABGEN_SCRATCH_S3_BUCKET, nothing else | scenerun: only run\n\
-                 \x20    scenes for another function's LOD lane, one per process),\n\
+                 \x20    scenes for another function's LOD lane),\n\
                  \x20    ABGEN_WORKER_FUNCTION, ABGEN_WORKER_TIMEOUT_S (default 810),\n\
                  \x20    ABGEN_SCRATCH_S3_BUCKET (publisher and worker)"
             );
