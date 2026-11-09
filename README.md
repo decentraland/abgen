@@ -330,13 +330,14 @@ release, never on the machine or thread count; changing either means new CIDs an
 - `glb-meshopt` models, **on by default** (`ABGEN_BEVY_GLB_MESHOPT=0` on the server,
   `--bevy-no-glb-meshopt` on `abgen-corpus`, independent of the GLB variants above): every
   `.glb`/`.gltf` becomes a GLB whose triangle meshes are `EXT_meshopt_compression` streams
-  (vertex and index codecs; EXPONENTIAL 16-bit positions and 15-bit UVs, OCTAHEDRAL 8-bit normals
-  and tangents; `KHR_mesh_quantization` is declared too) and nothing else is touched: images,
+  (vertex and index codecs; EXPONENTIAL positions and UVs with the bits chosen per stream so the
+  error stays within 2^-11 units (0.49 mm) and 2^-15, OCTAHEDRAL 10-bit normals and tangents as
+  normalized shorts; `KHR_mesh_quantization` is declared too) and nothing else is touched: images,
   their bufferViews and MIME types, external image URIs, materials, animations and extras stay as
   they are (external `.bin` buffers are inlined, because the meshes live there). Draco primitives
   are left alone; a file already using `EXT_meshopt_compression` gets none. The variant is kept
   only when smaller than the original. With `ABGEN_BEVY_PRECOMPRESS=br` (`--bevy-precompress br`)
-  each one is also stored as `bevy/contents/{cid}.br` (Brotli quality 11, window 22) for the
+  each one is also stored as `bevy/contents/{cid}.br` (Brotli quality 9, window 22) for the
   route above; KTX2 variants are never Brotli'd. `cargo run --release --example
   bevy-geometry-check -- <bevy-variants-stats.json> <out>/bevy/contents <files-dir>` decodes
   every variant and compares it with its original (indices identical; positions within 1 mm,
