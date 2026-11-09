@@ -35,6 +35,29 @@ env:
   ABGEN_GIT_REV: ${{ github.sha }}
 
 jobs:
+  # A release published before this run uploads its archives (one created in the web UI,
+  # say) is immutable: every upload below would fail with HTTP 422 after a full build.
+  # Fail here instead, before any target builds. Images and npm do not depend on it.
+  release-guard:
+    name: release not yet published
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: check the release for this tag
+        if: startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          draft="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+                     --json isDraft --jq .isDraft 2>/dev/null || echo none)"
+          if [ "$draft" = "false" ]; then
+            echo "::error title=release $GITHUB_REF_NAME is already published::A published release is immutable, so this run cannot attach its archives. It was most likely created in the web UI. Push a new tag instead and let this workflow create the release: git tag vX.Y.Z <sha> && git push origin vX.Y.Z (see DEVELOPMENT.md)."
+            exit 1
+          fi
+          echo "release $GITHUB_REF_NAME: ${draft/none/not created yet}"
+
   build-id:
     name: build id
     runs-on: ubuntu-24.04
@@ -165,7 +188,7 @@ jobs:
 
   build:
     name: ${{ matrix.target }}
-    needs: build-id
+    needs: [build-id, release-guard]
     if: needs.build-id.outputs.has_build == 'true'
     runs-on: ${{ matrix.runner }}
     env:
@@ -709,7 +732,7 @@ jobs:
 
   promote:
     name: promote prebuilt targets
-    needs: build-id
+    needs: [build-id, release-guard]
     if: needs.build-id.outputs.has_promote == 'true'
     runs-on: ubuntu-24.04
     permissions:
@@ -1076,11 +1099,12 @@ jobs:
           npm publish --access public
 
   publish:
-    needs: [build, promote, ci-green]
+    needs: [build, promote, ci-green, release-guard]
     runs-on: ubuntu-24.04
     if: >-
       !cancelled() &&
       startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true &&
+      needs.release-guard.result == 'success' &&
       needs.ci-green.result == 'success' &&
       needs.build.result != 'failure' && needs.build.result != 'cancelled' &&
       needs.promote.result != 'failure' && needs.promote.result != 'cancelled'

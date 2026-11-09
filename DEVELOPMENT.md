@@ -23,9 +23,11 @@ re-runs converge on the full asset set.
 1. Land a `chore: release X.Y.Z` PR bumping the crate version (Cargo.toml + Cargo.lock).
 2. Tag the merge commit and push the tag:
    `git tag vX.Y.Z <merge-sha> && git push origin vX.Y.Z`
-   Don't pre-create the release in the web UI: the pipeline adopts an existing release
-   rather than creating a new one, so a pre-created release ships with no assets
-   attached; only a CI-created release carries the notes from
+   Don't create or publish the release in the web UI: releases here are immutable once
+   published, so a release published before the pipeline uploads its archives can never
+   get them. The `release not yet published` job fails the run at the start in that case
+   (instead of every upload failing with HTTP 422 after a full build); recover by pushing
+   the next tag, the same way. Only a CI-created release carries the notes from
    `.github/release-notes.md`.
 3. What runs: each leg builds, packages, sanity-tests (`--version` + `/readyz`; windows
    legs are cross-built and not sanity-run), and uploads its archive with `--clobber`.
