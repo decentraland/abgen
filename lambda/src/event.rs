@@ -134,7 +134,9 @@ pub fn validate_content_server(url: &str, allowed: Option<&[String]>) -> Result<
 
 /// A dotted DNS name whose last label starts with a letter: rules out IP literals in any
 /// notation (`10.0.0.1`, `0x7f000001`, `[::1]`, a bare integer) and single-label or
-/// `localhost` names that resolve inside the network.
+/// `localhost`/`localdomain` names that resolve inside the host or network
+/// (`localhost.localdomain` is loopback in Amazon Linux's `/etc/hosts`). The allowlist is
+/// the real control; this only refuses what can never be a content server.
 fn is_public_dns_name(host: &str) -> bool {
     let host = host.strip_suffix('.').unwrap_or(host);
     let labels: Vec<&str> = host.split('.').collect();
@@ -144,9 +146,11 @@ fn is_public_dns_name(host: &str) -> bool {
                 && l.len() <= 63
                 && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         })
-        && labels
-            .last()
-            .is_some_and(|tld| tld.as_bytes()[0].is_ascii_alphabetic() && *tld != "localhost")
+        && labels.last().is_some_and(|tld| {
+            tld.as_bytes()[0].is_ascii_alphabetic()
+                && !tld.eq_ignore_ascii_case("localhost")
+                && !tld.eq_ignore_ascii_case("localdomain")
+        })
 }
 
 fn normalize_content_server(url: &str) -> String {
@@ -306,6 +310,8 @@ mod tests {
             "https://127.1",
             "https://localhost/content",
             "https://api.localhost",
+            "https://localhost.localdomain",
+            "https://peer.LOCALDOMAIN",
             "https://metadata",
             "https://peer..decentraland.org",
             "https://peer_x.decentraland.org",

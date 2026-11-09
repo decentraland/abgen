@@ -35,11 +35,15 @@
 //! QuickJS escape has the uid's ordinary access (files, sockets, `execve`); what it does
 //! not get is a second process, the parent's memory, or a life after the parent's.
 //!
-//! Without the filter the child also lowers `RLIMIT_NOFILE` to the descriptors it already
-//! has, so it cannot open files or sockets, and the self-test then proves that opening a
-//! file, opening a socket, starting a process and reading the parent's memory are all
-//! refused (`nofile_open`, `nofile_socket`, `nproc_clone`, `parent_mem`). Root is exempt
-//! from `RLIMIT_NPROC`, so without the filter a root process fails the self-test.
+//! The child also sets `RLIMIT_NOFILE` to 0: the descriptors it already has keep working,
+//! and every new one fails with `EMFILE`, even after it closes one of its own. Without the
+//! filter, the self-test closes its stdin and then proves that opening the parent's
+//! `/proc/<ppid>/environ`, opening a socket, starting a process and reading the parent's
+//! memory are all refused (`nofile_open`, `nofile_socket`, `nproc_clone`, `parent_mem`).
+//! Root is exempt from `RLIMIT_NPROC`, so without the filter a root process fails the
+//! self-test. What an escaped scene keeps without the filter: its pipes, stderr, CPU until
+//! the deadline kill, and signals to processes of the same user (it could stop the
+//! parent, which only holds up its own invocation until the function times out).
 //!
 //! A process that holds nothing worth protecting from the scene (the scene runner function,
 //! whose only permission is writing its own logs) can call [`accept_dumpable_parent`]: a
@@ -381,7 +385,7 @@ fn evaluate_report(
             "no seccomp ({reason}); scenes run in a separate process with an empty \
              environment{} only",
             if cfg!(target_os = "linux") {
-                ", RLIMIT_DATA, RLIMIT_NPROC=0, RLIMIT_NOFILE at its open descriptors and \
+                ", RLIMIT_DATA, RLIMIT_NPROC=0, RLIMIT_NOFILE=0 and \
                  parent-death kill"
             } else {
                 ": an escaped scene would have this user's file, network and exec access"
@@ -815,7 +819,10 @@ fn child_main() -> Result<()> {
         T_SELF_TEST => {
             let report = probe_confinement(&seccomp);
             let mut guard = lock(&io);
-            write_frame(&mut guard.1, T_SELF_TEST_REPORT, report.as_bytes())
+            write_frame(&mut guard.1, T_SELF_TEST_REPORT, report.as_bytes())?;
+            // The probes may have closed stdin under its owner; exit before anything is
+            // dropped rather than close it twice.
+            std::process::exit(0)
         }
         // The parent never sends a job before a passing self-test; this is the child's
         // own refusal in case one arrives anyway.
@@ -1316,24 +1323,18 @@ mod linux {
         }
     }
 
-    /// `RLIMIT_NOFILE` at the lowest descriptor number not in use (3: stdin, stdout,
-    /// stderr), soft and hard: every later `open`, `socket`, `pipe` or `dup` fails with
-    /// `EMFILE`, and an unprivileged process cannot raise it again.
+    /// `RLIMIT_NOFILE = 0`, soft and hard: descriptors already open keep working, and
+    /// every later `open`, `socket`, `pipe` or `dup` fails with `EMFILE` whatever slot is
+    /// free, so closing one of its own does not make room. An unprivileged process cannot
+    /// raise it again.
     pub(super) fn forbid_new_files() -> anyhow::Result<()> {
-        // SAFETY: fcntl on descriptor numbers only inspects them.
-        let next_free = (0..1024)
-            .find(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } == -1)
-            .unwrap_or(1024) as libc::rlim_t;
-        let limit = libc::rlimit {
-            rlim_cur: next_free,
-            rlim_max: next_free,
+        let none = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
         };
         // SAFETY: setrlimit on the current process with a valid struct.
-        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
-            anyhow::bail!(
-                "RLIMIT_NOFILE={next_free}: {}",
-                std::io::Error::last_os_error()
-            );
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &none) } != 0 {
+            anyhow::bail!("RLIMIT_NOFILE=0: {}", std::io::Error::last_os_error());
         }
         Ok(())
     }
@@ -1621,11 +1622,18 @@ mod linux {
 
     /// The child's limits without a filter: no new descriptors (`EMFILE`), no new
     /// processes (`EAGAIN` under `RLIMIT_NPROC=0`) and no access to the parent's memory.
+    /// Closes stdin first, so a free low slot exists and the descriptor probes show the
+    /// limit holds anyway; the caller must not read stdin afterwards.
     pub(super) fn unfiltered_probes() -> Vec<String> {
         // SAFETY: plain pid lookup.
         let parent_pid = unsafe { libc::getppid() };
+        let environ = std::ffi::CString::new(format!("/proc/{parent_pid}/environ"))
+            .expect("no NUL in a path built from a pid");
         // SAFETY: as in `probes`: each probe fails (expected) or its result is released.
+        // Closing fd 0 is fine: the self-test request has been read and nothing reads it
+        // again (the child exits right after reporting).
         unsafe {
+            libc::close(0);
             let close = |fd: c_long| {
                 libc::close(fd as libc::c_int);
             };
@@ -1633,7 +1641,7 @@ mod linux {
                 refused_with(
                     "nofile_open",
                     libc::EMFILE,
-                    || libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) as c_long,
+                    || libc::open(environ.as_ptr(), libc::O_RDONLY) as c_long,
                     close,
                 ),
                 refused_with(

@@ -61,7 +61,8 @@ const MIN_SCENE_DEADLINE: Duration = Duration::from_secs(5);
 /// `ABGEN_LOD_SUBPROC_TIMEOUT_S` sets a shorter one.
 const DEFAULT_SCENE_DEADLINE: Duration = Duration::from_secs(180);
 /// Time the function keeps after the scene deadline: the sandbox kills a child that
-/// ignores the deadline 30 s after it, then the answer still has to go out.
+/// ignores the deadline 30 s after it, then the answer still has to go out. A scene
+/// function with a timeout under about a minute therefore has no time left for scenes.
 const RUNNER_RESERVE: Duration = Duration::from_secs(45);
 /// What the function may answer with: Lambda's 6 MB less some room.
 const MAX_RESPONSE_BYTES: usize = 6_000_000;
@@ -137,7 +138,11 @@ fn scene_deadline(
         deadline = deadline.min(left.saturating_sub(RUNNER_RESERVE));
     }
     if deadline < Duration::from_secs(1) {
-        bail!("no time left in this invocation to run the scene");
+        bail!(
+            "no time left in this invocation to run the scene (the function keeps {}s after \
+             the scene deadline; give it a timeout of at least a minute)",
+            RUNNER_RESERVE.as_secs()
+        );
     }
     Ok(deadline)
 }
@@ -224,10 +229,12 @@ pub fn requested_content_servers(event: &serde_json::Value) -> Vec<String> {
 
 /// Function side: runs the requested scene in the sandbox child and returns the response
 /// payload. `check_server` vets every content server in the request before anything is
-/// fetched.
+/// fetched; `invocation_left` is the time the function's own invocation still has
+/// ([`crate::lambda_invoke::invocation_remaining`] on Lambda).
 pub fn serve(
     event: &serde_json::Value,
     check_server: &dyn Fn(&str) -> Result<()>,
+    invocation_left: Option<Duration>,
 ) -> Result<serde_json::Value> {
     let version = event.get(PROTOCOL_KEY).and_then(|v| v.as_u64());
     if version != Some(PROTOCOL_VERSION) {
@@ -262,7 +269,7 @@ pub fn serve(
         deadline: Some(scene_deadline(
             requested,
             crate::lodgen::simplify::subproc_deadline(),
-            invocation_remaining(),
+            invocation_left,
         )?),
         ..EngineLimits::default()
     };
@@ -442,19 +449,28 @@ mod tests {
         let client = CatalystClient::new("https://peer.example.org/content")
             .with_fallback_base("http://169.254.169.254".into());
         let req = request(&client, &scene(), Duration::from_secs(90));
-        let err = serve(&req, &|s: &str| {
-            if s.starts_with("https://") {
-                Ok(())
-            } else {
-                bail!("refused {s}")
-            }
-        })
+        let err = serve(
+            &req,
+            &|s: &str| {
+                if s.starts_with("https://") {
+                    Ok(())
+                } else {
+                    bail!("refused {s}")
+                }
+            },
+            None,
+        )
         .unwrap_err();
         assert!(
             err.to_string().contains("refused http://169.254.169.254"),
             "{err}"
         );
-        let err = serve(&serde_json::json!({PROTOCOL_KEY: 99}), &|_: &str| Ok(())).unwrap_err();
+        let err = serve(
+            &serde_json::json!({PROTOCOL_KEY: 99}),
+            &|_: &str| Ok(()),
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("version"), "{err}");
     }
 
@@ -534,7 +550,7 @@ module.exports.onUpdate = async function () {
         let client = CatalystClient::new("https://peer.example.org/content");
         let mut req = request(&client, &scene(), Duration::from_secs(90));
         req["projection"] = serde_json::json!("lww0:1");
-        let err = serve(&req, &|_: &str| Ok(())).unwrap_err();
+        let err = serve(&req, &|_: &str| Ok(()), None).unwrap_err();
         assert!(err.to_string().contains("lww0:1"), "{err}");
 
         let mut value = response(&SceneCapture::default());

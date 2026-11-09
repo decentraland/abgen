@@ -4,8 +4,12 @@
 //! Only what the LOD lane needs: a `RequestResponse` invoke of a function named by its
 //! plain name in the caller's region, a JSON payload in and the function's JSON result
 //! out. A function error (`X-Amz-Function-Error`) is returned as an error carrying the
-//! function's `errorMessage`. Throttling, 5xx and connection failures are retried with
-//! jittered backoff inside the time the caller allows; a timeout is not.
+//! function's `errorMessage`. Throttling (429), 5xx and failures to connect are retried
+//! with jittered backoff inside the time the caller allows. A 5xx may come after the
+//! function already started, so a retry can overlap a run still going: callers must only
+//! invoke functions without side effects (a scene run has none; the overlap costs
+//! concurrency). Errors after the request may have been sent (a dropped connection, an
+//! unreadable body, a timeout) are not retried.
 //!
 //! Also holds the deadline of the Lambda invocation this process is serving
 //! ([`set_invocation_deadline`]), so work started on its behalf can stop in time.
@@ -98,8 +102,8 @@ enum Attempt {
 
 const MAX_ATTEMPTS: u32 = 4;
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
-/// An attempt is not started with less than this left.
-const MIN_ATTEMPT: Duration = Duration::from_secs(2);
+/// A retry is not started with less than this left: about a cold start plus a short run.
+const MIN_ATTEMPT: Duration = Duration::from_secs(10);
 
 impl LambdaInvoker {
     /// `endpoint` overrides `https://lambda.{region}.amazonaws.com` (tests, local stacks).
@@ -228,8 +232,11 @@ impl LambdaInvoker {
                     timeout.as_secs()
                 )))
             }
-            Err(e) => {
+            Err(e) if never_sent(&e) => {
                 return Attempt::Retry(crate::anyhow!("invoke lambda {}: {e}", self.function))
+            }
+            Err(e) => {
+                return Attempt::Done(Err(crate::anyhow!("invoke lambda {}: {e}", self.function)))
             }
         };
         let status = resp.status().as_u16();
@@ -241,10 +248,10 @@ impl LambdaInvoker {
         let mut out = Vec::new();
         use std::io::Read;
         if let Err(e) = resp.into_body().into_reader().read_to_end(&mut out) {
-            return Attempt::Retry(crate::anyhow!(
+            return Attempt::Done(Err(crate::anyhow!(
                 "read lambda {} response: {e}",
                 self.function
-            ));
+            )));
         }
         if status != 200 {
             let err = crate::anyhow!(
@@ -281,15 +288,27 @@ impl LambdaInvoker {
     }
 }
 
+/// Errors that mean the request never reached Lambda: safe to retry.
+fn never_sent(e: &ureq::Error) -> bool {
+    use std::io::ErrorKind;
+    match e {
+        ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => true,
+        ureq::Error::Io(io) => matches!(
+            io.kind(),
+            ErrorKind::ConnectionRefused | ErrorKind::AddrNotAvailable | ErrorKind::NotConnected
+        ),
+        _ => false,
+    }
+}
+
 /// `BACKOFF_BASE * 2^(attempt-1)`, plus up to the same again of jitter so that throttled
-/// callers do not retry in step.
+/// callers do not retry in step. The jitter comes from a freshly keyed std hasher, which
+/// differs per call and per process.
 fn backoff(attempt: u32) -> Duration {
+    use std::hash::BuildHasher;
     let base = BACKOFF_BASE * 2u32.saturating_pow(attempt.saturating_sub(1));
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    base + base.mul_f64(f64::from(nanos % 1000) / 1000.0)
+    let random = std::collections::hash_map::RandomState::new().hash_one(attempt);
+    base + base.mul_f64((random % 1024) as f64 / 1024.0)
 }
 
 #[cfg(test)]
@@ -451,6 +470,15 @@ mod tests {
             "{msg}"
         );
         assert_eq!(server.join().unwrap().len(), MAX_ATTEMPTS as usize);
+
+        // A refused connection never reached Lambda: retried, then reported.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let err = invoker(&endpoint, None)
+            .invoke(&serde_json::json!({}), Duration::from_secs(60))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("4 attempt"), "{err:#}");
     }
 
     #[test]

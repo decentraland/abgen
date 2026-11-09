@@ -185,9 +185,13 @@ fn handle_scenerun(cfg: &config::Config, event: &serde_json::Value) -> Result<se
     if !remote::is_request(event) {
         anyhow::bail!("scene runner mode accepts scenerun requests only");
     }
-    remote::serve(event, &|server: &str| {
-        event::validate_content_server(server, cfg.allowed_content_server_hosts.as_deref())
-    })
+    remote::serve(
+        event,
+        &|server: &str| {
+            event::validate_content_server(server, cfg.allowed_content_server_hosts.as_deref())
+        },
+        abgen::lambda_invoke::invocation_remaining(),
+    )
 }
 
 fn run_once(cfg: &config::Config, path: &str) -> Result<serde_json::Value> {

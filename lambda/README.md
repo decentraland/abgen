@@ -590,7 +590,7 @@ second function built from the same image with `ABGEN_LAMBDA_MODE=scenerun`:
 - the scene runner refuses to start without `ALLOWED_CONTENT_SERVER_HOSTS`. Per request it
   checks every content server (https, a public DNS name, the allowlist), fetches the scene,
   and runs it in the sandbox child: empty environment, `RLIMIT_DATA`, `RLIMIT_NPROC=0`,
-  `RLIMIT_NOFILE` at its open descriptors (no files or sockets), parent-death kill, and a
+  `RLIMIT_NOFILE=0` (no new files or sockets, even after closing its own), parent-death kill, and a
   deadline that is always set (the shortest of the request's, `ABGEN_LOD_SUBPROC_TIMEOUT_S`
   or 180 s, and the invocation's remaining time less 45 s). The runtime will not make the
   runner non-dumpable, so its self-test additionally proves the child is refused the
@@ -601,7 +601,9 @@ second function built from the same image with `ABGEN_LAMBDA_MODE=scenerun`:
 Give the scene runner its own role with no permissions beyond writing its own logs, no VPC
 access and none of the converter's environment (in particular no `ABGEN_HTTP_SECRET`): it
 holds nothing the converter needs protected. Set its timeout no longer than the converter's
-`ABGEN_SCENERUN_TIMEOUT_S`, or it keeps running after the converter has given up. Lambda
+`ABGEN_SCENERUN_TIMEOUT_S`, or it keeps running after the converter has given up, and no
+shorter than about a minute: the runner keeps 45 s after the scene deadline for the
+sandbox's kill grace and its answer. Lambda
 caps the response at 6 MB; a folded state that does not fit (base64 in JSON leaves about
 4.4 MB of stream) fails that scene's LOD with an error naming it.
 

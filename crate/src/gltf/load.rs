@@ -32,7 +32,9 @@ pub(crate) fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
     base64_decode(&uri[comma + 1..])
 }
 
-/// Standard alphabet, padded: the inverse of [`base64_decode`].
+/// Standard alphabet, padded: the inverse of [`base64_decode`]. Only the scene runner
+/// protocol encodes.
+#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -296,7 +298,7 @@ fn load_gltf_inputs_impl(
     Ok((gltf, buffers))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32"), feature = "scene-runtime"))]
 mod base64_tests {
     use super::{base64_decode, base64_encode};
 
