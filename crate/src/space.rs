@@ -175,6 +175,10 @@ fn parse_iso8601_epoch(s: &str) -> Option<u64> {
 pub struct ObjectHeaders {
     pub content_type: &'static str,
     pub cache_control: &'static str,
+    /// `br` for a Bevy variant's Brotli sidecar (`bevy/contents/{cid}.br`), whose bytes are the
+    /// encoded representation of the plain object; anything reading the bucket directly then
+    /// decodes it like the edge's negotiated answer.
+    pub content_encoding: Option<&'static str>,
 }
 
 /// Verbatim from what the production writers put on the same keys:
@@ -235,9 +239,12 @@ pub fn object_headers(key: &str) -> ObjectHeaders {
     } else {
         IMMUTABLE_SOURCE
     };
+    let content_encoding =
+        (lower.starts_with("bevy/contents/") && lower.ends_with(".br")).then_some("br");
     ObjectHeaders {
         content_type,
         cache_control,
+        content_encoding,
     }
 }
 
@@ -570,6 +577,9 @@ impl Space {
         if let Some(token) = &c.session_token {
             req = req.header("x-amz-security-token", token);
         }
+        if let Some(encoding) = headers.content_encoding {
+            req = req.header("Content-Encoding", encoding);
+        }
         req.send(body)
             .map_err(|e| crate::anyhow!("space PUT {key}: {e}"))?;
         Ok(())
@@ -802,22 +812,46 @@ mod tests {
                 "application/json",
                 NO_CACHE,
             ),
+            (
+                "bevy/contents/bafkreivariant",
+                "application/octet-stream",
+                IMMUTABLE_SOURCE,
+            ),
+            (
+                "bevy/contents/bafkreivariant.br",
+                "application/octet-stream",
+                IMMUTABLE_SOURCE,
+            ),
         ] {
             let h = object_headers(key);
             assert_eq!(h.content_type, ct, "content type for {key}");
             assert_eq!(h.cache_control, cc, "cache control for {key}");
+            let br = key.starts_with("bevy/contents/") && key.ends_with(".br");
+            assert_eq!(h.content_encoding, br.then_some("br"), "content encoding for {key}");
         }
     }
 
     #[test]
     fn put_sends_key_derived_content_type_and_cache_control() {
-        for (key, ct, cc) in [
+        for (key, ct, cc, ce) in [
             (
                 "v41/cid/Qmhash_windows",
                 "application/wasm",
                 IMMUTABLE_BUNDLE,
+                None,
             ),
-            ("manifest/cid_windows.json", "application/json", NO_CACHE),
+            (
+                "manifest/cid_windows.json",
+                "application/json",
+                NO_CACHE,
+                None,
+            ),
+            (
+                "bevy/contents/bafkreivariant.br",
+                "application/octet-stream",
+                IMMUTABLE_SOURCE,
+                Some("br"),
+            ),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
@@ -837,7 +871,7 @@ mod tests {
             };
             assert_eq!(value("content-type").as_deref(), Some(ct), "{head}");
             assert_eq!(value("cache-control").as_deref(), Some(cc), "{head}");
-            assert_eq!(value("content-encoding"), None, "{head}");
+            assert_eq!(value("content-encoding").as_deref(), ce, "{head}");
         }
     }
 

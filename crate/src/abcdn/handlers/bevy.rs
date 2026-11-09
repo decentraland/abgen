@@ -123,6 +123,20 @@ pub(super) async fn bevy_fallback(
                 BevyTarget::Manifest(e) => bevyvariants::manifest_key(e),
                 BevyTarget::Content(c) => bevyvariants::content_key(c),
             };
+            // A content miss for a client that accepts `br` also fetches the variant's Brotli
+            // sidecar, so the local serve below can answer encoded. A miss there is normal (KTX2
+            // variants and builds without precompression have none). Once the plain file is on
+            // disk this path is not taken again, so a sidecar first wanted by a later client is
+            // not fetched; the plain bytes are still served.
+            if matches!(target, BevyTarget::Content(_)) && accepts_br(headers) {
+                let br_dst = bevyvariants::meshopt::br_sidecar(&dst);
+                if !br_dst.is_file() {
+                    let p3 = proxy.clone();
+                    let br_key = format!("{key}.br");
+                    space_materialize(Some("bevy-br"), br_dst, move || p3.space_get_key(&br_key))
+                        .await;
+                }
+            }
             let p2 = proxy.clone();
             if let Some(resp) = space_lane_serve(
                 state,
