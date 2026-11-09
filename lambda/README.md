@@ -70,6 +70,7 @@ all hits.
 | `ABGEN_SANDBOX_SECCOMP` | `required` (the `lambdaImage` bakes in `auto`) | scene sandbox policy for the LOD lane. Lambda's runtime refuses `prctl(PR_SET_NO_NEW_PRIVS)`, so the sandbox child cannot install its seccomp filter there; under `required` every LOD build then fails with `scene sandbox self-test failed, refusing to run scenes: seccomp is unavailable here (…); set ABGEN_SANDBOX_SECCOMP=auto …`; under `auto` scenes run in the separate process (empty environment, `RLIMIT_DATA`, `RLIMIT_NPROC=0`, own process group, parent-death kill, non-dumpable parent) **without the syscall filter**: a QuickJS escape would then have the function's ordinary file, network and exec access, though not a second process or the parent's memory. One warning is logged per process and `abgen_scene_sandbox_seccomp_total{state="unavailable"}` counts it |
 | `ABGEN_SCENERUN_FUNCTION` | unset | name of a function running this image with `ABGEN_LAMBDA_MODE=scenerun`. Set: the LOD lane runs every scene there with a synchronous `Invoke` instead of in a local child process, and the local sandbox self-test is not used (see [Running scenes in a separate function](#running-scenes-in-a-separate-function)). Needs `lambda:InvokeFunction` on it |
 | `ABGEN_SCENERUN_TIMEOUT_S` | `300` | how long the LOD lane waits for one scene in `ABGEN_SCENERUN_FUNCTION`, cold start and retries included, capped by the invocation's own deadline less 30 s. The scene function's timeout must not be longer |
+| `ABGEN_SANDBOX_PARENT_MEMORY` | `refuse` | scene runner only. `accept`: run scenes even where the sandbox child can access the runner's memory, as on AWS Lambda (see [Running scenes in a separate function](#running-scenes-in-a-separate-function)) |
 | `ABGEN_LAMBDA_MODE` | `convert` | `scenerun`: the function only runs scenes for another function's LOD lane, one per process, and needs `ALLOWED_CONTENT_SERVER_HOSTS` (see [Running scenes in a separate function](#running-scenes-in-a-separate-function)) |
 | `ABGEN_EMF_NAMESPACE` | — (off) | CloudWatch namespace for EMF metrics (e.g. `abgen/lambda`); unset means no recorder is installed and every `metrics::` call stays a no-op |
 | `ABGEN_LOG_FORMAT` | plain text | `json` for JSON log lines |
@@ -593,9 +594,14 @@ second function built from the same image with `ABGEN_LAMBDA_MODE=scenerun`:
   `RLIMIT_NOFILE=0` (no new files or sockets, even after closing its own), parent-death kill, and a
   deadline that is always set (the shortest of the request's, `ABGEN_LOD_SUBPROC_TIMEOUT_S`
   or 180 s, and the invocation's remaining time less 45 s). The runtime will not make the
-  runner non-dumpable, so its self-test additionally proves the child is refused the
-  parent's memory; if this runtime ever allowed it, scenes would be refused, not run.
-  The runner answers with the folded state and exits; exiting is hygiene, not the
+  runner non-dumpable, and AWS Lambda also lets the child read and write the runner's
+  memory (`parent_mem=FAIL` in the self-test). By default that refuses every scene;
+  `ABGEN_SANDBOX_PARENT_MEMORY=accept` runs them anyway, with every other probe still
+  required. An escaped scene can then take over the runner process: it gets the runner's
+  logs-only role and could answer later scene requests on that execution environment with
+  forged renderer state, which the converter accepts only as placements of the requesting
+  entity's own content. The converter's credentials, bucket, queue and VPC stay out of
+  reach. The runner answers with the folded state and exits; exiting is hygiene, not the
   isolation boundary.
 
 Give the scene runner its own role with no permissions beyond writing its own logs, no VPC
