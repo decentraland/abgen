@@ -3,21 +3,13 @@ use anyhow::Result;
 
 const API_VERSION: &str = "2018-06-01";
 
-/// What the process does once an invocation is answered.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AfterResponse {
-    /// Wait for the next invocation in the same process.
-    Continue,
-    /// Exit, so the next invocation starts a fresh process. Hygiene, not a boundary:
-    /// it only holds for code that stays inside this process's control, which is why
-    /// scenes run in the sandbox child even here.
-    Exit,
-}
-
+/// Serves invocations one after another in this process. A runtime that exits after
+/// answering is reported by Lambda as `Runtime.ExitError` on every invocation, so the
+/// process stays up; isolation between scenes comes from the sandbox child and, for the
+/// scene runner, from one Lambda tenant per entity.
 pub fn serve(
     cfg: &Config,
     handler: impl Fn(&Config, &serde_json::Value) -> Result<serde_json::Value>,
-    after: AfterResponse,
 ) -> ! {
     let api = std::env::var("AWS_LAMBDA_RUNTIME_API").unwrap_or_else(|_| {
         eprintln!(
@@ -69,9 +61,6 @@ pub fn serve(
                     eprintln!("runtime: failed to post error for {request_id}: {e:#}");
                 }
             }
-        }
-        if after == AfterResponse::Exit {
-            std::process::exit(0);
         }
     }
 }

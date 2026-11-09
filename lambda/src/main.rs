@@ -76,7 +76,7 @@ fn main() {
                  \x20    ABGEN_SCENERUN_TIMEOUT_S (default 300),\n\
                  \x20    ABGEN_SANDBOX_PARENT_MEMORY (scenerun: refuse | accept),\n\
                  \x20    ABGEN_LAMBDA_MODE (convert | scenerun: only run scenes for\n\
-                 \x20    another function's LOD lane, one per process)"
+                 \x20    another function's LOD lane)"
             );
         }
         Some(other) => {
@@ -89,7 +89,7 @@ fn main() {
             let cfg = config::Config::from_env();
             init_scenerun(&cfg);
             eprintln!("init: scene runner mode ({MODE_ENV}=scenerun)");
-            runtime::serve(&cfg, handle_scenerun, runtime::AfterResponse::Exit);
+            runtime::serve(&cfg, handle_scenerun);
         }
         None => {
             init();
@@ -100,7 +100,7 @@ fn main() {
                 );
             }
             let cfg = config::Config::from_env();
-            runtime::serve(&cfg, handle, runtime::AfterResponse::Continue);
+            runtime::serve(&cfg, handle);
         }
     }
 }
