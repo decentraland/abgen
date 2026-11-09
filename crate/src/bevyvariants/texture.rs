@@ -1,6 +1,7 @@
 //! Texture variants: PNG / JPEG in, KTX2 (BC1 / BC5 / BC7 payload, Zstandard-supercompressed,
 //! full mip chain, at most [`BEVY_TEXTURE_MAX`] on a side, top-down rows) out; creator UASTC
-//! KTX2 in, a single-level pure block transcode to BC7 KTX2 out. See the module docs of [`super`].
+//! KTX2 in, a single-level pure block transcode to BC7 KTX2 out. Every variant must be smaller
+//! than its original ([`size_gate`]). See the module docs of [`super`].
 
 use anyhow::{Context, Result};
 use image::RgbaImage;
@@ -25,11 +26,13 @@ impl Default for TexOptions {
     }
 }
 
-/// No variant, and why. `gated_size` is the BC7 transcode's size when the size gate dropped it.
+/// No variant, and why. `gated_size` and `gated_format` describe the variant the size gate
+/// dropped (it was not smaller than the original).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Miss {
     pub reason: NoVariant,
     pub gated_size: Option<u64>,
+    pub gated_format: Option<&'static str>,
 }
 
 impl From<NoVariant> for Miss {
@@ -37,8 +40,113 @@ impl From<NoVariant> for Miss {
         Miss {
             reason,
             gated_size: None,
+            gated_format: None,
         }
     }
+}
+
+/// The size gate every texture variant passes: it must be smaller than the original file, or
+/// the client is better off loading the original (`Err` carries the dropped variant's size
+/// and format as `NoVariant::SizeGate`).
+pub fn size_gate(
+    v: TextureVariant,
+    original_len: usize,
+) -> std::result::Result<TextureVariant, Miss> {
+    if v.bytes.len() < original_len {
+        Ok(v)
+    } else {
+        Err(Miss {
+            reason: NoVariant::SizeGate,
+            gated_size: Some(v.bytes.len() as u64),
+            gated_format: Some(v.format.manifest_name()),
+        })
+    }
+}
+
+/// An opaque sRGB image keeps its BC1 encode only when level 0 decodes to at least this PSNR
+/// (dB, RGB, against the source at the variant size); below it the image gets BC7. Posters,
+/// text and other hard-edged art fall below it (BC1 has four colours per block); photos and
+/// smooth textures stay well above.
+pub const BC1_MIN_PSNR_DB: f64 = 36.0;
+
+/// Decode one BC1 level (`w x h` texels, both multiples of 4, rows top-down) to RGBA8 with
+/// alpha 255. Both block modes are decoded; the three-colour mode's fourth index gives black.
+pub fn decode_bc1_rgba(blocks: &[u8], w: u32, h: u32) -> Vec<u8> {
+    use crate::gpu::corelib::dxt1::unpack_565;
+    let (w, h) = (w as usize, h as usize);
+    let bw = w.div_ceil(4);
+    let mut out = vec![0u8; w * h * 4];
+    for (bi, block) in blocks.chunks_exact(8).enumerate() {
+        let (bx, by) = (bi % bw, bi / bw);
+        let c0 = u16::from_le_bytes([block[0], block[1]]);
+        let c1 = u16::from_le_bytes([block[2], block[3]]);
+        let p0 = unpack_565(c0);
+        let p1 = unpack_565(c1);
+        let mix = |a: u8, b: u8, wa: u32, wb: u32, div: u32| -> u8 {
+            ((u32::from(a) * wa + u32::from(b) * wb + div / 2) / div) as u8
+        };
+        let palette: [[u8; 3]; 4] = if c0 > c1 {
+            [
+                p0,
+                p1,
+                [
+                    mix(p0[0], p1[0], 2, 1, 3),
+                    mix(p0[1], p1[1], 2, 1, 3),
+                    mix(p0[2], p1[2], 2, 1, 3),
+                ],
+                [
+                    mix(p0[0], p1[0], 1, 2, 3),
+                    mix(p0[1], p1[1], 1, 2, 3),
+                    mix(p0[2], p1[2], 1, 2, 3),
+                ],
+            ]
+        } else {
+            [
+                p0,
+                p1,
+                [
+                    mix(p0[0], p1[0], 1, 1, 2),
+                    mix(p0[1], p1[1], 1, 1, 2),
+                    mix(p0[2], p1[2], 1, 1, 2),
+                ],
+                [0, 0, 0],
+            ]
+        };
+        for ty in 0..4 {
+            let row = block[4 + ty];
+            for tx in 0..4 {
+                let (x, y) = (bx * 4 + tx, by * 4 + ty);
+                if x >= w || y >= h {
+                    continue;
+                }
+                let c = palette[usize::from((row >> (tx * 2)) & 3)];
+                let o = (y * w + x) * 4;
+                out[o..o + 3].copy_from_slice(&c);
+                out[o + 3] = 255;
+            }
+        }
+    }
+    out
+}
+
+/// PSNR in dB of `b` against `a` over the RGB channels of two RGBA8 buffers of the same size
+/// (`f64::INFINITY` when identical).
+pub fn psnr_rgb_db(a: &[u8], b: &[u8]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut se: u64 = 0;
+    let mut n: u64 = 0;
+    for (pa, pb) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        for c in 0..3 {
+            let d = i64::from(pa[c]) - i64::from(pb[c]);
+            se += (d * d) as u64;
+        }
+        n += 3;
+    }
+    if se == 0 {
+        return f64::INFINITY;
+    }
+    let mse = se as f64 / n.max(1) as f64;
+    10.0 * (255.0f64 * 255.0 / mse).log10()
 }
 
 /// How the entity's models sample an image.
@@ -112,7 +220,9 @@ impl TexFormat {
     }
 }
 
-/// The format rule: BC5 for normal-only images, BC1 when every texel is opaque, else BC7.
+/// The format rule: BC5 for normal-only images, BC1 when every texel is opaque, else BC7. An
+/// opaque sRGB image's BC1 is then checked against [`BC1_MIN_PSNR_DB`] and replaced by BC7 when
+/// it falls short (`encode_rgba`); linear images keep BC1.
 pub fn choose_format(slot: Slot, opaque: bool) -> TexFormat {
     match slot {
         Slot::Normal => TexFormat::Bc5,
@@ -139,6 +249,10 @@ pub struct TextureVariant {
     pub height: u32,
     pub mips: u32,
     pub path: EncodePath,
+    /// Opaque sRGB images: the PSNR of the BC1 encode's level 0 against the source.
+    pub bc1_psnr_db: Option<f64>,
+    /// The BC1 encode fell below [`BC1_MIN_PSNR_DB`] and this variant is BC7 instead.
+    pub bc1_rejected: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -186,13 +300,28 @@ pub fn target_size(w: u32, h: u32) -> (u32, u32) {
 /// JPEG or UASTC KTX2 (sniffed by bytes, never by name), tiny, or a KTX2 the pure transcode
 /// does not take or does not make smaller. `Err` is a PNG/JPEG that does not decode.
 pub fn encode_texture(bytes: &[u8], slot: Slot) -> Result<Option<TextureVariant>> {
-    encode_texture_with(bytes, slot, TexOptions::default(), &mut StageTimes::default())
-        .map(Result::ok)
+    encode_texture_with(
+        bytes,
+        slot,
+        TexOptions::default(),
+        &mut StageTimes::default(),
+    )
+    .map(Result::ok)
 }
 
 /// [`encode_texture`] with explicit settings, adding each stage's time to `times` and saying
-/// why there is no variant.
+/// why there is no variant: [`encode_texture_ungated`] followed by the [`size_gate`].
 pub fn encode_texture_with(
+    bytes: &[u8],
+    slot: Slot,
+    opts: TexOptions,
+    times: &mut StageTimes,
+) -> Result<std::result::Result<TextureVariant, Miss>> {
+    Ok(encode_texture_ungated(bytes, slot, opts, times)?.and_then(|v| size_gate(v, bytes.len())))
+}
+
+/// The encode alone, before the size gate (for tests and checks that need the bytes).
+pub fn encode_texture_ungated(
     bytes: &[u8],
     slot: Slot,
     opts: TexOptions,
@@ -202,18 +331,11 @@ pub fn encode_texture_with(
         return Ok(Err(NoVariant::NotAnImage.into()));
     };
     if source == Source::Ktx2 {
-        return Ok(match transcode_uastc_bc7_with(bytes, opts, times) {
-            Ok(v) if v.bytes.len() <= bytes.len() => Ok(v),
-            Ok(v) => Err(Miss {
-                reason: NoVariant::Ktx2SizeGate,
-                gated_size: Some(v.bytes.len() as u64),
-            }),
-            Err(r) => Err(r.into()),
-        });
+        return Ok(transcode_uastc_bc7_with(bytes, opts, times).map_err(Miss::from));
     }
     debug_assert!(matches!(source, Source::Png | Source::Jpeg));
-    let img = timed(&mut times.decode_ns, || image::load_from_memory(bytes))
-        .context("decode image")?;
+    let img =
+        timed(&mut times.decode_ns, || image::load_from_memory(bytes)).context("decode image")?;
     let img = timed(&mut times.decode_ns, || img.to_rgba8());
     if is_tiny(img.width(), img.height()) {
         return Ok(Err(NoVariant::Tiny.into()));
@@ -282,6 +404,8 @@ pub fn transcode_uastc_bc7_with(
         height: h,
         mips: 1,
         path: EncodePath::Ktx2Transcode,
+        bc1_psnr_db: None,
+        bc1_rejected: false,
     })
 }
 
@@ -309,42 +433,64 @@ fn encode_rgba(
         img.into_raw()
     };
     let opaque = buf.iter().skip(3).step_by(4).all(|&a| a == 255);
-    let format = choose_format(slot, opaque);
-    let slot_ns = match format {
-        TexFormat::Bc1 => &mut times.bc1_ns,
-        TexFormat::Bc5 => &mut times.bc5_ns,
-        TexFormat::Bc7 => &mut times.bc7_ns,
-    };
-    let encode_started = std::time::Instant::now();
-    let (data, mips) = match format {
-        // Opaque blocks only: the encoder always orders endpoints c0 > c1 (four-colour mode),
-        // so no texel decodes as BC1's transparent black.
-        TexFormat::Bc1 => crate::dxt1_pure::encode_dxt1_mip_chain(&buf, tw, th, None, false, srgb),
-        TexFormat::Bc5 => {
-            // The BC5 kernel packs (A, G) into (R, G) - Unity's DXT5nm layout. Bevy reads a
-            // two-channel normal map as (x, y) = (R, G), so put x into alpha first.
-            for px in buf.chunks_exact_mut(4) {
-                px[3] = px[0];
+    let mut format = choose_format(slot, opaque);
+    let mut bc1_psnr_db = None;
+    let mut bc1_rejected = false;
+    let encode = |format: TexFormat, buf: &mut Vec<u8>, times: &mut StageTimes| -> (Vec<u8>, i32) {
+        let started = std::time::Instant::now();
+        let out = match format {
+            // Opaque blocks only: the encoder always orders endpoints c0 > c1 (four-colour
+            // mode), so no texel decodes as BC1's transparent black.
+            TexFormat::Bc1 => {
+                crate::dxt1_pure::encode_dxt1_mip_chain(buf, tw, th, None, false, srgb)
             }
-            crate::bc5_pure::encode_bc5_mip_chain(&buf, tw, th, None, false)
-        }
-        TexFormat::Bc7 => {
-            if !opaque {
-                crate::alpha_bleed::alpha_bleed_inplace(&mut buf, tw, th);
+            TexFormat::Bc5 => {
+                // The BC5 kernel packs (A, G) into (R, G) - Unity's DXT5nm layout. Bevy reads
+                // a two-channel normal map as (x, y) = (R, G), so put x into alpha first.
+                for px in buf.chunks_exact_mut(4) {
+                    px[3] = px[0];
+                }
+                crate::bc5_pure::encode_bc5_mip_chain(buf, tw, th, None, false)
             }
-            crate::bc7_pure::encode_bc7_mip_chain_with_profile(
-                &buf,
-                tw,
-                th,
-                None,
-                false,
-                srgb,
-                srgb,
-                Bc7Profile::Basic,
-            )
-        }
+            TexFormat::Bc7 => {
+                if !opaque {
+                    crate::alpha_bleed::alpha_bleed_inplace(buf, tw, th);
+                }
+                crate::bc7_pure::encode_bc7_mip_chain_with_profile(
+                    buf,
+                    tw,
+                    th,
+                    None,
+                    false,
+                    srgb,
+                    srgb,
+                    Bc7Profile::Basic,
+                )
+            }
+        };
+        let slot_ns = match format {
+            TexFormat::Bc1 => &mut times.bc1_ns,
+            TexFormat::Bc5 => &mut times.bc5_ns,
+            TexFormat::Bc7 => &mut times.bc7_ns,
+        };
+        *slot_ns += super::stats::elapsed_ns(started);
+        out
     };
-    *slot_ns += super::stats::elapsed_ns(encode_started);
+    let (mut data, mut mips) = encode(format, &mut buf, times);
+    if format == TexFormat::Bc1 && srgb {
+        // The BC1 rule for colour data: keep it only when level 0 is close enough to the source.
+        // Linear (ORM) images keep BC1 regardless.
+        let psnr = timed(&mut times.bc1_check_ns, || {
+            let level0 = &data[..crate::ktx2_write::level_bytes(BcFormat::Bc1Rgb, tw, th)];
+            psnr_rgb_db(&buf, &decode_bc1_rgba(level0, tw, th))
+        });
+        bc1_psnr_db = Some(psnr);
+        if psnr < BC1_MIN_PSNR_DB {
+            bc1_rejected = true;
+            format = TexFormat::Bc7;
+            (data, mips) = encode(format, &mut buf, times);
+        }
+    }
     let levels = split_chain(format.bc(), tw, th, mips as u32, &data)?;
     let bytes = timed(&mut times.zstd_ns, || {
         write_ktx2(format.bc(), tw, th, &levels, opts.zstd_level)
@@ -356,5 +502,7 @@ fn encode_rgba(
         height: th,
         mips: mips as u32,
         path: EncodePath::Encode,
+        bc1_psnr_db,
+        bc1_rejected,
     })
 }

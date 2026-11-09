@@ -1,13 +1,16 @@
 use super::model::{transform_model, KTX2_MIME};
+use super::stats::{NoVariant, StageTimes};
 use super::texture::{
-    choose_format, encode_texture, transcode_uastc_bc7, EncodePath, Slot, TexFormat, Uses,
+    choose_format, decode_bc1_rgba, encode_texture, encode_texture_ungated, encode_texture_with,
+    psnr_rgb_db, transcode_uastc_bc7, EncodePath, Slot, TexFormat, TexOptions, TextureVariant,
+    Uses, BC1_MIN_PSNR_DB,
 };
-use crate::ktx2::Ktx2Header;
-use crate::ktx2_write::{read_levels, BcFormat};
 use super::*;
 use crate::bvwebgpu::emit;
 use crate::bvwebgpu::emit::tests::{mk_glb, noise_png_bytes, png_bytes, quad_bin_and_views};
 use crate::catalyst::{ContentEntry, Scene};
+use crate::ktx2::Ktx2Header;
+use crate::ktx2_write::{read_levels, BcFormat};
 use serde_json::{json, Value as J};
 use std::collections::HashMap;
 
@@ -24,7 +27,11 @@ fn ktx(bytes: &[u8], format: BcFormat) -> (Ktx2Header, Vec<Vec<u8>>) {
     assert_eq!(levels.len() as u32, h.levels);
     for (m, l) in levels.iter().enumerate() {
         let (w, hh) = ((h.width >> m).max(1), (h.height >> m).max(1));
-        assert_eq!(l.len(), crate::ktx2_write::level_bytes(format, w, hh), "level {m}");
+        assert_eq!(
+            l.len(),
+            crate::ktx2_write::level_bytes(format, w, hh),
+            "level {m}"
+        );
     }
     (h, levels)
 }
@@ -38,8 +45,12 @@ fn client_bc7_level(raw: &[u8]) -> Vec<u8> {
                 .is_ok_and(|i| i.width.max(i.height) <= 1024)
         })
         .unwrap();
-    t.transcode(level, basisu::TargetFormat::Bc7Rgba, basisu::DecodeFlags::NONE)
-        .unwrap()
+    t.transcode(
+        level,
+        basisu::TargetFormat::Bc7Rgba,
+        basisu::DecodeFlags::NONE,
+    )
+    .unwrap()
 }
 
 fn noise_alpha_png(w: u32, h: u32) -> Vec<u8> {
@@ -54,6 +65,125 @@ fn noise_alpha_png(w: u32, h: u32) -> Vec<u8> {
     img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
         .unwrap();
     out
+}
+
+/// An opaque image BC1 represents well (a smooth two-axis gradient) that PNG still cannot
+/// shrink much (a deterministic +-3 dither), so it passes both the BC1 PSNR rule and the size
+/// gate at any size from 16 px up.
+fn smooth_png_bytes(w: u32, h: u32) -> Vec<u8> {
+    let mut s = 0x9e37_79b9u32;
+    let mut img = image::RgbaImage::new(w, h);
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let d = |k: u32| ((s >> (8 * k)) % 7) as i32 - 3;
+        let r = (x * 200 / w.max(1)) as i32 + 20 + d(0);
+        let g = (y * 200 / h.max(1)) as i32 + 20 + d(1);
+        let b = ((x + y) * 100 / (w + h).max(1)) as i32 + 60 + d(2);
+        *p = image::Rgba([
+            r.clamp(0, 255) as u8,
+            g.clamp(0, 255) as u8,
+            b.clamp(0, 255) as u8,
+            255,
+        ]);
+    }
+    let mut out = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .unwrap();
+    out
+}
+
+/// An opaque image BC1 encodes losslessly: every 4x4 block has two 565 endpoints (c0 > c1) and
+/// texels drawn from the encoder's palette of them, with both extremes present so the encoder's
+/// principal-axis pick returns exactly those endpoints. Random per block, so PNG cannot shrink it
+/// much.
+fn bc1_exact_png_bytes(w: u32, h: u32) -> Vec<u8> {
+    use crate::gpu::corelib::dxt1::{pack_565, unpack_565};
+    let mut s = 0x1357_9bdfu32;
+    let mut next = || {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        s >> 8
+    };
+    let mut img = image::RgbaImage::new(w, h);
+    for by in 0..h.div_ceil(4) {
+        for bx in 0..w.div_ceil(4) {
+            let (mut c0, mut c1) = (0u16, 0u16);
+            while c0 == c1 {
+                let a = next();
+                let b = next();
+                c0 = pack_565(
+                    (a & 255) as u8,
+                    ((a >> 8) & 255) as u8,
+                    ((a >> 16) & 255) as u8,
+                );
+                c1 = pack_565(
+                    (b & 255) as u8,
+                    ((b >> 8) & 255) as u8,
+                    ((b >> 16) & 255) as u8,
+                );
+            }
+            if c0 < c1 {
+                std::mem::swap(&mut c0, &mut c1);
+            }
+            let (e0, e1) = (unpack_565(c0), unpack_565(c1));
+            let mix = |a: u8, b: u8, wa: u16, wb: u16| ((wa * a as u16 + wb * b as u16) / 3) as u8;
+            let palette = [
+                e0,
+                e1,
+                [
+                    mix(e0[0], e1[0], 2, 1),
+                    mix(e0[1], e1[1], 2, 1),
+                    mix(e0[2], e1[2], 2, 1),
+                ],
+                [
+                    mix(e0[0], e1[0], 1, 2),
+                    mix(e0[1], e1[1], 1, 2),
+                    mix(e0[2], e1[2], 1, 2),
+                ],
+            ];
+            for t in 0..16u32 {
+                let (x, y) = (bx * 4 + t % 4, by * 4 + t / 4);
+                if x >= w || y >= h {
+                    continue;
+                }
+                let k = match t {
+                    0 => 0,
+                    15 => 1,
+                    _ => (next() % 4) as usize,
+                };
+                let c = palette[k];
+                img.put_pixel(x, y, image::Rgba([c[0], c[1], c[2], 255]));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .unwrap();
+    out
+}
+
+/// The encode before the size gate.
+fn ungated(bytes: &[u8], slot: Slot) -> TextureVariant {
+    encode_texture_ungated(
+        bytes,
+        slot,
+        TexOptions::default(),
+        &mut StageTimes::default(),
+    )
+    .unwrap()
+    .ok()
+    .expect("a variant")
+}
+
+fn miss(bytes: &[u8], slot: Slot) -> super::texture::Miss {
+    encode_texture_with(
+        bytes,
+        slot,
+        TexOptions::default(),
+        &mut StageTimes::default(),
+    )
+    .unwrap()
+    .err()
+    .expect("no variant")
 }
 
 fn split(glb: &[u8]) -> (J, Vec<u8>) {
@@ -164,30 +294,127 @@ fn format_selection() {
 
 #[test]
 fn opaque_png_becomes_bc1_alpha_png_bc7_normal_bc5() {
-    let opaque = noise_png_bytes(16, 16);
-    let v = encode_texture(&opaque, Slot::Srgb).unwrap().unwrap();
-    assert_eq!((v.format, v.width, v.height, v.mips), (TexFormat::Bc1, 16, 16, 5));
+    let opaque = bc1_exact_png_bytes(32, 32);
+    let v = ungated(&opaque, Slot::Srgb);
+    assert_eq!(
+        (v.format, v.width, v.height, v.mips),
+        (TexFormat::Bc1, 32, 32, 6)
+    );
+    assert!(!v.bc1_rejected);
+    // Near-lossless: the encoder's endpoint pick is not exact on every block.
+    assert!(v.bc1_psnr_db.unwrap() > 50.0, "{:?}", v.bc1_psnr_db);
     let (h, levels) = ktx(&v.bytes, BcFormat::Bc1Rgb);
-    assert_eq!((h.width, h.height, h.levels), (16, 16, 5));
-    assert_eq!(levels[0].len(), 16 * 8);
+    assert_eq!((h.width, h.height, h.levels), (32, 32, 6));
+    assert_eq!(levels[0].len(), 64 * 8);
+    let src = image::load_from_memory(&opaque)
+        .unwrap()
+        .to_rgba8()
+        .into_raw();
+    assert!(psnr_rgb_db(&src, &decode_bc1_rgba(&levels[0], 32, 32)) > 50.0);
 
-    let alpha = noise_alpha_png(16, 8);
-    let v = encode_texture(&alpha, Slot::Srgb).unwrap().unwrap();
+    let alpha = noise_alpha_png(32, 16);
+    let v = ungated(&alpha, Slot::Srgb);
     assert_eq!(v.format, TexFormat::Bc7);
+    assert!(v.bc1_psnr_db.is_none() && !v.bc1_rejected);
     let (h, _) = ktx(&v.bytes, BcFormat::Bc7);
-    assert_eq!((h.width, h.height, h.levels), (16, 8, 5));
+    assert_eq!((h.width, h.height, h.levels), (32, 16, 6));
 
-    let v = encode_texture(&opaque, Slot::Normal).unwrap().unwrap();
+    let v = ungated(&noise_png_bytes(32, 32), Slot::Normal);
     assert_eq!(v.format, TexFormat::Bc5);
     let (h, _) = ktx(&v.bytes, BcFormat::Bc5);
-    assert_eq!(h.levels, 5);
+    assert_eq!(h.levels, 6);
+}
+
+#[test]
+fn opaque_srgb_image_bc1_cannot_hold_becomes_bc7_linear_keeps_bc1() {
+    // Noise: four colours per block are nowhere near enough, so the BC1 try is rejected.
+    let noise = noise_png_bytes(32, 32);
+    let v = ungated(&noise, Slot::Srgb);
+    assert_eq!(v.format, TexFormat::Bc7);
+    assert!(v.bc1_rejected);
+    assert!(
+        v.bc1_psnr_db.unwrap() < BC1_MIN_PSNR_DB,
+        "{:?}",
+        v.bc1_psnr_db
+    );
+    ktx(&v.bytes, BcFormat::Bc7);
+    // The same image as linear (ORM) data keeps BC1: the rule is for colour only.
+    let v = ungated(&noise, Slot::Linear);
+    assert_eq!(v.format, TexFormat::Bc1);
+    assert!(v.bc1_psnr_db.is_none() && !v.bc1_rejected);
+    // Both encodes are timed.
+    let mut times = StageTimes::default();
+    encode_texture_with(&noise, Slot::Srgb, TexOptions::default(), &mut times)
+        .unwrap()
+        .unwrap();
+    assert!(times.bc1_ns > 0 && times.bc1_check_ns > 0 && times.bc7_ns > 0);
+}
+
+#[test]
+fn bc1_decoder_and_psnr() {
+    // Four-colour block: c0 = pure red (0xF800), c1 = pure blue (0x001F), indices 0,1,2,3 on
+    // every row.
+    let block = [
+        0x00,
+        0xF8,
+        0x1F,
+        0x00,
+        0b1110_0100,
+        0b1110_0100,
+        0b1110_0100,
+        0b1110_0100,
+    ];
+    let px = decode_bc1_rgba(&block, 4, 4);
+    assert_eq!(&px[0..4], &[255, 0, 0, 255]);
+    assert_eq!(&px[4..8], &[0, 0, 255, 255]);
+    assert_eq!(&px[8..12], &[170, 0, 85, 255]);
+    assert_eq!(&px[12..16], &[85, 0, 170, 255]);
+    assert_eq!(&px[16..20], &[255, 0, 0, 255]);
+    // Three-colour block (c0 <= c1): index 3 is black.
+    let block = [0x1F, 0x00, 0x00, 0xF8, 0b1110_0100, 0, 0, 0];
+    let px = decode_bc1_rgba(&block, 4, 4);
+    assert_eq!(&px[8..12], &[128, 0, 128, 255]);
+    assert_eq!(&px[12..16], &[0, 0, 0, 255]);
+    // The decoder agrees with the encoder on a solid 565-representable colour (exact), and
+    // PSNR is as defined.
+    let c =
+        crate::gpu::corelib::dxt1::unpack_565(crate::gpu::corelib::dxt1::pack_565(200, 100, 50));
+    let solid: Vec<u8> = [c[0], c[1], c[2], 255].repeat(16);
+    let (chain, _) = crate::dxt1_pure::encode_dxt1_mip_chain(&solid, 4, 4, Some(1), false, true);
+    let back = decode_bc1_rgba(&chain[..8], 4, 4);
+    assert_eq!(back, solid);
+    assert_eq!(psnr_rgb_db(&solid, &back), f64::INFINITY);
+    let mut off = solid.clone();
+    off[0] = off[0].wrapping_add(1); // one channel of one texel off by one over 48 samples
+    let expect = 10.0 * (255.0f64 * 255.0 * 48.0).log10();
+    assert!((psnr_rgb_db(&solid, &off) - expect).abs() < 1e-9);
+}
+
+#[test]
+fn size_gate_drops_a_variant_not_smaller_than_its_original() {
+    // A solid 16x16 PNG is a few dozen bytes; any KTX2 of it is larger.
+    let solid = png_bytes(16, 16, [10, 20, 30, 255]);
+    let m = miss(&solid, Slot::Srgb);
+    assert_eq!(m.reason, NoVariant::SizeGate);
+    assert_eq!(m.gated_format, Some("ktx2-bc1"));
+    assert!(m.gated_size.unwrap() as usize >= solid.len());
+    let m = miss(&solid, Slot::Normal);
+    assert_eq!(
+        (m.reason, m.gated_format),
+        (NoVariant::SizeGate, Some("ktx2-bc5"))
+    );
+    let m = miss(&png_bytes(16, 16, [10, 20, 30, 128]), Slot::Srgb);
+    assert_eq!(
+        (m.reason, m.gated_format),
+        (NoVariant::SizeGate, Some("ktx2-bc7"))
+    );
 }
 
 #[test]
 fn encoded_levels_equal_the_encoders_chain() {
     // The container is a lossless wrapper: its levels concatenate to the encoder's output.
     let png = noise_alpha_png(16, 16);
-    let v = encode_texture(&png, Slot::Linear).unwrap().unwrap();
+    let v = ungated(&png, Slot::Linear);
     assert_eq!(v.format, TexFormat::Bc7);
     let rgba = image::load_from_memory(&png).unwrap().to_rgba8().into_raw();
     let mut bled = rgba;
@@ -212,30 +439,40 @@ fn tiny_unknown_and_oversize_inputs() {
     assert!(encode_texture(&png_bytes(2, 2, [1, 2, 3, 255]), Slot::Srgb)
         .unwrap()
         .is_none());
-    assert!(encode_texture(&png_bytes(64, 1, [1, 2, 3, 255]), Slot::Srgb)
-        .unwrap()
-        .is_none());
+    assert!(
+        encode_texture(&png_bytes(64, 1, [1, 2, 3, 255]), Slot::Srgb)
+            .unwrap()
+            .is_none()
+    );
     assert!(encode_texture(b"ID3 not an image", Slot::Srgb)
         .unwrap()
         .is_none());
     // Sniffed by bytes: PNG magic with a broken body is an error, not "no variant".
     assert!(encode_texture(b"\x89PNG\r\n\x1a\nbroken", Slot::Srgb).is_err());
-    let v = encode_texture(&noise_png_bytes(2048, 16), Slot::Srgb)
-        .unwrap()
-        .unwrap();
+    let v = ungated(&noise_png_bytes(2048, 16), Slot::Srgb);
     assert_eq!((v.width, v.height, v.mips), (1024, 8, 11));
     // NPOT snaps to powers of two (whole blocks for wgpu).
-    let v = encode_texture(&noise_png_bytes(24, 12), Slot::Srgb)
-        .unwrap()
-        .unwrap();
+    let v = ungated(&noise_png_bytes(24, 12), Slot::Srgb);
     assert_eq!((v.width, v.height), (32, 16));
 }
 
 #[test]
 fn jpeg_is_sniffed_and_encoded() {
     let jpeg = include_bytes!("../../testdata/gradient-16x16.jpg");
-    let v = encode_texture(jpeg, Slot::Srgb).unwrap().unwrap();
-    assert_eq!((v.format, v.width, v.height), (TexFormat::Bc1, 16, 16));
+    let v = ungated(jpeg, Slot::Srgb);
+    assert_eq!((v.width, v.height), (16, 16));
+    // Opaque colour: BC1 was tried and kept or rejected by the PSNR rule.
+    let psnr = v.bc1_psnr_db.expect("BC1 was tried");
+    assert_eq!(v.bc1_rejected, psnr < BC1_MIN_PSNR_DB);
+    assert_eq!(
+        v.format,
+        if v.bc1_rejected {
+            TexFormat::Bc7
+        } else {
+            TexFormat::Bc1
+        }
+    );
+    assert_eq!(ungated(jpeg, Slot::Linear).format, TexFormat::Bc1);
 }
 
 #[test]
@@ -252,7 +489,7 @@ fn rows_are_top_down() {
     let mut png = Vec::new();
     img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .unwrap();
-    let v = encode_texture(&png, Slot::Linear).unwrap().unwrap();
+    let v = ungated(&png, Slot::Linear);
     assert_eq!(v.format, TexFormat::Bc1);
     let (_, levels) = ktx(&v.bytes, BcFormat::Bc1Rgb);
     let l0 = &levels[0];
@@ -269,7 +506,10 @@ fn rows_are_top_down() {
 fn uastc_is_a_single_level_pure_transcode_matching_the_client() {
     let v = transcode_uastc_bc7(UASTC_8).expect("8x8 UASTC transcodes");
     assert_eq!(v.path, EncodePath::Ktx2Transcode);
-    assert_eq!((v.format, v.width, v.height, v.mips), (TexFormat::Bc7, 8, 8, 1));
+    assert_eq!(
+        (v.format, v.width, v.height, v.mips),
+        (TexFormat::Bc7, 8, 8, 1)
+    );
     // Exactly the one level the client's local path makes: no mips, nothing re-encoded.
     let (h, levels) = ktx(&v.bytes, BcFormat::Bc7);
     assert_eq!((h.width, h.height, h.levels), (8, 8, 1));
@@ -290,7 +530,7 @@ fn uastc_is_a_single_level_pure_transcode_matching_the_client() {
 fn uastc_variant_only_when_not_larger_than_the_original() {
     let v = transcode_uastc_bc7(UASTC_8).unwrap();
     let gated = encode_texture(UASTC_8, Slot::Srgb).unwrap();
-    assert_eq!(gated.is_some(), v.bytes.len() <= UASTC_8.len());
+    assert_eq!(gated.is_some(), v.bytes.len() < UASTC_8.len());
 }
 
 #[test]
@@ -311,12 +551,13 @@ fn uastc_that_needs_more_than_a_transcode_gets_no_variant() {
 }
 
 fn textured_quad_glb() -> (Vec<u8>, Vec<u8>) {
-    // Image 0 (normal map) is embedded in the quad's bin; image 1 is an opaque base colour
-    // appended after it; image 2 is external.
-    let normal_png = noise_png_bytes(16, 16);
+    // Image 0 (normal map) is embedded in the quad's bin; image 1 is an opaque occlusion map
+    // (linear: BC1 without the PSNR rule) appended after it; image 2, the base colour, is
+    // external.
+    let normal_png = noise_png_bytes(32, 32);
     let (mut bin, mut views, accessors) = quad_bin_and_views(&normal_png);
     emit::pad4(&mut bin, 0);
-    let color_png = noise_png_bytes(32, 32);
+    let color_png = smooth_png_bytes(64, 64);
     let off = bin.len();
     bin.extend_from_slice(&color_png);
     views
@@ -334,14 +575,14 @@ fn textured_quad_glb() -> (Vec<u8>, Vec<u8>) {
             }]}],
             "materials": [{
                 "normalTexture": {"index": 0},
-                "pbrMetallicRoughness": {"baseColorTexture": {"index": 1}},
-                "occlusionTexture": {"index": 2}
+                "occlusionTexture": {"index": 1},
+                "pbrMetallicRoughness": {"baseColorTexture": {"index": 2}}
             }],
             "textures": [{"source": 0}, {"source": 1}, {"source": 2}],
             "images": [
                 {"bufferView": 6, "mimeType": "image/png"},
                 {"bufferView": 7, "mimeType": "image/png"},
-                {"uri": "textures/ao.png"}
+                {"uri": "textures/color.png"}
             ],
             "bufferViews": views,
             "accessors": accessors
@@ -361,7 +602,7 @@ fn glb_embedded_images_become_bc_ktx2_by_slot_and_geometry_is_kept() {
     image_ktx(&doc, &bin, 0, BcFormat::Bc5);
     image_ktx(&doc, &bin, 1, BcFormat::Bc1Rgb);
     // External URI untouched.
-    assert_eq!(doc["images"][2], json!({"uri": "textures/ao.png"}));
+    assert_eq!(doc["images"][2], json!({"uri": "textures/color.png"}));
     // The PNG views are gone (6 geometry views + 2 KTX2 views remain).
     assert_eq!(doc["bufferViews"].as_array().unwrap().len(), 8);
     assert_eq!(doc["buffers"], json!([{"byteLength": bin.len()}]));
@@ -492,19 +733,20 @@ fn scene_of(entity: &str, content: &[(&str, &str)]) -> Scene {
 #[test]
 fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     let (embedded_glb, _) = textured_quad_glb();
-    // A model whose only image is external: no model variant, but its image is normal-only.
+    // A model whose images are external: no model variant, but one image is normal-only and
+    // the other linear (occlusion).
     let ext_glb = {
         let gltf = json!({
             "asset": {"version": "2.0"},
-            "images": [{"uri": "../tex/normal.png"}],
-            "textures": [{"source": 0}],
-            "materials": [{"normalTexture": {"index": 0}}]
+            "images": [{"uri": "../tex/normal.png"}, {"uri": "../color.png"}],
+            "textures": [{"source": 0}, {"source": 1}],
+            "materials": [{"normalTexture": {"index": 0}, "occlusionTexture": {"index": 1}}]
         });
         serde_json::to_vec(&gltf).unwrap()
     };
     let mut blobs: HashMap<&str, Vec<u8>> = HashMap::new();
-    blobs.insert("bafkcolor", noise_png_bytes(16, 16));
-    blobs.insert("bafknormal", noise_png_bytes(16, 16));
+    blobs.insert("bafkcolor", smooth_png_bytes(64, 64));
+    blobs.insert("bafknormal", noise_png_bytes(32, 32));
     blobs.insert("bafktiny", png_bytes(2, 2, [1, 1, 1, 255]));
     blobs.insert("bafkembed", embedded_glb);
     blobs.insert("bafkext", ext_glb);
@@ -528,10 +770,8 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     );
     let fetch = |h: &str| blobs.get(h).cloned();
     let run = |tag: &str, opts: BuildOptions| {
-        let out = std::env::temp_dir().join(format!(
-            "abgen-bevy-variants-{tag}-{}",
-            std::process::id()
-        ));
+        let out =
+            std::env::temp_dir().join(format!("abgen-bevy-variants-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out);
         let built = build_entity_variants(&scene, &fetch, &out, opts).unwrap();
         (out, built)
@@ -564,7 +804,7 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     let tex = &m.files["bafkcolor"][0];
     assert_eq!(
         (tex.kind.as_str(), tex.width, tex.height, tex.mips),
-        ("texture", Some(16), Some(16), Some(5))
+        ("texture", Some(64), Some(64), Some(7))
     );
 
     // Every listed variant is stored under the CID of its bytes, with its size.
@@ -584,7 +824,7 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     let parsed: Manifest = serde_json::from_slice(&on_disk).unwrap();
     assert_eq!(&parsed, m);
     let raw: J = serde_json::from_slice(&on_disk).unwrap();
-    assert_eq!(raw["files"]["bafkcolor"][0]["width"], 16);
+    assert_eq!(raw["files"]["bafkcolor"][0]["width"], 64);
 
     // Stats: one row per standalone image, with the reason for each miss.
     let st = &built.stats;
@@ -597,15 +837,23 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     assert_eq!(st.zstd_level, crate::ktx2_write::DEFAULT_ZSTD_LEVEL);
     assert_eq!(st.textures, 5); // color, normal, tiny, creator.ktx2, missing
     assert_eq!(reason("bafktiny"), Some(super::stats::NoVariant::Tiny));
-    assert_eq!(reason("bafkmissing"), Some(super::stats::NoVariant::Missing));
+    assert_eq!(
+        reason("bafkmissing"),
+        Some(super::stats::NoVariant::Missing)
+    );
     assert_eq!(
         reason("bafkktx"),
-        ktx_variant
-            .is_none()
-            .then_some(super::stats::NoVariant::Ktx2SizeGate)
+        ktx_variant.is_none().then_some(NoVariant::SizeGate)
     );
     assert_eq!(st.variants["ktx2-bc1 from png"].count, 1);
     assert_eq!(st.variants["ktx2-bc5 from png"].count, 1);
+    assert_eq!(st.bc1_rejected, 0);
+    let color = st.files.iter().find(|f| f.hash == "bafkcolor").unwrap();
+    // Linear: BC1 without the PSNR check.
+    assert!(color.bc1_rejected.is_none() && color.bc1_psnr_db.is_none());
+    if ktx_variant.is_none() {
+        assert_eq!(st.size_gated["ktx2-bc7"].count, 1);
+    }
     assert_eq!(st.unique_variants as usize, built.variants.len());
     assert!(st.stages.bc1_ns > 0 && st.stages.bc5_ns > 0 && st.stages.zstd_ns > 0);
     assert!(st.summary_json().get("files").is_none());
@@ -624,11 +872,18 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
         },
     );
     let m4 = &built4.manifest;
-    assert_eq!(m4.files.keys().collect::<Vec<_>>(), m.files.keys().collect::<Vec<_>>());
+    assert_eq!(
+        m4.files.keys().collect::<Vec<_>>(),
+        m.files.keys().collect::<Vec<_>>()
+    );
     for (k, e) in &m4.files {
         let a = std::fs::read(content_path(&out4, &e[0].cid).unwrap()).unwrap();
         let b = std::fs::read(content_path(&out, &m.files[k][0].cid).unwrap()).unwrap();
-        assert_eq!(read_levels(&a).unwrap(), read_levels(&b).unwrap(), "{k}: same blocks");
+        assert_eq!(
+            read_levels(&a).unwrap(),
+            read_levels(&b).unwrap(),
+            "{k}: same blocks"
+        );
     }
     let _ = std::fs::remove_dir_all(&out4);
 
@@ -643,7 +898,10 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     );
     let m3 = &built3.manifest;
     let model = &m3.files["bafkembed"][0];
-    assert_eq!((model.kind.as_str(), model.format.as_str()), ("model", "glb"));
+    assert_eq!(
+        (model.kind.as_str(), model.format.as_str()),
+        ("model", "glb")
+    );
     assert!(model.width.is_none() && model.mips.is_none());
     assert!(!m3.files.contains_key("bafkext"));
     let raw3: J = serde_json::from_slice(&built3.manifest_bytes).unwrap();
