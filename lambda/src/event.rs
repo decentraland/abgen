@@ -91,7 +91,9 @@ fn job_from_value(v: &Value) -> Result<Job> {
     bail!("unrecognized event shape: expected entityId or entity.entityId")
 }
 
-fn validated_entity_id(id: &str) -> Result<String> {
+/// Entity ids are ASCII alphanumerics (CIDs); anything else is refused before it reaches
+/// a URL or an S3 key.
+pub(crate) fn validated_entity_id(id: &str) -> Result<String> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
         bail!(
             "invalid entityId {:?}",

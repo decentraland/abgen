@@ -9,6 +9,7 @@ mod notify;
 mod output;
 mod runtime;
 mod satellite;
+mod split;
 
 use anyhow::{Context, Result};
 
@@ -21,18 +22,17 @@ fn main() {
                 eprintln!("--once needs an event file path");
                 std::process::exit(2);
             };
-            if scenerun_mode() {
+            let mode = mode();
+            if mode == Mode::Scenerun {
                 init_tracing();
                 emf::init();
             } else {
                 init();
             }
             let mut cfg = config::Config::from_env();
-            if scenerun_mode() {
-                init_scenerun(&cfg);
-            }
+            init_mode(mode, &cfg);
             cfg.keep_output = true;
-            let result = run_once(&cfg, path);
+            let result = run_once(mode, &cfg, path);
             emf::flush();
             match result {
                 Ok(v) => {
@@ -75,33 +75,57 @@ fn main() {
                  \x20    ABGEN_SCENERUN_FUNCTION (run LOD scenes in that function),\n\
                  \x20    ABGEN_SCENERUN_TIMEOUT_S (default 300),\n\
                  \x20    ABGEN_SANDBOX_PARENT_MEMORY (scenerun: refuse | accept),\n\
-                 \x20    ABGEN_LAMBDA_MODE (convert | scenerun: only run scenes for\n\
-                 \x20    another function's LOD lane)"
+                 \x20    ABGEN_LAMBDA_MODE (convert: everything in this function, the\n\
+                 \x20    default | publisher: convert through ABGEN_WORKER_FUNCTION and\n\
+                 \x20    publish what it stages | worker: convert requests into\n\
+                 \x20    ABGEN_SCRATCH_S3_BUCKET, nothing else | scenerun: only run\n\
+                 \x20    scenes for another function's LOD lane, one per process),\n\
+                 \x20    ABGEN_WORKER_FUNCTION, ABGEN_WORKER_TIMEOUT_S (default 810),\n\
+                 \x20    ABGEN_SCRATCH_S3_BUCKET (publisher and worker)"
             );
         }
         Some(other) => {
             eprintln!("unknown argument: {other} (try --help)");
             std::process::exit(2);
         }
-        None if scenerun_mode() => {
-            init_tracing();
-            emf::init();
-            let cfg = config::Config::from_env();
-            init_scenerun(&cfg);
-            eprintln!("init: scene runner mode ({MODE_ENV}=scenerun)");
-            runtime::serve(&cfg, handle_scenerun);
-        }
-        None => {
-            init();
-            if std::env::var_os(PARENT_MEMORY_ENV).is_some() {
-                eprintln!(
-                    "init: {PARENT_MEMORY_ENV} is ignored outside {MODE_ENV}=scenerun; this \
-                     function runs no scenes with a dumpable parent"
-                );
+        None => match mode() {
+            Mode::Scenerun => {
+                init_tracing();
+                emf::init();
+                let cfg = config::Config::from_env();
+                init_scenerun(&cfg);
+                eprintln!("init: scene runner mode ({MODE_ENV}=scenerun)");
+                runtime::serve(&cfg, handle_scenerun);
             }
-            let cfg = config::Config::from_env();
-            runtime::serve(&cfg, handle);
-        }
+            Mode::Worker => {
+                init();
+                warn_parent_memory_ignored();
+                let cfg = config::Config::from_env();
+                init_worker(&cfg);
+                eprintln!("init: worker mode ({MODE_ENV}=worker)");
+                runtime::serve(&cfg, handle_worker);
+            }
+            Mode::Publisher => {
+                init();
+                warn_parent_memory_ignored();
+                let cfg = config::Config::from_env();
+                init_publisher(&cfg);
+                eprintln!("init: publisher mode ({MODE_ENV}=publisher)");
+                runtime::serve(&cfg, handle);
+            }
+            Mode::Convert => {
+                init();
+                warn_parent_memory_ignored();
+                let cfg = config::Config::from_env();
+                if std::env::var(split::WORKER_FUNCTION_ENV).is_ok_and(|v| !v.trim().is_empty()) {
+                    eprintln!(
+                        "init: {} is set but {MODE_ENV} is not `publisher`; converting here",
+                        split::WORKER_FUNCTION_ENV
+                    );
+                }
+                runtime::serve(&cfg, handle);
+            }
+        },
     }
 }
 
@@ -146,10 +170,92 @@ fn init_tracing() {
     }
 }
 
-/// Selects what the function does. Unset: convert (the default). `scenerun`: run one
-/// scene per invocation for another function's LOD lane
+/// Selects what the function does. Unset: convert (the default). `publisher` and
+/// `worker` are the two halves of the publisher/worker split (`split`). `scenerun`: run
+/// one scene per invocation for another function's LOD lane
 /// (`abgen::lodgen::scenerun::remote`) and nothing else.
 const MODE_ENV: &str = "ABGEN_LAMBDA_MODE";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// Everything in this function: fetch, decode, write through to the CDN, notify.
+    Convert,
+    /// The SQS consumer of the split: converts through the worker, publishes the result.
+    Publisher,
+    /// Converts one entity per request into the scratch bucket; publishes nothing.
+    Worker,
+    /// Runs one scene per request for another function's LOD lane.
+    Scenerun,
+}
+
+/// [`MODE_ENV`] parsed; unset or blank is convert.
+fn parse_mode(value: Option<&str>) -> Result<Mode> {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("convert") => Ok(Mode::Convert),
+        Some("publisher") => Ok(Mode::Publisher),
+        Some("worker") => Ok(Mode::Worker),
+        Some("scenerun") => Ok(Mode::Scenerun),
+        Some(other) => {
+            anyhow::bail!("{MODE_ENV}={other:?} is none of convert, publisher, worker, scenerun")
+        }
+    }
+}
+
+fn mode() -> Mode {
+    parse_mode(std::env::var(MODE_ENV).ok().as_deref()).unwrap_or_else(|e| {
+        eprintln!("fatal: {e:#}");
+        std::process::exit(1);
+    })
+}
+
+/// Per-mode start-up after `init`, for `--once` runs: what `main` does before serving.
+fn init_mode(mode: Mode, cfg: &config::Config) {
+    match mode {
+        Mode::Scenerun => init_scenerun(cfg),
+        Mode::Worker => init_worker(cfg),
+        Mode::Publisher => init_publisher(cfg),
+        Mode::Convert => {}
+    }
+}
+
+/// Worker start-up: refuses to serve without a content server allowlist, a read-only view
+/// of the CDN and a scratch bucket (`split::worker_preflight`).
+fn init_worker(cfg: &config::Config) {
+    if let Err(e) = split::worker_preflight(cfg) {
+        eprintln!("fatal: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+/// Publisher start-up: the worker client, and a refusal to run the LOD lane here.
+fn init_publisher(cfg: &config::Config) {
+    if let Err(e) = publisher_preflight(cfg).and_then(|()| split::init_publisher()) {
+        eprintln!("fatal: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+/// The LOD lane decodes creator assets (glTF, Draco, textures) in-process, which is what
+/// the split moves out of the publisher; until the lane runs in the worker, a publisher
+/// with LODs on is a misconfiguration, not a degraded mode.
+fn publisher_preflight(cfg: &config::Config) -> Result<()> {
+    if cfg.lods_enabled {
+        anyhow::bail!(
+            "{MODE_ENV}=publisher with ENABLE_LODS on: the LOD lane would decode creator \
+             assets in this function; set ENABLE_LODS=0 here until the lane runs in the worker"
+        );
+    }
+    Ok(())
+}
+
+/// Worker invocations: only convert requests. Anything else is an error, never a
+/// conversion the publisher did not ask for.
+fn handle_worker(cfg: &config::Config, event: &serde_json::Value) -> Result<serde_json::Value> {
+    if !split::is_request(event) {
+        anyhow::bail!("worker mode accepts convert requests only");
+    }
+    split::serve_worker(cfg, event)
+}
 
 /// Scene runner start-up: refuses to serve without a content server allowlist, and lets
 /// the sandbox run scenes under a parent the runtime will not make non-dumpable. The
@@ -180,6 +286,17 @@ fn init_scenerun(cfg: &config::Config) {
 /// and write this process's memory (AWS Lambda does). Unset or `refuse`: they may not.
 const PARENT_MEMORY_ENV: &str = "ABGEN_SANDBOX_PARENT_MEMORY";
 
+/// The parent-memory policy is the scene runner's; set anywhere else it is an environment
+/// applied to the wrong function, and says so.
+fn warn_parent_memory_ignored() {
+    if std::env::var_os(PARENT_MEMORY_ENV).is_some() {
+        eprintln!(
+            "init: {PARENT_MEMORY_ENV} is ignored outside {MODE_ENV}=scenerun; this \
+             function runs no scenes with a dumpable parent"
+        );
+    }
+}
+
 fn parent_memory_policy(value: Option<&str>) -> Result<bool> {
     match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
         None | Some("") | Some("refuse") => Ok(false),
@@ -200,18 +317,6 @@ fn scenerun_preflight(cfg: &config::Config) -> Result<()> {
     }
 }
 
-fn scenerun_mode() -> bool {
-    match std::env::var(MODE_ENV) {
-        Ok(v) if v.trim().eq_ignore_ascii_case("scenerun") => true,
-        Ok(v) if v.trim().is_empty() || v.trim().eq_ignore_ascii_case("convert") => false,
-        Ok(v) => {
-            eprintln!("fatal: {MODE_ENV}={v:?} is neither `convert` nor `scenerun`");
-            std::process::exit(1);
-        }
-        Err(_) => false,
-    }
-}
-
 /// Scene runner invocations: only scenerun requests, and only for content servers this
 /// function would convert from. Anything else is an error, never a conversion.
 fn handle_scenerun(cfg: &config::Config, event: &serde_json::Value) -> Result<serde_json::Value> {
@@ -228,14 +333,15 @@ fn handle_scenerun(cfg: &config::Config, event: &serde_json::Value) -> Result<se
     )
 }
 
-fn run_once(cfg: &config::Config, path: &str) -> Result<serde_json::Value> {
+fn run_once(mode: Mode, cfg: &config::Config, path: &str) -> Result<serde_json::Value> {
     let raw = std::fs::read_to_string(path).with_context(|| format!("read event file {path}"))?;
     let event: serde_json::Value =
         serde_json::from_str(&raw).with_context(|| format!("parse event file {path} as JSON"))?;
-    if scenerun_mode() {
-        return handle_scenerun(cfg, &event);
+    match mode {
+        Mode::Scenerun => handle_scenerun(cfg, &event),
+        Mode::Worker => handle_worker(cfg, &event),
+        Mode::Publisher | Mode::Convert => handle(cfg, &event),
     }
-    handle(cfg, &event)
 }
 
 fn handle(cfg: &config::Config, event: &serde_json::Value) -> Result<serde_json::Value> {
@@ -435,7 +541,26 @@ fn convert_asset_bundles(
         .version_for(output::entity_type(&entity_doc))
         .to_string();
 
-    let outcome = convert::convert_entity(cfg, proxy, &job.entity_id, content_server, &pending)?;
+    // Publisher mode converts in the worker and gets back what it staged; the outcome
+    // then reads the same here, and the staged objects are copied in at publish time.
+    // What the worker may stage is decided from the entity document fetched here: its
+    // lane, its placement and its own content hashes.
+    let staged = match split::publisher() {
+        Some(publisher) => {
+            let policy = split::KeyPolicy::new(&job.entity_id, &built_lane, &entity_doc, &pending);
+            Some(publisher.convert(cfg, &policy, content_server)?)
+        }
+        None => None,
+    };
+    let converted;
+    let outcome: &convert::EntityOutcome = match &staged {
+        Some(staged) => &staged.outcome,
+        None => {
+            converted =
+                convert::convert_entity(cfg, proxy, &job.entity_id, content_server, &pending)?;
+            &converted
+        }
+    };
 
     metrics::counter!("abgen_lambda_texencode_cache_total", "outcome" => "hit")
         .increment(outcome.cache_hits);
@@ -443,7 +568,7 @@ fn convert_asset_bundles(
         .increment(outcome.cache_misses);
     for p in &outcome.platforms {
         metrics::counter!("abgen_lambda_bundles_total", "platform" => p.platform.clone())
-            .increment(p.built.len() as u64);
+            .increment(p.bundles as u64);
     }
 
     let published = publish_forget_notify(
@@ -451,10 +576,16 @@ fn convert_asset_bundles(
         // precedes notify: a failed notify is redelivered as already converted, which would
         // never write it. Genesis City records are the LOD lane's (`lod::record_reuse_miss`).
         || {
-            let upload = output::publish(cfg, &agent, proxy, &entity_doc, &outcome)?;
+            // Staged bundles and manifests land first: `output::publish` only adds the
+            // scene sources, and the notify after it tells the registry the manifest is there.
+            let copied = match (&staged, split::publisher()) {
+                (Some(staged), Some(publisher)) => Some(publisher.publish(proxy, staged)?),
+                _ => None,
+            };
+            let upload = output::publish(cfg, &agent, proxy, &entity_doc, outcome)?;
             let record =
                 satellite::on_conversion(proxy, &entity_doc, &job.entity_id, content_server);
-            Ok((upload, record))
+            Ok((upload, record, copied))
         },
         || {
             if job.force {
@@ -488,7 +619,7 @@ fn convert_asset_bundles(
     if !cfg.keep_output {
         let _ = std::fs::remove_dir_all(&outcome.cid_dir);
     }
-    let ((upload, satellite_rebuild), notified) = published?;
+    let ((upload, satellite_rebuild, copied), notified) = published?;
 
     eprintln!(
         "done: {} platforms={} exitCode={} texcache hits={} misses={}",
@@ -496,7 +627,7 @@ fn convert_asset_bundles(
         outcome
             .platforms
             .iter()
-            .map(|p| format!("{}:{}", p.platform, p.built.len()))
+            .map(|p| format!("{}:{}", p.platform, p.bundles))
             .collect::<Vec<_>>()
             .join(","),
         outcome.exit_code(),
@@ -510,7 +641,7 @@ fn convert_asset_bundles(
         "exitCode": outcome.exit_code(),
         "platforms": outcome.platforms.iter().map(|p| serde_json::json!({
             "platform": p.platform,
-            "bundles": p.built.len(),
+            "bundles": p.bundles,
             "exitCode": p.exit_code,
         })).collect::<Vec<_>>(),
         "texEncodeCache": { "hits": outcome.cache_hits, "misses": outcome.cache_misses },
@@ -521,6 +652,13 @@ fn convert_asset_bundles(
     // world's put may have failed.
     if let Some(key) = satellite_rebuild {
         summary["satelliteRebuildRecord"] = serde_json::json!(key);
+    }
+    if let Some(copied) = copied {
+        summary["staged"] = serde_json::json!({
+            "copied": copied.copied,
+            "alreadyPresent": copied.already_present,
+            "deleted": copied.deleted,
+        });
     }
     Ok(summary)
 }
@@ -638,6 +776,139 @@ mod tests {
             lods_enabled: false,
             max_receive_count: 3,
             lod_levels: vec![1],
+        }
+    }
+
+    /// Publisher mode end to end, against one fake server standing in for the content
+    /// server, the worker function and both buckets: the entity document is fetched here,
+    /// the worker is asked for the pending platforms, what it staged is copied into the
+    /// CDN and deleted from scratch, and the summary says so.
+    #[test]
+    fn publisher_mode_converts_through_the_worker_and_copies_what_it_staged() {
+        use crate::split::tests::{wearable_doc, ENTITY};
+        let invoke_path = "/2015-03-31/functions/abgen-worker/invocations";
+        let response = json!({
+            "abgenConvert": 1,
+            "entityId": ENTITY,
+            "contentServer": "x",
+            "platforms": [
+                {"platform": "windows", "bundles": 1, "exitCode": 0},
+                {"platform": "mac", "bundles": 1, "exitCode": 0},
+            ],
+            "objects": [
+                {"key": format!("v49w/{ENTITY}/Qmhash_windows"), "size": 10},
+                {"key": format!("v49w/{ENTITY}/qmhash_mac"), "size": 10},
+                {"key": format!("manifest/{ENTITY}_windows.json"), "size": 100},
+                {"key": format!("manifest/{ENTITY}_mac.json"), "size": 100},
+            ],
+        });
+        let (host, seen) = crate::output::tests::serve(vec![
+            (
+                format!("/contents/{ENTITY}"),
+                200,
+                serde_json::to_vec(&wearable_doc()).unwrap(),
+            ),
+            (
+                invoke_path.to_string(),
+                200,
+                response.to_string().into_bytes(),
+            ),
+            // No manifest yet, so nothing is already converted; every copy and delete lands.
+            (
+                format!("/cdn/manifest/{ENTITY}_windows.json"),
+                404,
+                Vec::new(),
+            ),
+            (format!("/cdn/manifest/{ENTITY}_mac.json"), 404, Vec::new()),
+            ("/".to_string(), 200, Vec::new()),
+        ]);
+        let content_server = format!("http://{host}");
+        let _space = crate::output::tests::point_space_at(&host);
+        std::env::set_var("ABGEN_S3_BUCKET", "cdn");
+        std::env::set_var(split::WORKER_FUNCTION_ENV, "abgen-worker");
+        std::env::set_var(split::WORKER_ENDPOINT_ENV, &content_server);
+        std::env::set_var(split::SCRATCH_BUCKET_ENV, "scratch");
+        let installed = split::init_publisher();
+        let mut cfg = crate::split::tests::cfg("publisher-flow");
+        cfg.allowed_content_server_hosts = None;
+        let proxy = convert::make_proxy(&cfg, &content_server);
+        for var in [
+            "ABGEN_S3_BUCKET",
+            split::WORKER_FUNCTION_ENV,
+            split::WORKER_ENDPOINT_ENV,
+            split::SCRATCH_BUCKET_ENV,
+        ] {
+            std::env::remove_var(var);
+        }
+        installed.unwrap();
+        assert!(split::publisher().is_some());
+
+        let job = event::Job {
+            entity_id: ENTITY.to_string(),
+            content_server_url: None,
+            force: false,
+            receive_count: 1,
+        };
+        let summary = convert_asset_bundles(&cfg, &proxy, &job, &content_server).unwrap();
+        assert_eq!(summary["exitCode"], 0);
+        assert_eq!(
+            summary["staged"],
+            json!({"copied": 4, "alreadyPresent": 0, "deleted": 4})
+        );
+        assert_eq!(summary["notified"], false);
+        assert_eq!(summary["platforms"][0]["bundles"], 1);
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.contains(&format!("GET /contents/{ENTITY}")),
+            "{seen:?}"
+        );
+        assert!(seen.contains(&format!("POST {invoke_path}")), "{seen:?}");
+        assert!(
+            seen.contains(&format!("PUT /cdn/v49w/{ENTITY}/Qmhash_windows")),
+            "{seen:?}"
+        );
+        assert!(
+            seen.contains(&format!("PUT /cdn/manifest/{ENTITY}_mac.json")),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|s| s.starts_with(&format!("DELETE /scratch/jobs/{ENTITY}/"))),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn modes_parse_from_the_env_value() {
+        assert_eq!(parse_mode(None).unwrap(), Mode::Convert);
+        assert_eq!(parse_mode(Some("")).unwrap(), Mode::Convert);
+        assert_eq!(parse_mode(Some(" convert ")).unwrap(), Mode::Convert);
+        assert_eq!(parse_mode(Some("Publisher")).unwrap(), Mode::Publisher);
+        assert_eq!(parse_mode(Some("worker")).unwrap(), Mode::Worker);
+        assert_eq!(parse_mode(Some("scenerun")).unwrap(), Mode::Scenerun);
+        assert!(parse_mode(Some("converter")).is_err());
+    }
+
+    #[test]
+    fn a_publisher_refuses_to_run_the_lod_lane() {
+        let mut cfg = test_cfg();
+        assert!(publisher_preflight(&cfg).is_ok());
+        cfg.lods_enabled = true;
+        let err = publisher_preflight(&cfg).unwrap_err().to_string();
+        assert!(err.contains("ENABLE_LODS"), "{err}");
+    }
+
+    #[test]
+    fn worker_mode_only_serves_convert_requests() {
+        let cfg = test_cfg();
+        for event in [
+            json!({"Records": [{"messageId": "m1", "body": "{}"}]}),
+            json!({"entityId": "bafkreiexample", "contentServerUrls": ["https://peer.decentraland.org/content"]}),
+            json!({"abgenScenerun": 2}),
+            http_post(&json!({"entityId": "bafkreiexample"}), "x"),
+        ] {
+            let err = handle_worker(&cfg, &event).unwrap_err();
+            assert!(err.to_string().contains("convert requests only"), "{err}");
         }
     }
 

@@ -31,6 +31,7 @@ entities. The Lambda handler enables it once and clears it after each entity.
 | 5 | already-converted skip (entity-level manifest check) **and** per-file asset reuse (space probe per digest-named glb) | done |
 | 6 | container image (`nix build .#lambdaImage`) | done |
 | 7 | LOD generation — a scene conversion continues into the `lodgen` LOD lane once its bundles are notified, opt-in with `ENABLE_LODS` | done |
+| 8 | publisher/worker split — decoding in one function, publishing in another, each with only the access its half needs (`ABGEN_LAMBDA_MODE=publisher` / `worker`) | done; the LOD lane does not run split yet |
 
 ## Local run (no AWS)
 
@@ -71,7 +72,11 @@ all hits.
 | `ABGEN_SCENERUN_FUNCTION` | unset | name of a function running this image with `ABGEN_LAMBDA_MODE=scenerun`. Set: the LOD lane runs every scene there with a synchronous `Invoke` instead of in a local child process, and the local sandbox self-test is not used (see [Running scenes in a separate function](#running-scenes-in-a-separate-function)). Needs `lambda:InvokeFunction` on it |
 | `ABGEN_SCENERUN_TIMEOUT_S` | `300` | how long the LOD lane waits for one scene in `ABGEN_SCENERUN_FUNCTION`, cold start and retries included, capped by the invocation's own deadline less 30 s. The scene function's timeout must not be longer |
 | `ABGEN_SANDBOX_PARENT_MEMORY` | `refuse` | scene runner only. `accept`: run scenes even where the sandbox child can access the runner's memory, as on AWS Lambda (see [Running scenes in a separate function](#running-scenes-in-a-separate-function)) |
-| `ABGEN_LAMBDA_MODE` | `convert` | `scenerun`: the function only runs scenes for another function's LOD lane, each in a fresh sandbox child, and needs `ALLOWED_CONTENT_SERVER_HOSTS` (see [Running scenes in a separate function](#running-scenes-in-a-separate-function)) |
+| `ABGEN_LAMBDA_MODE` | `convert` | `publisher` / `worker`: the two halves of the [publisher/worker split](#publisher-and-worker-functions). `scenerun`: the function only runs scenes for another function's LOD lane, one per process, and needs `ALLOWED_CONTENT_SERVER_HOSTS` (see [Running scenes in a separate function](#running-scenes-in-a-separate-function)) |
+| `ABGEN_WORKER_FUNCTION` | — | publisher mode: name of the function running this image with `ABGEN_LAMBDA_MODE=worker`. Needs `lambda:InvokeFunction` on it |
+| `ABGEN_WORKER_TIMEOUT_S` | `810` | publisher mode: how long one conversion may take in the worker, cold start and retries included, capped by the invocation's own deadline less 90 s. The worker function's timeout must not be longer |
+| `ABGEN_WORKER_ENDPOINT` | `lambda.{region}.amazonaws.com` | Lambda endpoint override (tests, local stacks; plain http only for loopback) |
+| `ABGEN_SCRATCH_S3_BUCKET` | — | publisher and worker modes: the scratch bucket a conversion is staged in, on the same endpoint and credentials as `ABGEN_S3_*`; both modes need `ABGEN_S3_PATH_STYLE=1` |
 | `ABGEN_EMF_NAMESPACE` | — (off) | CloudWatch namespace for EMF metrics (e.g. `abgen/lambda`); unset means no recorder is installed and every `metrics::` call stays a no-op |
 | `ABGEN_LOG_FORMAT` | plain text | `json` for JSON log lines |
 | `ABGEN_MAX_RECEIVE_COUNT` | `3` | must match the SQS redrive `maxReceiveCount`: a conversion failing on this receive publishes an `exitCode: 5` tombstone manifest per unconverted platform (+ a `statusCode: 5` finished event) and acks, instead of erroring into the DLQ. A tombstone never blocks reconversion — the already-converted check requires `exitCode: 0` — and if the tombstone itself cannot be published the original error propagates, so the message still reaches the DLQ. |
@@ -607,8 +612,7 @@ second function built from the same image with `ABGEN_LAMBDA_MODE=scenerun`:
   forged answer can only reach the entity whose own scene escaped. An isolated function
   refuses an invoke without a tenant id, and the converter always sends one. The
   converter's credentials, bucket, queue and VPC stay out of reach either way. The runner
-  answers with the folded state and waits for the next invocation; each scene runs in its
-  own sandbox child, and the execution environment is never shared across entities.
+  answers with the folded state and exits; exiting is hygiene, not the isolation boundary.
 
 Create the scene runner with tenant isolation (it can only be set at creation), and give it
 its own role with no permissions beyond writing its own logs, no VPC access and none of the
@@ -629,6 +633,82 @@ Known boundaries: level 2 is never emitted (production stopped emitting it),
 and level 0 (when requested) is the ISS-era pass-through bake rather than the
 retired legacy LOD0 shape (same divergence `abgen-lod generate` documents).
 
+
+## Publisher and worker functions
+
+In `convert` mode one function does everything: it fetches the entity, decodes its glTF,
+Draco, JPEG and font bytes in-process, writes bundles and manifests through to the CDN as
+it builds, and publishes the finished event. The split runs the two halves in different
+functions built from the same image, so the decoders run with read access to the CDN and
+write access to a scratch bucket only, and the function that writes the CDN decodes
+nothing:
+
+- the **publisher** (`ABGEN_LAMBDA_MODE=publisher`, the SQS consumer) keeps the
+  already-converted check, the markers, the scene sources, the satellite records, the
+  finished events and the failure tombstones, and converts by sending
+  `{"abgenConvert": 1, "entityId", "contentServer", "platforms", "scratch": {"bucket",
+  "prefix"}}` to `ABGEN_WORKER_FUNCTION` with a synchronous `Invoke`. The prefix is
+  `jobs/{entityId}/{nonce}` in `ABGEN_SCRATCH_S3_BUCKET`, a nonce per attempt. It waits at
+  most `ABGEN_WORKER_TIMEOUT_S`, never past its own deadline less 90 s; throttling and 5xx
+  answers are retried within that time. It then copies what the worker staged into the CDN
+  server-side (one `CopyObject` per key, eight at a time, with the destination key's own
+  Content-Type and Cache-Control), bundles before manifests, deletes the staged copies,
+  and carries on exactly as `convert` mode does after a build. It never decodes a creator
+  file (the scene sources it uploads are copied as they are);
+- the **worker** (`ABGEN_LAMBDA_MODE=worker`) accepts convert requests only. It checks
+  the entity id, the content server (https, a public DNS name, the allowlist), that every
+  platform is one it builds, that the bucket is its own `ABGEN_SCRATCH_S3_BUCKET` and the
+  prefix has the shape above for that entity, and then runs the ordinary build with two
+  spaces: reads and the per-file reuse probes go to the CDN, which it must see read-only
+  (`ABGEN_S3_READ_ONLY=1`, refused at start-up otherwise), every put goes to the scratch
+  bucket under the prefix. The output directory is cleared before the build and after
+  the request, so a failed attempt never leaves files a later attempt would take as
+  already uploaded. It answers with the per-platform exit codes and bundle counts and
+  the list of objects it wrote (`{"key", "size"}`, the CDN key each would have), fails
+  the request when a platform's manifest is not among them, and exits after each answer,
+  so one request never shares a process with the next.
+
+The publisher checks the answer before it copies anything, against the entity document it
+fetched itself: a key is copied only when it is one this entity's conversion may produce —
+a bundle named `{hash}_{platform}` or `{hash}_{digest}_{platform}` after one of the
+entity's own content hashes for a requested platform, under the lane its type selects
+(`AB_VERSION` for scenes, `WEARABLE_AB_VERSION` otherwise) and in the placement its type
+selects (`{lane}/assets/` for scenes, `{lane}/{entityId}/` for everything else), or
+`manifest/{entityId}_{platform}.json` for a requested platform — and the job fails on
+anything else, on an unrequested platform, a non-standing exit code (anything but `0` and
+`12`), a missing manifest, more than 10 000 objects, an object over the 5 GB a single copy
+allows or more than 16 GB in all. Digest-named shared bundles are copied conditionally
+(`If-None-Match: *`): one already on the CDN is left as it is, which is what `convert`
+mode does too, where the build reuses those off the CDN and never rewrites them; every
+other object is copied over whatever is there, as a rebuild would. Copies stop, and the
+job fails whole so it is retried, when the invocation has under 20 s left.
+
+Failure semantics are `convert` mode's: a worker that errors, times out or answers badly
+fails the job, SQS redelivers it, and the final receive tombstones. A publisher invocation
+that does not have 30 s to spare for the worker fails the job without calling it. Every
+attempt names a fresh nonce, the invoke client's own retries of throttling and 5xx answers
+included, so a retry never shares staged objects with a run still writing. The LOD lane
+does not run split yet: it decodes creator assets too, so publisher mode refuses to start
+with `ENABLE_LODS` on.
+
+The worker needs a role that can write its own logs, `s3:GetObject` and `s3:ListBucket` on
+the CDN bucket (the reuse probes) and `s3:PutObject` under `jobs/*` of the scratch bucket,
+and nothing of the publisher's environment (no `ABGEN_SNS_TOPIC_ARN`, no
+`ABGEN_REDIS_URL`, no `ABGEN_HTTP_SECRET`); it needs no VPC attachment. The publisher's
+role gains `lambda:InvokeFunction` on the worker and
+`s3:GetObject` + `s3:DeleteObject` under `jobs/*` of the scratch bucket. Give the scratch
+bucket a one-day expiration rule for what a failed job leaves behind. Both functions must
+run the same `AB_VERSION` and `WEARABLE_AB_VERSION`, since the publisher accepts keys only
+under its own lanes, and the worker keeps the converter's memory, storage and platforms
+while the publisher can run small. Set the worker's timeout below
+`ABGEN_WORKER_TIMEOUT_S`, and that below the publisher's timeout less 90 s.
+
+```bash
+# worker, locally: stage one entity into a scratch bucket
+ABGEN_LAMBDA_MODE=worker ABGEN_S3_READ_ONLY=1 ABGEN_SCRATCH_S3_BUCKET=my-scratch \
+  ALLOWED_CONTENT_SERVER_HOSTS=peer.decentraland.org \
+  ./target/release/abgen-lambda --once convert-request.json
+```
 
 ## Partial batch responses
 

@@ -142,7 +142,10 @@ pub fn publish(
     entity_doc: &serde_json::Value,
     outcome: &EntityOutcome,
 ) -> Result<serde_json::Value> {
-    let total_bundles: usize = outcome.platforms.iter().map(|p| p.built.len()).sum();
+    let total_bundles: usize = outcome
+        .platforms
+        .iter()
+        .fold(0usize, |total, p| total.saturating_add(p.bundles));
     if !proxy.space_configured() {
         eprintln!(
             "output: no space configured (set ABGEN_S3_ENDPOINT/ABGEN_S3_BUCKET) — \
@@ -338,6 +341,8 @@ pub(crate) mod tests {
         std::env::set_var("ABGEN_S3_ENDPOINT", format!("http://{host}"));
         std::env::set_var("AWS_ACCESS_KEY_ID", "AKIATEST");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+        // Path style, as the deployments: a bucket, when a test sets one, is in the path.
+        std::env::set_var("ABGEN_S3_PATH_STYLE", "1");
         (lock, EnvGuard)
     }
 
@@ -348,6 +353,7 @@ pub(crate) mod tests {
                 "ABGEN_S3_ENDPOINT",
                 "AWS_ACCESS_KEY_ID",
                 "AWS_SECRET_ACCESS_KEY",
+                "ABGEN_S3_PATH_STYLE",
             ] {
                 std::env::remove_var(k);
             }

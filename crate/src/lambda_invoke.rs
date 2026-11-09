@@ -173,13 +173,26 @@ impl LambdaInvoker {
         budget: Duration,
         tenant: Option<&str>,
     ) -> Result<serde_json::Value> {
+        self.invoke_with(&mut |_| payload.clone(), budget, tenant)
+    }
+
+    /// [`LambdaInvoker::invoke`] with a payload built per attempt (`payload(attempt)`,
+    /// attempts from 1): for a function with side effects, each attempt can then name a
+    /// fresh target, so a retry after a 5xx never overlaps a run still writing to the
+    /// previous one.
+    pub fn invoke_with(
+        &self,
+        payload: &mut dyn FnMut(u32) -> serde_json::Value,
+        budget: Duration,
+        tenant: Option<&str>,
+    ) -> Result<serde_json::Value> {
         if let Some(tenant) = tenant.filter(|t| !valid_tenant_id(t)) {
             crate::bail!("lambda tenant id {tenant:?} is not a valid tenant id");
         }
-        let body = serde_json::to_vec(payload)?;
         let deadline = Instant::now() + budget;
         let mut attempt = 1;
         loop {
+            let body = serde_json::to_vec(&payload(attempt))?;
             let left = deadline.saturating_duration_since(Instant::now());
             let err = match self.invoke_once(&body, left, tenant) {
                 Attempt::Done(result) => return result,
@@ -306,6 +319,46 @@ impl LambdaInvoker {
         }
         Attempt::Done(Ok(value))
     }
+}
+
+/// A timeout setting from the environment: unset or blank is `default`, anything else a
+/// positive integer of seconds. `env_name` names the variable in the error.
+pub fn parse_timeout_setting(
+    env_name: &str,
+    value: Option<&str>,
+    default: Duration,
+) -> Result<Duration> {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(default),
+        Some(v) => v
+            .parse::<u64>()
+            .ok()
+            .filter(|s| *s > 0)
+            .map(Duration::from_secs)
+            .ok_or_else(|| crate::anyhow!("{env_name}={v:?} is not a positive integer")),
+    }
+}
+
+/// How long one call may take: `timeout`, capped by what is left of the caller's own
+/// invocation after `reserve`. Below `min_budget` the call is not started at all, and
+/// the error says so ("not starting").
+pub fn call_budget(
+    timeout: Duration,
+    invocation_left: Option<Duration>,
+    reserve: Duration,
+    min_budget: Duration,
+) -> Result<Duration> {
+    let budget = match invocation_left {
+        Some(left) => timeout.min(left.saturating_sub(reserve)),
+        None => timeout,
+    };
+    if budget < min_budget {
+        crate::bail!(
+            "only {}s left in this invocation for the call, not starting it",
+            budget.as_secs()
+        );
+    }
+    Ok(budget)
 }
 
 /// Errors that mean the request never reached Lambda: safe to retry.
@@ -462,6 +515,46 @@ mod tests {
 
     const OK: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}";
     const BUDGET: Duration = Duration::from_secs(20);
+
+    #[test]
+    fn each_attempt_can_carry_a_fresh_payload() {
+        let (endpoint, server) = server(vec![
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            OK,
+        ]);
+        let got = invoker(&endpoint, None)
+            .invoke_with(
+                &mut |attempt| serde_json::json!({"attempt": attempt}),
+                BUDGET,
+                None,
+            )
+            .unwrap();
+        assert_eq!(got, serde_json::json!({"ok": true}));
+        let bodies: Vec<Vec<u8>> = server.join().unwrap().into_iter().map(|(_, b)| b).collect();
+        assert_eq!(
+            bodies,
+            vec![br#"{"attempt":1}"#.to_vec(), br#"{"attempt":2}"#.to_vec()]
+        );
+    }
+
+    #[test]
+    fn timeout_settings_and_budgets_are_shared() {
+        let s = Duration::from_secs;
+        assert_eq!(parse_timeout_setting("X", None, s(7)).unwrap(), s(7));
+        assert_eq!(
+            parse_timeout_setting("X", Some(" 45 "), s(7)).unwrap(),
+            s(45)
+        );
+        let err = parse_timeout_setting("X_TIMEOUT", Some("5m"), s(7)).unwrap_err();
+        assert!(err.to_string().contains("X_TIMEOUT"), "{err}");
+        assert_eq!(call_budget(s(270), None, s(30), s(10)).unwrap(), s(270));
+        assert_eq!(
+            call_budget(s(270), Some(s(100)), s(30), s(10)).unwrap(),
+            s(70)
+        );
+        let err = call_budget(s(270), Some(s(35)), s(30), s(10)).unwrap_err();
+        assert!(err.to_string().contains("not starting"), "{err}");
+    }
 
     #[test]
     fn invoke_signs_and_posts_the_payload() {

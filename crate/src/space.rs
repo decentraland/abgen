@@ -41,6 +41,21 @@ pub struct Space {
     pub path_style: bool,
     pub read_only: bool,
     creds: CredsSource,
+    /// `prefix/` put in front of every key on the wire, reads and writes alike: one job's
+    /// view of a bucket, which is how the worker of the publisher/worker split stages a
+    /// conversion under a prefix of the publisher's choosing. The caller's key stays the
+    /// caller's: `object_headers` and the write log see it without the prefix.
+    key_prefix: Option<String>,
+    /// Every key this space has put, with its size, once [`Space::logging_writes`] asked
+    /// for it: what a worker reports back as the objects it staged.
+    written: Option<Mutex<Vec<WrittenObject>>>,
+}
+
+/// One object a logging space put.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WrittenObject {
+    pub key: String,
+    pub bytes: u64,
 }
 
 pub(crate) fn agent() -> &'static ureq::Agent {
@@ -329,7 +344,54 @@ impl Space {
             path_style,
             read_only,
             creds,
+            key_prefix: None,
+            written: None,
         })
+    }
+
+    /// The same endpoint and credentials, another bucket, and writes allowed whatever
+    /// `ABGEN_S3_READ_ONLY` said: the scratch bucket a worker stages into while its view
+    /// of the CDN stays read-only. Path-style addressing only: with virtual-hosted
+    /// addressing the bucket is in the host, which this does not rewrite, so the request
+    /// would still go to the first bucket.
+    pub fn writable_bucket(mut self, bucket: &str) -> Result<Space> {
+        if !self.path_style {
+            crate::bail!(
+                "another bucket on the same endpoint needs path-style addressing \
+                 (ABGEN_S3_PATH_STYLE=1)"
+            );
+        }
+        self.bucket = Some(bucket.to_string());
+        self.read_only = false;
+        Ok(self)
+    }
+
+    /// Puts every key under `prefix/` on the wire, and reads them from there. Blank or
+    /// all slashes means no prefix.
+    pub fn with_key_prefix(mut self, prefix: &str) -> Space {
+        let trimmed = prefix.trim_matches('/');
+        self.key_prefix = (!trimmed.is_empty()).then(|| format!("{trimmed}/"));
+        self
+    }
+
+    /// The prefix [`Space::with_key_prefix`] set, with its trailing slash.
+    pub fn key_prefix(&self) -> Option<&str> {
+        self.key_prefix.as_deref()
+    }
+
+    /// Keeps the log [`Space::written_objects`] reads: every successful put, in order.
+    pub fn logging_writes(mut self) -> Space {
+        self.written = Some(Mutex::new(Vec::new()));
+        self
+    }
+
+    /// What this space has put so far, by the caller's key (no prefix). Empty unless
+    /// [`Space::logging_writes`] was asked for.
+    pub fn written_objects(&self) -> Vec<WrittenObject> {
+        self.written
+            .as_ref()
+            .map(|log| log.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .unwrap_or_default()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -355,6 +417,8 @@ impl Space {
                 secret_key: secret_key.to_string(),
                 session_token: None,
             }),
+            key_prefix: None,
+            written: None,
         }
     }
 
@@ -424,7 +488,10 @@ impl CredsSource {
 
 impl Space {
     fn path(&self, key: &str) -> String {
-        let encoded = uri_encode_key(key);
+        let encoded = match &self.key_prefix {
+            Some(prefix) => uri_encode_key(&format!("{prefix}{key}")),
+            None => uri_encode_key(key),
+        };
         match (self.path_style, &self.bucket) {
             (true, Some(b)) => format!("/{b}/{encoded}"),
             _ => format!("/{encoded}"),
@@ -440,23 +507,43 @@ impl Space {
         amz_date: &str,
         date: &str,
     ) -> String {
+        self.authorize_with(c, method, key, payload_hash, amz_date, date, &[])
+    }
+
+    /// [`Space::authorize`] for a request carrying further `x-amz-*` headers (`extra`,
+    /// lowercase names): S3 refuses a request whose amz headers are not all signed.
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_with(
+        &self,
+        c: &ResolvedCreds,
+        method: &str,
+        key: &str,
+        payload_hash: &str,
+        amz_date: &str,
+        date: &str,
+        extra: &[(&str, &str)],
+    ) -> String {
         let canonical_uri = self.path(key);
-        let (signed_headers, canonical_headers) = match &c.session_token {
-            Some(token) => (
-                "host;x-amz-content-sha256;x-amz-date;x-amz-security-token",
-                format!(
-                    "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\nx-amz-security-token:{}\n",
-                    self.host, payload_hash, amz_date, token
-                ),
-            ),
-            None => (
-                "host;x-amz-content-sha256;x-amz-date",
-                format!(
-                    "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
-                    self.host, payload_hash, amz_date
-                ),
-            ),
-        };
+        let mut headers: Vec<(&str, &str)> = vec![
+            ("host", self.host.as_str()),
+            ("x-amz-content-sha256", payload_hash),
+            ("x-amz-date", amz_date),
+        ];
+        if let Some(token) = &c.session_token {
+            headers.push(("x-amz-security-token", token.as_str()));
+        }
+        headers.extend(extra.iter().copied());
+        // Canonical headers are sorted by name.
+        headers.sort_by(|a, b| a.0.cmp(b.0));
+        let signed_headers = headers
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(";");
+        let canonical_headers: String = headers
+            .iter()
+            .map(|(name, value)| format!("{name}:{value}\n"))
+            .collect();
         let canonical_request = format!(
             "{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
         );
@@ -569,7 +656,111 @@ impl Space {
         }
         req.send(body)
             .map_err(|e| crate::anyhow!("space PUT {key}: {e}"))?;
+        if let Some(log) = &self.written {
+            log.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(WrittenObject {
+                    key: key.to_string(),
+                    bytes: body.len() as u64,
+                });
+        }
         Ok(())
+    }
+
+    /// Server-side copy of `source_key` in `source_bucket` (same endpoint, same
+    /// credentials) to `key` here, carrying the metadata a fresh put of `key` would
+    /// (`object_headers`), whatever the source carried. No bytes pass through this
+    /// process; S3 copies at most 5 GB in one request. With `only_if_absent` the copy is
+    /// conditional (`If-None-Match: *`): an object already at `key` is left as it is and
+    /// the answer is `false`, atomically, with no probe first. The publisher of the
+    /// publisher/worker split moves staged objects into the CDN with it.
+    pub fn copy_from(
+        &self,
+        source_bucket: &str,
+        source_key: &str,
+        key: &str,
+        only_if_absent: bool,
+    ) -> Result<bool> {
+        if self.read_only {
+            return Err(crate::anyhow!(
+                "space is read-only (ABGEN_S3_READ_ONLY): refusing COPY to {key}"
+            ));
+        }
+        let headers = object_headers(key);
+        let c = self.creds()?;
+        let payload_hash = sha256_hex(b"");
+        let (date, amz) = timestamps();
+        let copy_source = format!("/{source_bucket}/{}", uri_encode_key(source_key));
+        let mut extra: Vec<(&str, &str)> = vec![
+            ("x-amz-copy-source", copy_source.as_str()),
+            ("x-amz-metadata-directive", "REPLACE"),
+        ];
+        if only_if_absent {
+            extra.push(("if-none-match", "*"));
+        }
+        let auth = self.authorize_with(&c, "PUT", key, &payload_hash, &amz, &date, &extra);
+        let url = format!("{}://{}{}", self.scheme, self.host, self.path(key));
+        let mut req = agent()
+            .put(&url)
+            .header("x-amz-date", &amz)
+            .header("x-amz-content-sha256", &payload_hash)
+            .header("x-amz-copy-source", &copy_source)
+            .header("x-amz-metadata-directive", "REPLACE")
+            .header("Authorization", &auth)
+            .header("Content-Type", headers.content_type)
+            .header("Cache-Control", headers.cache_control);
+        if only_if_absent {
+            req = req.header("If-None-Match", "*");
+        }
+        if let Some(token) = &c.session_token {
+            req = req.header("x-amz-security-token", token);
+        }
+        let empty: &[u8] = &[];
+        let resp = match req.send(empty) {
+            Ok(resp) => resp,
+            Err(ureq::Error::StatusCode(412)) if only_if_absent => return Ok(false),
+            Err(e) => {
+                return Err(crate::anyhow!(
+                    "space COPY {source_bucket}/{source_key} -> {key}: {e}"
+                ))
+            }
+        };
+        // A copy that fails after S3 has started it is answered 200 with an <Error> body.
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut resp.into_body().into_reader(), &mut out)?;
+        if out.windows(7).any(|w| w == b"<Error>") {
+            return Err(crate::anyhow!(
+                "space COPY {source_bucket}/{source_key} -> {key}: {}",
+                String::from_utf8_lossy(&out[..out.len().min(512)])
+            ));
+        }
+        Ok(true)
+    }
+
+    /// Deletes `key`. A key that is not there is not an error.
+    pub fn delete(&self, key: &str) -> Result<()> {
+        if self.read_only {
+            return Err(crate::anyhow!(
+                "space is read-only (ABGEN_S3_READ_ONLY): refusing DELETE {key}"
+            ));
+        }
+        let c = self.creds()?;
+        let payload_hash = sha256_hex(b"");
+        let (date, amz) = timestamps();
+        let auth = self.authorize(&c, "DELETE", key, &payload_hash, &amz, &date);
+        let url = format!("{}://{}{}", self.scheme, self.host, self.path(key));
+        let mut req = agent()
+            .delete(&url)
+            .header("x-amz-date", &amz)
+            .header("x-amz-content-sha256", &payload_hash)
+            .header("Authorization", &auth);
+        if let Some(token) = &c.session_token {
+            req = req.header("x-amz-security-token", token);
+        }
+        match req.call() {
+            Ok(_) | Err(ureq::Error::StatusCode(404)) => Ok(()),
+            Err(e) => Err(crate::anyhow!("space DELETE {key}: {e}")),
+        }
     }
 
     pub(crate) fn put_timed(&self, key: &str, bytes: &[u8]) -> Result<()> {
@@ -606,7 +797,262 @@ mod tests {
                 secret_key: "secret".to_string(),
                 session_token: session_token.map(str::to_string),
             }),
+            key_prefix: None,
+            written: None,
         }
+    }
+
+    /// The request head the fake server captured, split into the request line and a
+    /// case-insensitive header lookup.
+    fn header_value(head: &str, name: &str) -> Option<String> {
+        head.lines()
+            .find(|l| l.to_ascii_lowercase().starts_with(&format!("{name}:")))
+            .and_then(|l| l.split_once(':'))
+            .map(|(_, v)| v.trim().to_string())
+    }
+
+    fn signed_headers(head: &str) -> Vec<String> {
+        header_value(head, "authorization")
+            .unwrap()
+            .split("SignedHeaders=")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .split(';')
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn key_prefix_is_on_the_wire_only() {
+        let s = test_space(false, None).with_key_prefix("/jobs/bafk/abc/");
+        assert_eq!(s.key_prefix(), Some("jobs/bafk/abc/"));
+        assert_eq!(
+            s.path("v41/assets/Qm_windows"),
+            "/jobs/bafk/abc/v41/assets/Qm_windows"
+        );
+        let mut path_style = test_space(false, None).with_key_prefix("jobs/x");
+        path_style.path_style = true;
+        assert_eq!(
+            path_style.path("manifest/c_mac.json"),
+            "/bucket/jobs/x/manifest/c_mac.json"
+        );
+        assert_eq!(
+            test_space(false, None).with_key_prefix("//").key_prefix(),
+            None
+        );
+    }
+
+    #[test]
+    fn writable_bucket_switches_bucket_and_lifts_read_only() {
+        let mut path_style = test_space(true, None);
+        path_style.path_style = true;
+        let s = path_style.writable_bucket("scratch").unwrap();
+        assert_eq!(s.bucket.as_deref(), Some("scratch"));
+        assert!(!s.read_only);
+        assert_eq!(s.path("k"), "/scratch/k");
+        // Virtual-hosted addressing keeps the bucket in the host: refused rather than
+        // silently writing to the first bucket.
+        let err = test_space(true, None)
+            .writable_bucket("scratch")
+            .unwrap_err();
+        assert!(err.to_string().contains("ABGEN_S3_PATH_STYLE"), "{err}");
+    }
+
+    #[test]
+    fn written_objects_are_logged_by_caller_key() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handle = capture_one_request(listener, captured.clone());
+        let mut s = test_space(false, None)
+            .with_key_prefix("jobs/bafk/nonce")
+            .logging_writes();
+        s.scheme = "http".to_string();
+        s.host = addr.to_string();
+        assert!(s.written_objects().is_empty());
+        s.put("v41/assets/Qmhash_windows", b"bytes").unwrap();
+        handle.join().unwrap();
+        assert_eq!(
+            s.written_objects(),
+            vec![WrittenObject {
+                key: "v41/assets/Qmhash_windows".to_string(),
+                bytes: 5
+            }]
+        );
+        let head = captured.lock().unwrap().join("\n");
+        assert!(
+            head.starts_with("PUT /jobs/bafk/nonce/v41/assets/Qmhash_windows HTTP/1.1"),
+            "{head}"
+        );
+        // A space that does not log answers nothing, even after a put.
+        assert!(test_space(false, None).written_objects().is_empty());
+    }
+
+    #[test]
+    fn copy_sends_and_signs_the_copy_headers() {
+        for token in [None, Some("tok123")] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let handle = capture_one_request(listener, captured.clone());
+            let mut s = test_space(false, token);
+            s.scheme = "http".to_string();
+            s.host = addr.to_string();
+            let copied = s
+                .copy_from(
+                    "scratch",
+                    "jobs/bafk/n/manifest/bafk_mac.json",
+                    "manifest/bafk_mac.json",
+                    false,
+                )
+                .unwrap();
+            assert!(copied);
+            handle.join().unwrap();
+            let head = captured.lock().unwrap().join("\n");
+            assert!(
+                head.starts_with("PUT /manifest/bafk_mac.json HTTP/1.1"),
+                "{head}"
+            );
+            assert_eq!(
+                header_value(&head, "x-amz-copy-source").as_deref(),
+                Some("/scratch/jobs/bafk/n/manifest/bafk_mac.json")
+            );
+            assert_eq!(
+                header_value(&head, "x-amz-metadata-directive").as_deref(),
+                Some("REPLACE")
+            );
+            // The destination's own metadata, not whatever the staged copy carried.
+            assert_eq!(
+                header_value(&head, "content-type").as_deref(),
+                Some("application/json")
+            );
+            assert_eq!(
+                header_value(&head, "cache-control").as_deref(),
+                Some(NO_CACHE)
+            );
+            assert_eq!(header_value(&head, "content-length").as_deref(), Some("0"));
+            let signed = signed_headers(&head);
+            for name in head.lines().filter_map(|l| {
+                let (name, _) = l.split_once(':')?;
+                let n = name.trim().to_ascii_lowercase();
+                n.starts_with("x-amz-").then_some(n)
+            }) {
+                assert!(signed.contains(&name), "unsigned {name} in {head}");
+            }
+            assert_eq!(
+                signed,
+                signed
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "signed headers are in canonical order: {head}"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_and_delete_refuse_on_a_read_only_space() {
+        let s = test_space(true, None);
+        assert!(s
+            .copy_from("b", "k", "k", false)
+            .unwrap_err()
+            .to_string()
+            .contains("read-only"));
+        assert!(s.delete("k").unwrap_err().to_string().contains("read-only"));
+    }
+
+    #[test]
+    fn a_conditional_copy_sends_if_none_match_and_reads_412_as_present() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handle = answer_one_request(
+            listener,
+            captured.clone(),
+            "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let mut s = test_space(false, None);
+        s.scheme = "http".to_string();
+        s.host = addr.to_string();
+        let copied = s
+            .copy_from(
+                "scratch",
+                "jobs/n/v41/assets/Qm_d_windows",
+                "v41/assets/Qm_d_windows",
+                true,
+            )
+            .unwrap();
+        assert!(!copied, "412 means the object was already there");
+        handle.join().unwrap();
+        let head = captured.lock().unwrap().join("\n");
+        assert_eq!(header_value(&head, "if-none-match").as_deref(), Some("*"));
+        assert!(
+            signed_headers(&head).contains(&"if-none-match".to_string()),
+            "{head}"
+        );
+
+        // Without the condition a 412 is an error like any other.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = answer_one_request(
+            listener,
+            captured.clone(),
+            "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        s.host = addr.to_string();
+        assert!(s.copy_from("scratch", "k", "k", false).is_err());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_copy_answered_200_with_an_error_body_is_an_error() {
+        let body = "<?xml version=\"1.0\"?><Error><Code>InternalError</Code></Error>";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let response: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let handle = answer_one_request(listener, captured, response);
+        let mut s = test_space(false, None);
+        s.scheme = "http".to_string();
+        s.host = addr.to_string();
+        let err = s
+            .copy_from("scratch", "k", "manifest/k.json", false)
+            .unwrap_err();
+        assert!(err.to_string().contains("InternalError"), "{err}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn delete_is_a_signed_delete_under_the_prefix() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handle = capture_one_request(listener, captured.clone());
+        let mut s = test_space(false, None).with_key_prefix("jobs/bafk/n");
+        s.scheme = "http".to_string();
+        s.host = addr.to_string();
+        s.delete("v41/assets/Qm_windows").unwrap();
+        handle.join().unwrap();
+        let head = captured.lock().unwrap().join("\n");
+        assert!(
+            head.starts_with("DELETE /jobs/bafk/n/v41/assets/Qm_windows HTTP/1.1"),
+            "{head}"
+        );
+        assert!(
+            signed_headers(&head).contains(&"x-amz-date".to_string()),
+            "{head}"
+        );
     }
 
     #[test]
@@ -640,6 +1086,19 @@ mod tests {
         listener: std::net::TcpListener,
         out: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) -> std::thread::JoinHandle<()> {
+        answer_one_request(
+            listener,
+            out,
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+    }
+
+    /// Reads one request, records its head, answers with `response` verbatim.
+    fn answer_one_request(
+        listener: std::net::TcpListener,
+        out: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        response: &'static str,
+    ) -> std::thread::JoinHandle<()> {
         use std::io::{BufRead, BufReader, Read, Write};
         std::thread::spawn(move || {
             let Ok((mut stream, _)) = listener.accept() else {
@@ -667,8 +1126,7 @@ mod tests {
                 let _ = reader.read_exact(&mut body);
             }
             out.lock().unwrap().push(head.join("\n"));
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
         })
     }
