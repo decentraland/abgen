@@ -21,7 +21,12 @@ fn main() {
                 eprintln!("--once needs an event file path");
                 std::process::exit(2);
             };
-            init();
+            if scenerun_mode() {
+                init_tracing();
+                emf::init();
+            } else {
+                init();
+            }
             let mut cfg = config::Config::from_env();
             cfg.keep_output = true;
             let result = run_once(&cfg, path);
@@ -63,17 +68,28 @@ fn main() {
                  \x20    ENABLE_LODS (off: LOD jobs are acked and skipped; on: LOD_LEVELS\n\
                  \x20    are regenerated from the scene and written to LOD/<level>/ and\n\
                  \x20    lods-unity/manifests/ — the deployment's FBX sources are unused),\n\
-                 \x20    LOD_LEVELS (default 1; 0,1 for both levels)"
+                 \x20    LOD_LEVELS (default 1; 0,1 for both levels),\n\
+                 \x20    ABGEN_SCENERUN_FUNCTION (run LOD scenes in that function),\n\
+                 \x20    ABGEN_SCENERUN_TIMEOUT_S (default 300),\n\
+                 \x20    ABGEN_LAMBDA_MODE (convert | scenerun: only run scenes for\n\
+                 \x20    another function's LOD lane, one per process)"
             );
         }
         Some(other) => {
             eprintln!("unknown argument: {other} (try --help)");
             std::process::exit(2);
         }
+        None if scenerun_mode() => {
+            init_tracing();
+            emf::init();
+            let cfg = config::Config::from_env();
+            eprintln!("init: scene runner mode ({MODE_ENV}=scenerun)");
+            runtime::serve(&cfg, handle_scenerun, runtime::AfterResponse::Exit);
+        }
         None => {
             init();
             let cfg = config::Config::from_env();
-            runtime::serve(&cfg, handle);
+            runtime::serve(&cfg, handle, runtime::AfterResponse::Continue);
         }
     }
 }
@@ -119,10 +135,42 @@ fn init_tracing() {
     }
 }
 
+/// Selects what the function does. Unset: convert (the default). `scenerun`: run one
+/// scene per invocation for another function's LOD lane
+/// (`abgen::lodgen::scenerun::remote`) and nothing else.
+const MODE_ENV: &str = "ABGEN_LAMBDA_MODE";
+
+fn scenerun_mode() -> bool {
+    match std::env::var(MODE_ENV) {
+        Ok(v) if v.trim().eq_ignore_ascii_case("scenerun") => true,
+        Ok(v) if v.trim().is_empty() || v.trim().eq_ignore_ascii_case("convert") => false,
+        Ok(v) => {
+            eprintln!("fatal: {MODE_ENV}={v:?} is neither `convert` nor `scenerun`");
+            std::process::exit(1);
+        }
+        Err(_) => false,
+    }
+}
+
+/// Scene runner invocations: only scenerun requests, and only for content servers this
+/// function would convert from. Anything else is an error, never a conversion.
+fn handle_scenerun(cfg: &config::Config, event: &serde_json::Value) -> Result<serde_json::Value> {
+    use abgen::lodgen::scenerun::remote;
+    if !remote::is_request(event) {
+        anyhow::bail!("scene runner mode accepts scenerun requests only");
+    }
+    remote::serve(event, &|server: &str| {
+        event::validate_content_server(server, cfg.allowed_content_server_hosts.as_deref())
+    })
+}
+
 fn run_once(cfg: &config::Config, path: &str) -> Result<serde_json::Value> {
     let raw = std::fs::read_to_string(path).with_context(|| format!("read event file {path}"))?;
     let event: serde_json::Value =
         serde_json::from_str(&raw).with_context(|| format!("parse event file {path} as JSON"))?;
+    if scenerun_mode() {
+        return handle_scenerun(cfg, &event);
+    }
     handle(cfg, &event)
 }
 

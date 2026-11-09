@@ -3,9 +3,20 @@ use anyhow::Result;
 
 const API_VERSION: &str = "2018-06-01";
 
+/// What the process does once an invocation is answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AfterResponse {
+    /// Wait for the next invocation in the same process.
+    Continue,
+    /// Exit, so the next invocation starts a fresh process: nothing one invocation
+    /// left in memory reaches the next.
+    Exit,
+}
+
 pub fn serve(
     cfg: &Config,
     handler: impl Fn(&Config, &serde_json::Value) -> Result<serde_json::Value>,
+    after: AfterResponse,
 ) -> ! {
     let api = std::env::var("AWS_LAMBDA_RUNTIME_API").unwrap_or_else(|_| {
         eprintln!(
@@ -55,6 +66,9 @@ pub fn serve(
                     eprintln!("runtime: failed to post error for {request_id}: {e:#}");
                 }
             }
+        }
+        if after == AfterResponse::Exit {
+            std::process::exit(0);
         }
     }
 }

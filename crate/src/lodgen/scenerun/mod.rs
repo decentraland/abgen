@@ -13,6 +13,9 @@ pub use engine::QuickJsEngine;
 pub mod sandbox;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
+pub mod remote;
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
 pub use sandbox::SandboxedEngine;
 
 /// Call first thing in `main` of every binary that can run scenes: when the process was
@@ -130,12 +133,19 @@ fn default_engine() -> impl SceneEngine {
     QuickJsEngine
 }
 
+/// Runs the scene and projects its renderer state into placements. With
+/// [`remote::FUNCTION_ENV`] set the scene runs in that Lambda function ([`remote`]);
+/// otherwise in a local child process ([`sandbox`]).
 #[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
 pub fn run_scene_placements(
     client: &crate::catalyst::CatalystClient,
     ent: &crate::catalyst::Scene,
 ) -> anyhow::Result<Option<crate::lodgen::placements::ManifestPlacements>> {
-    run_scene_with(&default_engine(), client, ent)
+    let capture = match remote::runner() {
+        Some(runner) => runner?.capture(client, ent)?,
+        None => capture_scene(&default_engine(), client, ent)?,
+    };
+    project_capture(ent, capture)
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "scene-runtime")))]
@@ -146,12 +156,22 @@ pub fn run_scene_placements(
     anyhow::bail!("embedded scene execution requires the scene-runtime feature")
 }
 
+/// What running a scene produced, before projection: the renderer stream and every
+/// deployment file the scene read, under the hash it was served as.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, Default)]
+pub struct SceneCapture {
+    pub outcome: CaptureOutcome,
+    pub files_read: std::collections::BTreeMap<String, String>,
+}
+
+/// Fetches the scene's code (and `main.crdt` for SDK7) and runs it on `engine`.
 #[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
-fn run_scene_with(
+pub fn capture_scene(
     engine: &dyn SceneEngine,
     client: &crate::catalyst::CatalystClient,
     ent: &crate::catalyst::Scene,
-) -> anyhow::Result<Option<crate::lodgen::placements::ManifestPlacements>> {
+) -> anyhow::Result<SceneCapture> {
     use anyhow::{anyhow, Context};
     let sdk7 = ent.metadata.get("runtimeVersion").and_then(|v| v.as_str()) == Some("7");
     let content = ent.content_by_file();
@@ -202,14 +222,31 @@ fn run_scene_with(
         limits: EngineLimits::default(),
     };
     let outcome = engine.run_capture(job)?;
+    let files_read = files_read.lock().map(|m| m.clone()).unwrap_or_default();
+    Ok(SceneCapture {
+        outcome,
+        files_read,
+    })
+}
+
+/// Projects a capture into placements: `None` when the scene sent no renderer state.
+#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
+fn project_capture(
+    ent: &crate::catalyst::Scene,
+    capture: SceneCapture,
+) -> anyhow::Result<Option<crate::lodgen::placements::ManifestPlacements>> {
+    let SceneCapture {
+        outcome,
+        files_read,
+    } = capture;
     if outcome.stream.is_empty() {
         if let Some(e) = outcome.eval_error {
             anyhow::bail!("scene {} script failed to evaluate: {e}", ent.entity_id);
         }
         return Ok(None);
     }
-    let mut placements = crdt::placements_from_crdt(&outcome.stream, &content);
-    placements.files_read = files_read.lock().map(|m| m.clone()).unwrap_or_default();
+    let mut placements = crdt::placements_from_crdt(&outcome.stream, &ent.content_by_file());
+    placements.files_read = files_read;
     Ok(Some(placements))
 }
 

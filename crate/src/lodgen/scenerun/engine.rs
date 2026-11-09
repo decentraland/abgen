@@ -523,6 +523,23 @@ module.exports = {{
     }
 
     #[test]
+    fn compacted_stream_projects_like_the_full_stream() {
+        let mut content = HashMap::new();
+        content.insert("model.glb".to_string(), "hmodel".to_string());
+        // A main.crdt is prepended to every send, the case that makes streams large.
+        let main_crdt = crdt::synthetic_initial_state(None);
+        let outcome = QuickJsEngine
+            .run_capture(job(SYNTHETIC_GAME.into(), Some(main_crdt)))
+            .unwrap();
+        let compact = crdt::compact_stream(&outcome.stream);
+        assert!(compact.len() < outcome.stream.len());
+        let full = crdt::placements_from_crdt(&outcome.stream, &content);
+        assert!(!full.placements.is_empty());
+        assert_eq!(crdt::placements_from_crdt(&compact, &content), full);
+        assert_eq!(crdt::compact_stream(&compact), compact);
+    }
+
+    #[test]
     fn immediates_queued_in_start_send_before_the_first_update() {
         let code = format!(
             "{SCENE_HELPERS}

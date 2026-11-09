@@ -104,6 +104,19 @@ impl LwwState {
         }
     }
 
+    /// The folded state as a stream: one PUT per tracked cell, in first-seen order and
+    /// with its winning timestamp. Ingesting it rebuilds this state (same cells, same
+    /// order), so it projects exactly like the stream it was folded from.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut ordered: Vec<(&(u32, u32), &(u32, u64, Vec<u8>))> = self.cells.iter().collect();
+        ordered.sort_by_key(|(_, (_, seq, _))| *seq);
+        let mut out = Vec::new();
+        for ((entity, component), (timestamp, _, data)) in ordered {
+            encode_put(&mut out, *entity, *component, *timestamp, data);
+        }
+        out
+    }
+
     pub fn project(&self, content_by_file: &HashMap<String, String>) -> ManifestPlacements {
         let mut ordered: Vec<(&(u32, u32), &(u32, u64, Vec<u8>))> = self.cells.iter().collect();
         ordered.sort_by_key(|(_, (_, seq, _))| *seq);
@@ -279,6 +292,14 @@ pub fn synthetic_initial_state(main_crdt: Option<&[u8]>) -> Vec<u8> {
         out.extend_from_slice(bytes);
     }
     out
+}
+
+/// A renderer stream reduced to the state it folds to (see [`LwwState::encode`]): what
+/// the placements depend on, without every intermediate frame the scene sent.
+pub fn compact_stream(stream: &[u8]) -> Vec<u8> {
+    let mut state = LwwState::default();
+    state.ingest(stream);
+    state.encode()
 }
 
 pub fn placements_from_crdt(

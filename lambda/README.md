@@ -68,6 +68,9 @@ all hits.
 | `LOD_LEVELS` | `1` | comma-separated LOD levels the LOD lane builds and publishes (`0,1` for both); level 2 is refused |
 | `ALLOWED_CONTENT_SERVER_HOSTS` | — (**fail-open**) | comma-separated allowlist of hosts an event's `contentServerUrl` may name; **unset means any https host is accepted**, so every deployment should set it. Scheme/shape validation (https only, no userinfo) applies regardless — allowlist or not, a plaintext or internal-IP URL is rejected. The `lambdaImage` bakes in `peer.decentraland.org`; a function env var overrides it. |
 | `ABGEN_SANDBOX_SECCOMP` | `required` (the `lambdaImage` bakes in `auto`) | scene sandbox policy for the LOD lane. Lambda's runtime refuses `prctl(PR_SET_NO_NEW_PRIVS)`, so the sandbox child cannot install its seccomp filter there; under `required` every LOD build then fails with `scene sandbox self-test failed, refusing to run scenes: seccomp is unavailable here (…); set ABGEN_SANDBOX_SECCOMP=auto …`; under `auto` scenes run in the separate process (empty environment, `RLIMIT_DATA`, `RLIMIT_NPROC=0`, own process group, parent-death kill, non-dumpable parent) **without the syscall filter**: a QuickJS escape would then have the function's ordinary file, network and exec access, though not a second process or the parent's memory. One warning is logged per process and `abgen_scene_sandbox_seccomp_total{state="unavailable"}` counts it |
+| `ABGEN_SCENERUN_FUNCTION` | unset | name of a function running this image with `ABGEN_LAMBDA_MODE=scenerun`. Set: the LOD lane runs every scene there with a synchronous `Invoke` instead of in a local child process, and the local sandbox self-test is not used (see [Running scenes in a separate function](#running-scenes-in-a-separate-function)). Needs `lambda:InvokeFunction` on it |
+| `ABGEN_SCENERUN_TIMEOUT_S` | `300` | how long the LOD lane waits for one scene in `ABGEN_SCENERUN_FUNCTION`, cold start included |
+| `ABGEN_LAMBDA_MODE` | `convert` | `scenerun`: the function only runs scenes for another function's LOD lane, one per process (see [Running scenes in a separate function](#running-scenes-in-a-separate-function)) |
 | `ABGEN_EMF_NAMESPACE` | — (off) | CloudWatch namespace for EMF metrics (e.g. `abgen/lambda`); unset means no recorder is installed and every `metrics::` call stays a no-op |
 | `ABGEN_LOG_FORMAT` | plain text | `json` for JSON log lines |
 | `ABGEN_MAX_RECEIVE_COUNT` | `3` | must match the SQS redrive `maxReceiveCount`: a conversion failing on this receive publishes an `exitCode: 5` tombstone manifest per unconverted platform (+ a `statusCode: 5` finished event) and acks, instead of erroring into the DLQ. A tombstone never blocks reconversion — the already-converted check requires `exitCode: 0` — and if the tombstone itself cannot be published the original error propagates, so the message still reaches the DLQ. |
@@ -568,6 +571,29 @@ and no LOD is produced anywhere. Turn it on per environment: a LOD build is a
 whole-scene bake and costs far more CPU/RAM/time than a single-entity
 conversion, so size the function (memory, timeout, SQS visibility) for it
 first.
+
+### Running scenes in a separate function
+
+Placements come from executing the scene's code. Where the converter's runtime cannot
+confine the scene child (on Lambda the sandbox self-test refuses to run scenes: the runtime
+rejects seccomp and `PR_SET_DUMPABLE`), point `ABGEN_SCENERUN_FUNCTION` at a second function
+built from the same image with `ABGEN_LAMBDA_MODE=scenerun`:
+
+- the converter sends `{"abgenScenerun": 1, "contentServer", "fallbackContentServers",
+  "entity"}` and projects the returned renderer stream as a local run would. Only the
+  stream, the evaluation error and the files the scene read are taken from the response,
+  and a file counts only when the entity lists it under the same hash;
+- the scene runner fetches the scene's code and files from the content server (https, and
+  `ALLOWED_CONTENT_SERVER_HOSTS` when set), runs it in-process, answers, and exits, so every
+  invocation starts in a fresh process. It accepts nothing but scenerun requests.
+
+Give the scene runner its own role with no permissions beyond writing its logs and no
+access to the converter's resources: it holds nothing the converter needs protected. Its
+response is capped by Lambda at 6 MB; a larger renderer stream fails that scene's LOD.
+
+```bash
+ABGEN_LAMBDA_MODE=scenerun ./target/release/abgen-lambda --once scenerun-request.json
+```
 
 Known boundaries: level 2 is never emitted (production stopped emitting it),
 and level 0 (when requested) is the ISS-era pass-through bake rather than the
