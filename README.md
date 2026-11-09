@@ -303,14 +303,18 @@ release, never on the machine or thread count; changing either means new CIDs an
 - PNG/JPEG textures (sniffed by bytes): full mip chain, longest side capped at 1024 and snapped
   to powers of two (whole 4x4 blocks). `ktx2-bc5` for images the entity's models use only as
   normal maps (x in R, y in G - Bevy's two-channel normal path), `ktx2-bc1` for fully opaque
-  images, `ktx2-bc7` otherwise. Images 2 px or less on a side get none.
+  images, `ktx2-bc7` otherwise. An opaque colour (sRGB) image keeps BC1 only when its BC1
+  level 0, decoded, is within 36 dB PSNR (RGB) of the source at the variant size; below that
+  (posters, text, hard-edged art) it gets `ktx2-bc7` instead (`bc1_rejected` in the stats).
+  Linear (metallic-roughness, occlusion) images keep BC1. Images 2 px or less on a side get none.
+- Every texture variant must be smaller than its original file; otherwise the original is
+  served as is (`size-gate` in the stats, with the dropped variant's format and size).
 - creator UASTC KTX2 (standalone or embedded in a GLB): a pure block-for-block UASTC -> BC7
   transcode (`ktx2-bc7`) of one level only - the first level no larger than 1024, at its own
   size, exactly what the explorer's local path transcodes (same vendored basisu sources, one
   level, no mips) - so remote and localhost give the same texture. No resize, re-encode, BC1/BC5
-  or mips: a file that would need a resize or re-encode gets no variant, and so does a variant
-  larger than its original. Shipping the file's lower mips would need the explorer's local
-  transcode to keep them too (a separate change).
+  or mips: a file that would need a resize or re-encode gets no variant. Shipping the file's
+  lower mips would need the explorer's local transcode to keep them too (a separate change).
 - models, **off by default** (`ABGEN_BEVY_GLB_VARIANTS=1` on the server, `--bevy-glb-variants`
   on `abgen-corpus`): Bevy's glTF loader does not take GLB variants yet (it rejects
   `KHR_texture_basisu` in `extensionsRequired`, so a GLB embedding KTX2 cannot load), so by
@@ -330,8 +334,9 @@ abgen-corpus --entity-ids ids.txt --fetch-missing --bevy-variants ./out   # add 
 ABGEN_OUT_ROOT=./out ./target/release/abgen   # serves /bevy/manifest/... and /bevy/contents/...
 ```
 `abgen-corpus --bevy-variants` prints one `BEVY_STATS {json}` line per entity (stage times summed
-over files - fetch, decode, resize, BC1/BC5/BC7 encode with mips, UASTC->BC7 transcode, zstd,
-hash+write - counts and bytes by format and source, no-variant reasons such as the UASTC size gate)
+over files - fetch, decode, resize, BC1/BC5/BC7 encode with mips, the BC1 PSNR check, UASTC->BC7
+transcode, zstd, hash+write - counts and bytes by format and source, no-variant reasons, size-gated
+variants by format, BC1 rejections)
 and writes the full stats, per-file rows included, to `./out/bevy-variants-stats.json`.
 ### LOD JIT lane
 `ABGEN_LOD_JIT=1` enables JIT LOD builds on `GET /LOD/1/...` misses (level 1 only, the production

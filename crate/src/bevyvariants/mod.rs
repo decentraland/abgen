@@ -4,12 +4,15 @@
 //! - PNG/JPEG textures become KTX2 (`crate::ktx2_write`): BC1 / BC5 / BC7 UNORM blocks, each
 //!   level Zstandard-supercompressed, full mip chain, longest side at most [`BEVY_TEXTURE_MAX`]
 //!   (powers of two). BC5 for images the entity's models use only as normal maps, BC1 for fully
-//!   opaque images, BC7 otherwise.
+//!   opaque images whose BC1 level 0 stays within `texture::BC1_MIN_PSNR_DB` of the source
+//!   (linear ORM images keep BC1 regardless), BC7 otherwise.
+//! - Every texture variant must be smaller than its original file, or the original is served
+//!   as is (`size-gate` in the stats).
 //! - Creator UASTC KTX2 textures (standalone or embedded in a GLB) are only ever transcoded block
 //!   for block to BC7, and only the single level the explorer's local path picks (the first
 //!   level at most 1024 on a side, no mips), so remote equals localhost; anything that would
-//!   need a resize or re-encode gets no variant, and neither does a variant larger than its
-//!   original. Keeping the file's lower mips needs the explorer's local path to keep them too.
+//!   need a resize or re-encode gets no variant. Keeping the file's lower mips needs the
+//!   explorer's local path to keep them too.
 //! - Models (opt-in: `ABGEN_BEVY_GLB_VARIANTS=1` or `abgen-corpus --bevy-glb-variants`; off by
 //!   default because Bevy's glTF loader does not take them yet) become a GLB with Draco decoded, `KHR_texture_basisu` resolved and every embedded
 //!   image replaced by its KTX2 variant (`image/ktx2`). External image URIs are left as they are:
@@ -33,9 +36,9 @@ mod build;
 #[cfg(feature = "bevy-variants")]
 pub mod model;
 #[cfg(feature = "bevy-variants")]
-pub mod texture;
-#[cfg(feature = "bevy-variants")]
 pub mod stats;
+#[cfg(feature = "bevy-variants")]
+pub mod texture;
 
 #[cfg(feature = "bevy-variants")]
 pub use build::{build_entity_variants, BuildOptions, BuildOutput};
@@ -171,7 +174,9 @@ impl crate::live::Proxy {
             for (vcid, path) in &out.variants {
                 match std::fs::read(path) {
                     Ok(bytes) => self.space_put_key(&content_key(vcid), &bytes),
-                    Err(e) => tracing::warn!(cid = %vcid, error = %e, "bevy variants: re-read for upload failed"),
+                    Err(e) => {
+                        tracing::warn!(cid = %vcid, error = %e, "bevy variants: re-read for upload failed")
+                    }
                 }
             }
             self.space_put_key(&manifest_key(cid), &out.manifest_bytes);

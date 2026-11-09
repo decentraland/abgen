@@ -23,6 +23,9 @@ pub struct StageTimes {
     /// BC encode of the full chain, mip generation included (the encoders build each mip
     /// while encoding), alpha bleed included for BC7.
     pub bc1_ns: u64,
+    /// BC1 quality check of an opaque sRGB image: level 0 decoded and compared with the source
+    /// (`texture::BC1_MIN_PSNR_DB`); a rejected BC1 is followed by a BC7 encode (`bc7_ns`).
+    pub bc1_check_ns: u64,
     pub bc5_ns: u64,
     pub bc7_ns: u64,
     /// UASTC -> BC7 block transcode (creator KTX2).
@@ -39,6 +42,7 @@ impl StageTimes {
         self.decode_ns += o.decode_ns;
         self.resize_ns += o.resize_ns;
         self.bc1_ns += o.bc1_ns;
+        self.bc1_check_ns += o.bc1_check_ns;
         self.bc5_ns += o.bc5_ns;
         self.bc7_ns += o.bc7_ns;
         self.transcode_ns += o.transcode_ns;
@@ -51,6 +55,7 @@ impl StageTimes {
             + self.decode_ns
             + self.resize_ns
             + self.bc1_ns
+            + self.bc1_check_ns
             + self.bc5_ns
             + self.bc7_ns
             + self.transcode_ns
@@ -91,8 +96,8 @@ pub enum NoVariant {
     Ktx2NotWholeBlocks,
     /// The transcoder refused or failed.
     Ktx2TranscodeFailed,
-    /// The BC7 variant is larger than the original KTX2.
-    Ktx2SizeGate,
+    /// The variant is not smaller than the original (any source, any format).
+    SizeGate,
     /// Encode or write failed.
     EncodeError,
 }
@@ -127,11 +132,20 @@ pub struct FileStat {
     pub height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mips: Option<u32>,
-    /// The BC7 transcode's size when the size gate dropped it.
+    /// The variant's size and format when the size gate dropped it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gated_size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub gated_format: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<NoVariant>,
+    /// Opaque sRGB images only: PSNR (dB, RGB) of the BC1 encode's level 0 against the source
+    /// at the variant size, and whether it fell below `texture::BC1_MIN_PSNR_DB` (then the
+    /// variant is BC7).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bc1_psnr_db: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bc1_rejected: Option<bool>,
     pub times: StageTimes,
 }
 
@@ -157,6 +171,11 @@ pub struct BuildStats {
     pub variants: BTreeMap<String, CountBytes>,
     /// No-variant reason -> count and original bytes.
     pub no_variant: BTreeMap<String, CountBytes>,
+    /// Size-gated variants by the format that was tried -> count, original bytes and the
+    /// dropped variants' bytes.
+    pub size_gated: BTreeMap<String, CountBytes>,
+    /// Opaque sRGB images whose BC1 fell below the PSNR floor and became BC7.
+    pub bc1_rejected: u64,
     /// Unique variant files written by this build and their bytes.
     pub unique_variants: u64,
     pub unique_variant_bytes: u64,
@@ -196,6 +215,18 @@ impl BuildStats {
             e.count += 1;
             e.original_bytes += f.original_size;
             e.variant_bytes += f.variant_size.unwrap_or(0);
+            if f.reason == Some(NoVariant::SizeGate) {
+                let g = s
+                    .size_gated
+                    .entry(f.gated_format.unwrap_or("unknown").to_string())
+                    .or_default();
+                g.count += 1;
+                g.original_bytes += f.original_size;
+                g.variant_bytes += f.gated_size.unwrap_or(0);
+            }
+            if f.bc1_rejected == Some(true) {
+                s.bc1_rejected += 1;
+            }
         }
         s.files = files;
         s
@@ -215,6 +246,7 @@ impl BuildStats {
                     "decode": ms(st.decode_ns),
                     "resize": ms(st.resize_ns),
                     "bc1": ms(st.bc1_ns),
+                    "bc1_check": ms(st.bc1_check_ns),
                     "bc5": ms(st.bc5_ns),
                     "bc7": ms(st.bc7_ns),
                     "transcode_uastc_bc7": ms(st.transcode_ns),

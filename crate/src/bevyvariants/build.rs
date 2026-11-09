@@ -48,7 +48,12 @@ impl BuildOptions {
     /// is logged and the default is used).
     pub fn from_env() -> Self {
         let zstd_level = match std::env::var(ZSTD_LEVEL_ENV) {
-            Ok(v) => match v.trim().parse::<i32>().map_err(anyhow::Error::from).and_then(crate::ktx2_write::check_zstd_level) {
+            Ok(v) => match v
+                .trim()
+                .parse::<i32>()
+                .map_err(anyhow::Error::from)
+                .and_then(crate::ktx2_write::check_zstd_level)
+            {
                 Ok(l) => l,
                 Err(e) => {
                     tracing::warn!(value = %v, error = %format!("{e:#}"), "{ZSTD_LEVEL_ENV} ignored");
@@ -111,7 +116,11 @@ fn model_ext(file: &str) -> &'static str {
 
 /// Write `bytes` at `bevy/contents/{cid}` unless it is already there (content-addressed, so an
 /// existing file is the same bytes). Returns the CID and path.
-fn store_variant(out_root: &Path, bytes: &[u8], times: &mut StageTimes) -> Result<(String, PathBuf)> {
+fn store_variant(
+    out_root: &Path,
+    bytes: &[u8],
+    times: &mut StageTimes,
+) -> Result<(String, PathBuf)> {
     let started = std::time::Instant::now();
     let out = store_variant_untimed(out_root, bytes);
     times.hash_write_ns += elapsed_ns(started);
@@ -166,7 +175,9 @@ pub fn build_entity_variants(
         if skipped.contains(&c.hash) {
             continue;
         }
-        let e = by_hash.entry(c.hash.as_str()).or_insert((c.file.as_str(), kind));
+        let e = by_hash
+            .entry(c.hash.as_str())
+            .or_insert((c.file.as_str(), kind));
         if c.file.as_str() < e.0 {
             *e = (c.file.as_str(), kind);
         }
@@ -225,7 +236,10 @@ pub fn build_entity_variants(
                 height: None,
                 mips: None,
                 gated_size: None,
+                gated_format: None,
                 reason: None,
+                bc1_psnr_db: None,
+                bc1_rejected: None,
                 times,
             };
             let none = (hash.to_string(), None, None);
@@ -239,9 +253,14 @@ pub fn build_entity_variants(
             let slot = uses.get(hash).copied().unwrap_or_default().slot();
             let v = match encode_texture_with(&bytes, slot, tex_opts, &mut times) {
                 Ok(Ok(v)) => v,
-                Ok(Err(Miss { reason, gated_size })) => {
+                Ok(Err(Miss {
+                    reason,
+                    gated_size,
+                    gated_format,
+                })) => {
                     stat.reason = Some(reason);
                     stat.gated_size = gated_size;
+                    stat.gated_format = gated_format;
                     stat.times = times;
                     return Ok((none, stat));
                 }
@@ -259,6 +278,8 @@ pub fn build_entity_variants(
             stat.width = Some(v.width);
             stat.height = Some(v.height);
             stat.mips = Some(v.mips);
+            stat.bc1_psnr_db = v.bc1_psnr_db.map(|p| p as f32);
+            stat.bc1_rejected = v.bc1_psnr_db.map(|_| v.bc1_rejected);
             stat.times = times;
             Ok((
                 (
