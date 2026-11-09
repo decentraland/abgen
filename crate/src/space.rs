@@ -88,6 +88,51 @@ pub(crate) fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     m.finalize().into_bytes().to_vec()
 }
 
+/// The `Authorization` header for a SigV4 request signed over `host`, `x-amz-date` and,
+/// with a session token, `x-amz-security-token` (the caller sends exactly those headers).
+/// `path` is the canonical (already encoded) URI and `query` the canonical query string.
+/// Shared by the SNS and Lambda clients; S3 here signs its own header set.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sigv4_authorization(
+    c: &ResolvedCreds,
+    service: &str,
+    region: &str,
+    method: &str,
+    host: &str,
+    path: &str,
+    query: &str,
+    payload_hash: &str,
+    amz_date: &str,
+    date: &str,
+) -> String {
+    let (signed_headers, canonical_headers) = match &c.session_token {
+        Some(token) => (
+            "host;x-amz-date;x-amz-security-token",
+            format!("host:{host}\nx-amz-date:{amz_date}\nx-amz-security-token:{token}\n"),
+        ),
+        None => (
+            "host;x-amz-date",
+            format!("host:{host}\nx-amz-date:{amz_date}\n"),
+        ),
+    };
+    let canonical_request =
+        format!("{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+    let scope = format!("{date}/{region}/{service}/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let k_date = hmac(format!("AWS4{}", c.secret_key).as_bytes(), date.as_bytes());
+    let k_region = hmac(&k_date, region.as_bytes());
+    let k_service = hmac(&k_region, service.as_bytes());
+    let k_signing = hmac(&k_service, b"aws4_request");
+    let signature = hex(&hmac(&k_signing, string_to_sign.as_bytes()));
+    format!(
+        "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
+        c.access_key
+    )
+}
+
 fn now_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -197,18 +242,33 @@ impl CredsSource {
     /// Static env vars first, then the ECS container credential endpoint;
     /// shared by S3 here and SNS in [`crate::sns`].
     pub(crate) fn from_env() -> Option<CredsSource> {
+        Self::from_vars(
+            &["ABGEN_S3_ACCESS_KEY", "AWS_ACCESS_KEY_ID"],
+            &["ABGEN_S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY"],
+            &["ABGEN_S3_SESSION_TOKEN", "AWS_SESSION_TOKEN"],
+        )
+    }
+
+    /// [`Self::from_env`] without the `ABGEN_S3_*` overrides, which may point at
+    /// storage that is not AWS: for clients that only ever talk to AWS itself.
+    pub(crate) fn from_aws_env() -> Option<CredsSource> {
+        Self::from_vars(
+            &["AWS_ACCESS_KEY_ID"],
+            &["AWS_SECRET_ACCESS_KEY"],
+            &["AWS_SESSION_TOKEN"],
+        )
+    }
+
+    fn from_vars(access: &[&str], secret: &[&str], token: &[&str]) -> Option<CredsSource> {
         let first = |vars: &[&str]| {
             vars.iter()
                 .find_map(|v| std::env::var(v).ok().filter(|s| !s.is_empty()))
         };
-        let static_creds = match (
-            first(&["ABGEN_S3_ACCESS_KEY", "AWS_ACCESS_KEY_ID"]),
-            first(&["ABGEN_S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY"]),
-        ) {
+        let static_creds = match (first(access), first(secret)) {
             (Some(access_key), Some(secret_key)) => Some(ResolvedCreds {
                 access_key,
                 secret_key,
-                session_token: first(&["ABGEN_S3_SESSION_TOKEN", "AWS_SESSION_TOKEN"]),
+                session_token: first(token),
             }),
             _ => None,
         };

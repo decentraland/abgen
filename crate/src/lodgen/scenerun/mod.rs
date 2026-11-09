@@ -32,6 +32,9 @@ pub struct EngineLimits {
     pub memory_bytes: usize,
     pub stack_bytes: usize,
     pub deadline: Option<std::time::Duration>,
+    /// Most renderer stream bytes one run may produce (`main.crdt` included every time
+    /// it is prepended); past it the run fails instead of growing the buffer further.
+    pub max_stream_bytes: usize,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -41,6 +44,7 @@ impl Default for EngineLimits {
             memory_bytes: 256 << 20,
             stack_bytes: 1 << 20,
             deadline: crate::lodgen::simplify::subproc_deadline(),
+            max_stream_bytes: MAX_RENDERER_STREAM_BYTES,
         }
     }
 }
@@ -70,6 +74,10 @@ pub struct SceneJob {
     pub read_file: ReadFileFn,
     pub limits: EngineLimits,
 }
+
+/// Default [`EngineLimits::max_stream_bytes`].
+#[cfg(not(target_arch = "wasm32"))]
+pub const MAX_RENDERER_STREAM_BYTES: usize = 128 << 20;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug, Default)]
@@ -165,12 +173,24 @@ pub struct SceneCapture {
     pub files_read: std::collections::BTreeMap<String, String>,
 }
 
-/// Fetches the scene's code (and `main.crdt` for SDK7) and runs it on `engine`.
+/// Fetches the scene's code (and `main.crdt` for SDK7) and runs it on `engine` with the
+/// default [`EngineLimits`].
 #[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
 pub fn capture_scene(
     engine: &dyn SceneEngine,
     client: &crate::catalyst::CatalystClient,
     ent: &crate::catalyst::Scene,
+) -> anyhow::Result<SceneCapture> {
+    capture_scene_with(engine, client, ent, EngineLimits::default())
+}
+
+/// [`capture_scene`] under explicit limits.
+#[cfg(all(not(target_arch = "wasm32"), feature = "scene-runtime"))]
+pub fn capture_scene_with(
+    engine: &dyn SceneEngine,
+    client: &crate::catalyst::CatalystClient,
+    ent: &crate::catalyst::Scene,
+    limits: EngineLimits,
 ) -> anyhow::Result<SceneCapture> {
     use anyhow::{anyhow, Context};
     let sdk7 = ent.metadata.get("runtimeVersion").and_then(|v| v.as_str()) == Some("7");
@@ -219,7 +239,7 @@ pub fn capture_scene(
         code,
         main_crdt,
         read_file,
-        limits: EngineLimits::default(),
+        limits,
     };
     let outcome = engine.run_capture(job)?;
     let files_read = files_read.lock().map(|m| m.clone()).unwrap_or_default();

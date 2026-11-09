@@ -1,14 +1,42 @@
-//! Synchronous AWS Lambda `Invoke` client, SigV4 sibling of [`crate::sns`] (shared creds
-//! and hash primitives from [`crate::space`]).
+//! Synchronous AWS Lambda `Invoke` client, SigV4 sibling of [`crate::sns`] (shared signer,
+//! creds and hash primitives from [`crate::space`]).
 //!
 //! Only what the LOD lane needs: a `RequestResponse` invoke of a function named by its
 //! plain name in the caller's region, a JSON payload in and the function's JSON result
 //! out. A function error (`X-Amz-Function-Error`) is returned as an error carrying the
-//! function's `errorMessage`.
+//! function's `errorMessage`. Throttling, 5xx and connection failures are retried with
+//! jittered backoff inside the time the caller allows; a timeout is not.
+//!
+//! Also holds the deadline of the Lambda invocation this process is serving
+//! ([`set_invocation_deadline`]), so work started on its behalf can stop in time.
 
-use crate::space::{hex, hmac, sha256_hex, timestamps, CredsSource, ResolvedCreds};
+use crate::space::{sha256_hex, sigv4_authorization, timestamps, CredsSource};
 use crate::Result;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
+
+static INVOCATION_DEADLINE: Mutex<Option<SystemTime>> = Mutex::new(None);
+
+/// Records when the invocation being served must have answered (Lambda's
+/// `Lambda-Runtime-Deadline-Ms`), or clears it.
+pub fn set_invocation_deadline(deadline: Option<SystemTime>) {
+    *INVOCATION_DEADLINE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = deadline;
+}
+
+/// Time left in the invocation being served: `None` outside one (local runs), zero once
+/// it has passed.
+pub fn invocation_remaining() -> Option<Duration> {
+    let deadline = (*INVOCATION_DEADLINE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()))?;
+    Some(
+        deadline
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
+}
 
 pub struct LambdaInvoker {
     function: String,
@@ -30,60 +58,88 @@ pub fn valid_function_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-fn split_endpoint(endpoint: &str) -> (String, String) {
-    match endpoint.split_once("://") {
-        Some((s, h)) => (s.to_string(), h.trim_end_matches('/').to_string()),
+/// `scheme://host[:port]` of an endpoint override. Plain `http` is accepted only for a
+/// loopback host: the request carries a session token.
+fn split_endpoint(endpoint: &str) -> Result<(String, String)> {
+    let (scheme, host) = match endpoint.split_once("://") {
+        Some((s, h)) => (s.to_ascii_lowercase(), h.trim_end_matches('/').to_string()),
         None => (
             "https".to_string(),
             endpoint.trim_end_matches('/').to_string(),
         ),
+    };
+    if host.is_empty() || host.contains(['/', '@', '?', '#']) {
+        crate::bail!("lambda endpoint {endpoint:?} is not scheme://host[:port]");
     }
+    match scheme.as_str() {
+        "https" => {}
+        "http" if is_loopback(&host) => {}
+        _ => crate::bail!("lambda endpoint {endpoint:?}: https required (http only for loopback)"),
+    }
+    Ok((scheme, host))
 }
+
+fn is_loopback(authority: &str) -> bool {
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// How one attempt ended, for the retry decision.
+enum Attempt {
+    Done(Result<serde_json::Value>),
+    Retry(anyhow::Error),
+}
+
+const MAX_ATTEMPTS: u32 = 4;
+const BACKOFF_BASE: Duration = Duration::from_millis(250);
+/// An attempt is not started with less than this left.
+const MIN_ATTEMPT: Duration = Duration::from_secs(2);
 
 impl LambdaInvoker {
     /// `endpoint` overrides `https://lambda.{region}.amazonaws.com` (tests, local stacks).
-    pub fn new(
-        function: &str,
-        region: &str,
-        endpoint: Option<&str>,
-        timeout: Duration,
-    ) -> Result<LambdaInvoker> {
+    /// Credentials come from the AWS variables or the container endpoint only, never the
+    /// `ABGEN_S3_*` overrides.
+    pub fn new(function: &str, region: &str, endpoint: Option<&str>) -> Result<LambdaInvoker> {
         if !valid_function_name(function) {
             crate::bail!("lambda function name {function:?} is not a plain function name");
         }
-        let creds = CredsSource::from_env()
+        let creds = CredsSource::from_aws_env()
             .ok_or_else(|| crate::anyhow!("no AWS credentials to invoke lambda {function}"))?;
-        Ok(Self::with_creds(function, region, endpoint, timeout, creds))
+        Self::with_creds(function, region, endpoint, creds)
     }
 
     fn with_creds(
         function: &str,
         region: &str,
         endpoint: Option<&str>,
-        timeout: Duration,
         creds: CredsSource,
-    ) -> LambdaInvoker {
-        let (scheme, host) = match endpoint.filter(|e| !e.is_empty()) {
-            Some(e) => split_endpoint(e),
+    ) -> Result<LambdaInvoker> {
+        let (scheme, host) = match endpoint.map(str::trim).filter(|e| !e.is_empty()) {
+            Some(e) => split_endpoint(e)?,
             None => (
                 "https".to_string(),
                 format!("lambda.{region}.amazonaws.com"),
             ),
         };
         let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(timeout))
             .max_redirects(0)
             .http_status_as_error(false)
             .build()
             .into();
-        LambdaInvoker {
+        Ok(LambdaInvoker {
             function: function.to_string(),
             scheme,
             host,
             region: region.to_string(),
             creds,
             agent,
-        }
+        })
     }
 
     pub fn function(&self) -> &str {
@@ -94,67 +150,88 @@ impl LambdaInvoker {
         format!("/2015-03-31/functions/{}/invocations", self.function)
     }
 
-    fn authorize(
+    /// One `RequestResponse` invoke that must finish within `budget`, retries included.
+    /// Only throttling (429), 5xx and connection failures are retried: a scene run has no
+    /// side effects, but a function error or a timeout would only repeat.
+    pub fn invoke(
         &self,
-        c: &ResolvedCreds,
-        payload_hash: &str,
-        amz_date: &str,
-        date: &str,
-    ) -> String {
-        let (signed_headers, canonical_headers) = match &c.session_token {
-            Some(token) => (
-                "host;x-amz-date;x-amz-security-token",
-                format!(
-                    "host:{}\nx-amz-date:{}\nx-amz-security-token:{}\n",
-                    self.host, amz_date, token
-                ),
-            ),
-            None => (
-                "host;x-amz-date",
-                format!("host:{}\nx-amz-date:{}\n", self.host, amz_date),
-            ),
-        };
-        let canonical_request = format!(
-            "POST\n{}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
-            self.path()
-        );
-        let scope = format!("{date}/{}/lambda/aws4_request", self.region);
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
-            sha256_hex(canonical_request.as_bytes())
-        );
-        let k_date = hmac(format!("AWS4{}", c.secret_key).as_bytes(), date.as_bytes());
-        let k_region = hmac(&k_date, self.region.as_bytes());
-        let k_service = hmac(&k_region, b"lambda");
-        let k_signing = hmac(&k_service, b"aws4_request");
-        let signature = hex(&hmac(&k_signing, string_to_sign.as_bytes()));
-        format!(
-            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
-            c.access_key
-        )
+        payload: &serde_json::Value,
+        budget: Duration,
+    ) -> Result<serde_json::Value> {
+        let body = serde_json::to_vec(payload)?;
+        let deadline = Instant::now() + budget;
+        let mut attempt = 1;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let err = match self.invoke_once(&body, left) {
+                Attempt::Done(result) => return result,
+                Attempt::Retry(e) => e,
+            };
+            let backoff = backoff(attempt);
+            let left = deadline.saturating_duration_since(Instant::now());
+            if attempt >= MAX_ATTEMPTS || left < backoff + MIN_ATTEMPT {
+                return Err(err.context(format!(
+                    "invoke lambda {} (gave up after {attempt} attempt(s))",
+                    self.function
+                )));
+            }
+            tracing::warn!(
+                function = %self.function,
+                attempt,
+                error = %err,
+                "lambda invoke attempt failed, retrying"
+            );
+            std::thread::sleep(backoff);
+            attempt += 1;
+        }
     }
 
-    /// One `RequestResponse` invoke. No retries: the caller decides whether a failed
-    /// scene is worth running again.
-    pub fn invoke(&self, payload: &serde_json::Value) -> Result<serde_json::Value> {
-        let body = serde_json::to_vec(payload)?;
-        let c = self.creds.resolve()?;
-        let payload_hash = sha256_hex(&body);
+    fn invoke_once(&self, body: &[u8], timeout: Duration) -> Attempt {
+        let c = match self.creds.resolve() {
+            Ok(c) => c,
+            Err(e) => return Attempt::Done(Err(e)),
+        };
+        let payload_hash = sha256_hex(body);
         let (date, amz) = timestamps();
-        let auth = self.authorize(&c, &payload_hash, &amz, &date);
-        let url = format!("{}://{}{}", self.scheme, self.host, self.path());
+        let path = self.path();
+        let auth = sigv4_authorization(
+            &c,
+            "lambda",
+            &self.region,
+            "POST",
+            &self.host,
+            &path,
+            "",
+            &payload_hash,
+            &amz,
+            &date,
+        );
+        let url = format!("{}://{}{}", self.scheme, self.host, path);
         let mut req = self
             .agent
             .post(&url)
+            .config()
+            .timeout_global(Some(timeout))
+            .build()
             .header("Content-Type", "application/json")
             .header("x-amz-date", &amz)
             .header("Authorization", &auth);
         if let Some(token) = &c.session_token {
             req = req.header("x-amz-security-token", token);
         }
-        let resp = req
-            .send(&body[..])
-            .map_err(|e| crate::anyhow!("invoke lambda {}: {e}", self.function))?;
+        let resp = match req.send(body) {
+            Ok(resp) => resp,
+            Err(ureq::Error::Timeout(t)) => {
+                return Attempt::Done(Err(crate::anyhow!(
+                    "invoke lambda {}: no answer within {}s ({t})",
+                    self.function,
+                    timeout.as_secs()
+                )))
+            }
+            Err(e) => {
+                return Attempt::Retry(crate::anyhow!("invoke lambda {}: {e}", self.function))
+            }
+        };
         let status = resp.status().as_u16();
         let function_error = resp
             .headers()
@@ -163,33 +240,62 @@ impl LambdaInvoker {
             .map(str::to_string);
         let mut out = Vec::new();
         use std::io::Read;
-        resp.into_body()
-            .into_reader()
-            .read_to_end(&mut out)
-            .map_err(|e| crate::anyhow!("read lambda {} response: {e}", self.function))?;
+        if let Err(e) = resp.into_body().into_reader().read_to_end(&mut out) {
+            return Attempt::Retry(crate::anyhow!(
+                "read lambda {} response: {e}",
+                self.function
+            ));
+        }
         if status != 200 {
-            crate::bail!(
+            let err = crate::anyhow!(
                 "invoke lambda {}: HTTP {status}: {}",
                 self.function,
                 String::from_utf8_lossy(&out[..out.len().min(512)])
             );
+            return if status == 429 || status >= 500 {
+                Attempt::Retry(err)
+            } else {
+                Attempt::Done(Err(err))
+            };
         }
-        let value: serde_json::Value = serde_json::from_slice(&out)
-            .map_err(|e| crate::anyhow!("lambda {} returned non-JSON: {e}", self.function))?;
+        let value: serde_json::Value = match serde_json::from_slice(&out) {
+            Ok(v) => v,
+            Err(e) => {
+                return Attempt::Done(Err(crate::anyhow!(
+                    "lambda {} returned non-JSON: {e}",
+                    self.function
+                )))
+            }
+        };
         if let Some(kind) = function_error {
             let message = value
                 .get("errorMessage")
                 .and_then(|m| m.as_str())
                 .unwrap_or("no errorMessage");
-            crate::bail!("lambda {} failed ({kind}): {message}", self.function);
+            return Attempt::Done(Err(crate::anyhow!(
+                "lambda {} failed ({kind}): {message}",
+                self.function
+            )));
         }
-        Ok(value)
+        Attempt::Done(Ok(value))
     }
+}
+
+/// `BACKOFF_BASE * 2^(attempt-1)`, plus up to the same again of jitter so that throttled
+/// callers do not retry in step.
+fn backoff(attempt: u32) -> Duration {
+    let base = BACKOFF_BASE * 2u32.saturating_pow(attempt.saturating_sub(1));
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    base + base.mul_f64(f64::from(nanos % 1000) / 1000.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::space::ResolvedCreds;
     use std::io::{Read, Write};
 
     fn creds(token: Option<&str>) -> CredsSource {
@@ -198,6 +304,11 @@ mod tests {
             secret_key: "example-secret".into(),
             session_token: token.map(str::to_string),
         })
+    }
+
+    fn invoker(endpoint: &str, token: Option<&str>) -> LambdaInvoker {
+        LambdaInvoker::with_creds("abgen-scenerun", "us-east-1", Some(endpoint), creds(token))
+            .unwrap()
     }
 
     #[test]
@@ -212,55 +323,97 @@ mod tests {
         assert!(!valid_function_name(&"a".repeat(65)));
     }
 
-    /// Serves one canned HTTP response and hands back the request it read.
-    fn one_shot(response: &'static str) -> (String, std::thread::JoinHandle<(String, Vec<u8>)>) {
+    #[test]
+    fn plain_http_endpoints_must_be_loopback() {
+        for ok in [
+            "http://127.0.0.1:9001",
+            "http://localhost:4566/",
+            "http://[::1]:4566",
+            "https://lambda.example.org",
+            "lambda.example.org",
+        ] {
+            assert!(split_endpoint(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://lambda.example.org",
+            "http://10.0.0.5:4566",
+            "ftp://127.0.0.1",
+            "https://user@lambda.example.org",
+            "https://lambda.example.org/path",
+            "https://",
+        ] {
+            assert!(split_endpoint(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn invocation_deadline_counts_down() {
+        set_invocation_deadline(Some(SystemTime::now() + Duration::from_secs(60)));
+        let left = invocation_remaining().unwrap();
+        assert!(left > Duration::from_secs(55) && left <= Duration::from_secs(60));
+        set_invocation_deadline(Some(SystemTime::now() - Duration::from_secs(1)));
+        assert_eq!(invocation_remaining(), Some(Duration::ZERO));
+        set_invocation_deadline(None);
+        assert_eq!(invocation_remaining(), None);
+    }
+
+    /// Serves one canned HTTP response per connection, in order, and hands back the
+    /// requests it read.
+    fn server(
+        responses: Vec<&'static str>,
+    ) -> (String, std::thread::JoinHandle<Vec<(String, Vec<u8>)>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            let (head, body_start, len) = loop {
-                let n = sock.read(&mut chunk).unwrap();
-                buf.extend_from_slice(&chunk[..n]);
-                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let head = String::from_utf8_lossy(&buf[..i]).to_string();
-                    let len = head
-                        .lines()
-                        .find_map(|l| {
-                            let (k, v) = l.split_once(':')?;
-                            k.eq_ignore_ascii_case("content-length")
-                                .then(|| v.trim().parse::<usize>().ok())?
-                        })
-                        .unwrap_or(0);
-                    break (head, i + 4, len);
+            let mut seen = Vec::new();
+            for response in responses {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let (head, body_start, len) = loop {
+                    let n = sock.read(&mut chunk).unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..i]).to_string();
+                        let len = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        break (head, i + 4, len);
+                    }
+                };
+                while buf.len() < body_start + len {
+                    let n = sock.read(&mut chunk).unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
                 }
-            };
-            while buf.len() < body_start + len {
-                let n = sock.read(&mut chunk).unwrap();
-                buf.extend_from_slice(&chunk[..n]);
+                if response.is_empty() {
+                    // Hold the connection open, unanswered, past the client's timeout.
+                    std::thread::sleep(Duration::from_secs(2));
+                } else {
+                    sock.write_all(response.as_bytes()).unwrap();
+                }
+                seen.push((head, buf[body_start..body_start + len].to_vec()));
             }
-            sock.write_all(response.as_bytes()).unwrap();
-            (head, buf[body_start..body_start + len].to_vec())
+            seen
         });
         (format!("http://{addr}"), handle)
     }
 
+    const OK: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}";
+    const BUDGET: Duration = Duration::from_secs(20);
+
     #[test]
     fn invoke_signs_and_posts_the_payload() {
-        let (endpoint, server) = one_shot(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
-        );
-        let inv = LambdaInvoker::with_creds(
-            "abgen-scenerun",
-            "us-east-1",
-            Some(&endpoint),
-            Duration::from_secs(5),
-            creds(Some("example-token")),
-        );
-        let got = inv.invoke(&serde_json::json!({"a": 1})).unwrap();
+        let (endpoint, server) = server(vec![OK]);
+        let got = invoker(&endpoint, Some("example-token"))
+            .invoke(&serde_json::json!({"a": 1}), BUDGET)
+            .unwrap();
         assert_eq!(got, serde_json::json!({"ok": true}));
-        let (head, body) = server.join().unwrap();
+        let (head, body) = server.join().unwrap().remove(0);
         assert!(head.starts_with("POST /2015-03-31/functions/abgen-scenerun/invocations HTTP/1.1"));
         let lower = head.to_lowercase();
         assert!(lower.contains("authorization: aws4-hmac-sha256 credential=akidexample/"));
@@ -271,39 +424,66 @@ mod tests {
     }
 
     #[test]
-    fn function_errors_surface_the_error_message() {
-        let (endpoint, server) = one_shot(
+    fn throttling_and_5xx_are_retried() {
+        let (endpoint, server) = server(vec![
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            OK,
+        ]);
+        let got = invoker(&endpoint, None)
+            .invoke(&serde_json::json!({}), BUDGET)
+            .unwrap();
+        assert_eq!(got, serde_json::json!({"ok": true}));
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn retries_stop_after_the_last_attempt() {
+        const BUSY: &str =
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        let (endpoint, server) = server(vec![BUSY; MAX_ATTEMPTS as usize]);
+        let err = invoker(&endpoint, None)
+            .invoke(&serde_json::json!({}), Duration::from_secs(60))
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("HTTP 429") && msg.contains("4 attempt"),
+            "{msg}"
+        );
+        assert_eq!(server.join().unwrap().len(), MAX_ATTEMPTS as usize);
+    }
+
+    #[test]
+    fn function_errors_and_4xx_are_not_retried() {
+        let (endpoint, server) = server(vec![
             "HTTP/1.1 200 OK\r\nX-Amz-Function-Error: Unhandled\r\nContent-Length: 30\r\nConnection: close\r\n\r\n{\"errorMessage\":\"scene broke\"}",
-        );
-        let inv = LambdaInvoker::with_creds(
-            "abgen-scenerun",
-            "us-east-1",
-            Some(&endpoint),
-            Duration::from_secs(5),
-            creds(None),
-        );
-        let err = inv.invoke(&serde_json::json!({})).unwrap_err().to_string();
-        server.join().unwrap();
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\nConnection: close\r\n\r\n{\"x\":\"y\"}",
+        ]);
+        let inv = invoker(&endpoint, None);
+        let err = inv.invoke(&serde_json::json!({}), BUDGET).unwrap_err();
+        let err = format!("{err:#}");
         assert!(
             err.contains("Unhandled") && err.contains("scene broke"),
             "{err}"
         );
+        let err = format!(
+            "{:#}",
+            inv.invoke(&serde_json::json!({}), BUDGET).unwrap_err()
+        );
+        assert!(err.contains("HTTP 403"), "{err}");
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 
     #[test]
-    fn non_200_is_an_error() {
-        let (endpoint, server) = one_shot(
-            "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\nConnection: close\r\n\r\n{\"x\":\"y\"}",
-        );
-        let inv = LambdaInvoker::with_creds(
-            "abgen-scenerun",
-            "us-east-1",
-            Some(&endpoint),
-            Duration::from_secs(5),
-            creds(None),
-        );
-        let err = inv.invoke(&serde_json::json!({})).unwrap_err().to_string();
+    fn a_timeout_ends_the_invoke() {
+        // The server reads the request and never answers.
+        let (endpoint, server) = server(vec![""]);
+        let started = Instant::now();
+        let err = invoker(&endpoint, None)
+            .invoke(&serde_json::json!({}), Duration::from_millis(500))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("no answer within"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
         server.join().unwrap();
-        assert!(err.contains("HTTP 403"), "{err}");
     }
 }

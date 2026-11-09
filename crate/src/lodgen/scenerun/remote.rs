@@ -1,27 +1,34 @@
 //! Scene execution in a separate AWS Lambda function.
 //!
-//! Some runtimes can host the scene child of [`super::sandbox`] but cannot confine it:
-//! AWS Lambda refuses both seccomp and `PR_SET_DUMPABLE`, so a child there shares the
-//! parent's user, address-space visibility and environment through `/proc`, and the
-//! self-test refuses to run scenes. In that case scenes run in a function of their own,
-//! whose execution environment is a separate microVM with its own (minimal) role:
+//! Some runtimes can host the scene child of [`super::sandbox`] but not protect the parent
+//! from it: AWS Lambda refuses both seccomp and `PR_SET_DUMPABLE`, so the self-test refuses
+//! to run scenes in a process that holds the converter's credentials. There scenes run in
+//! a function of their own, a separate execution environment whose role may only write its
+//! own logs:
 //!
 //! - **caller** (the converter): with [`FUNCTION_ENV`] set, [`super::run_scene_placements`]
 //!   sends the entity and its content server(s) to that function with a synchronous
-//!   `Invoke` and projects the returned renderer stream exactly as a local run would.
-//!   It treats the response as untrusted: only the stream, the evaluation error and the
-//!   files the scene read are taken from it, and a file is kept only when the entity's
-//!   own content lists it under the same hash.
+//!   `Invoke` and projects the returned renderer state exactly as a local run would. The
+//!   wait is capped by [`TIMEOUT_ENV`] and by the time left in the caller's own
+//!   invocation. The response is untrusted: only the stream, the evaluation error and the
+//!   files the scene read are taken from it, a file is kept only when the entity's own
+//!   content lists it under the same hash, and both sides must fold the stream the same
+//!   way ([`super::crdt::projection_id`]).
 //! - **function** (`abgen-lambda` started with `ABGEN_LAMBDA_MODE=scenerun`): [`serve`]
-//!   fetches the scene's code and files from the content server and runs it in-process
-//!   on [`super::QuickJsEngine`]. The binary posts the result and exits, so the next
-//!   invocation starts a fresh process.
+//!   fetches the scene's code and files from the content server and runs the scene in the
+//!   sandbox child ([`super::sandbox`]), under a deadline even when the request names
+//!   none. The child gets an empty environment, no new processes, no new file
+//!   descriptors (so no files or sockets) and no access to the parent's memory, which the
+//!   self-test proves before the first scene; that, not the process exiting after each
+//!   answer, is what keeps an escaped scene away from the runtime API and from later
+//!   invocations. Exiting after each answer is hygiene on top.
 //!
-//! The function's response is limited to 6 MB by Lambda; a larger renderer stream fails
-//! that scene's LOD build.
+//! Lambda caps a synchronous response at 6 MB. The function sends the folded state rather
+//! than every frame, and fails with a clear error when even that does not fit.
 
-use super::{capture_scene, CaptureOutcome, QuickJsEngine, SceneCapture};
+use super::{capture_scene_with, default_engine, CaptureOutcome, EngineLimits, SceneCapture};
 use crate::catalyst::{CatalystClient, Scene};
+use crate::lambda_invoke::{invocation_remaining, LambdaInvoker};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -29,19 +36,39 @@ use std::time::Duration;
 
 /// Name of the function that runs scenes. Unset: scenes run in a local child process.
 pub const FUNCTION_ENV: &str = "ABGEN_SCENERUN_FUNCTION";
-/// Overrides the Lambda endpoint (tests, local stacks).
+/// Overrides the Lambda endpoint (tests, local stacks; plain http only for loopback).
 pub const ENDPOINT_ENV: &str = "ABGEN_SCENERUN_ENDPOINT";
-/// Seconds to wait for one scene, including the function's cold start (default 300).
+/// Seconds to wait for one scene, including the function's cold start (default 300). The
+/// scene function's own timeout must not be longer, or it keeps running after the caller
+/// has given up.
 pub const TIMEOUT_ENV: &str = "ABGEN_SCENERUN_TIMEOUT_S";
 
 const DEFAULT_TIMEOUT_S: u64 = 300;
 /// Marks a scenerun request or response and versions its shape.
 const PROTOCOL_KEY: &str = "abgenScenerun";
-const PROTOCOL_VERSION: u64 = 1;
+const PROTOCOL_VERSION: u64 = 2;
 const MAX_EVAL_ERROR_CHARS: usize = 2000;
 
+/// Time the caller keeps for itself after the scene (projection, LOD build, upload).
+const CALLER_RESERVE: Duration = Duration::from_secs(30);
+/// Below this, the caller does not start a call at all.
+const MIN_CALL_BUDGET: Duration = Duration::from_secs(10);
+/// Part of the call budget that is not scene time: cold start, fetching the scene, the
+/// sandbox's kill grace and the answer.
+const CALL_OVERHEAD: Duration = Duration::from_secs(60);
+const MIN_SCENE_DEADLINE: Duration = Duration::from_secs(5);
+/// The function's scene deadline when neither the request nor
+/// `ABGEN_LOD_SUBPROC_TIMEOUT_S` sets a shorter one.
+const DEFAULT_SCENE_DEADLINE: Duration = Duration::from_secs(180);
+/// Time the function keeps after the scene deadline: the sandbox kills a child that
+/// ignores the deadline 30 s after it, then the answer still has to go out.
+const RUNNER_RESERVE: Duration = Duration::from_secs(45);
+/// What the function may answer with: Lambda's 6 MB less some room.
+const MAX_RESPONSE_BYTES: usize = 6_000_000;
+
 pub struct RemoteRunner {
-    invoker: crate::lambda_invoke::LambdaInvoker,
+    invoker: LambdaInvoker,
+    timeout: Duration,
 }
 
 /// The configured runner, built once per process. `None` when [`FUNCTION_ENV`] is unset.
@@ -60,6 +87,61 @@ pub fn runner() -> Option<Result<&'static RemoteRunner>> {
     })
 }
 
+/// [`TIMEOUT_ENV`]: unset or blank is the default, anything else a positive integer.
+fn parse_timeout(value: Option<&str>) -> Result<Duration> {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(Duration::from_secs(DEFAULT_TIMEOUT_S)),
+        Some(v) => v
+            .parse::<u64>()
+            .ok()
+            .filter(|s| *s > 0)
+            .map(Duration::from_secs)
+            .ok_or_else(|| anyhow!("{TIMEOUT_ENV}={v:?} is not a positive integer")),
+    }
+}
+
+/// How long one call may take: the configured timeout, capped by what is left of the
+/// caller's own invocation after [`CALLER_RESERVE`].
+fn call_budget(timeout: Duration, invocation_left: Option<Duration>) -> Result<Duration> {
+    let budget = match invocation_left {
+        Some(left) => timeout.min(left.saturating_sub(CALLER_RESERVE)),
+        None => timeout,
+    };
+    if budget < MIN_CALL_BUDGET {
+        bail!(
+            "only {}s left for the scene in this invocation, not starting it",
+            budget.as_secs()
+        );
+    }
+    Ok(budget)
+}
+
+/// The scene deadline the caller asks for: its call budget less [`CALL_OVERHEAD`].
+fn requested_scene_deadline(budget: Duration) -> Duration {
+    budget.saturating_sub(CALL_OVERHEAD).max(MIN_SCENE_DEADLINE)
+}
+
+/// The deadline the function runs a scene under: the shortest of what the request asks,
+/// the configured one (or [`DEFAULT_SCENE_DEADLINE`]) and what its own invocation still
+/// allows after [`RUNNER_RESERVE`]. Never unbounded.
+fn scene_deadline(
+    requested: Option<Duration>,
+    configured: Option<Duration>,
+    invocation_left: Option<Duration>,
+) -> Result<Duration> {
+    let mut deadline = configured.unwrap_or(DEFAULT_SCENE_DEADLINE);
+    if let Some(requested) = requested {
+        deadline = deadline.min(requested);
+    }
+    if let Some(left) = invocation_left {
+        deadline = deadline.min(left.saturating_sub(RUNNER_RESERVE));
+    }
+    if deadline < Duration::from_secs(1) {
+        bail!("no time left in this invocation to run the scene");
+    }
+    Ok(deadline)
+}
+
 impl RemoteRunner {
     fn from_env(function: &str) -> Result<RemoteRunner> {
         let region = std::env::var("AWS_REGION")
@@ -67,43 +149,35 @@ impl RemoteRunner {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "us-east-1".to_string());
         let endpoint = std::env::var(ENDPOINT_ENV).ok();
-        let timeout = match std::env::var(TIMEOUT_ENV) {
-            Ok(v) if !v.trim().is_empty() => v
-                .trim()
-                .parse::<u64>()
-                .ok()
-                .filter(|s| *s > 0)
-                .ok_or_else(|| anyhow!("{TIMEOUT_ENV}={v:?} is not a positive integer"))?,
-            _ => DEFAULT_TIMEOUT_S,
-        };
-        let invoker = crate::lambda_invoke::LambdaInvoker::new(
-            function,
-            &region,
-            endpoint.as_deref(),
-            Duration::from_secs(timeout),
-        )?;
+        let timeout = parse_timeout(std::env::var(TIMEOUT_ENV).ok().as_deref())?;
+        let invoker = LambdaInvoker::new(function, &region, endpoint.as_deref())?;
         tracing::info!(
             function,
-            timeout_s = timeout,
+            timeout_s = timeout.as_secs(),
             "scenes run in a separate function"
         );
-        Ok(RemoteRunner { invoker })
+        Ok(RemoteRunner { invoker, timeout })
     }
 
     /// Runs `ent` in the function and returns what it produced.
     pub fn capture(&self, client: &CatalystClient, ent: &Scene) -> Result<SceneCapture> {
-        let response = self
-            .invoker
-            .invoke(&request(client, ent))
-            .with_context(|| {
-                format!("run scene {} in {}", ent.entity_id, self.invoker.function())
-            })?;
+        let budget = call_budget(self.timeout, invocation_remaining())
+            .with_context(|| format!("run scene {}", ent.entity_id))?;
+        let payload = request(client, ent, requested_scene_deadline(budget));
+        let response = self.invoker.invoke(&payload, budget).with_context(|| {
+            format!("run scene {} in {}", ent.entity_id, self.invoker.function())
+        })?;
         parse_response(ent, &response)
     }
 }
 
-/// The invoke payload: the entity as the content server lists it, and where to fetch it.
-pub fn request(client: &CatalystClient, ent: &Scene) -> serde_json::Value {
+/// The invoke payload: the entity as the content server lists it, where to fetch it, how
+/// long the scene may run and how the caller folds the result.
+pub fn request(
+    client: &CatalystClient,
+    ent: &Scene,
+    scene_deadline: Duration,
+) -> serde_json::Value {
     let content: Vec<serde_json::Value> = ent
         .content
         .iter()
@@ -111,6 +185,8 @@ pub fn request(client: &CatalystClient, ent: &Scene) -> serde_json::Value {
         .collect();
     serde_json::json!({
         PROTOCOL_KEY: PROTOCOL_VERSION,
+        "projection": super::crdt::projection_id(),
+        "sceneDeadlineMs": u64::try_from(scene_deadline.as_millis()).unwrap_or(u64::MAX),
         "contentServer": client.base_url(),
         "fallbackContentServers": client.fallback_bases(),
         "entity": {
@@ -146,8 +222,9 @@ pub fn requested_content_servers(event: &serde_json::Value) -> Vec<String> {
     out
 }
 
-/// Function side: runs the requested scene in-process and returns the response payload.
-/// `check_server` vets every content server in the request before anything is fetched.
+/// Function side: runs the requested scene in the sandbox child and returns the response
+/// payload. `check_server` vets every content server in the request before anything is
+/// fetched.
 pub fn serve(
     event: &serde_json::Value,
     check_server: &dyn Fn(&str) -> Result<()>,
@@ -156,6 +233,7 @@ pub fn serve(
     if version != Some(PROTOCOL_VERSION) {
         bail!("unsupported {PROTOCOL_KEY} version {version:?}");
     }
+    check_projection(event.get("projection"), "caller")?;
     let base = event
         .get("contentServer")
         .and_then(|v| v.as_str())
@@ -176,18 +254,57 @@ pub fn serve(
         .get("entity")
         .ok_or_else(|| anyhow!("scenerun request has no entity"))?;
     let ent = CatalystClient::parse_entity(entity)?;
-    let mut capture = capture_scene(&QuickJsEngine, &client, &ent)?;
+    let requested = event
+        .get("sceneDeadlineMs")
+        .and_then(|v| v.as_u64())
+        .map(Duration::from_millis);
+    let limits = EngineLimits {
+        deadline: Some(scene_deadline(
+            requested,
+            crate::lodgen::simplify::subproc_deadline(),
+            invocation_remaining(),
+        )?),
+        ..EngineLimits::default()
+    };
+    let mut capture = capture_scene_with(&default_engine(), &client, &ent, limits)?;
     // Every frame the scene sent, with `main.crdt` ahead of each, folds to far less;
     // only the folded state counts against the response limit.
     capture.outcome.stream = super::crdt::compact_stream(&capture.outcome.stream);
-    Ok(response(&capture))
+    sized_response(&ent, &capture)
+}
+
+/// [`response`], or an error naming the scene when it would not fit a Lambda response.
+fn sized_response(ent: &Scene, capture: &SceneCapture) -> Result<serde_json::Value> {
+    let value = response(capture);
+    let size = serde_json::to_vec(&value)?.len();
+    if size > MAX_RESPONSE_BYTES {
+        bail!(
+            "scene {} folds to a {size}-byte response, over the {MAX_RESPONSE_BYTES} bytes a \
+             Lambda response may carry",
+            ent.entity_id
+        );
+    }
+    Ok(value)
+}
+
+/// Both sides must fold the stream the same way; `who` names the other side.
+fn check_projection(theirs: Option<&serde_json::Value>, who: &str) -> Result<()> {
+    let ours = super::crdt::projection_id();
+    match theirs.and_then(|v| v.as_str()) {
+        Some(theirs) if theirs == ours => Ok(()),
+        theirs => bail!(
+            "{who} folds renderer state as {theirs:?}, this build as {ours:?}: run the same \
+             abgen version on both functions"
+        ),
+    }
 }
 
 fn response(capture: &SceneCapture) -> serde_json::Value {
     serde_json::json!({
         PROTOCOL_KEY: PROTOCOL_VERSION,
+        "projection": super::crdt::projection_id(),
         "sent": capture.outcome.sent,
-        "stream": base64_encode(&capture.outcome.stream),
+        "stream": crate::gltf::base64_encode(&capture.outcome.stream),
         "evalError": capture.outcome.eval_error,
         "filesRead": capture.files_read,
     })
@@ -199,6 +316,7 @@ fn parse_response(ent: &Scene, value: &serde_json::Value) -> Result<SceneCapture
     if version != Some(PROTOCOL_VERSION) {
         bail!("scene runner answered with {PROTOCOL_KEY} version {version:?}");
     }
+    check_projection(value.get("projection"), "scene runner")?;
     let stream = match value.get("stream").and_then(|v| v.as_str()) {
         Some("") | None => Vec::new(),
         Some(s) => crate::gltf::base64_decode(s)
@@ -229,34 +347,9 @@ fn parse_response(ent: &Scene, value: &serde_json::Value) -> Result<SceneCapture
     })
 }
 
-fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::{capture_scene, QuickJsEngine};
     use super::*;
     use crate::catalyst::ContentEntry;
 
@@ -280,28 +373,10 @@ mod tests {
     }
 
     #[test]
-    fn base64_round_trips() {
-        for len in 0..40usize {
-            let bytes: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
-            let enc = base64_encode(&bytes);
-            assert_eq!(enc.len() % 4, 0);
-            let dec = if enc.is_empty() {
-                Vec::new()
-            } else {
-                crate::gltf::base64_decode(&enc).unwrap()
-            };
-            assert_eq!(dec, bytes, "len {len}");
-        }
-        assert_eq!(base64_encode(b"Man"), "TWFu");
-        assert_eq!(base64_encode(b"Ma"), "TWE=");
-        assert_eq!(base64_encode(b"M"), "TQ==");
-    }
-
-    #[test]
     fn request_carries_the_entity_and_servers() {
         let client = CatalystClient::new("https://peer.example.org/content/")
             .with_fallback_base("https://worlds.example.org".into());
-        let req = request(&client, &scene());
+        let req = request(&client, &scene(), Duration::from_secs(90));
         assert!(is_request(&req));
         assert_eq!(
             requested_content_servers(&req),
@@ -352,7 +427,11 @@ mod tests {
         assert!(err.to_string().contains("version"), "{err}");
         let err = parse_response(
             &scene(),
-            &serde_json::json!({PROTOCOL_KEY: 1, "stream": "!!not base64!!"}),
+            &serde_json::json!({
+                PROTOCOL_KEY: PROTOCOL_VERSION,
+                "projection": super::super::crdt::projection_id(),
+                "stream": "!!not base64!!",
+            }),
         )
         .unwrap_err();
         assert!(err.to_string().contains("base64"), "{err}");
@@ -362,7 +441,7 @@ mod tests {
     fn serve_checks_every_server_before_fetching() {
         let client = CatalystClient::new("https://peer.example.org/content")
             .with_fallback_base("http://169.254.169.254".into());
-        let req = request(&client, &scene());
+        let req = request(&client, &scene(), Duration::from_secs(90));
         let err = serve(&req, &|s: &str| {
             if s.starts_with("https://") {
                 Ok(())
@@ -375,7 +454,7 @@ mod tests {
             err.to_string().contains("refused http://169.254.169.254"),
             "{err}"
         );
-        let err = serve(&serde_json::json!({PROTOCOL_KEY: 2}), &|_: &str| Ok(())).unwrap_err();
+        let err = serve(&serde_json::json!({PROTOCOL_KEY: 99}), &|_: &str| Ok(())).unwrap_err();
         assert!(err.to_string().contains("version"), "{err}");
     }
 
@@ -440,5 +519,98 @@ module.exports.onUpdate = async function () {
             placements.files_read.get("data.json").map(String::as_str),
             Some("hdata")
         );
+    }
+
+    #[test]
+    fn request_carries_deadline_and_projection() {
+        let client = CatalystClient::new("https://peer.example.org/content");
+        let req = request(&client, &scene(), Duration::from_millis(1500));
+        assert_eq!(req["sceneDeadlineMs"], 1500);
+        assert_eq!(req["projection"], super::super::crdt::projection_id());
+    }
+
+    #[test]
+    fn projection_mismatches_are_refused_both_ways() {
+        let client = CatalystClient::new("https://peer.example.org/content");
+        let mut req = request(&client, &scene(), Duration::from_secs(90));
+        req["projection"] = serde_json::json!("lww0:1");
+        let err = serve(&req, &|_: &str| Ok(())).unwrap_err();
+        assert!(err.to_string().contains("lww0:1"), "{err}");
+
+        let mut value = response(&SceneCapture::default());
+        value["projection"] = serde_json::json!("lww9:1,2");
+        let err = parse_response(&scene(), &value).unwrap_err();
+        assert!(err.to_string().contains("lww9:1,2"), "{err}");
+        value.as_object_mut().unwrap().remove("projection");
+        assert!(parse_response(&scene(), &value).is_err());
+    }
+
+    #[test]
+    fn timeout_setting_is_a_positive_integer() {
+        assert_eq!(parse_timeout(None).unwrap(), Duration::from_secs(300));
+        assert_eq!(parse_timeout(Some("  ")).unwrap(), Duration::from_secs(300));
+        assert_eq!(
+            parse_timeout(Some(" 45 ")).unwrap(),
+            Duration::from_secs(45)
+        );
+        for bad in ["0", "-3", "1.5", "5m"] {
+            let err = parse_timeout(Some(bad)).unwrap_err();
+            assert!(err.to_string().contains(TIMEOUT_ENV), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_call_fits_the_callers_invocation() {
+        let s = Duration::from_secs;
+        assert_eq!(call_budget(s(270), None).unwrap(), s(270));
+        assert_eq!(call_budget(s(270), Some(s(900))).unwrap(), s(270));
+        assert_eq!(call_budget(s(270), Some(s(100))).unwrap(), s(70));
+        let err = call_budget(s(270), Some(s(35))).unwrap_err();
+        assert!(err.to_string().contains("not starting"), "{err}");
+        assert_eq!(requested_scene_deadline(s(270)), s(210));
+        assert_eq!(requested_scene_deadline(s(20)), MIN_SCENE_DEADLINE);
+    }
+
+    #[test]
+    fn the_scene_always_runs_under_a_deadline() {
+        let s = Duration::from_secs;
+        assert_eq!(
+            scene_deadline(None, None, None).unwrap(),
+            DEFAULT_SCENE_DEADLINE
+        );
+        assert_eq!(
+            scene_deadline(Some(s(210)), Some(s(180)), None).unwrap(),
+            s(180)
+        );
+        assert_eq!(
+            scene_deadline(Some(s(30)), Some(s(180)), None).unwrap(),
+            s(30)
+        );
+        assert_eq!(
+            scene_deadline(Some(s(210)), Some(s(180)), Some(s(100))).unwrap(),
+            s(55)
+        );
+        assert!(scene_deadline(Some(s(210)), None, Some(s(45))).is_err());
+    }
+
+    #[test]
+    fn an_oversized_response_is_a_clear_error() {
+        // Bytes that base64 cannot shrink: past the limit once encoded.
+        let stream: Vec<u8> = (0..MAX_RESPONSE_BYTES)
+            .map(|i| (i * 131 % 251) as u8)
+            .collect();
+        let capture = SceneCapture {
+            outcome: CaptureOutcome {
+                sent: true,
+                stream,
+                eval_error: None,
+            },
+            files_read: BTreeMap::new(),
+        };
+        let err = sized_response(&scene(), &capture).unwrap_err();
+        assert!(err.to_string().contains("bafkScene"), "{err}");
+        assert!(err.to_string().contains("Lambda response"), "{err}");
+        let small = SceneCapture::default();
+        assert!(sized_response(&scene(), &small).is_ok());
     }
 }

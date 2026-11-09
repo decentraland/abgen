@@ -3,10 +3,10 @@ mod load;
 mod scene_build;
 mod transform;
 
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) use load::base64_decode;
 #[cfg(all(not(target_arch = "wasm32"), feature = "web-pack"))]
 pub(crate) use load::decode_data_uri;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use load::{base64_decode, base64_encode};
 pub use load::{load_gltf_inputs, load_gltf_inputs_for_classify};
 
 use crate::mesh_layout;

@@ -3,7 +3,9 @@
 //! the ARN) + optional `ABGEN_SNS_ENDPOINT`. Message attributes matter:
 //! SQS subscription filter policies match on them, not on the JSON body.
 
-use crate::space::{agent, hex, hmac, sha256_hex, timestamps, CredsSource, ResolvedCreds};
+use crate::space::{
+    agent, sha256_hex, sigv4_authorization, timestamps, CredsSource, ResolvedCreds,
+};
 use crate::Result;
 
 pub struct Sns {
@@ -130,34 +132,17 @@ impl Sns {
         amz_date: &str,
         date: &str,
     ) -> String {
-        let (signed_headers, canonical_headers) = match &c.session_token {
-            Some(token) => (
-                "host;x-amz-date;x-amz-security-token",
-                format!(
-                    "host:{}\nx-amz-date:{}\nx-amz-security-token:{}\n",
-                    self.host, amz_date, token
-                ),
-            ),
-            None => (
-                "host;x-amz-date",
-                format!("host:{}\nx-amz-date:{}\n", self.host, amz_date),
-            ),
-        };
-        let canonical_request =
-            format!("POST\n/\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
-        let scope = format!("{date}/{}/sns/aws4_request", self.region);
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
-            sha256_hex(canonical_request.as_bytes())
-        );
-        let k_date = hmac(format!("AWS4{}", c.secret_key).as_bytes(), date.as_bytes());
-        let k_region = hmac(&k_date, self.region.as_bytes());
-        let k_service = hmac(&k_region, b"sns");
-        let k_signing = hmac(&k_service, b"aws4_request");
-        let signature = hex(&hmac(&k_signing, string_to_sign.as_bytes()));
-        format!(
-            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
-            c.access_key
+        sigv4_authorization(
+            c,
+            "sns",
+            &self.region,
+            "POST",
+            &self.host,
+            "/",
+            "",
+            payload_hash,
+            amz_date,
+            date,
         )
     }
 

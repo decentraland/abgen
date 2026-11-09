@@ -22,6 +22,17 @@ const TRACKED: [u32; 5] = [
     VISIBILITY,
 ];
 
+/// Bumped whenever folding or projection changes meaning (new message types, a different
+/// tie-break), so a caller and a scene runner on different builds refuse each other
+/// instead of projecting from a state the other side folded differently.
+const PROJECTION_GENERATION: u32 = 1;
+
+/// What a folded stream depends on: the projection generation and the tracked components.
+pub fn projection_id() -> String {
+    let tracked: Vec<String> = TRACKED.iter().map(u32::to_string).collect();
+    format!("lww{PROJECTION_GENERATION}:{}", tracked.join(","))
+}
+
 const HEADER_LEN: usize = 8;
 
 pub const TRANSFORM_DEFAULT_PAYLOAD: &[u8] =
@@ -335,6 +346,52 @@ pub(crate) fn gltf_srcs_from_crdt(stream: &[u8]) -> Vec<(u32, String)> {
 mod tests {
     use super::*;
     use crate::lodgen::placements::parse_lod_manifest_full;
+
+    fn put_bytes(entity: u32, component: u32, timestamp: u32, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_put(&mut out, entity, component, timestamp, data);
+        out
+    }
+
+    #[test]
+    fn compaction_keeps_the_winner_per_cell() {
+        let mut stream = Vec::new();
+        stream.extend(put_bytes(7, GLTF_CONTAINER, 5, b"first"));
+        // Lower timestamp: ignored.
+        stream.extend(put_bytes(7, GLTF_CONTAINER, 4, b"older"));
+        // Equal timestamp: the later message wins, as the folding does today.
+        stream.extend(put_bytes(7, GLTF_CONTAINER, 5, b"same-ts"));
+        stream.extend(put_bytes(8, TRANSFORM, 1, b"t8"));
+        // Untracked component: dropped.
+        stream.extend(put_bytes(9, UI_CANVAS_INFORMATION, 1, b"ui"));
+        // Higher timestamp: wins, but the cell keeps its first-seen position.
+        stream.extend(put_bytes(7, GLTF_CONTAINER, 9, b"last"));
+        let compact = compact_stream(&stream);
+        let want = [
+            put_bytes(7, GLTF_CONTAINER, 9, b"last"),
+            put_bytes(8, TRANSFORM, 1, b"t8"),
+        ]
+        .concat();
+        assert_eq!(compact, want);
+    }
+
+    #[test]
+    fn compaction_stops_at_a_malformed_tail() {
+        let mut stream = put_bytes(1, TRANSFORM, 1, b"ok");
+        let good = stream.clone();
+        // A header claiming more bytes than follow: ignored, like the projection does.
+        stream.extend_from_slice(&1000u32.to_le_bytes());
+        stream.extend_from_slice(&PUT_COMPONENT.to_le_bytes());
+        stream.extend_from_slice(b"short");
+        assert_eq!(compact_stream(&stream), good);
+        assert!(compact_stream(&[1, 2, 3]).is_empty());
+        assert!(compact_stream(&[]).is_empty());
+    }
+
+    #[test]
+    fn projection_id_names_generation_and_components() {
+        assert_eq!(projection_id(), "lww1:1,1017,1018,1041,1081");
+    }
 
     fn transform_bytes(p: [f32; 3], r: [f32; 4], s: [f32; 3], parent: u32) -> Vec<u8> {
         let mut out = Vec::new();

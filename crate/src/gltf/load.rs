@@ -32,6 +32,33 @@ pub(crate) fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
     base64_decode(&uri[comma + 1..])
 }
 
+/// Standard alphabet, padded: the inverse of [`base64_decode`].
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     const fn val(c: u8) -> Option<u8> {
         match c {
@@ -267,4 +294,22 @@ fn load_gltf_inputs_impl(
         crate::draco::materialize(&mut gltf, &mut buffers)?;
     }
     Ok((gltf, buffers))
+}
+
+#[cfg(test)]
+mod base64_tests {
+    use super::{base64_decode, base64_encode};
+
+    #[test]
+    fn base64_round_trips() {
+        for len in 0..40usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            let enc = base64_encode(&bytes);
+            assert_eq!(enc.len() % 4, 0);
+            assert_eq!(base64_decode(&enc).unwrap(), bytes, "len {len}");
+        }
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert_eq!(base64_encode(b"Ma"), "TWE=");
+        assert_eq!(base64_encode(b"M"), "TQ==");
+    }
 }

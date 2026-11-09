@@ -28,6 +28,9 @@ fn main() {
                 init();
             }
             let mut cfg = config::Config::from_env();
+            if scenerun_mode() {
+                init_scenerun(&cfg);
+            }
             cfg.keep_output = true;
             let result = run_once(&cfg, path);
             emf::flush();
@@ -83,6 +86,7 @@ fn main() {
             init_tracing();
             emf::init();
             let cfg = config::Config::from_env();
+            init_scenerun(&cfg);
             eprintln!("init: scene runner mode ({MODE_ENV}=scenerun)");
             runtime::serve(&cfg, handle_scenerun, runtime::AfterResponse::Exit);
         }
@@ -139,6 +143,28 @@ fn init_tracing() {
 /// scene per invocation for another function's LOD lane
 /// (`abgen::lodgen::scenerun::remote`) and nothing else.
 const MODE_ENV: &str = "ABGEN_LAMBDA_MODE";
+
+/// Scene runner start-up: refuses to serve without a content server allowlist, and lets
+/// the sandbox run scenes under a parent the runtime will not make non-dumpable. The
+/// runner holds nothing a scene could use (its role only writes its own logs); the
+/// self-test still requires the child to be refused the parent's memory.
+fn init_scenerun(cfg: &config::Config) {
+    if let Err(e) = scenerun_preflight(cfg) {
+        eprintln!("fatal: {e:#}");
+        std::process::exit(1);
+    }
+    abgen::lodgen::scenerun::sandbox::accept_dumpable_parent();
+}
+
+fn scenerun_preflight(cfg: &config::Config) -> Result<()> {
+    match cfg.allowed_content_server_hosts.as_deref() {
+        Some(hosts) if !hosts.is_empty() => Ok(()),
+        _ => anyhow::bail!(
+            "{MODE_ENV}=scenerun needs ALLOWED_CONTENT_SERVER_HOSTS: it fetches whatever \
+             content server a request names"
+        ),
+    }
+}
 
 fn scenerun_mode() -> bool {
     match std::env::var(MODE_ENV) {
@@ -575,6 +601,42 @@ mod tests {
             max_receive_count: 3,
             lod_levels: vec![1],
         }
+    }
+
+    #[test]
+    fn scenerun_needs_an_allowlist() {
+        let mut cfg = test_cfg();
+        assert!(scenerun_preflight(&cfg).is_err());
+        cfg.allowed_content_server_hosts = Some(vec![]);
+        assert!(scenerun_preflight(&cfg).is_err());
+        cfg.allowed_content_server_hosts = Some(vec!["peer.decentraland.org".into()]);
+        assert!(scenerun_preflight(&cfg).is_ok());
+    }
+
+    #[test]
+    fn scenerun_mode_only_runs_scenerun_requests() {
+        let mut cfg = test_cfg();
+        cfg.allowed_content_server_hosts = Some(vec!["peer.decentraland.org".into()]);
+        for event in [
+            json!({"Records": [{"messageId": "m1", "body": "{}"}]}),
+            json!({"entityId": "bafkreiexample", "contentServerUrls": ["https://peer.decentraland.org/content"]}),
+            http_post(&json!({"entityId": "bafkreiexample"}), "x"),
+        ] {
+            let err = handle_scenerun(&cfg, &event).unwrap_err();
+            assert!(err.to_string().contains("scenerun requests only"), "{err}");
+        }
+        // A scenerun request for a host outside the allowlist is refused before any fetch.
+        let request = json!({
+            "abgenScenerun": 2,
+            "projection": abgen::lodgen::scenerun::crdt::projection_id(),
+            "contentServer": "https://evil.example.org/content",
+            "entity": {"id": "bafkreiexample", "type": "scene", "pointers": ["0,0"], "content": [], "metadata": {}},
+        });
+        let err = handle_scenerun(&cfg, &request).unwrap_err();
+        assert!(
+            err.to_string().contains("ALLOWED_CONTENT_SERVER_HOSTS"),
+            "{err}"
+        );
     }
 
     fn http_post(body: &serde_json::Value, secret: &str) -> serde_json::Value {
