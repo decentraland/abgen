@@ -93,6 +93,12 @@ fn main() {
         }
         None => {
             init();
+            if std::env::var_os(PARENT_MEMORY_ENV).is_some() {
+                eprintln!(
+                    "init: {PARENT_MEMORY_ENV} is ignored outside {MODE_ENV}=scenerun; this \
+                     function runs no scenes with a dumpable parent"
+                );
+            }
             let cfg = config::Config::from_env();
             runtime::serve(&cfg, handle, runtime::AfterResponse::Continue);
         }
@@ -147,8 +153,10 @@ const MODE_ENV: &str = "ABGEN_LAMBDA_MODE";
 
 /// Scene runner start-up: refuses to serve without a content server allowlist, and lets
 /// the sandbox run scenes under a parent the runtime will not make non-dumpable. The
-/// runner holds nothing a scene could use (its role only writes its own logs); the
-/// self-test still requires the child to be refused the parent's memory.
+/// runner holds nothing a scene could use (its role only writes its own logs). The
+/// self-test requires the child to be refused the parent's memory unless
+/// `ABGEN_SANDBOX_PARENT_MEMORY=accept`; that is only safe on a function created with tenant
+/// isolation, which the converter invokes with one tenant per entity.
 fn init_scenerun(cfg: &config::Config) {
     if let Err(e) = scenerun_preflight(cfg) {
         eprintln!("fatal: {e:#}");

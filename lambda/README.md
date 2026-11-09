@@ -597,15 +597,21 @@ second function built from the same image with `ABGEN_LAMBDA_MODE=scenerun`:
   runner non-dumpable, and AWS Lambda also lets the child read and write the runner's
   memory (`parent_mem=FAIL` in the self-test). By default that refuses every scene;
   `ABGEN_SANDBOX_PARENT_MEMORY=accept` runs them anyway, with every other probe still
-  required. An escaped scene can then take over the runner process: it gets the runner's
-  logs-only role and could answer later scene requests on that execution environment with
-  forged renderer state, which the converter accepts only as placements of the requesting
-  entity's own content. The converter's credentials, bucket, queue and VPC stay out of
-  reach. The runner answers with the folded state and exits; exiting is hygiene, not the
-  isolation boundary.
+  required. An escaped scene can then take over the runner process and its execution
+  environment: it gets the runner's logs-only role, and it could answer later requests on
+  that environment with forged renderer state, primitives and external texture URLs
+  included, which the converter would build into that entity's LOD. So `accept` is only
+  safe on a function **created with tenant isolation** (`TenancyConfig:
+  TenantIsolationMode=PER_TENANT`): the converter invokes it with the entity id as
+  `X-Amz-Tenant-Id`, and Lambda never reuses an execution environment across tenants, so a
+  forged answer can only reach the entity whose own scene escaped. An isolated function
+  refuses an invoke without a tenant id, and the converter always sends one. The
+  converter's credentials, bucket, queue and VPC stay out of reach either way. The runner
+  answers with the folded state and exits; exiting is hygiene, not the isolation boundary.
 
-Give the scene runner its own role with no permissions beyond writing its own logs, no VPC
-access and none of the converter's environment (in particular no `ABGEN_HTTP_SECRET`): it
+Create the scene runner with tenant isolation (it can only be set at creation), and give it
+its own role with no permissions beyond writing its own logs, no VPC access and none of the
+converter's environment (in particular no `ABGEN_HTTP_SECRET`): it
 holds nothing the converter needs protected. Set its timeout no longer than the converter's
 `ABGEN_SCENERUN_TIMEOUT_S`, or it keeps running after the converter has given up, and no
 shorter than about a minute: the runner keeps 45 s after the scene deadline for the

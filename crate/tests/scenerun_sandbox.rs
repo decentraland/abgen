@@ -379,6 +379,12 @@ fn a_dumpable_parent_is_refused_unless_accepted() {
         println!("dumpable-accepted on this host: {verdict}");
         let report = scenario("dumpable-memory-accepted");
         assert!(report.contains("nofile_open=ok"), "{report}");
+        // Which branch ran depends on the host (Yama `ptrace_scope`, the runtime's filter).
+        let probe = report
+            .lines()
+            .find(|l| l.starts_with("parent_mem="))
+            .unwrap_or("none");
+        println!("dumpable-memory-accepted on this host: {probe}");
     }
 }
 

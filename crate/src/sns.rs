@@ -143,6 +143,7 @@ impl Sns {
             payload_hash,
             amz_date,
             date,
+            &[],
         )
     }
 

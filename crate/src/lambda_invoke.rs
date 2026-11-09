@@ -62,6 +62,14 @@ pub fn valid_function_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Invoke's `TenantId`: 1 to 256 of letters, digits, space and `._:/=+-@`.
+pub fn valid_tenant_id(id: &str) -> bool {
+    (1..=256).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b" ._:/=+-@".contains(&b))
+}
+
 /// `scheme://host[:port]` of an endpoint override. Plain `http` is accepted only for a
 /// loopback host: the request carries a session token.
 fn split_endpoint(endpoint: &str) -> Result<(String, String)> {
@@ -156,18 +164,24 @@ impl LambdaInvoker {
 
     /// One `RequestResponse` invoke that must finish within `budget`, retries included.
     /// Only throttling (429), 5xx and connection failures are retried: a scene run has no
-    /// side effects, but a function error or a timeout would only repeat.
+    /// side effects, but a function error or a timeout would only repeat. `tenant` is sent
+    /// as `X-Amz-Tenant-Id`: a function created with tenant isolation never reuses an
+    /// execution environment across tenants, and refuses an invoke without one.
     pub fn invoke(
         &self,
         payload: &serde_json::Value,
         budget: Duration,
+        tenant: Option<&str>,
     ) -> Result<serde_json::Value> {
+        if let Some(tenant) = tenant.filter(|t| !valid_tenant_id(t)) {
+            crate::bail!("lambda tenant id {tenant:?} is not a valid tenant id");
+        }
         let body = serde_json::to_vec(payload)?;
         let deadline = Instant::now() + budget;
         let mut attempt = 1;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            let err = match self.invoke_once(&body, left) {
+            let err = match self.invoke_once(&body, left, tenant) {
                 Attempt::Done(result) => return result,
                 Attempt::Retry(e) => e,
             };
@@ -190,7 +204,7 @@ impl LambdaInvoker {
         }
     }
 
-    fn invoke_once(&self, body: &[u8], timeout: Duration) -> Attempt {
+    fn invoke_once(&self, body: &[u8], timeout: Duration, tenant: Option<&str>) -> Attempt {
         let c = match self.creds.resolve() {
             Ok(c) => c,
             Err(e) => return Attempt::Done(Err(e)),
@@ -209,6 +223,9 @@ impl LambdaInvoker {
             &payload_hash,
             &amz,
             &date,
+            &tenant
+                .map(|t| vec![("x-amz-tenant-id", t)])
+                .unwrap_or_default(),
         );
         let url = format!("{}://{}{}", self.scheme, self.host, path);
         let mut req = self
@@ -222,6 +239,9 @@ impl LambdaInvoker {
             .header("Authorization", &auth);
         if let Some(token) = &c.session_token {
             req = req.header("x-amz-security-token", token);
+        }
+        if let Some(tenant) = tenant {
+            req = req.header("x-amz-tenant-id", tenant);
         }
         let resp = match req.send(body) {
             Ok(resp) => resp,
@@ -343,6 +363,24 @@ mod tests {
     }
 
     #[test]
+    fn tenant_ids_follow_invokes_pattern() {
+        assert!(valid_tenant_id(
+            "bafkreicpsymzaoea3ft3qblmraprpcswhr2adogz3uifaa2okthohlk42y"
+        ));
+        assert!(valid_tenant_id("0xAb@deployer:1/x=y+z_w-v.u t"));
+        assert!(!valid_tenant_id(""));
+        assert!(!valid_tenant_id(&"a".repeat(257)));
+        for bad in ["a\nb", "a#b", "a?b", "ñ"] {
+            assert!(!valid_tenant_id(bad), "{bad:?}");
+        }
+        let inv = invoker("http://127.0.0.1:9", None);
+        let err = inv
+            .invoke(&serde_json::json!({}), BUDGET, Some("a#b"))
+            .unwrap_err();
+        assert!(err.to_string().contains("tenant id"), "{err}");
+    }
+
+    #[test]
     fn plain_http_endpoints_must_be_loopback() {
         for ok in [
             "http://127.0.0.1:9001",
@@ -429,7 +467,7 @@ mod tests {
     fn invoke_signs_and_posts_the_payload() {
         let (endpoint, server) = server(vec![OK]);
         let got = invoker(&endpoint, Some("example-token"))
-            .invoke(&serde_json::json!({"a": 1}), BUDGET)
+            .invoke(&serde_json::json!({"a": 1}), BUDGET, Some("bafkreientity"))
             .unwrap();
         assert_eq!(got, serde_json::json!({"ok": true}));
         let (head, body) = server.join().unwrap().remove(0);
@@ -437,7 +475,10 @@ mod tests {
         let lower = head.to_lowercase();
         assert!(lower.contains("authorization: aws4-hmac-sha256 credential=akidexample/"));
         assert!(lower.contains("/us-east-1/lambda/aws4_request"));
-        assert!(lower.contains("signedheaders=host;x-amz-date;x-amz-security-token"));
+        assert!(
+            lower.contains("signedheaders=host;x-amz-date;x-amz-security-token;x-amz-tenant-id")
+        );
+        assert!(lower.contains("x-amz-tenant-id: bafkreientity"));
         assert!(lower.contains("x-amz-security-token: example-token"));
         assert_eq!(body, br#"{"a":1}"#);
     }
@@ -450,7 +491,7 @@ mod tests {
             OK,
         ]);
         let got = invoker(&endpoint, None)
-            .invoke(&serde_json::json!({}), BUDGET)
+            .invoke(&serde_json::json!({}), BUDGET, None)
             .unwrap();
         assert_eq!(got, serde_json::json!({"ok": true}));
         assert_eq!(server.join().unwrap().len(), 3);
@@ -462,7 +503,7 @@ mod tests {
             "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
         let (endpoint, server) = server(vec![BUSY; MAX_ATTEMPTS as usize]);
         let err = invoker(&endpoint, None)
-            .invoke(&serde_json::json!({}), Duration::from_secs(60))
+            .invoke(&serde_json::json!({}), Duration::from_secs(60), None)
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
@@ -476,7 +517,7 @@ mod tests {
         let endpoint = format!("http://{}", closed.local_addr().unwrap());
         drop(closed);
         let err = invoker(&endpoint, None)
-            .invoke(&serde_json::json!({}), Duration::from_secs(60))
+            .invoke(&serde_json::json!({}), Duration::from_secs(60), None)
             .unwrap_err();
         assert!(format!("{err:#}").contains("4 attempt"), "{err:#}");
     }
@@ -488,7 +529,9 @@ mod tests {
             "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\nConnection: close\r\n\r\n{\"x\":\"y\"}",
         ]);
         let inv = invoker(&endpoint, None);
-        let err = inv.invoke(&serde_json::json!({}), BUDGET).unwrap_err();
+        let err = inv
+            .invoke(&serde_json::json!({}), BUDGET, None)
+            .unwrap_err();
         let err = format!("{err:#}");
         assert!(
             err.contains("Unhandled") && err.contains("scene broke"),
@@ -496,7 +539,8 @@ mod tests {
         );
         let err = format!(
             "{:#}",
-            inv.invoke(&serde_json::json!({}), BUDGET).unwrap_err()
+            inv.invoke(&serde_json::json!({}), BUDGET, None)
+                .unwrap_err()
         );
         assert!(err.contains("HTTP 403"), "{err}");
         assert_eq!(server.join().unwrap().len(), 2);
@@ -508,7 +552,7 @@ mod tests {
         let (endpoint, server) = server(vec![""]);
         let started = Instant::now();
         let err = invoker(&endpoint, None)
-            .invoke(&serde_json::json!({}), Duration::from_millis(500))
+            .invoke(&serde_json::json!({}), Duration::from_millis(500), None)
             .unwrap_err();
         assert!(format!("{err:#}").contains("no answer within"), "{err:#}");
         assert!(started.elapsed() < Duration::from_secs(5));

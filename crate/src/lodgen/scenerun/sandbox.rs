@@ -52,8 +52,9 @@
 //! AWS Lambda lets a same-user child access a dumpable parent's memory, so there the scene
 //! runner additionally needs [`accept_parent_memory_access`], which it calls only when its
 //! deployment opts in (`ABGEN_SANDBOX_PARENT_MEMORY=accept`). Then an escaped scene can take
-//! over the runner process itself; the boundary is the runner's own execution environment
-//! (its logs-only role, no VPC) and the caller treating every answer as untrusted.
+//! over the runner process and its execution environment. The boundary is then that
+//! environment: its logs-only role, no VPC, and tenant isolation per entity, so whatever an
+//! escaped scene answers can only reach its own entity's LOD.
 //!
 //! Concurrent children are capped at `default_file_concurrency()`, as the in-process pool
 //! was; callers' LOD limits already keep them below that today.
@@ -351,11 +352,17 @@ fn evaluate_report(
     let mut failed = Vec::new();
     let mut seccomp_unavailable = None;
     let mut memory_readable = None;
+    // Only the unfiltered probe set may be excused: with the filter on, a `parent_mem`
+    // failure means the filter let `process_vm_readv` through, a failure under any policy.
+    let unfiltered = report
+        .lines()
+        .any(|l| l.starts_with("seccomp=unavailable("));
     for line in report.lines() {
         if line.ends_with("=ok") {
             continue;
         }
         if line.starts_with("parent_mem=")
+            && unfiltered
             && parent_dumpable.is_some()
             && dumpable == DumpableParent::WithMemoryAccess
         {
@@ -375,14 +382,13 @@ fn evaluate_report(
     }
     let mut warnings = Vec::new();
     if let Some(why) = parent_dumpable {
-        match dumpable {
-            DumpableParent::Refuse => {
+        match (dumpable, memory_readable) {
+            (DumpableParent::Refuse, _) => {
                 return Err(format!("parent process is still dumpable ({why})"));
             }
-            _ if memory_readable.is_some() => warnings.push(format!(
+            (_, Some(probe)) => warnings.push(format!(
                 "parent process is dumpable ({why}) and the child can access its memory \
-                 ({}); accepted for this process",
-                memory_readable.unwrap_or_default()
+                 ({probe}); accepted for this process"
             )),
             _ if report.lines().any(|l| l == "parent_mem=ok") => warnings.push(format!(
                 "parent process is dumpable ({why}); accepted for this process, and the \
@@ -741,13 +747,24 @@ enum DumpableParent {
     WithMemoryAccess,
 }
 
-static DUMPABLE_PARENT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+const DUMPABLE_REFUSE: u8 = 0;
+const DUMPABLE_IF_MEMORY_REFUSED: u8 = 1;
+const DUMPABLE_WITH_MEMORY_ACCESS: u8 = 2;
+
+static DUMPABLE_PARENT: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(DUMPABLE_REFUSE);
 
 /// Lets scenes run under a parent that stays dumpable (see the module docs). Only for a
 /// process with no credentials or data the scene must not reach; call it before the first
 /// scene. The child must still be refused access to the parent's memory.
 pub fn accept_dumpable_parent() {
-    let _ = DUMPABLE_PARENT.compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed);
+    // Never downgrades `accept_parent_memory_access`.
+    let _ = DUMPABLE_PARENT.compare_exchange(
+        DUMPABLE_REFUSE,
+        DUMPABLE_IF_MEMORY_REFUSED,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
 }
 
 /// [`accept_dumpable_parent`], and scenes run even when the runtime lets the child read and
@@ -755,14 +772,14 @@ pub fn accept_dumpable_parent() {
 /// only for a process that holds nothing but what its own scenes may see, and whose answers
 /// the caller treats as untrusted. The self-test still requires every other probe.
 pub fn accept_parent_memory_access() {
-    DUMPABLE_PARENT.store(2, Ordering::Relaxed);
+    DUMPABLE_PARENT.store(DUMPABLE_WITH_MEMORY_ACCESS, Ordering::Relaxed);
 }
 
 fn dumpable_parent() -> DumpableParent {
     match DUMPABLE_PARENT.load(Ordering::Relaxed) {
-        0 => DumpableParent::Refuse,
-        1 => DumpableParent::IfMemoryRefused,
-        _ => DumpableParent::WithMemoryAccess,
+        DUMPABLE_IF_MEMORY_REFUSED => DumpableParent::IfMemoryRefused,
+        DUMPABLE_WITH_MEMORY_ACCESS => DumpableParent::WithMemoryAccess,
+        _ => DumpableParent::Refuse,
     }
 }
 
@@ -2016,6 +2033,17 @@ mod tests {
             readable,
             SeccompPolicy::Auto,
             None,
+            DumpableParent::WithMemoryAccess,
+        )
+        .unwrap_err();
+        assert!(err.contains("parent_mem=FAIL"), "{err}");
+
+        // With the filter on, a failed memory probe is a filter fault: never excused.
+        let filtered = "empty_env=ok\nseccomp=ok\nparent_mem=FAIL(rc=8 errno=None)";
+        let err = evaluate_report(
+            filtered,
+            SeccompPolicy::Auto,
+            dumpable,
             DumpableParent::WithMemoryAccess,
         )
         .unwrap_err();
