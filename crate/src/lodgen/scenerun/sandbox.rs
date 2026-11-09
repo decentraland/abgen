@@ -35,6 +35,21 @@
 //! QuickJS escape has the uid's ordinary access (files, sockets, `execve`); what it does
 //! not get is a second process, the parent's memory, or a life after the parent's.
 //!
+//! The child also sets `RLIMIT_NOFILE` to 0: the descriptors it already has keep working,
+//! and every new one fails with `EMFILE`, even after it closes one of its own. Without the
+//! filter, the self-test closes its stdin and then proves that opening the parent's
+//! `/proc/<ppid>/environ`, opening a socket, starting a process and reading the parent's
+//! memory are all refused (`nofile_open`, `nofile_socket`, `nproc_clone`, `parent_mem`).
+//! Root is exempt from `RLIMIT_NPROC`, so without the filter a root process fails the
+//! self-test. What an escaped scene keeps without the filter: its pipes, stderr, CPU until
+//! the deadline kill, and signals to processes of the same user (it could stop the
+//! parent, which only holds up its own invocation until the function times out).
+//!
+//! A process that holds nothing worth protecting from the scene (the scene runner function,
+//! whose only permission is writing its own logs) can call [`accept_dumpable_parent`]: a
+//! parent that stays dumpable is then a warning instead of a failure, provided the child
+//! still cannot read or write the parent's memory (`parent_mem=ok`). Nothing else calls it.
+//!
 //! Concurrent children are capped at `default_file_concurrency()`, as the in-process pool
 //! was; callers' LOD limits already keep them below that today.
 //!
@@ -290,7 +305,12 @@ fn self_test_report() -> std::result::Result<String, SelfTestError> {
     };
     metrics::counter!("abgen_scene_sandbox_seccomp_total", "state" => seccomp_state).increment(1);
     let dumpable = parent_dumpable_error();
-    match evaluate_report(&report, seccomp_policy(), dumpable.as_deref()) {
+    match evaluate_report(
+        &report,
+        seccomp_policy(),
+        dumpable.as_deref(),
+        dumpable_parent_accepted(),
+    ) {
         Ok(warnings) => {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
@@ -312,11 +332,14 @@ fn self_test_report() -> std::result::Result<String, SelfTestError> {
 /// `required` on Linux only; elsewhere seccomp never exists. A parent that is still
 /// dumpable (`parent_dumpable` names why) is a failure under either policy: without the
 /// filter, non-dumpability is what keeps an escaped scene out of `/proc/<ppid>/environ`
-/// and `/proc/<ppid>/mem`, which on Lambda hold the function's credentials.
+/// and `/proc/<ppid>/mem`, which on Lambda hold the function's credentials. With
+/// `dumpable_accepted` ([`accept_dumpable_parent`]) it is a warning instead, but only when
+/// the report proves the child was refused the parent's memory (`parent_mem=ok`).
 fn evaluate_report(
     report: &str,
     policy: SeccompPolicy,
     parent_dumpable: Option<&str>,
+    dumpable_accepted: bool,
 ) -> std::result::Result<Vec<String>, String> {
     let mut failed = Vec::new();
     let mut seccomp_unavailable = None;
@@ -335,10 +358,22 @@ fn evaluate_report(
     if !failed.is_empty() {
         return Err(format!("sandbox probes not refused: {}", failed.join(", ")));
     }
-    if let Some(why) = parent_dumpable {
-        return Err(format!("parent process is still dumpable ({why})"));
-    }
     let mut warnings = Vec::new();
+    if let Some(why) = parent_dumpable {
+        if !dumpable_accepted {
+            return Err(format!("parent process is still dumpable ({why})"));
+        }
+        if !report.lines().any(|l| l == "parent_mem=ok") {
+            return Err(format!(
+                "parent process is still dumpable ({why}) and the self-test did not prove \
+                 the child is refused its memory"
+            ));
+        }
+        warnings.push(format!(
+            "parent process is dumpable ({why}); accepted for this process, and the child is \
+             refused the parent's memory"
+        ));
+    }
     if let Some(reason) = seccomp_unavailable {
         if cfg!(target_os = "linux") && policy == SeccompPolicy::Required {
             return Err(format!(
@@ -348,12 +383,12 @@ fn evaluate_report(
         }
         warnings.push(format!(
             "no seccomp ({reason}); scenes run in a separate process with an empty \
-             environment{} only: an escaped scene would have this user's file, network and \
-             exec access",
+             environment{} only",
             if cfg!(target_os = "linux") {
-                ", RLIMIT_DATA, RLIMIT_NPROC=0 and parent-death kill"
+                ", RLIMIT_DATA, RLIMIT_NPROC=0, RLIMIT_NOFILE=0 and \
+                 parent-death kill"
             } else {
-                ""
+                ": an escaped scene would have this user's file, network and exec access"
             }
         ));
     }
@@ -673,6 +708,20 @@ fn kill_child(child: &mut Child) -> bool {
     child.kill().is_ok()
 }
 
+static DUMPABLE_PARENT_ACCEPTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Lets scenes run under a parent that stays dumpable (see the module docs). Only for a
+/// process with no credentials or data the scene must not reach; call it before the first
+/// scene. The child must still be refused access to the parent's memory.
+pub fn accept_dumpable_parent() {
+    DUMPABLE_PARENT_ACCEPTED.store(true, Ordering::Relaxed);
+}
+
+fn dumpable_parent_accepted() -> bool {
+    DUMPABLE_PARENT_ACCEPTED.load(Ordering::Relaxed)
+}
+
 /// `PR_SET_DUMPABLE` failures, kept for the self-test's verdict.
 #[cfg(target_os = "linux")]
 static PARENT_DUMPABLE_ERROR: Mutex<Option<String>> = Mutex::new(None);
@@ -770,7 +819,10 @@ fn child_main() -> Result<()> {
         T_SELF_TEST => {
             let report = probe_confinement(&seccomp);
             let mut guard = lock(&io);
-            write_frame(&mut guard.1, T_SELF_TEST_REPORT, report.as_bytes())
+            write_frame(&mut guard.1, T_SELF_TEST_REPORT, report.as_bytes())?;
+            // The probes may have closed stdin under its owner; exit before anything is
+            // dropped rather than close it twice.
+            std::process::exit(0)
         }
         // The parent never sends a job before a passing self-test; this is the child's
         // own refusal in case one arrives anyway.
@@ -972,6 +1024,9 @@ fn install_child_sandbox() -> Result<SeccompState> {
         // No further processes or threads from here on, whether or not the filter goes
         // on (which would deny clone anyway). Root is exempt from RLIMIT_NPROC.
         linux::forbid_new_processes();
+        // No new descriptors either: only the pipes to the parent and stderr stay usable,
+        // so without the filter the child still cannot open files or sockets.
+        linux::forbid_new_files()?;
         match linux::install_seccomp() {
             Ok(()) => Ok(SeccompState::Installed),
             Err(linux::SeccompError::Refused(reason)) => Ok(SeccompState::Unavailable(reason)),
@@ -1024,6 +1079,8 @@ fn probe_confinement(seccomp: &SeccompState) -> String {
                 "seccomp=unavailable({})",
                 reason.replace('\n', " ")
             ));
+            #[cfg(target_os = "linux")]
+            lines.extend(linux::unfiltered_probes());
         }
     }
     lines.join("\n")
@@ -1116,6 +1173,7 @@ fn encode_job(
         d.as_millis().min(u128::from(NO_DEADLINE - 1)) as u64
     });
     out.extend_from_slice(&deadline.to_le_bytes());
+    out.extend_from_slice(&(limits.max_stream_bytes as u64).to_le_bytes());
     out.push(log_level);
     match main_crdt {
         Some(c) => {
@@ -1138,6 +1196,7 @@ fn decode_job(body: &[u8]) -> Result<DecodedJob> {
         NO_DEADLINE => None,
         ms => Some(Duration::from_millis(ms)),
     };
+    let max_stream_bytes = usize::try_from(cur.u64()?)?;
     let log_level = cur.u8()?;
     let main_crdt = match cur.u8()? {
         0 => None,
@@ -1152,6 +1211,7 @@ fn decode_job(body: &[u8]) -> Result<DecodedJob> {
             memory_bytes,
             stack_bytes,
             deadline,
+            max_stream_bytes,
         },
         log_level,
     ))
@@ -1261,6 +1321,22 @@ mod linux {
         unsafe {
             libc::setrlimit(libc::RLIMIT_NPROC, &none);
         }
+    }
+
+    /// `RLIMIT_NOFILE = 0`, soft and hard: descriptors already open keep working, and
+    /// every later `open`, `socket`, `pipe` or `dup` fails with `EMFILE` whatever slot is
+    /// free, so closing one of its own does not make room. An unprivileged process cannot
+    /// raise it again.
+    pub(super) fn forbid_new_files() -> anyhow::Result<()> {
+        let none = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: setrlimit on the current process with a valid struct.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &none) } != 0 {
+            anyhow::bail!("RLIMIT_NOFILE=0: {}", std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     pub(super) fn is_non_dumpable() -> bool {
@@ -1505,15 +1581,91 @@ mod linux {
     /// Runs one probe and reads errno right after it. `cleanup` releases whatever the
     /// probe got if it unexpectedly succeeded.
     fn refused(name: &str, probe: impl FnOnce() -> c_long, cleanup: impl FnOnce(c_long)) -> String {
+        refused_with(name, libc::EPERM, probe, cleanup)
+    }
+
+    /// [`refused`] for a probe that must fail with `errno` rather than `EPERM`.
+    fn refused_with(
+        name: &str,
+        errno: libc::c_int,
+        probe: impl FnOnce() -> c_long,
+        cleanup: impl FnOnce(c_long),
+    ) -> String {
         let rc = probe();
         let err = std::io::Error::last_os_error().raw_os_error();
-        if rc == -1 && err == Some(libc::EPERM) {
+        if rc == -1 && err == Some(errno) {
             return format!("{name}=ok");
         }
         if rc >= 0 {
             cleanup(rc);
         }
         format!("{name}=FAIL(rc={rc} errno={err:?})")
+    }
+
+    /// Reads one word of the parent's memory with `process_vm_readv`. The kernel checks
+    /// ptrace access before it looks at the address, so a refusal is `EPERM` and anything
+    /// else (`EFAULT` on the arbitrary address included) means the access was allowed.
+    fn read_parent_memory(parent_pid: libc::pid_t) -> c_long {
+        let mut word = 0u64;
+        let local = libc::iovec {
+            iov_base: (&mut word as *mut u64).cast(),
+            iov_len: std::mem::size_of::<u64>(),
+        };
+        let remote = libc::iovec {
+            iov_base: 0x10000 as *mut libc::c_void,
+            iov_len: std::mem::size_of::<u64>(),
+        };
+        // SAFETY: the local iovec points at a live u64; the remote one is only read by the
+        // kernel on the parent's side, if at all.
+        unsafe { libc::process_vm_readv(parent_pid, &local, 1, &remote, 1, 0) as c_long }
+    }
+
+    /// The child's limits without a filter: no new descriptors (`EMFILE`), no new
+    /// processes (`EAGAIN` under `RLIMIT_NPROC=0`) and no access to the parent's memory.
+    /// Closes stdin first, so a free low slot exists and the descriptor probes show the
+    /// limit holds anyway; the caller must not read stdin afterwards.
+    pub(super) fn unfiltered_probes() -> Vec<String> {
+        // SAFETY: plain pid lookup.
+        let parent_pid = unsafe { libc::getppid() };
+        let environ = std::ffi::CString::new(format!("/proc/{parent_pid}/environ"))
+            .expect("no NUL in a path built from a pid");
+        // SAFETY: as in `probes`: each probe fails (expected) or its result is released.
+        // Closing fd 0 is fine: the self-test request has been read and nothing reads it
+        // again (the child exits right after reporting).
+        unsafe {
+            libc::close(0);
+            let close = |fd: c_long| {
+                libc::close(fd as libc::c_int);
+            };
+            vec![
+                refused_with(
+                    "nofile_open",
+                    libc::EMFILE,
+                    || libc::open(environ.as_ptr(), libc::O_RDONLY) as c_long,
+                    close,
+                ),
+                refused_with(
+                    "nofile_socket",
+                    libc::EMFILE,
+                    || libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) as c_long,
+                    close,
+                ),
+                refused_with(
+                    "nproc_clone",
+                    libc::EAGAIN,
+                    || {
+                        let rc =
+                            libc::syscall(libc::SYS_clone, libc::SIGCHLD as c_ulong, 0 as c_ulong);
+                        if rc == 0 {
+                            libc::_exit(0);
+                        }
+                        rc
+                    },
+                    |_| {},
+                ),
+                refused("parent_mem", || read_parent_memory(parent_pid), |_| {}),
+            ]
+        }
     }
 
     /// Syscalls outside the child's allowlist, each expected to fail with EPERM.
@@ -1527,6 +1679,11 @@ mod linux {
                 libc::close(fd as libc::c_int);
             };
             vec![
+                refused(
+                    "parent_mem",
+                    || read_parent_memory(parent_pid as libc::pid_t),
+                    |_| {},
+                ),
                 refused(
                     "tgkill_other",
                     || libc::syscall(libc::SYS_tgkill, parent_pid, parent_pid, 0 as c_ulong),
@@ -1620,6 +1777,7 @@ mod tests {
             memory_bytes: 123,
             stack_bytes: 456,
             deadline: Some(Duration::from_millis(789)),
+            max_stream_bytes: 1011,
         };
         let body = encode_job("code ✓", Some(&[1, 2, 3]), &limits, 2);
         let (code, crdt, got, level) = decode_job(&body).unwrap();
@@ -1627,6 +1785,7 @@ mod tests {
         assert_eq!(crdt.as_deref(), Some(&[1u8, 2, 3][..]));
         assert_eq!((got.memory_bytes, got.stack_bytes), (123, 456));
         assert_eq!(got.deadline, Some(Duration::from_millis(789)));
+        assert_eq!(got.max_stream_bytes, 1011);
         assert_eq!(level_from_wire(level), Some(tracing::Level::WARN));
 
         let none = EngineLimits {
@@ -1658,29 +1817,30 @@ mod tests {
 
     #[test]
     fn report_evaluation_follows_the_policy() {
-        let confined = "empty_env=ok\nseccomp=ok\nopen=ok\nsocket=ok";
+        let confined = "empty_env=ok\nseccomp=ok\nparent_mem=ok\nopen=ok\nsocket=ok";
         assert_eq!(
-            evaluate_report(confined, SeccompPolicy::Required, None),
+            evaluate_report(confined, SeccompPolicy::Required, None, false),
             Ok(vec![])
         );
         assert_eq!(
-            evaluate_report(confined, SeccompPolicy::Auto, None),
+            evaluate_report(confined, SeccompPolicy::Auto, None, false),
             Ok(vec![])
         );
 
         // A filter that is on but does not refuse is a failure under any policy.
         let leaky = "empty_env=ok\nseccomp=ok\nopen=FAIL(rc=3 errno=None)";
         for policy in [SeccompPolicy::Required, SeccompPolicy::Auto] {
-            let err = evaluate_report(leaky, policy, None).unwrap_err();
+            let err = evaluate_report(leaky, policy, None, false).unwrap_err();
             assert!(err.contains("open=FAIL"), "{err}");
         }
 
-        let unavailable =
-            "empty_env=ok\nseccomp=unavailable(PR_SET_NO_NEW_PRIVS: Operation not permitted)";
-        let auto = evaluate_report(unavailable, SeccompPolicy::Auto, None).unwrap();
+        let unavailable = "empty_env=ok\n\
+             seccomp=unavailable(PR_SET_NO_NEW_PRIVS: Operation not permitted)\n\
+             nofile_open=ok\nnofile_socket=ok\nnproc_clone=ok\nparent_mem=ok";
+        let auto = evaluate_report(unavailable, SeccompPolicy::Auto, None, false).unwrap();
         assert_eq!(auto.len(), 1, "{auto:?}");
         assert!(auto[0].contains("PR_SET_NO_NEW_PRIVS"), "{auto:?}");
-        let required = evaluate_report(unavailable, SeccompPolicy::Required, None);
+        let required = evaluate_report(unavailable, SeccompPolicy::Required, None, false);
         if cfg!(target_os = "linux") {
             let err = required.unwrap_err();
             assert!(err.contains(SANDBOX_SECCOMP_ENV), "{err}");
@@ -1688,18 +1848,49 @@ mod tests {
             assert_eq!(required.unwrap().len(), 1);
         }
 
+        // Without the filter, a descriptor or process limit that did not hold fails.
+        let open_files = "empty_env=ok\nseccomp=unavailable(x)\n\
+             nofile_open=FAIL(rc=3 errno=None)\nparent_mem=ok";
+        let err = evaluate_report(open_files, SeccompPolicy::Auto, None, false).unwrap_err();
+        assert!(err.contains("nofile_open=FAIL"), "{err}");
+
         // An environment the parent did not clear fails whatever the policy.
         let env = "empty_env=FAIL(env present: HOME)\nseccomp=unavailable(x)";
-        assert!(evaluate_report(env, SeccompPolicy::Auto, None).is_err());
+        assert!(evaluate_report(env, SeccompPolicy::Auto, None, false).is_err());
 
         // A dumpable parent is fatal under either policy, with the prctl error in the text.
         for policy in [SeccompPolicy::Required, SeccompPolicy::Auto] {
-            let err =
-                evaluate_report(confined, policy, Some("PR_SET_DUMPABLE: EPERM")).unwrap_err();
+            let err = evaluate_report(confined, policy, Some("PR_SET_DUMPABLE: EPERM"), false)
+                .unwrap_err();
             assert!(err.contains("dumpable") && err.contains("EPERM"), "{err}");
-            let err = evaluate_report(unavailable, policy, Some("x")).unwrap_err();
+            let err = evaluate_report(unavailable, policy, Some("x"), false).unwrap_err();
             assert!(err.contains("dumpable"), "{err}");
         }
+    }
+
+    #[test]
+    fn an_accepted_dumpable_parent_still_needs_its_memory_refused() {
+        let unavailable = "empty_env=ok\nseccomp=unavailable(x)\n\
+             nofile_open=ok\nnofile_socket=ok\nnproc_clone=ok\nparent_mem=ok";
+        let warnings = evaluate_report(
+            unavailable,
+            SeccompPolicy::Auto,
+            Some("PR_SET_DUMPABLE: EPERM"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("dumpable"), "{warnings:?}");
+
+        // Memory access allowed: the probe line fails the report on its own.
+        let readable = unavailable.replace("parent_mem=ok", "parent_mem=FAIL(rc=-1 errno=14)");
+        let err = evaluate_report(&readable, SeccompPolicy::Auto, Some("x"), true).unwrap_err();
+        assert!(err.contains("parent_mem=FAIL"), "{err}");
+
+        // No memory probe in the report at all: not proven, so refused.
+        let unproven = "empty_env=ok\nseccomp=unavailable(x)";
+        let err = evaluate_report(unproven, SeccompPolicy::Auto, Some("x"), true).unwrap_err();
+        assert!(err.contains("did not prove"), "{err}");
     }
 
     #[test]

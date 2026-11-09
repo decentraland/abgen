@@ -3,9 +3,21 @@ use anyhow::Result;
 
 const API_VERSION: &str = "2018-06-01";
 
+/// What the process does once an invocation is answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AfterResponse {
+    /// Wait for the next invocation in the same process.
+    Continue,
+    /// Exit, so the next invocation starts a fresh process. Hygiene, not a boundary:
+    /// it only holds for code that stays inside this process's control, which is why
+    /// scenes run in the sandbox child even here.
+    Exit,
+}
+
 pub fn serve(
     cfg: &Config,
     handler: impl Fn(&Config, &serde_json::Value) -> Result<serde_json::Value>,
+    after: AfterResponse,
 ) -> ! {
     let api = std::env::var("AWS_LAMBDA_RUNTIME_API").unwrap_or_else(|_| {
         eprintln!(
@@ -18,7 +30,7 @@ pub fn serve(
     let next_url = format!("http://{api}/{API_VERSION}/runtime/invocation/next");
 
     loop {
-        let (request_id, event) = match next_invocation(&agent, &next_url) {
+        let (request_id, deadline, event) = match next_invocation(&agent, &next_url) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("runtime: failed to fetch next invocation: {e:#}");
@@ -27,8 +39,10 @@ pub fn serve(
             }
         };
 
+        abgen::lambda_invoke::set_invocation_deadline(deadline);
         let started = std::time::Instant::now();
         let outcome = handler(cfg, &event);
+        abgen::lambda_invoke::set_invocation_deadline(None);
         let result = if outcome.is_ok() { "ok" } else { "error" };
         metrics::counter!("abgen_lambda_invocations_total", "result" => result).increment(1);
         metrics::histogram!("abgen_lambda_invocation_duration_seconds", "result" => result)
@@ -56,10 +70,15 @@ pub fn serve(
                 }
             }
         }
+        if after == AfterResponse::Exit {
+            std::process::exit(0);
+        }
     }
 }
 
-fn next_invocation(agent: &ureq::Agent, url: &str) -> Result<(String, serde_json::Value)> {
+type Invocation = (String, Option<std::time::SystemTime>, serde_json::Value);
+
+fn next_invocation(agent: &ureq::Agent, url: &str) -> Result<Invocation> {
     let resp = agent
         .get(url)
         .call()
@@ -70,12 +89,23 @@ fn next_invocation(agent: &ureq::Agent, url: &str) -> Result<(String, serde_json
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("invocation/next without Lambda-Runtime-Aws-Request-Id"))?;
+    let deadline = resp
+        .headers()
+        .get("lambda-runtime-deadline-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_deadline_ms);
     let mut buf = Vec::new();
     use std::io::Read;
     resp.into_body().into_reader().read_to_end(&mut buf)?;
     let event: serde_json::Value = serde_json::from_slice(&buf)
         .map_err(|e| anyhow::anyhow!("invocation payload is not JSON: {e}"))?;
-    Ok((request_id, event))
+    Ok((request_id, deadline, event))
+}
+
+/// `Lambda-Runtime-Deadline-Ms`: the invocation's deadline in Unix epoch milliseconds.
+fn parse_deadline_ms(value: &str) -> Option<std::time::SystemTime> {
+    let ms = value.trim().parse::<u64>().ok()?;
+    std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_millis(ms))
 }
 
 fn post_json(agent: &ureq::Agent, url: &str, body: &serde_json::Value) -> Result<()> {
@@ -85,4 +115,20 @@ fn post_json(agent: &ureq::Agent, url: &str, body: &serde_json::Value) -> Result
         .send(body.to_string())
         .map_err(|e| anyhow::anyhow!("POST {url}: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deadline_header_is_epoch_millis() {
+        let got = parse_deadline_ms(" 1700000000123 ").unwrap();
+        assert_eq!(
+            got.duration_since(std::time::UNIX_EPOCH).unwrap(),
+            std::time::Duration::from_millis(1_700_000_000_123)
+        );
+        assert!(parse_deadline_ms("soon").is_none());
+        assert!(parse_deadline_ms("").is_none());
+    }
 }

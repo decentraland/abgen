@@ -87,10 +87,18 @@ fn run_on_thread(job: SceneJob) -> Result<CaptureOutcome> {
     }
     let context = Context::full(&runtime).map_err(|e| anyhow!("quickjs context: {e}"))?;
     let capture = Rc::new(RefCell::new(CaptureOutcome::default()));
+    let overflow = Rc::new(std::cell::Cell::new(false));
+    let max_stream = limits.max_stream_bytes;
     context.with(|ctx| -> Result<()> {
-        install_host(&ctx, main_crdt, read_file, capture.clone())
-            .catch(&ctx)
-            .map_err(|e| anyhow!("install scene host: {e}"))
+        install_host(
+            &ctx,
+            main_crdt,
+            read_file,
+            capture.clone(),
+            (max_stream, overflow.clone()),
+        )
+        .catch(&ctx)
+        .map_err(|e| anyhow!("install scene host: {e}"))
     })?;
     let mut session = QuickJsSession {
         runtime: &runtime,
@@ -98,6 +106,9 @@ fn run_on_thread(job: SceneJob) -> Result<CaptureOutcome> {
         expired: &expired,
     };
     let eval_error = driver::drive(&mut session, &code)?;
+    if overflow.get() {
+        bail!("scene renderer stream exceeded {max_stream} bytes");
+    }
     runtime.set_interrupt_handler(None);
     drop(context);
     drop(runtime);
@@ -171,6 +182,7 @@ fn install_host<'js>(
     main_crdt: Option<Vec<u8>>,
     read_file: ReadFileFn,
     capture: Rc<RefCell<CaptureOutcome>>,
+    (max_stream, overflow): (usize, Rc<std::cell::Cell<bool>>),
 ) -> rquickjs::Result<()> {
     let parts = initial_state_parts(main_crdt.as_deref());
     let get_state = Function::new(
@@ -187,11 +199,15 @@ fn install_host<'js>(
     let prefix = main_crdt.clone();
     let send = Function::new(ctx.clone(), move |data: TypedArray<'js, u8>| {
         let mut cap = sink.borrow_mut();
-        if let Some(head) = &prefix {
-            cap.stream.extend_from_slice(head);
+        let data = data.as_bytes().unwrap_or_default();
+        let head = prefix.as_deref().unwrap_or_default();
+        if overflow.get() || cap.stream.len() + head.len() + data.len() > max_stream {
+            // Dropped, not truncated: the run fails once the scene returns.
+            overflow.set(true);
+            return;
         }
-        cap.stream
-            .extend_from_slice(data.as_bytes().unwrap_or_default());
+        cap.stream.extend_from_slice(head);
+        cap.stream.extend_from_slice(data);
         cap.sent = true;
     })?;
     let read = Function::new(
@@ -226,7 +242,7 @@ fn install_host<'js>(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::super::{crdt, EngineLimits};
+    use super::super::{crdt, EngineLimits, MAX_RENDERER_STREAM_BYTES};
     use super::*;
     use std::collections::HashMap;
 
@@ -279,6 +295,7 @@ function joinParts(parts) {
             memory_bytes: 256 << 20,
             stack_bytes: 1 << 20,
             deadline: None,
+            max_stream_bytes: MAX_RENDERER_STREAM_BYTES,
         }
     }
 
@@ -373,6 +390,29 @@ module.exports.onUpdate = async function (dt) {{
         assert_eq!(p.glb_hash.as_deref(), Some("hchild"));
         assert_eq!(p.position, [8.0, 0.0, 4.0]);
         assert_eq!(p.scale, [2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn an_oversized_renderer_stream_fails_the_run() {
+        // Half the cap plus one byte, prepended to each of two sends: the second overflows.
+        const CAP: usize = 4096;
+        let main = vec![0u8; CAP / 2 + 1];
+        let code = "
+const engineApi = require('~system/EngineApi');
+let frames = 0;
+module.exports.onUpdate = async function (_dt) {
+  frames += 1;
+  if (frames > 2) return;
+  await engineApi.crdtSendToRenderer({ data: new Uint8Array(0) });
+};
+";
+        let mut capped = job(code.into(), Some(main));
+        capped.limits.max_stream_bytes = CAP;
+        let err = QuickJsEngine.run_capture(capped).unwrap_err();
+        assert!(
+            err.to_string().contains("renderer stream exceeded"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -520,6 +560,23 @@ module.exports = {{
         }
         assert_eq!(runs[0], runs[1]);
         assert!(runs[0].contains("hmodel"));
+    }
+
+    #[test]
+    fn compacted_stream_projects_like_the_full_stream() {
+        let mut content = HashMap::new();
+        content.insert("model.glb".to_string(), "hmodel".to_string());
+        // A main.crdt is prepended to every send, the case that makes streams large.
+        let main_crdt = crdt::synthetic_initial_state(None);
+        let outcome = QuickJsEngine
+            .run_capture(job(SYNTHETIC_GAME.into(), Some(main_crdt)))
+            .unwrap();
+        let compact = crdt::compact_stream(&outcome.stream);
+        assert!(compact.len() < outcome.stream.len());
+        let full = crdt::placements_from_crdt(&outcome.stream, &content);
+        assert!(!full.placements.is_empty());
+        assert_eq!(crdt::placements_from_crdt(&compact, &content), full);
+        assert_eq!(crdt::compact_stream(&compact), compact);
     }
 
     #[test]

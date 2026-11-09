@@ -182,6 +182,11 @@ impl CatalystClient {
         }
     }
 
+    /// Content servers tried, in order, when the base misses.
+    pub fn fallback_bases(&self) -> &[String] {
+        &self.fallback_bases
+    }
+
     pub fn with_fallback_base(mut self, base: String) -> Self {
         self.fallback_bases
             .push(base.trim_end_matches('/').to_string());

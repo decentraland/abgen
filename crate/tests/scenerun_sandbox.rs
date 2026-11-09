@@ -68,6 +68,7 @@ fn child_is_confined() {
         "clone",
         "execve",
         "tgkill_other",
+        "parent_mem",
     ] {
         assert!(
             report.contains(&format!("{probe}=ok")),
@@ -168,8 +169,10 @@ impl tracing::Subscriber for Recorder {
 #[cfg(target_os = "linux")]
 const SCENARIO_ENV: &str = "ABGEN_SANDBOX_TEST_SCENARIO";
 
+/// With `also_dumpable`, `prctl(PR_SET_DUMPABLE)` is refused as well, so the parent stays
+/// dumpable: the other half of what AWS Lambda refuses.
 #[cfg(target_os = "linux")]
-fn deny_no_new_privs_in_this_process() {
+fn deny_no_new_privs_in_this_process(also_dumpable: bool) {
     // Classic BPF over `seccomp_data`: nr at 0, args at 16 (low word on little-endian).
     const LD_W_ABS: u16 = 0x20;
     const JEQ_K: u16 = 0x15;
@@ -183,11 +186,17 @@ fn deny_no_new_privs_in_this_process() {
         k,
     };
     let jump = |code: u16, k: u32, jt: u8, jf: u8| libc::sock_filter { code, jt, jf, k };
+    let dumpable_option = if also_dumpable {
+        libc::PR_SET_DUMPABLE as u32
+    } else {
+        libc::PR_SET_NO_NEW_PRIVS as u32
+    };
     let prog = [
         stmt(LD_W_ABS, 0),
-        jump(JEQ_K, libc::SYS_prctl as u32, 0, 3),
+        jump(JEQ_K, libc::SYS_prctl as u32, 0, 4),
         stmt(LD_W_ABS, 16),
-        jump(JEQ_K, libc::PR_SET_NO_NEW_PRIVS as u32, 0, 1),
+        jump(JEQ_K, libc::PR_SET_NO_NEW_PRIVS as u32, 1, 0),
+        jump(JEQ_K, dumpable_option, 0, 1),
         stmt(RET_K, RET_ERRNO | libc::EPERM as u32),
         stmt(RET_K, RET_ALLOW),
     ];
@@ -216,15 +225,19 @@ fn deny_no_new_privs_in_this_process() {
 /// Runs one scenario in this (throwaway) process; exits 0 when it behaved as expected.
 #[cfg(target_os = "linux")]
 fn run_scenario(scenario: &str) -> ! {
-    deny_no_new_privs_in_this_process();
+    deny_no_new_privs_in_this_process(scenario.starts_with("dumpable-"));
+    let unfiltered_limits_hold = |report: &str| {
+        report.contains("seccomp=unavailable(PR_SET_NO_NEW_PRIVS")
+            && !report.contains("\nopen=")
+            && ["nofile_open", "nofile_socket", "nproc_clone", "parent_mem"]
+                .iter()
+                .all(|probe| report.contains(&format!("\n{probe}=ok")))
+    };
     let code = match scenario {
         "no-seccomp-auto" => {
             std::env::set_var(sandbox::SANDBOX_SECCOMP_ENV, "auto");
             match sandbox::check() {
-                Ok(report)
-                    if report.contains("seccomp=unavailable(PR_SET_NO_NEW_PRIVS")
-                        && !report.contains("open=") =>
-                {
+                Ok(report) if unfiltered_limits_hold(&report) => {
                     println!("{report}");
                     0
                 }
@@ -252,6 +265,52 @@ fn run_scenario(scenario: &str) -> ! {
                 1
             }
         },
+        "dumpable-refused" => {
+            std::env::set_var(sandbox::SANDBOX_SECCOMP_ENV, "auto");
+            match sandbox::check() {
+                // Refused either way: for the dumpable parent itself, or earlier, because
+                // this host also lets the child read the parent's memory.
+                Err(e)
+                    if format!("{e:#}").contains("parent process is still dumpable")
+                        || format!("{e:#}").contains("parent_mem=FAIL") =>
+                {
+                    println!("{e:#}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("wrong error for a dumpable parent: {e:#}");
+                    1
+                }
+                Ok(report) => {
+                    eprintln!("check passed with a dumpable parent:\n{report}");
+                    1
+                }
+            }
+        }
+        // Whether a same-user child may read a dumpable parent's memory is the host's call
+        // (Yama, the runtime's own filter). Either way the verdict must follow the probe.
+        "dumpable-accepted" => {
+            std::env::set_var(sandbox::SANDBOX_SECCOMP_ENV, "auto");
+            sandbox::accept_dumpable_parent();
+            match sandbox::check() {
+                Ok(report) if unfiltered_limits_hold(&report) => {
+                    println!("accepted:\n{report}");
+                    0
+                }
+                Err(e) if format!("{e:#}").contains("parent_mem=FAIL") => {
+                    println!("refused:\n{e:#}");
+                    0
+                }
+                Ok(report) => {
+                    eprintln!("unexpected report:\n{report}");
+                    1
+                }
+                Err(e) => {
+                    eprintln!("unexpected error: {e:#}");
+                    1
+                }
+            }
+        }
         other => {
             eprintln!("unknown scenario {other}");
             2
@@ -287,6 +346,21 @@ fn auto_runs_scenes_where_seccomp_is_refused() {
     }
 }
 
+/// Lambda refuses `PR_SET_DUMPABLE` too: a dumpable parent stops scenes unless the
+/// process accepted it, and then only when the child is refused the parent's memory.
+fn a_dumpable_parent_is_refused_unless_accepted() {
+    #[cfg(target_os = "linux")]
+    {
+        let err = scenario("dumpable-refused");
+        assert!(
+            err.contains("dumpable") || err.contains("parent_mem=FAIL"),
+            "{err}"
+        );
+        let verdict = scenario("dumpable-accepted");
+        println!("dumpable-accepted on this host: {verdict}");
+    }
+}
+
 /// Same host, default policy: refused, with the hint, as a definitive verdict.
 fn required_refuses_scenes_where_seccomp_is_refused() {
     #[cfg(target_os = "linux")]
@@ -303,8 +377,12 @@ fn main() {
         run_scenario(&name);
     }
 
-    let tests: [(&str, fn()); 9] = [
+    let tests: [(&str, fn()); 10] = [
         ("child_is_confined", child_is_confined),
+        (
+            "a_dumpable_parent_is_refused_unless_accepted",
+            a_dumpable_parent_is_refused_unless_accepted,
+        ),
         (
             "auto_runs_scenes_where_seccomp_is_refused",
             auto_runs_scenes_where_seccomp_is_refused,

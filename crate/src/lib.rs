@@ -76,6 +76,8 @@ pub mod hashes;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod jitcache;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod lambda_invoke;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod live;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod local_store;

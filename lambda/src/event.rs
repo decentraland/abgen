@@ -118,12 +118,39 @@ pub fn validate_content_server(url: &str, allowed: Option<&[String]>) -> Result<
     if authority.contains('@') || host.is_empty() {
         bail!("content server {url:?} rejected: bad authority");
     }
+    if !is_public_dns_name(host) {
+        bail!(
+            "content server {url:?} rejected: host must be a public DNS name, not an IP \
+             literal or a local name"
+        );
+    }
     if let Some(allowed) = allowed {
         if !allowed.iter().any(|a| a == host) {
             bail!("content server host {host:?} is not in ALLOWED_CONTENT_SERVER_HOSTS");
         }
     }
     Ok(())
+}
+
+/// A dotted DNS name whose last label starts with a letter: rules out IP literals in any
+/// notation (`10.0.0.1`, `0x7f000001`, `[::1]`, a bare integer) and single-label or
+/// `localhost`/`localdomain` names that resolve inside the host or network
+/// (`localhost.localdomain` is loopback in Amazon Linux's `/etc/hosts`). The allowlist is
+/// the real control; this only refuses what can never be a content server.
+fn is_public_dns_name(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let labels: Vec<&str> = host.split('.').collect();
+    labels.len() >= 2
+        && labels.iter().all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+        && labels.last().is_some_and(|tld| {
+            tld.as_bytes()[0].is_ascii_alphabetic()
+                && !tld.eq_ignore_ascii_case("localhost")
+                && !tld.eq_ignore_ascii_case("localdomain")
+        })
 }
 
 fn normalize_content_server(url: &str) -> String {
@@ -272,5 +299,26 @@ mod tests {
         assert!(!ok("https://user:pass@evil.example.com/content"));
         assert!(!ok("https://"));
         assert!(!ok("ftp://host"));
+        // IP literals in any notation, and local names, even over https.
+        for bad in [
+            "https://10.0.3.7/content",
+            "https://169.254.169.254",
+            "https://[::1]/content",
+            "https://[fd00::1]:443",
+            "https://0x7f000001",
+            "https://2130706433",
+            "https://127.1",
+            "https://localhost/content",
+            "https://api.localhost",
+            "https://localhost.localdomain",
+            "https://peer.LOCALDOMAIN",
+            "https://metadata",
+            "https://peer..decentraland.org",
+            "https://peer_x.decentraland.org",
+        ] {
+            assert!(!ok(bad), "{bad}");
+        }
+        assert!(ok("https://peer.decentraland.org./content"));
+        assert!(ok("https://worlds-content-server.decentraland.org"));
     }
 }
