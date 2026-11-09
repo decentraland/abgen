@@ -7,9 +7,73 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::emit::{acc_kind, is_draco, read_f32_rows, read_indices, read_tight};
 
 pub(crate) const EXT_NAME: &str = "EXT_meshopt_compression";
-const POSITION_EXP_BITS: i32 = 16;
-const TEXCOORD_EXP_BITS: i32 = 15;
-const OCT_BITS: i32 = 8;
+
+/// Mantissa bits of an `EXPONENTIAL` filter stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExpBits {
+    /// The same bit count for every stream.
+    Fixed(i32),
+    /// Per stream, the fewest bits that keep every value within `2^e` of the original. meshopt
+    /// rounds a value `v` to a step of `2^(E - bits + 1)` where `E` is the exponent of the
+    /// largest magnitude the exponent is shared with (`v = f * 2^E`, `f` in `[0.5, 1)`), so the
+    /// error is at most `2^(E - bits)`; `bits = E - e` meets the bound (clamped to meshopt's
+    /// 1..=24, so magnitudes above `2^(24 + e)` are the only ones that can exceed it). With a
+    /// shared per-vector exponent, meshopt gives an exactly-zero component the exponent 0, so a
+    /// vertex on an axis plane is rounded at `2^(-bits)` however small the mesh: there `E` is
+    /// at least 0.
+    WithinPow2(i32),
+}
+
+/// Filter precision of a [`Plan`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Precision {
+    /// Positions: `EXPONENTIAL`, one exponent per vertex.
+    pub position: ExpBits,
+    /// Texture coordinates: `EXPONENTIAL`, one exponent per component.
+    pub texcoord: ExpBits,
+    /// Normals and tangents: `OCTAHEDRAL` bits per component. Up to 8 are stored as normalized
+    /// `I8` (4 bytes per vertex), 9..=16 as normalized `I16` (8 bytes per vertex).
+    pub oct_bits: i32,
+}
+
+impl Precision {
+    /// The bvwebgpu pack lane's numbers (gltfpack-like, byte normals).
+    pub const PACK: Precision = Precision {
+        position: ExpBits::Fixed(16),
+        texcoord: ExpBits::Fixed(15),
+        oct_bits: 8,
+    };
+    /// The Bevy variants lane: positions within 2^-11 glTF units (0.49 mm), UVs within 2^-15
+    /// (half a texel at 16k), normals and tangents 10-bit (about 0.3 degrees), so a decoded
+    /// variant meets `examples/bevy_geometry_check.rs`'s 1 mm / 1 degree / 1/16384 bar.
+    pub const BEVY: Precision = Precision {
+        position: ExpBits::WithinPow2(-11),
+        texcoord: ExpBits::WithinPow2(-15),
+        oct_bits: 10,
+    };
+}
+
+impl ExpBits {
+    /// The bit count for a stream holding `values`, encoded with one exponent per vector
+    /// (`shared_vector`) or per component.
+    fn for_values(self, values: &[f32], shared_vector: bool) -> i32 {
+        match self {
+            ExpBits::Fixed(bits) => bits,
+            ExpBits::WithinPow2(e) => {
+                let max = values.iter().fold(0f32, |m, v| m.max(v.abs()));
+                if max == 0.0 || !max.is_normal() {
+                    return 1;
+                }
+                // meshopt's optlog2: the biased exponent field plus one.
+                let mut exponent = ((max.to_bits() >> 23) & 0xff) as i32 - 126;
+                if shared_vector && values.contains(&0.0) {
+                    exponent = exponent.max(0);
+                }
+                (exponent - e).clamp(1, 24)
+            }
+        }
+    }
+}
 
 pub(crate) struct Stream {
     pub accessor: usize,
@@ -78,14 +142,25 @@ fn codec_index(indices: &[u32]) -> Option<Vec<u8>> {
     })
 }
 
-fn filter_oct8(rows: &[[f32; 4]]) -> Vec<u8> {
-    let mut out = vec![0u8; rows.len() * 4];
+/// Storage of an `OCTAHEDRAL` stream at `bits`: bytes per vertex and component type.
+fn oct_storage(bits: i32) -> (usize, ComponentType) {
+    if bits <= 8 {
+        (4, ComponentType::I8)
+    } else {
+        (8, ComponentType::I16)
+    }
+}
+
+/// `OCTAHEDRAL`-filter `rows` (unit xyz, w is the tangent sign or 1) at `bits` per component.
+fn filter_oct(rows: &[[f32; 4]], bits: i32) -> Vec<u8> {
+    let (stride, _) = oct_storage(bits);
+    let mut out = vec![0u8; rows.len() * stride];
     unsafe {
         meshopt::ffi::meshopt_encodeFilterOct(
             out.as_mut_ptr().cast(),
             rows.len(),
-            4,
-            OCT_BITS,
+            stride,
+            bits.clamp(1, 16),
             rows.as_ptr().cast(),
         );
     }
@@ -153,7 +228,13 @@ fn raw_stream(root: &Root, bin: &[u8], ai: usize) -> Option<Stream> {
     Some(stream(ai, encoded, None, elem, count, ct, ty, normalized))
 }
 
+/// The pack lane's tangent stream (8-bit `OCTAHEDRAL`, normalized `I8`, stride 4): the encoded
+/// bytes and the vertex count.
 pub(super) fn tangent_stream(rows: &[[f32; 4]]) -> Option<(Vec<u8>, usize)> {
+    tangent_stream_bits(rows, Precision::PACK.oct_bits)
+}
+
+fn tangent_stream_bits(rows: &[[f32; 4]], bits: i32) -> Option<(Vec<u8>, usize)> {
     if rows.is_empty()
         || rows
             .iter()
@@ -161,17 +242,29 @@ pub(super) fn tangent_stream(rows: &[[f32; 4]]) -> Option<(Vec<u8>, usize)> {
     {
         return None;
     }
-    Some((codec_vertex(&filter_oct8(rows), rows.len(), 4)?, rows.len()))
+    let (stride, _) = oct_storage(bits);
+    Some((
+        codec_vertex(&filter_oct(rows, bits), rows.len(), stride)?,
+        rows.len(),
+    ))
 }
 
-fn attr_stream(root: &Root, bin: &[u8], sem: &mesh::Semantic, ai: usize) -> Option<Stream> {
+fn attr_stream(
+    root: &Root,
+    bin: &[u8],
+    sem: &mesh::Semantic,
+    ai: usize,
+    precision: Precision,
+) -> Option<Stream> {
     let (ct, ty, _) = acc_kind(root, ai)?;
+    let (oct_stride, oct_ct) = oct_storage(precision.oct_bits);
     let filtered = match sem {
         mesh::Semantic::Positions if ct == ComponentType::F32 && ty == Type::Vec3 => {
             let rows = read_f32_rows::<3>(root, bin, ai)?;
             let flat: Vec<f32> = rows.iter().flatten().copied().collect();
             if flat.iter().all(|v| v.is_finite()) {
-                let f = filter_exp(&flat, rows.len(), 12, POSITION_EXP_BITS, true);
+                let bits = precision.position.for_values(&flat, true);
+                let f = filter_exp(&flat, rows.len(), 12, bits, true);
                 codec_vertex(&f, rows.len(), 12).map(|b| {
                     stream(
                         ai,
@@ -192,32 +285,34 @@ fn attr_stream(root: &Root, bin: &[u8], sem: &mesh::Semantic, ai: usize) -> Opti
             let rows = read_f32_rows::<3>(root, bin, ai)?;
             if rows.iter().all(|r| oct_encodable(r[0], r[1], r[2])) {
                 let quads: Vec<[f32; 4]> = rows.iter().map(|r| [r[0], r[1], r[2], 1.0]).collect();
-                codec_vertex(&filter_oct8(&quads), rows.len(), 4).map(|b| {
-                    stream(
-                        ai,
-                        b,
-                        Some("OCTAHEDRAL"),
-                        4,
-                        rows.len(),
-                        ComponentType::I8,
-                        Type::Vec3,
-                        true,
-                    )
-                })
+                codec_vertex(&filter_oct(&quads, precision.oct_bits), rows.len(), oct_stride).map(
+                    |b| {
+                        stream(
+                            ai,
+                            b,
+                            Some("OCTAHEDRAL"),
+                            oct_stride,
+                            rows.len(),
+                            oct_ct,
+                            Type::Vec3,
+                            true,
+                        )
+                    },
+                )
             } else {
                 None
             }
         }
         mesh::Semantic::Tangents if ct == ComponentType::F32 && ty == Type::Vec4 => {
             let rows = read_f32_rows::<4>(root, bin, ai)?;
-            tangent_stream(&rows).map(|(b, count)| {
+            tangent_stream_bits(&rows, precision.oct_bits).map(|(b, count)| {
                 stream(
                     ai,
                     b,
                     Some("OCTAHEDRAL"),
-                    4,
+                    oct_stride,
                     count,
-                    ComponentType::I8,
+                    oct_ct,
                     Type::Vec4,
                     true,
                 )
@@ -227,7 +322,8 @@ fn attr_stream(root: &Root, bin: &[u8], sem: &mesh::Semantic, ai: usize) -> Opti
             let rows = read_f32_rows::<2>(root, bin, ai)?;
             let flat: Vec<f32> = rows.iter().flatten().copied().collect();
             if flat.iter().all(|v| v.is_finite()) {
-                let f = filter_exp(&flat, rows.len(), 8, TEXCOORD_EXP_BITS, false);
+                let bits = precision.texcoord.for_values(&flat, false);
+                let f = filter_exp(&flat, rows.len(), 8, bits, false);
                 codec_vertex(&f, rows.len(), 8).map(|b| {
                     stream(
                         ai,
@@ -280,7 +376,7 @@ fn mark(flags: &mut [bool], i: usize) {
     }
 }
 
-pub(crate) fn plan(root: &Root, bin: &[u8]) -> Option<Plan> {
+pub(crate) fn plan(root: &Root, bin: &[u8], precision: Precision) -> Option<Plan> {
     let nacc = root.accessors.len();
     let nviews = root.buffer_views.len();
     let mut protected = vec![false; nacc];
@@ -379,7 +475,7 @@ pub(crate) fn plan(root: &Root, bin: &[u8]) -> Option<Plan> {
         if protected[ai] || index_jobs.contains(&ai) {
             continue;
         }
-        if let Some(s) = attr_stream(root, bin, sem, ai) {
+        if let Some(s) = attr_stream(root, bin, sem, ai, precision) {
             compressed[ai] = true;
             streams.push(s);
         }
@@ -555,6 +651,45 @@ pub(crate) fn decode_stream(
 mod tests {
     use super::super::emit::{self, tests as fix};
     use super::*;
+
+    #[test]
+    fn bevy_precision_bounds_position_error() {
+        // Vertex clouds at several scales, the first vertex of each on an axis plane (a zero
+        // component, which meshopt gives the exponent 0): every decoded component within 2^-11
+        // of the original, and the small clouds spend fewer bits than the large ones.
+        let mut chosen = Vec::new();
+        for scale in [0.05f32, 0.09, 0.7, 3.7, 40.0, 600.0] {
+            let rows: Vec<[f32; 3]> = (0..300)
+                .map(|i| {
+                    let t = i as f32 * 0.37;
+                    [
+                        scale * t.sin(),
+                        scale * (t * 1.7).cos() * 0.5,
+                        scale * (t * 0.3).sin() * 0.9,
+                    ]
+                })
+                .collect();
+            let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+            let bits = Precision::BEVY.position.for_values(&flat, true);
+            let f = filter_exp(&flat, rows.len(), 12, bits, true);
+            let enc = codec_vertex(&f, rows.len(), 12).unwrap();
+            let dec = super::decode_stream(&enc, rows.len(), 12, "ATTRIBUTES", Some("EXPONENTIAL"))
+                .unwrap();
+            let worst = flat
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    (f32::from_le_bytes(dec[i * 4..i * 4 + 4].try_into().unwrap()) - v).abs()
+                })
+                .fold(0f32, f32::max);
+            assert!(
+                worst <= 2f32.powi(-11),
+                "scale {scale}: {bits} bits, worst error {worst:e}"
+            );
+            chosen.push(bits);
+        }
+        assert_eq!(chosen, vec![11, 11, 11, 13, 17, 21]);
+    }
 
     fn quad_glb(png: &[u8]) -> Vec<u8> {
         let (bin, views, accessors) = fix::quad_bin_and_views(png);

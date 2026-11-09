@@ -1,9 +1,11 @@
 //! `glb-meshopt` model variants: the original glTF/GLB with its triangle meshes encoded as
 //! `EXT_meshopt_compression` streams (`crate::bvwebgpu::meshcomp`: vertex and index codecs,
-//! EXPONENTIAL 16/15-bit position/UV and OCTAHEDRAL 8-bit normal/tangent filters) and nothing
-//! else touched: images, their bufferViews and MIME types, external image URIs, materials,
-//! animations, skins and extras stay as they are. Draco primitives are left alone (meshcomp
-//! protects them); a file already using `EXT_meshopt_compression` gets no variant.
+//! EXPONENTIAL position/UV and OCTAHEDRAL normal/tangent filters at
+//! [`meshcomp::Precision::BEVY`]: positions within 0.49 mm, UVs within 2^-15, normals and
+//! tangents 10-bit) and nothing else touched: images, their bufferViews and MIME types,
+//! external image URIs, materials, animations, skins and extras stay as they are. Draco
+//! primitives are left alone (meshcomp protects them); a file already using
+//! `EXT_meshopt_compression` gets no variant.
 //!
 //! The output is always a GLB with one BIN: external `.bin` buffers of a `.gltf` have to be read
 //! to compress their meshes, so they are inlined (only buffers; image URIs are never resolved).
@@ -24,8 +26,9 @@ use crate::bvwebgpu::meshcomp;
 /// The manifest `format` of these variants.
 pub const FORMAT: &str = "glb-meshopt";
 pub const EXT_MESHOPT: &str = "EXT_meshopt_compression";
-/// Brotli quality and window of the `.br` sidecar.
-pub const BROTLI_QUALITY: u32 = 11;
+/// Brotli quality and window of the `.br` sidecar. Quality 9: on Genesis Plaza's 376 mesh
+/// variants (29.9 MB) it gives 14.6 MB in 1.1 s of CPU, where 11 gives 13.8 MB in 57 s.
+pub const BROTLI_QUALITY: u32 = 9;
 pub const BROTLI_LGWIN: u32 = 22;
 
 #[derive(Debug)]
@@ -112,7 +115,7 @@ pub fn compress_model(
     if root.meshes.is_empty() {
         return Ok(Err(NoModelVariant::NothingToCompress));
     }
-    let Some(plan) = meshcomp::plan(&root, &merged) else {
+    let Some(plan) = meshcomp::plan(&root, &merged, meshcomp::Precision::BEVY) else {
         return Ok(Err(NoModelVariant::NothingToCompress));
     };
 
