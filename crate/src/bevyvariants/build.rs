@@ -5,11 +5,12 @@ use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+use super::meshopt::{self, NoModelVariant};
 use super::model::{image_uses, transform_model_with};
-use super::stats::{elapsed_ns, timed, BuildStats, FileStat, NoVariant, StageTimes};
+use super::stats::{elapsed_ns, timed, BuildStats, FileStat, ModelStat, NoVariant, StageTimes};
 use super::texture::{encode_texture_with, source_kind, Miss, TexOptions, Uses};
 use super::{
-    cid_v1_raw_sha256, content_path, generator, manifest_path, Manifest, VariantEntry,
+    cid_v1_raw_sha256, content_key, content_path, generator, manifest_path, Manifest, VariantEntry,
     MANIFEST_VERSION,
 };
 use crate::catalyst::Scene;
@@ -25,6 +26,11 @@ pub struct BuildOptions {
     /// load), so the manifest lists texture variants only. Images embedded in GLBs never get a
     /// texture variant of their own either way.
     pub glb_variants: bool,
+    /// `glb-meshopt` model variants (`super::meshopt`): on by default, independent of
+    /// `glb_variants`.
+    pub glb_meshopt: bool,
+    /// Store each `glb-meshopt` variant Brotli-compressed as `{cid}.br` beside it, too.
+    pub precompress_br: bool,
     /// Zstandard level of every KTX2 level ([`crate::ktx2_write::DEFAULT_ZSTD_LEVEL`] by
     /// default). Part of the variant bytes: a different level gives different CIDs.
     pub zstd_level: i32,
@@ -34,6 +40,8 @@ impl Default for BuildOptions {
     fn default() -> Self {
         BuildOptions {
             glb_variants: false,
+            glb_meshopt: true,
+            precompress_br: false,
             zstd_level: crate::ktx2_write::DEFAULT_ZSTD_LEVEL,
         }
     }
@@ -41,9 +49,15 @@ impl Default for BuildOptions {
 
 /// The env var that sets [`BuildOptions::zstd_level`].
 pub const ZSTD_LEVEL_ENV: &str = "ABGEN_BEVY_ZSTD_LEVEL";
+/// `0` turns [`BuildOptions::glb_meshopt`] off.
+pub const GLB_MESHOPT_ENV: &str = "ABGEN_BEVY_GLB_MESHOPT";
+/// `br` turns [`BuildOptions::precompress_br`] on (anything else: off).
+pub const PRECOMPRESS_ENV: &str = "ABGEN_BEVY_PRECOMPRESS";
 
 impl BuildOptions {
     /// `ABGEN_BEVY_GLB_VARIANTS=1` turns GLB variants on (default off);
+    /// `ABGEN_BEVY_GLB_MESHOPT=0` turns `glb-meshopt` variants off (default on);
+    /// `ABGEN_BEVY_PRECOMPRESS=br` stores `.br` sidecars of them (default off);
     /// `ABGEN_BEVY_ZSTD_LEVEL` (1..=19) sets the Zstandard level (default 19; an invalid value
     /// is logged and the default is used).
     pub fn from_env() -> Self {
@@ -64,6 +78,9 @@ impl BuildOptions {
         };
         BuildOptions {
             glb_variants: crate::clihelp::env_bool("ABGEN_BEVY_GLB_VARIANTS", false),
+            glb_meshopt: crate::clihelp::env_bool(GLB_MESHOPT_ENV, true),
+            precompress_br: std::env::var(PRECOMPRESS_ENV)
+                .is_ok_and(|v| v.trim().eq_ignore_ascii_case("br")),
             zstd_level,
         }
     }
@@ -81,6 +98,8 @@ pub struct BuildOutput {
     pub manifest_bytes: Vec<u8>,
     /// Every variant the manifest lists, with the file holding its bytes.
     pub variants: Vec<(String, PathBuf)>,
+    /// `.br` sidecars of `glb-meshopt` variants: object key (`bevy/contents/{cid}.br`) and file.
+    pub sidecars: Vec<(String, PathBuf)>,
     /// Stage times and outcomes of the standalone textures (not part of any hashed output).
     pub stats: BuildStats,
 }
@@ -346,10 +365,121 @@ pub fn build_entity_variants(
         })
         .collect::<Result<_>>()?;
 
+    // Pass 4: glb-meshopt variants (on by default, see `BuildOptions::glb_meshopt`).
+    type ModelRow = (Row, ModelStat, Option<(String, PathBuf)>);
+    let meshopt_rows: Vec<ModelRow> = models
+        .par_iter()
+        .filter(|_| opts.glb_meshopt)
+        .map(|&(hash, file)| -> Result<ModelRow> {
+            let mut times = StageTimes::default();
+            let mut stat = ModelStat {
+                hash: hash.to_string(),
+                file: file.to_string(),
+                original_size: 0,
+                format: None,
+                variant_cid: None,
+                variant_size: None,
+                br_size: None,
+                streams: None,
+                gated_size: None,
+                reason: None,
+                times,
+            };
+            let none = (hash.to_string(), None, None);
+            let Some(bytes) = model_bytes.get(hash) else {
+                stat.reason = Some(NoModelVariant::Missing);
+                return Ok((none, stat, None));
+            };
+            stat.original_size = bytes.len() as u64;
+            let resolve = |uri: &str| -> Option<Vec<u8>> {
+                fetch(crate::naming::uri_content_hash(uri, file, &content_by_file)?.as_str())
+            };
+            let caught = timed(&mut times.meshopt_ns, || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    meshopt::compress_model(bytes, model_ext(file), Some(&resolve))
+                }))
+            });
+            let v = match caught {
+                Ok(Ok(Ok(v))) => v,
+                Ok(Ok(Err(reason))) => {
+                    stat.reason = Some(reason);
+                    stat.times = times;
+                    return Ok((none, stat, None));
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(entity = %entity, file = %file, error = %format!("{e:#}"), "bevy glb-meshopt variant skipped");
+                    stat.reason = Some(NoModelVariant::Error);
+                    stat.times = times;
+                    return Ok((none, stat, None));
+                }
+                Err(_) => {
+                    tracing::warn!(entity = %entity, file = %file, "bevy glb-meshopt variant panicked; skipped");
+                    stat.reason = Some(NoModelVariant::Error);
+                    stat.times = times;
+                    return Ok((none, stat, None));
+                }
+            };
+            stat.streams = Some(v.streams as u64);
+            if v.glb.len() >= bytes.len() {
+                stat.reason = Some(NoModelVariant::SizeGate);
+                stat.gated_size = Some(v.glb.len() as u64);
+                stat.times = times;
+                return Ok((none, stat, None));
+            }
+            let (cid, path) = store_variant(out_root, &v.glb, &mut times)?;
+            let mut sidecar = None;
+            if opts.precompress_br {
+                let br = timed(&mut times.brotli_ns, || meshopt::brotli_compress(&v.glb))?;
+                let br_path = meshopt::br_sidecar(&path);
+                timed(&mut times.hash_write_ns, || -> Result<()> {
+                    if !br_path.is_file() {
+                        write_atomic(&br_path, &br)?;
+                    }
+                    Ok(())
+                })?;
+                stat.br_size = Some(br.len() as u64);
+                sidecar = Some((format!("{}.br", content_key(&cid)), br_path));
+            }
+            stat.format = Some(meshopt::FORMAT);
+            stat.variant_cid = Some(cid.clone());
+            stat.variant_size = Some(v.glb.len() as u64);
+            stat.times = times;
+            Ok((
+                (
+                    hash.to_string(),
+                    Some(VariantEntry {
+                        cid,
+                        kind: "model".into(),
+                        format: meshopt::FORMAT.into(),
+                        width: None,
+                        height: None,
+                        mips: None,
+                        size: v.glb.len() as u64,
+                    }),
+                    Some(path),
+                ),
+                stat,
+                sidecar,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let mut meshopt_variants: Vec<Row> = Vec::with_capacity(meshopt_rows.len());
+    let mut model_stats: Vec<ModelStat> = Vec::with_capacity(meshopt_rows.len());
+    let mut sidecars: Vec<(String, PathBuf)> = Vec::new();
+    for (row, stat, sidecar) in meshopt_rows {
+        meshopt_variants.push(row);
+        model_stats.push(stat);
+        sidecars.extend(sidecar);
+    }
+
     let mut files: BTreeMap<String, Vec<VariantEntry>> = BTreeMap::new();
     let mut variants: Vec<(String, PathBuf)> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    for (hash, entry, path) in textures.into_iter().chain(model_variants) {
+    for (hash, entry, path) in textures
+        .into_iter()
+        .chain(model_variants)
+        .chain(meshopt_variants)
+    {
         if let (Some(entry), Some(path)) = (entry, path) {
             if seen.insert(entry.cid.clone()) {
                 variants.push((entry.cid.clone(), path));
@@ -367,9 +497,15 @@ pub fn build_entity_variants(
     write_atomic(&manifest_dst, &manifest_bytes)?;
     let mut stats = BuildStats::from_files(file_stats, opts.zstd_level, started.elapsed());
     stats.models = models.len() as u64;
+    stats.add_models(model_stats);
     let mut unique: BTreeMap<&str, u64> = BTreeMap::new();
     for f in &stats.files {
         if let (Some(c), Some(n)) = (&f.variant_cid, f.variant_size) {
+            unique.insert(c, n);
+        }
+    }
+    for m in &stats.model_files {
+        if let (Some(c), Some(n)) = (&m.variant_cid, m.variant_size) {
             unique.insert(c, n);
         }
     }
@@ -380,6 +516,7 @@ pub fn build_entity_variants(
         manifest,
         manifest_bytes,
         variants,
+        sidecars,
         stats,
     })
 }

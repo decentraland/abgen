@@ -285,12 +285,15 @@ can be switched off at any time. Built by `crate/src/bevyvariants` (feature `bev
 with `server`).
 
 - `GET /bevy/manifest/{entity}.json` - `{"v":1,"entity","generator":"abgen <version>","files":{"<original cid>":[{"cid","kind","format","width","height","mips","size"}]}}`
-  (`format`: `ktx2-bc7` | `ktx2-bc1` | `ktx2-bc5`, plus `glb` only when GLB variants are on; `width`/`height`/`mips` only on
-  textures). 404 while absent; a miss starts a background build
+  (`format`: `ktx2-bc7` | `ktx2-bc1` | `ktx2-bc5` | `glb-meshopt`, plus `glb` only when GLB variants are on;
+  `width`/`height`/`mips` only on textures). 404 while absent; a miss starts a background build
   (`X-Abgen-Reason: bevy-variants-cold`), `?wait=1` builds synchronously, failures are
   negative-cached for `ABGEN_JIT_FAIL_TTL_S`. `Cache-Control: private, max-age=0, no-cache`.
 - `GET /bevy/contents/{variantCid}` - variant bytes, `public,max-age=31536000,immutable`, `Range`,
   `ETag`, CORS (preflight allows `X-IPFS`). Never built on its own: it exists once its manifest does.
+  When the variant has a Brotli sidecar (`{cid}.br`, see `glb-meshopt` below) and the request's
+  `Accept-Encoding` includes `br`, the sidecar's bytes are sent with `Content-Encoding: br`; such
+  responses carry `Vary: Accept-Encoding` either way. The CID is always of the plain bytes.
 - With the S3 space configured, both read through from and write back to the same keys
   (`bevy/manifest/…`, `bevy/contents/…`). `ABGEN_BEVY_VARIANTS=0` turns the JIT side off.
 
@@ -324,6 +327,20 @@ release, never on the machine or thread count; changing either means new CIDs an
   replaced by its texture variant (`image/ktx2`, rules above). External image URIs are left as
   they are. A model nothing changes in gets no variant; `EXT_meshopt_compression` models are not
   handled yet.
+- `glb-meshopt` models, **on by default** (`ABGEN_BEVY_GLB_MESHOPT=0` on the server,
+  `--bevy-no-glb-meshopt` on `abgen-corpus`, independent of the GLB variants above): every
+  `.glb`/`.gltf` becomes a GLB whose triangle meshes are `EXT_meshopt_compression` streams
+  (vertex and index codecs; EXPONENTIAL 16-bit positions and 15-bit UVs, OCTAHEDRAL 8-bit normals
+  and tangents; `KHR_mesh_quantization` is declared too) and nothing else is touched: images,
+  their bufferViews and MIME types, external image URIs, materials, animations and extras stay as
+  they are (external `.bin` buffers are inlined, because the meshes live there). Draco primitives
+  are left alone; a file already using `EXT_meshopt_compression` gets none. The variant is kept
+  only when smaller than the original. With `ABGEN_BEVY_PRECOMPRESS=br` (`--bevy-precompress br`)
+  each one is also stored as `bevy/contents/{cid}.br` (Brotli quality 11, window 22) for the
+  route above; KTX2 variants are never Brotli'd. `cargo run --release --example
+  bevy-geometry-check -- <bevy-variants-stats.json> <out>/bevy/contents <files-dir>` decodes
+  every variant and compares it with its original (indices identical; positions within 1 mm,
+  normals and tangents within 1 degree, UVs within 1/16384).
 - nothing for scene code, source maps, audio, video or display-only thumbnails.
 
 Rows are top-down (Bevy and glTF's top-left UV origin), unlike the Unity lanes, which flip.
@@ -335,8 +352,9 @@ ABGEN_OUT_ROOT=./out ./target/release/abgen   # serves /bevy/manifest/... and /b
 ```
 `abgen-corpus --bevy-variants` prints one `BEVY_STATS {json}` line per entity (stage times summed
 over files - fetch, decode, resize, BC1/BC5/BC7 encode with mips, the BC1 PSNR check, UASTC->BC7
-transcode, zstd, hash+write - counts and bytes by format and source, no-variant reasons, size-gated
-variants by format, BC1 rejections)
+transcode, zstd, meshopt, brotli, hash+write - counts and bytes by format and source, no-variant
+reasons, size-gated variants by format, BC1 rejections, and the `glb_meshopt` totals: models, variant
+and `.br` bytes, size-gated attempts)
 and writes the full stats, per-file rows included, to `./out/bevy-variants-stats.json`.
 ### LOD JIT lane
 `ABGEN_LOD_JIT=1` enables JIT LOD builds on `GET /LOD/1/...` misses (level 1 only, the production

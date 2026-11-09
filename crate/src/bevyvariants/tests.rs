@@ -163,15 +163,17 @@ fn bc1_exact_png_bytes(w: u32, h: u32) -> Vec<u8> {
 
 /// The encode before the size gate.
 fn ungated(bytes: &[u8], slot: Slot) -> TextureVariant {
-    encode_texture_ungated(
+    match encode_texture_ungated(
         bytes,
         slot,
         TexOptions::default(),
         &mut StageTimes::default(),
     )
     .unwrap()
-    .ok()
-    .expect("a variant")
+    {
+        Ok(v) => v,
+        Err(m) => panic!("no variant: {m:?}"),
+    }
 }
 
 fn miss(bytes: &[u8], slot: Slot) -> super::texture::Miss {
@@ -182,8 +184,7 @@ fn miss(bytes: &[u8], slot: Slot) -> super::texture::Miss {
         &mut StageTimes::default(),
     )
     .unwrap()
-    .err()
-    .expect("no variant")
+    .expect_err("no variant")
 }
 
 fn split(glb: &[u8]) -> (J, Vec<u8>) {
@@ -714,6 +715,201 @@ fn draco_glb_is_decoded_and_keeps_geometry() {
     assert_eq!(geometry(&v.glb), geometry(&glb));
 }
 
+/// An `n x n` vertex grid with positions, normals, UVs and u16 indices, plus an external image:
+/// big enough that its meshopt variant is smaller than the original.
+fn grid_glb(n: u32) -> Vec<u8> {
+    let mut bin: Vec<u8> = Vec::new();
+    fn put(bin: &mut Vec<u8>, v: &[f32]) {
+        for x in v {
+            bin.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    let mut s = 7u32;
+    for y in 0..n {
+        for x in 0..n {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let h = (s >> 16) as f32 / 65536.0 * 0.3;
+            put(&mut bin, &[x as f32 * 0.37, h, y as f32 * 0.37]);
+        }
+    }
+    let pos_len = bin.len();
+    let mut s2 = 11u32;
+    for _ in 0..n * n {
+        s2 = s2.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let a = (s2 >> 8) as f32 / 16_777_216.0 * std::f32::consts::TAU;
+        let (sa, ca) = a.sin_cos();
+        let z = 0.8f32;
+        let r = (1.0 - z * z).sqrt();
+        put(&mut bin, &[r * ca, r * sa, z]);
+    }
+    let nrm_len = bin.len() - pos_len;
+    for y in 0..n {
+        for x in 0..n {
+            put(
+                &mut bin,
+                &[x as f32 / (n - 1) as f32 * 3.0, y as f32 / (n - 1) as f32],
+            );
+        }
+    }
+    let uv_len = bin.len() - pos_len - nrm_len;
+    let idx_off = bin.len();
+    let mut count = 0;
+    for y in 0..n - 1 {
+        for x in 0..n - 1 {
+            let a = (y * n + x) as u16;
+            for i in [
+                a,
+                a + 1,
+                a + n as u16,
+                a + 1,
+                a + n as u16 + 1,
+                a + n as u16,
+            ] {
+                bin.extend_from_slice(&i.to_le_bytes());
+                count += 1;
+            }
+        }
+    }
+    let idx_len = bin.len() - idx_off;
+    mk_glb(
+        json!({
+            "scene": 0,
+            "scenes": [{"nodes": [0]}],
+            "nodes": [{"mesh": 0}],
+            "meshes": [{"primitives": [{
+                "attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2},
+                "indices": 3, "material": 0
+            }]}],
+            "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}],
+            "textures": [{"source": 0}],
+            "images": [{"uri": "grid.png"}],
+            "bufferViews": [
+                {"buffer": 0, "byteOffset": 0, "byteLength": pos_len},
+                {"buffer": 0, "byteOffset": pos_len, "byteLength": nrm_len},
+                {"buffer": 0, "byteOffset": pos_len + nrm_len, "byteLength": uv_len},
+                {"buffer": 0, "byteOffset": idx_off, "byteLength": idx_len}
+            ],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "count": n * n, "type": "VEC3",
+                 "min": [0.0, 0.0, 0.0], "max": [(n - 1) as f32 * 0.37, 0.3, (n - 1) as f32 * 0.37]},
+                {"bufferView": 1, "componentType": 5126, "count": n * n, "type": "VEC3"},
+                {"bufferView": 2, "componentType": 5126, "count": n * n, "type": "VEC2"},
+                {"bufferView": 3, "componentType": 5123, "count": count, "type": "SCALAR"}
+            ]
+        }),
+        &bin,
+    )
+}
+
+#[test]
+fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
+    use super::meshopt::{self, read_accessor_f32, read_indices};
+    let grid = grid_glb(24);
+    let (quad, _) = textured_quad_glb();
+    let mut blobs: HashMap<&str, Vec<u8>> = HashMap::new();
+    blobs.insert("bafkgrid", grid.clone());
+    blobs.insert("bafkquad", quad);
+    blobs.insert("bafkgridpng", smooth_png_bytes(64, 64));
+    let scene = scene_of(
+        "bafkentitym",
+        &[
+            ("models/grid.glb", "bafkgrid"),
+            ("models/grid.png", "bafkgridpng"),
+            ("models/quad.glb", "bafkquad"),
+        ],
+    );
+    let fetch = |h: &str| blobs.get(h).cloned();
+    let out = std::env::temp_dir().join(format!("abgen-bevy-meshopt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    let built = build_entity_variants(
+        &scene,
+        &fetch,
+        &out,
+        BuildOptions {
+            precompress_br: true,
+            ..BuildOptions::default()
+        },
+    )
+    .unwrap();
+    let m = &built.manifest;
+    let entry = &m.files["bafkgrid"][0];
+    assert_eq!(
+        (entry.kind.as_str(), entry.format.as_str()),
+        ("model", "glb-meshopt")
+    );
+    assert!(entry.width.is_none() && entry.mips.is_none());
+    let glb = std::fs::read(content_path(&out, &entry.cid).unwrap()).unwrap();
+    assert_eq!(cid_v1_raw_sha256(&glb), entry.cid);
+    assert_eq!(glb.len() as u64, entry.size);
+    assert!(glb.len() < grid.len());
+    // The sidecar holds the Brotli of the plain bytes and is listed for upload.
+    let br_path = meshopt::br_sidecar(&content_path(&out, &entry.cid).unwrap());
+    let br = std::fs::read(&br_path).unwrap();
+    assert_eq!(meshopt::brotli_decompress(&br).unwrap(), glb);
+    assert_eq!(
+        built.sidecars,
+        vec![(format!("bevy/contents/{}.br", entry.cid), br_path)]
+    );
+    // Geometry round-trips; the external image URI is untouched.
+    let (o, ob) = meshopt::load_merged(&grid, None).unwrap();
+    let (v, vb) = meshopt::load_merged(&glb, None).unwrap();
+    assert_eq!(v.images[0].uri.as_deref(), Some("grid.png"));
+    // Same triangles, same winding; the index codec may rotate a triangle's vertices.
+    let (ia, ib) = (
+        read_indices(&o, &ob, 3).unwrap(),
+        read_indices(&v, &vb, 3).unwrap(),
+    );
+    assert!(meshopt::same_triangles(&ia, &ib).is_ok());
+    let (a, b) = (
+        read_accessor_f32(&o, &ob, 0).unwrap(),
+        read_accessor_f32(&v, &vb, 0).unwrap(),
+    );
+    for (ra, rb) in a.iter().zip(&b) {
+        for (x, y) in ra.iter().zip(rb) {
+            assert!((x - y).abs() <= 1e-3, "{x} vs {y}");
+        }
+    }
+    // Stats: one row per model, totals, stage times.
+    let st = &built.stats;
+    assert_eq!(st.glb_meshopt.considered, 2);
+    assert_eq!(st.glb_meshopt.variants + st.glb_meshopt.size_gated.count, 2);
+    assert_eq!(st.glb_meshopt.variant_bytes, glb.len() as u64);
+    assert_eq!(st.glb_meshopt.br_bytes, br.len() as u64);
+    assert!(st.stages.meshopt_ns > 0 && st.stages.brotli_ns > 0);
+    let row = st
+        .model_files
+        .iter()
+        .find(|r| r.hash == "bafkgrid")
+        .unwrap();
+    assert_eq!(
+        (row.format, row.br_size),
+        (Some("glb-meshopt"), Some(br.len() as u64))
+    );
+    assert!(st.summary_json().get("model_files").is_none());
+    // Off: no model entries at all.
+    let out2 = std::env::temp_dir().join(format!("abgen-bevy-meshopt-off-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out2);
+    let built2 = build_entity_variants(
+        &scene,
+        &fetch,
+        &out2,
+        BuildOptions {
+            glb_meshopt: false,
+            ..BuildOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(built2
+        .manifest
+        .files
+        .values()
+        .flatten()
+        .all(|e| e.kind == "texture"));
+    assert!(built2.stats.model_files.is_empty());
+    let _ = std::fs::remove_dir_all(&out);
+    let _ = std::fs::remove_dir_all(&out2);
+}
+
 fn scene_of(entity: &str, content: &[(&str, &str)]) -> Scene {
     Scene {
         entity_id: entity.into(),
@@ -776,15 +972,22 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
         let built = build_entity_variants(&scene, &fetch, &out, opts).unwrap();
         (out, built)
     };
-    // Default: texture variants only (GLB variants are opt-in).
+    // Default: texture and glb-meshopt variants (GLB variants with KTX2 inside are opt-in).
     assert_eq!(
         BuildOptions::default(),
         BuildOptions {
             glb_variants: false,
+            glb_meshopt: true,
+            precompress_br: false,
             zstd_level: crate::ktx2_write::DEFAULT_ZSTD_LEVEL,
         }
     );
-    let (out, built) = run("a", BuildOptions::default());
+    // These runs look at textures only.
+    let textures_only_opts = BuildOptions {
+        glb_meshopt: false,
+        ..BuildOptions::default()
+    };
+    let (out, built) = run("a", textures_only_opts);
     let m = &built.manifest;
     assert_eq!(m.v, 1);
     assert_eq!(m.entity, "bafkentity");
@@ -859,7 +1062,7 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     assert!(st.summary_json().get("files").is_none());
 
     // Same inputs, same bytes.
-    let (out2, built2) = run("b", BuildOptions::default());
+    let (out2, built2) = run("b", textures_only_opts);
     assert_eq!(built2.manifest_bytes, built.manifest_bytes);
 
     // Another zstd level: same pixels, different variant bytes (so different CIDs), same
@@ -868,7 +1071,7 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
         "z3",
         BuildOptions {
             zstd_level: 3,
-            ..BuildOptions::default()
+            ..textures_only_opts
         },
     );
     let m4 = &built4.manifest;
@@ -893,7 +1096,7 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
         "g",
         BuildOptions {
             glb_variants: true,
-            ..BuildOptions::default()
+            ..textures_only_opts
         },
     );
     let m3 = &built3.manifest;

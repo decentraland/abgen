@@ -125,6 +125,9 @@ ttf-parser = { version = "0.25.1", default-features = false, features = ["std", 
 # explicitly in the writer.
 zstd = { version = "=0.13.3", default-features = false }
 zstd-sys = { version = "=2.0.16", default-features = false }
+# Brotli precompression of glb-meshopt variants (`ABGEN_BEVY_PRECOMPRESS=br`): pure Rust. The
+# `.br` bytes are a sidecar, never a CID, so the crate is not pinned exactly.
+brotli = { version = "8.0", default-features = false, features = ["std"] }
 chrono = { version = "0.4", optional = true }
 hmac = "0.13"
 libc = "0.2"
@@ -181,6 +184,11 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 [[example]]
 name = "bc7-parity-o08"
 path = "examples/bc7_parity_o08.rs"
+
+[[example]]
+name = "bevy-geometry-check"
+path = "examples/bevy_geometry_check.rs"
+required-features = ["bevy-variants"]
 
 [[test]]
 name = "bc7_mip_parity"
