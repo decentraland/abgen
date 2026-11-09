@@ -49,6 +49,12 @@
 //! whose only permission is writing its own logs) can call [`accept_dumpable_parent`]: a
 //! parent that stays dumpable is then a warning instead of a failure, provided the child
 //! still cannot read or write the parent's memory (`parent_mem=ok`). Nothing else calls it.
+//! AWS Lambda lets a same-user child access a dumpable parent's memory, so there the scene
+//! runner additionally needs [`accept_parent_memory_access`], which it calls only when its
+//! deployment opts in (`ABGEN_SANDBOX_PARENT_MEMORY=accept`). Then an escaped scene can take
+//! over the runner process and its execution environment. The boundary is then that
+//! environment: its logs-only role, no VPC, and tenant isolation per entity, so whatever an
+//! escaped scene answers can only reach its own entity's LOD.
 //!
 //! Concurrent children are capped at `default_file_concurrency()`, as the in-process pool
 //! was; callers' LOD limits already keep them below that today.
@@ -309,7 +315,7 @@ fn self_test_report() -> std::result::Result<String, SelfTestError> {
         &report,
         seccomp_policy(),
         dumpable.as_deref(),
-        dumpable_parent_accepted(),
+        dumpable_parent(),
     ) {
         Ok(warnings) => {
             static WARNED: std::sync::Once = std::sync::Once::new();
@@ -333,18 +339,34 @@ fn self_test_report() -> std::result::Result<String, SelfTestError> {
 /// dumpable (`parent_dumpable` names why) is a failure under either policy: without the
 /// filter, non-dumpability is what keeps an escaped scene out of `/proc/<ppid>/environ`
 /// and `/proc/<ppid>/mem`, which on Lambda hold the function's credentials. With
-/// `dumpable_accepted` ([`accept_dumpable_parent`]) it is a warning instead, but only when
-/// the report proves the child was refused the parent's memory (`parent_mem=ok`).
+/// [`accept_dumpable_parent`] it is a warning instead, but only when the report proves the
+/// child was refused the parent's memory (`parent_mem=ok`); with
+/// [`accept_parent_memory_access`] a failed `parent_mem` probe of a dumpable parent is a
+/// warning too, and every other probe must still pass.
 fn evaluate_report(
     report: &str,
     policy: SeccompPolicy,
     parent_dumpable: Option<&str>,
-    dumpable_accepted: bool,
+    dumpable: DumpableParent,
 ) -> std::result::Result<Vec<String>, String> {
     let mut failed = Vec::new();
     let mut seccomp_unavailable = None;
+    let mut memory_readable = None;
+    // Only the unfiltered probe set may be excused: with the filter on, a `parent_mem`
+    // failure means the filter let `process_vm_readv` through, a failure under any policy.
+    let unfiltered = report
+        .lines()
+        .any(|l| l.starts_with("seccomp=unavailable("));
     for line in report.lines() {
         if line.ends_with("=ok") {
+            continue;
+        }
+        if line.starts_with("parent_mem=")
+            && unfiltered
+            && parent_dumpable.is_some()
+            && dumpable == DumpableParent::WithMemoryAccess
+        {
+            memory_readable = Some(line);
             continue;
         }
         match line
@@ -360,19 +382,25 @@ fn evaluate_report(
     }
     let mut warnings = Vec::new();
     if let Some(why) = parent_dumpable {
-        if !dumpable_accepted {
-            return Err(format!("parent process is still dumpable ({why})"));
+        match (dumpable, memory_readable) {
+            (DumpableParent::Refuse, _) => {
+                return Err(format!("parent process is still dumpable ({why})"));
+            }
+            (_, Some(probe)) => warnings.push(format!(
+                "parent process is dumpable ({why}) and the child can access its memory \
+                 ({probe}); accepted for this process"
+            )),
+            _ if report.lines().any(|l| l == "parent_mem=ok") => warnings.push(format!(
+                "parent process is dumpable ({why}); accepted for this process, and the \
+                 child is refused the parent's memory"
+            )),
+            _ => {
+                return Err(format!(
+                    "parent process is still dumpable ({why}) and the self-test did not \
+                     prove the child is refused its memory"
+                ));
+            }
         }
-        if !report.lines().any(|l| l == "parent_mem=ok") {
-            return Err(format!(
-                "parent process is still dumpable ({why}) and the self-test did not prove \
-                 the child is refused its memory"
-            ));
-        }
-        warnings.push(format!(
-            "parent process is dumpable ({why}); accepted for this process, and the child is \
-             refused the parent's memory"
-        ));
     }
     if let Some(reason) = seccomp_unavailable {
         if cfg!(target_os = "linux") && policy == SeccompPolicy::Required {
@@ -708,18 +736,51 @@ fn kill_child(child: &mut Child) -> bool {
     child.kill().is_ok()
 }
 
-static DUMPABLE_PARENT_ACCEPTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// How far a process accepts a parent the runtime will not make non-dumpable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DumpableParent {
+    /// A dumpable parent stops every scene (the default).
+    Refuse,
+    /// Scenes run if the child is still refused the parent's memory (`parent_mem=ok`).
+    IfMemoryRefused,
+    /// Scenes run even when the child can read and write the parent's memory.
+    WithMemoryAccess,
+}
+
+const DUMPABLE_REFUSE: u8 = 0;
+const DUMPABLE_IF_MEMORY_REFUSED: u8 = 1;
+const DUMPABLE_WITH_MEMORY_ACCESS: u8 = 2;
+
+static DUMPABLE_PARENT: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(DUMPABLE_REFUSE);
 
 /// Lets scenes run under a parent that stays dumpable (see the module docs). Only for a
 /// process with no credentials or data the scene must not reach; call it before the first
 /// scene. The child must still be refused access to the parent's memory.
 pub fn accept_dumpable_parent() {
-    DUMPABLE_PARENT_ACCEPTED.store(true, Ordering::Relaxed);
+    // Never downgrades `accept_parent_memory_access`.
+    let _ = DUMPABLE_PARENT.compare_exchange(
+        DUMPABLE_REFUSE,
+        DUMPABLE_IF_MEMORY_REFUSED,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
 }
 
-fn dumpable_parent_accepted() -> bool {
-    DUMPABLE_PARENT_ACCEPTED.load(Ordering::Relaxed)
+/// [`accept_dumpable_parent`], and scenes run even when the runtime lets the child read and
+/// write the parent's memory (AWS Lambda does). An escaped scene then controls the parent:
+/// only for a process that holds nothing but what its own scenes may see, and whose answers
+/// the caller treats as untrusted. The self-test still requires every other probe.
+pub fn accept_parent_memory_access() {
+    DUMPABLE_PARENT.store(DUMPABLE_WITH_MEMORY_ACCESS, Ordering::Relaxed);
+}
+
+fn dumpable_parent() -> DumpableParent {
+    match DUMPABLE_PARENT.load(Ordering::Relaxed) {
+        DUMPABLE_IF_MEMORY_REFUSED => DumpableParent::IfMemoryRefused,
+        DUMPABLE_WITH_MEMORY_ACCESS => DumpableParent::WithMemoryAccess,
+        _ => DumpableParent::Refuse,
+    }
 }
 
 /// `PR_SET_DUMPABLE` failures, kept for the self-test's verdict.
@@ -1819,28 +1880,44 @@ mod tests {
     fn report_evaluation_follows_the_policy() {
         let confined = "empty_env=ok\nseccomp=ok\nparent_mem=ok\nopen=ok\nsocket=ok";
         assert_eq!(
-            evaluate_report(confined, SeccompPolicy::Required, None, false),
+            evaluate_report(
+                confined,
+                SeccompPolicy::Required,
+                None,
+                DumpableParent::Refuse
+            ),
             Ok(vec![])
         );
         assert_eq!(
-            evaluate_report(confined, SeccompPolicy::Auto, None, false),
+            evaluate_report(confined, SeccompPolicy::Auto, None, DumpableParent::Refuse),
             Ok(vec![])
         );
 
         // A filter that is on but does not refuse is a failure under any policy.
         let leaky = "empty_env=ok\nseccomp=ok\nopen=FAIL(rc=3 errno=None)";
         for policy in [SeccompPolicy::Required, SeccompPolicy::Auto] {
-            let err = evaluate_report(leaky, policy, None, false).unwrap_err();
+            let err = evaluate_report(leaky, policy, None, DumpableParent::Refuse).unwrap_err();
             assert!(err.contains("open=FAIL"), "{err}");
         }
 
         let unavailable = "empty_env=ok\n\
              seccomp=unavailable(PR_SET_NO_NEW_PRIVS: Operation not permitted)\n\
              nofile_open=ok\nnofile_socket=ok\nnproc_clone=ok\nparent_mem=ok";
-        let auto = evaluate_report(unavailable, SeccompPolicy::Auto, None, false).unwrap();
+        let auto = evaluate_report(
+            unavailable,
+            SeccompPolicy::Auto,
+            None,
+            DumpableParent::Refuse,
+        )
+        .unwrap();
         assert_eq!(auto.len(), 1, "{auto:?}");
         assert!(auto[0].contains("PR_SET_NO_NEW_PRIVS"), "{auto:?}");
-        let required = evaluate_report(unavailable, SeccompPolicy::Required, None, false);
+        let required = evaluate_report(
+            unavailable,
+            SeccompPolicy::Required,
+            None,
+            DumpableParent::Refuse,
+        );
         if cfg!(target_os = "linux") {
             let err = required.unwrap_err();
             assert!(err.contains(SANDBOX_SECCOMP_ENV), "{err}");
@@ -1851,19 +1928,31 @@ mod tests {
         // Without the filter, a descriptor or process limit that did not hold fails.
         let open_files = "empty_env=ok\nseccomp=unavailable(x)\n\
              nofile_open=FAIL(rc=3 errno=None)\nparent_mem=ok";
-        let err = evaluate_report(open_files, SeccompPolicy::Auto, None, false).unwrap_err();
+        let err = evaluate_report(
+            open_files,
+            SeccompPolicy::Auto,
+            None,
+            DumpableParent::Refuse,
+        )
+        .unwrap_err();
         assert!(err.contains("nofile_open=FAIL"), "{err}");
 
         // An environment the parent did not clear fails whatever the policy.
         let env = "empty_env=FAIL(env present: HOME)\nseccomp=unavailable(x)";
-        assert!(evaluate_report(env, SeccompPolicy::Auto, None, false).is_err());
+        assert!(evaluate_report(env, SeccompPolicy::Auto, None, DumpableParent::Refuse).is_err());
 
         // A dumpable parent is fatal under either policy, with the prctl error in the text.
         for policy in [SeccompPolicy::Required, SeccompPolicy::Auto] {
-            let err = evaluate_report(confined, policy, Some("PR_SET_DUMPABLE: EPERM"), false)
-                .unwrap_err();
+            let err = evaluate_report(
+                confined,
+                policy,
+                Some("PR_SET_DUMPABLE: EPERM"),
+                DumpableParent::Refuse,
+            )
+            .unwrap_err();
             assert!(err.contains("dumpable") && err.contains("EPERM"), "{err}");
-            let err = evaluate_report(unavailable, policy, Some("x"), false).unwrap_err();
+            let err = evaluate_report(unavailable, policy, Some("x"), DumpableParent::Refuse)
+                .unwrap_err();
             assert!(err.contains("dumpable"), "{err}");
         }
     }
@@ -1876,7 +1965,7 @@ mod tests {
             unavailable,
             SeccompPolicy::Auto,
             Some("PR_SET_DUMPABLE: EPERM"),
-            true,
+            DumpableParent::IfMemoryRefused,
         )
         .unwrap();
         assert_eq!(warnings.len(), 2, "{warnings:?}");
@@ -1884,13 +1973,91 @@ mod tests {
 
         // Memory access allowed: the probe line fails the report on its own.
         let readable = unavailable.replace("parent_mem=ok", "parent_mem=FAIL(rc=-1 errno=14)");
-        let err = evaluate_report(&readable, SeccompPolicy::Auto, Some("x"), true).unwrap_err();
+        let err = evaluate_report(
+            &readable,
+            SeccompPolicy::Auto,
+            Some("x"),
+            DumpableParent::IfMemoryRefused,
+        )
+        .unwrap_err();
         assert!(err.contains("parent_mem=FAIL"), "{err}");
 
         // No memory probe in the report at all: not proven, so refused.
         let unproven = "empty_env=ok\nseccomp=unavailable(x)";
-        let err = evaluate_report(unproven, SeccompPolicy::Auto, Some("x"), true).unwrap_err();
+        let err = evaluate_report(
+            unproven,
+            SeccompPolicy::Auto,
+            Some("x"),
+            DumpableParent::IfMemoryRefused,
+        )
+        .unwrap_err();
         assert!(err.contains("did not prove"), "{err}");
+    }
+
+    #[test]
+    fn parent_memory_access_is_accepted_only_when_asked_and_only_for_that_probe() {
+        let readable = "empty_env=ok\nseccomp=unavailable(x)\n\
+             nofile_open=ok\nnofile_socket=ok\nnproc_clone=ok\n\
+             parent_mem=FAIL(rc=-1 errno=Some(14))";
+        let dumpable = Some("PR_SET_DUMPABLE: EPERM");
+        for refused in [DumpableParent::Refuse, DumpableParent::IfMemoryRefused] {
+            let err =
+                evaluate_report(readable, SeccompPolicy::Auto, dumpable, refused).unwrap_err();
+            assert!(err.contains("parent_mem=FAIL"), "{err}");
+        }
+        let warnings = evaluate_report(
+            readable,
+            SeccompPolicy::Auto,
+            dumpable,
+            DumpableParent::WithMemoryAccess,
+        )
+        .unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("can access its memory")),
+            "{warnings:?}"
+        );
+
+        // Every other probe still has to pass.
+        let open_files = readable.replace("nofile_open=ok", "nofile_open=FAIL(rc=3 errno=None)");
+        let err = evaluate_report(
+            &open_files,
+            SeccompPolicy::Auto,
+            dumpable,
+            DumpableParent::WithMemoryAccess,
+        )
+        .unwrap_err();
+        assert!(err.contains("nofile_open=FAIL"), "{err}");
+
+        // A parent that is not dumpable but readable anyway is never accepted.
+        let err = evaluate_report(
+            readable,
+            SeccompPolicy::Auto,
+            None,
+            DumpableParent::WithMemoryAccess,
+        )
+        .unwrap_err();
+        assert!(err.contains("parent_mem=FAIL"), "{err}");
+
+        // With the filter on, a failed memory probe is a filter fault: never excused.
+        let filtered = "empty_env=ok\nseccomp=ok\nparent_mem=FAIL(rc=8 errno=None)";
+        let err = evaluate_report(
+            filtered,
+            SeccompPolicy::Auto,
+            dumpable,
+            DumpableParent::WithMemoryAccess,
+        )
+        .unwrap_err();
+        assert!(err.contains("parent_mem=FAIL"), "{err}");
+
+        // No memory probe at all: nothing was measured, so nothing is accepted.
+        let unmeasured = "empty_env=ok\nseccomp=unavailable(x)";
+        assert!(evaluate_report(
+            unmeasured,
+            SeccompPolicy::Auto,
+            dumpable,
+            DumpableParent::WithMemoryAccess
+        )
+        .is_err());
     }
 
     #[test]

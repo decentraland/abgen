@@ -311,6 +311,25 @@ fn run_scenario(scenario: &str) -> ! {
                 }
             }
         }
+        // Accepting memory access runs scenes whatever this host answers to the probe.
+        "dumpable-memory-accepted" => {
+            std::env::set_var(sandbox::SANDBOX_SECCOMP_ENV, "auto");
+            sandbox::accept_parent_memory_access();
+            match sandbox::check() {
+                Ok(report) if report.contains("\nparent_mem=") => {
+                    println!("{report}");
+                    0
+                }
+                Ok(report) => {
+                    eprintln!("no memory probe in the report:\n{report}");
+                    1
+                }
+                Err(e) => {
+                    eprintln!("check failed with memory access accepted: {e:#}");
+                    1
+                }
+            }
+        }
         other => {
             eprintln!("unknown scenario {other}");
             2
@@ -358,6 +377,14 @@ fn a_dumpable_parent_is_refused_unless_accepted() {
         );
         let verdict = scenario("dumpable-accepted");
         println!("dumpable-accepted on this host: {verdict}");
+        let report = scenario("dumpable-memory-accepted");
+        assert!(report.contains("nofile_open=ok"), "{report}");
+        // Which branch ran depends on the host (Yama `ptrace_scope`, the runtime's filter).
+        let probe = report
+            .lines()
+            .find(|l| l.starts_with("parent_mem="))
+            .unwrap_or("none");
+        println!("dumpable-memory-accepted on this host: {probe}");
     }
 }
 

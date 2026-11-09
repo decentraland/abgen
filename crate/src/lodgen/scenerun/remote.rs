@@ -13,15 +13,18 @@
 //!   invocation. The response is untrusted: only the stream, the evaluation error and the
 //!   files the scene read are taken from it, a file is kept only when the entity's own
 //!   content lists it under the same hash, and both sides must fold the stream the same
-//!   way ([`super::crdt::projection_id`]).
+//!   way ([`super::crdt::projection_id`]). Every invoke names the entity as its Lambda tenant
+//!   (`X-Amz-Tenant-Id`), so on a function created with tenant isolation no execution
+//!   environment serves two entities.
 //! - **function** (`abgen-lambda` started with `ABGEN_LAMBDA_MODE=scenerun`): [`serve`]
 //!   fetches the scene's code and files from the content server and runs the scene in the
 //!   sandbox child ([`super::sandbox`]), under a deadline even when the request names
-//!   none. The child gets an empty environment, no new processes, no new file
-//!   descriptors (so no files or sockets) and no access to the parent's memory, which the
-//!   self-test proves before the first scene; that, not the process exiting after each
-//!   answer, is what keeps an escaped scene away from the runtime API and from later
-//!   invocations. Exiting after each answer is hygiene on top.
+//!   none. The child gets an empty environment, no new processes and no new file
+//!   descriptors (so no files or sockets), which the self-test proves before the first
+//!   scene. Where the runtime also lets the child reach the runner's memory (AWS Lambda),
+//!   scenes run only with `ABGEN_SANDBOX_PARENT_MEMORY=accept`: an escaped scene can then take
+//!   over the runner's execution environment, and tenant isolation per entity is what keeps
+//!   it from answering for any other entity. Exiting after each answer is hygiene on top.
 //!
 //! Lambda caps a synchronous response at 6 MB. The function sends the folded state rather
 //! than every frame, and fails with a clear error when even that does not fit.
@@ -169,9 +172,14 @@ impl RemoteRunner {
         let budget = call_budget(self.timeout, invocation_remaining())
             .with_context(|| format!("run scene {}", ent.entity_id))?;
         let payload = request(client, ent, requested_scene_deadline(budget));
-        let response = self.invoker.invoke(&payload, budget).with_context(|| {
-            format!("run scene {} in {}", ent.entity_id, self.invoker.function())
-        })?;
+        // One tenant per entity: the scene function is created with tenant isolation, so an
+        // execution environment that ran this entity never runs another one.
+        let response = self
+            .invoker
+            .invoke(&payload, budget, Some(&ent.entity_id))
+            .with_context(|| {
+                format!("run scene {} in {}", ent.entity_id, self.invoker.function())
+            })?;
         parse_response(ent, &response)
     }
 }

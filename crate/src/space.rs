@@ -88,8 +88,9 @@ pub(crate) fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     m.finalize().into_bytes().to_vec()
 }
 
-/// The `Authorization` header for a SigV4 request signed over `host`, `x-amz-date` and,
-/// with a session token, `x-amz-security-token` (the caller sends exactly those headers).
+/// The `Authorization` header for a SigV4 request signed over `host`, `x-amz-date`, with a
+/// session token `x-amz-security-token`, and the `extra` headers (lowercase names); the
+/// caller sends exactly those headers.
 /// `path` is the canonical (already encoded) URI and `query` the canonical query string.
 /// Shared by the SNS and Lambda clients; S3 here signs its own header set.
 #[allow(clippy::too_many_arguments)]
@@ -104,17 +105,23 @@ pub(crate) fn sigv4_authorization(
     payload_hash: &str,
     amz_date: &str,
     date: &str,
+    extra: &[(&str, &str)],
 ) -> String {
-    let (signed_headers, canonical_headers) = match &c.session_token {
-        Some(token) => (
-            "host;x-amz-date;x-amz-security-token",
-            format!("host:{host}\nx-amz-date:{amz_date}\nx-amz-security-token:{token}\n"),
-        ),
-        None => (
-            "host;x-amz-date",
-            format!("host:{host}\nx-amz-date:{amz_date}\n"),
-        ),
-    };
+    let mut headers: Vec<(&str, &str)> = vec![("host", host), ("x-amz-date", amz_date)];
+    if let Some(token) = &c.session_token {
+        headers.push(("x-amz-security-token", token));
+    }
+    headers.extend_from_slice(extra);
+    headers.sort_by_key(|(name, _)| *name);
+    let signed_headers = headers
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical_headers: String = headers
+        .iter()
+        .map(|(name, value)| format!("{name}:{}\n", value.trim()))
+        .collect();
     let canonical_request =
         format!("{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
     let scope = format!("{date}/{region}/{service}/aws4_request");

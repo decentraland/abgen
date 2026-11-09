@@ -74,6 +74,7 @@ fn main() {
                  \x20    LOD_LEVELS (default 1; 0,1 for both levels),\n\
                  \x20    ABGEN_SCENERUN_FUNCTION (run LOD scenes in that function),\n\
                  \x20    ABGEN_SCENERUN_TIMEOUT_S (default 300),\n\
+                 \x20    ABGEN_SANDBOX_PARENT_MEMORY (scenerun: refuse | accept),\n\
                  \x20    ABGEN_LAMBDA_MODE (convert | scenerun: only run scenes for\n\
                  \x20    another function's LOD lane, one per process)"
             );
@@ -92,6 +93,12 @@ fn main() {
         }
         None => {
             init();
+            if std::env::var_os(PARENT_MEMORY_ENV).is_some() {
+                eprintln!(
+                    "init: {PARENT_MEMORY_ENV} is ignored outside {MODE_ENV}=scenerun; this \
+                     function runs no scenes with a dumpable parent"
+                );
+            }
             let cfg = config::Config::from_env();
             runtime::serve(&cfg, handle, runtime::AfterResponse::Continue);
         }
@@ -146,14 +153,41 @@ const MODE_ENV: &str = "ABGEN_LAMBDA_MODE";
 
 /// Scene runner start-up: refuses to serve without a content server allowlist, and lets
 /// the sandbox run scenes under a parent the runtime will not make non-dumpable. The
-/// runner holds nothing a scene could use (its role only writes its own logs); the
-/// self-test still requires the child to be refused the parent's memory.
+/// runner holds nothing a scene could use (its role only writes its own logs). The
+/// self-test requires the child to be refused the parent's memory unless
+/// `ABGEN_SANDBOX_PARENT_MEMORY=accept`; that is only safe on a function created with tenant
+/// isolation, which the converter invokes with one tenant per entity.
 fn init_scenerun(cfg: &config::Config) {
     if let Err(e) = scenerun_preflight(cfg) {
         eprintln!("fatal: {e:#}");
         std::process::exit(1);
     }
     abgen::lodgen::scenerun::sandbox::accept_dumpable_parent();
+    match parent_memory_policy(std::env::var(PARENT_MEMORY_ENV).ok().as_deref()) {
+        Ok(true) => {
+            abgen::lodgen::scenerun::sandbox::accept_parent_memory_access();
+            eprintln!("init: scenes may run where the child can access this process's memory ({PARENT_MEMORY_ENV}=accept)");
+        }
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!("fatal: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Scene runner only: whether scenes may run when the runtime lets the sandbox child read
+/// and write this process's memory (AWS Lambda does). Unset or `refuse`: they may not.
+const PARENT_MEMORY_ENV: &str = "ABGEN_SANDBOX_PARENT_MEMORY";
+
+fn parent_memory_policy(value: Option<&str>) -> Result<bool> {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("refuse") => Ok(false),
+        Some("accept") => Ok(true),
+        Some(other) => {
+            anyhow::bail!("{PARENT_MEMORY_ENV}={other:?} is neither `refuse` nor `accept`")
+        }
+    }
 }
 
 fn scenerun_preflight(cfg: &config::Config) -> Result<()> {
@@ -604,6 +638,18 @@ mod tests {
             lods_enabled: false,
             max_receive_count: 3,
             lod_levels: vec![1],
+        }
+    }
+
+    #[test]
+    fn parent_memory_access_is_opt_in() {
+        for refuse in [None, Some(""), Some("refuse"), Some(" REFUSE ")] {
+            assert!(!parent_memory_policy(refuse).unwrap(), "{refuse:?}");
+        }
+        assert!(parent_memory_policy(Some("accept")).unwrap());
+        assert!(parent_memory_policy(Some(" Accept ")).unwrap());
+        for bad in ["yes", "1", "true", "allow"] {
+            assert!(parent_memory_policy(Some(bad)).is_err(), "{bad}");
         }
     }
 
