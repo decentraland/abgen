@@ -6,12 +6,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::emit::{acc_kind, is_draco, read_f32_rows, read_indices, read_tight};
 
-pub(super) const EXT_NAME: &str = "EXT_meshopt_compression";
+pub(crate) const EXT_NAME: &str = "EXT_meshopt_compression";
 const POSITION_EXP_BITS: i32 = 16;
 const TEXCOORD_EXP_BITS: i32 = 15;
 const OCT_BITS: i32 = 8;
 
-pub(super) struct Stream {
+pub(crate) struct Stream {
     pub accessor: usize,
     pub bytes: Vec<u8>,
     pub mode: &'static str,
@@ -23,7 +23,7 @@ pub(super) struct Stream {
     pub normalized: bool,
 }
 
-pub(super) struct Plan {
+pub(crate) struct Plan {
     pub streams: Vec<Stream>,
     pub zombies: Vec<usize>,
     pub eligible: BTreeSet<(usize, usize)>,
@@ -280,7 +280,7 @@ fn mark(flags: &mut [bool], i: usize) {
     }
 }
 
-pub(super) fn plan(root: &Root, bin: &[u8]) -> Option<Plan> {
+pub(crate) fn plan(root: &Root, bin: &[u8]) -> Option<Plan> {
     let nacc = root.accessors.len();
     let nviews = root.buffer_views.len();
     let mut protected = vec![false; nacc];
@@ -480,7 +480,7 @@ pub(super) fn append_stream_view(root: &mut Root, new_bin: &mut Vec<u8>, s: &Str
     vidx
 }
 
-pub(super) fn apply(root: &mut Root, new_bin: &mut Vec<u8>, streams: &[Stream]) {
+pub(crate) fn apply(root: &mut Root, new_bin: &mut Vec<u8>, streams: &[Stream]) {
     for s in streams {
         let vidx = append_stream_view(root, new_bin, s);
         let a = &mut root.accessors[s.accessor];
@@ -498,6 +498,57 @@ pub(super) fn apply(root: &mut Root, new_bin: &mut Vec<u8>, streams: &[Stream]) 
             root.extensions_required.push(name.to_owned());
         }
     }
+}
+
+/// Decode one `EXT_meshopt_compression` stream (`src`) to `count * stride` plain bytes: the
+/// index codec for `mode` `TRIANGLES`, the vertex codec otherwise, then the `OCTAHEDRAL` or
+/// `EXPONENTIAL` filter when named. `None` when the decoder rejects the stream.
+pub(crate) fn decode_stream(
+    src: &[u8],
+    count: usize,
+    stride: usize,
+    mode: &str,
+    filter: Option<&str>,
+) -> Option<Vec<u8>> {
+    let mut out = vec![0u8; count.checked_mul(stride)?];
+    if mode == "TRIANGLES" {
+        let rc = unsafe {
+            meshopt::ffi::meshopt_decodeIndexBuffer(
+                out.as_mut_ptr().cast(),
+                count,
+                stride,
+                src.as_ptr(),
+                src.len(),
+            )
+        };
+        return (rc == 0).then_some(out);
+    }
+    let rc = unsafe {
+        meshopt::ffi::meshopt_decodeVertexBuffer(
+            out.as_mut_ptr().cast(),
+            count,
+            stride,
+            src.as_ptr(),
+            src.len(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    match filter {
+        Some("OCTAHEDRAL") => unsafe {
+            meshopt::ffi::meshopt_decodeFilterOct(out.as_mut_ptr().cast(), count, stride)
+        },
+        Some("EXPONENTIAL") => unsafe {
+            meshopt::ffi::meshopt_decodeFilterExp(out.as_mut_ptr().cast(), count, stride)
+        },
+        Some("QUATERNION") => unsafe {
+            meshopt::ffi::meshopt_decodeFilterQuat(out.as_mut_ptr().cast(), count, stride)
+        },
+        Some(_) => return None,
+        None => {}
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -545,39 +596,14 @@ mod tests {
         let stride = e["byteStride"].as_u64().unwrap() as usize;
         let count = e["count"].as_u64().unwrap() as usize;
         let src = &bin[off..off + len];
-        let mut out = vec![0u8; count * stride];
-        if e["mode"] == "TRIANGLES" {
-            let rc = unsafe {
-                meshopt::ffi::meshopt_decodeIndexBuffer(
-                    out.as_mut_ptr().cast(),
-                    count,
-                    stride,
-                    src.as_ptr(),
-                    src.len(),
-                )
-            };
-            assert_eq!(rc, 0);
-        } else {
-            let rc = unsafe {
-                meshopt::ffi::meshopt_decodeVertexBuffer(
-                    out.as_mut_ptr().cast(),
-                    count,
-                    stride,
-                    src.as_ptr(),
-                    src.len(),
-                )
-            };
-            assert_eq!(rc, 0);
-            match e.get("filter").and_then(Value::as_str) {
-                Some("OCTAHEDRAL") => unsafe {
-                    meshopt::ffi::meshopt_decodeFilterOct(out.as_mut_ptr().cast(), count, stride)
-                },
-                Some("EXPONENTIAL") => unsafe {
-                    meshopt::ffi::meshopt_decodeFilterExp(out.as_mut_ptr().cast(), count, stride)
-                },
-                _ => {}
-            }
-        }
+        let out = super::decode_stream(
+            src,
+            count,
+            stride,
+            e["mode"].as_str().unwrap(),
+            e.get("filter").and_then(Value::as_str),
+        )
+        .expect("stream decodes");
         (out, count, stride)
     }
 

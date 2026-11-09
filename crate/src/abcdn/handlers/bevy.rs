@@ -52,16 +52,49 @@ pub(super) async fn bevy_serve_local(
     match &target {
         BevyTarget::Manifest(_) => serve::serve_manifest(state, path, &exact, method).await,
         BevyTarget::Content(cid) => {
-            let mut resp = serve::serve_binary(state, path, &exact, cid, method, headers).await;
+            // A `glb-meshopt` variant may have a Brotli sidecar (`{cid}.br`): clients that
+            // accept `br` get those bytes as the encoded representation of the same resource.
+            let br = bevyvariants::meshopt::br_sidecar(&exact);
+            let has_br = br.is_file();
+            let send_br = has_br && accepts_br(headers);
+            let mut resp = if send_br {
+                let key = format!("{path}.br");
+                let etag = format!("{cid}.br");
+                serve::serve_binary(state, &key, &br, &etag, method, headers).await
+            } else {
+                serve::serve_binary(state, path, &exact, cid, method, headers).await
+            };
             if resp.status().is_success() {
-                resp.headers_mut().insert(
-                    "Content-Type",
-                    "application/octet-stream".parse().unwrap(),
-                );
+                let h = resp.headers_mut();
+                h.insert("Content-Type", "application/octet-stream".parse().unwrap());
+                if has_br {
+                    h.insert("Vary", "Accept-Encoding".parse().unwrap());
+                }
+                if send_br {
+                    h.insert("Content-Encoding", "br".parse().unwrap());
+                }
             }
             resp
         }
     }
+}
+
+/// Whether the request's `Accept-Encoding` lists `br` with a non-zero quality.
+pub(super) fn accepts_br(headers: &HeaderMap) -> bool {
+    headers
+        .get_all("accept-encoding")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|item| {
+            let mut parts = item.split(';').map(str::trim);
+            let coding = parts.next().unwrap_or("");
+            let q_zero = parts.any(|p| {
+                p.strip_prefix("q=")
+                    .is_some_and(|q| q.trim().parse::<f32>().is_ok_and(|q| q <= 0.0))
+            });
+            coding.eq_ignore_ascii_case("br") && !q_zero
+        })
 }
 
 /// Misses: object-storage read-through for both kinds; manifests additionally build in the
@@ -160,5 +193,21 @@ mod tests {
         ] {
             assert_eq!(bevy_target(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn accept_encoding_br_is_parsed() {
+        let h = |v: &str| {
+            let mut m = HeaderMap::new();
+            m.insert("accept-encoding", v.parse().unwrap());
+            m
+        };
+        assert!(accepts_br(&h("gzip, deflate, br")));
+        assert!(accepts_br(&h("br;q=1.0, gzip;q=0.8")));
+        assert!(accepts_br(&h("BR")));
+        assert!(!accepts_br(&h("gzip, deflate")));
+        assert!(!accepts_br(&h("br;q=0")));
+        assert!(!accepts_br(&h("brotli")));
+        assert!(!accepts_br(&HeaderMap::new()));
     }
 }

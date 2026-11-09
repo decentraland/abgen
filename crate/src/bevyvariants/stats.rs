@@ -32,7 +32,11 @@ pub struct StageTimes {
     pub transcode_ns: u64,
     /// Zstandard compression of every level plus KTX2 assembly.
     pub zstd_ns: u64,
-    /// CID (sha256) plus writing the variant file.
+    /// `glb-meshopt` models: parse, meshopt encode and GLB rewrite.
+    pub meshopt_ns: u64,
+    /// Brotli of a `glb-meshopt` variant (`ABGEN_BEVY_PRECOMPRESS=br`).
+    pub brotli_ns: u64,
+    /// CID (sha256) plus writing the variant file (and its `.br` sidecar).
     pub hash_write_ns: u64,
 }
 
@@ -47,6 +51,8 @@ impl StageTimes {
         self.bc7_ns += o.bc7_ns;
         self.transcode_ns += o.transcode_ns;
         self.zstd_ns += o.zstd_ns;
+        self.meshopt_ns += o.meshopt_ns;
+        self.brotli_ns += o.brotli_ns;
         self.hash_write_ns += o.hash_write_ns;
     }
 
@@ -60,6 +66,8 @@ impl StageTimes {
             + self.bc7_ns
             + self.transcode_ns
             + self.zstd_ns
+            + self.meshopt_ns
+            + self.brotli_ns
             + self.hash_write_ns
     }
 }
@@ -149,6 +157,51 @@ pub struct FileStat {
     pub times: StageTimes,
 }
 
+/// One model's `glb-meshopt` outcome.
+#[derive(Clone, Debug, Serialize)]
+pub struct ModelStat {
+    pub hash: String,
+    pub file: String,
+    pub original_size: u64,
+    /// `glb-meshopt`, or `None` with a `reason`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant_cid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant_size: Option<u64>,
+    /// Size of the `.br` sidecar when precompression is on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub br_size: Option<u64>,
+    /// Compressed streams in the variant (or in the size-gated attempt).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub streams: Option<u64>,
+    /// The variant's size when the size gate dropped it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gated_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<super::meshopt::NoModelVariant>,
+    pub times: StageTimes,
+}
+
+/// The `glb-meshopt` lane's totals.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ModelSummary {
+    /// Models considered and their bytes.
+    pub considered: u64,
+    pub original_bytes: u64,
+    /// Models that got a variant: count, their originals' bytes, the variants' bytes and the
+    /// `.br` sidecars' bytes (0 when precompression is off).
+    pub variants: u64,
+    pub variants_original_bytes: u64,
+    pub variant_bytes: u64,
+    pub br_bytes: u64,
+    /// Size-gated attempts: count, original bytes, the dropped variants' bytes.
+    pub size_gated: CountBytes,
+    /// Other no-variant reasons -> count.
+    pub no_variant: BTreeMap<String, u64>,
+}
+
 /// Count and bytes of one group.
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct CountBytes {
@@ -182,6 +235,9 @@ pub struct BuildStats {
     /// Originals considered (standalone textures) and their bytes.
     pub original_bytes: u64,
     pub files: Vec<FileStat>,
+    /// The `glb-meshopt` lane: totals and one row per model.
+    pub glb_meshopt: ModelSummary,
+    pub model_files: Vec<ModelStat>,
 }
 
 impl BuildStats {
@@ -232,11 +288,43 @@ impl BuildStats {
         s
     }
 
+    /// Add the `glb-meshopt` rows: totals and stage times.
+    pub fn add_models(&mut self, rows: Vec<ModelStat>) {
+        let g = &mut self.glb_meshopt;
+        for m in &rows {
+            g.considered += 1;
+            g.original_bytes += m.original_size;
+            self.stages.add(&m.times);
+            match (&m.variant_size, m.reason) {
+                (Some(n), _) => {
+                    g.variants += 1;
+                    g.variants_original_bytes += m.original_size;
+                    g.variant_bytes += n;
+                    g.br_bytes += m.br_size.unwrap_or(0);
+                }
+                (None, Some(super::meshopt::NoModelVariant::SizeGate)) => {
+                    g.size_gated.count += 1;
+                    g.size_gated.original_bytes += m.original_size;
+                    g.size_gated.variant_bytes += m.gated_size.unwrap_or(0);
+                }
+                (None, r) => {
+                    let key = r
+                        .and_then(|r| serde_json::to_value(r).ok())
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    *g.no_variant.entry(key).or_default() += 1;
+                }
+            }
+        }
+        self.model_files = rows;
+    }
+
     /// The summary as JSON without the per-file rows.
     pub fn summary_json(&self) -> serde_json::Value {
         let mut v = serde_json::to_value(self).unwrap_or_default();
         if let Some(o) = v.as_object_mut() {
             o.remove("files");
+            o.remove("model_files");
             let ms = |ns: u64| (ns as f64 / 1e6 * 10.0).round() / 10.0;
             let st = &self.stages;
             o.insert(
@@ -251,6 +339,8 @@ impl BuildStats {
                     "bc7": ms(st.bc7_ns),
                     "transcode_uastc_bc7": ms(st.transcode_ns),
                     "zstd": ms(st.zstd_ns),
+                    "meshopt": ms(st.meshopt_ns),
+                    "brotli": ms(st.brotli_ns),
                     "hash_write": ms(st.hash_write_ns),
                     "total": ms(st.total_ns()),
                 }),

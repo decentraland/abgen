@@ -17,6 +17,12 @@
 //!   default because Bevy's glTF loader does not take them yet) become a GLB with Draco decoded, `KHR_texture_basisu` resolved and every embedded
 //!   image replaced by its KTX2 variant (`image/ktx2`). External image URIs are left as they are:
 //!   they resolve to their own original CID, which has its own texture variant.
+//! - Models also get a `glb-meshopt` variant (`model`, on by default, `ABGEN_BEVY_GLB_MESHOPT=0`
+//!   turns it off; [`meshopt`]): the original with its triangle meshes as
+//!   `EXT_meshopt_compression` streams and nothing else touched, kept only when smaller than the
+//!   original. With `ABGEN_BEVY_PRECOMPRESS=br` each one is also stored Brotli-compressed as
+//!   `bevy/contents/{cid}.br` and served with `Content-Encoding: br` to clients that accept it;
+//!   the CID is always of the plain bytes. KTX2 variants are never Brotli'd (zstd inside).
 //! - Nothing else gets a variant (scene code, audio, video, source maps, unknown files).
 //!
 //! The client contract: no manifest, no entry, or any failure means the client loads the
@@ -33,6 +39,8 @@
 
 #[cfg(feature = "bevy-variants")]
 mod build;
+#[cfg(feature = "bevy-variants")]
+pub mod meshopt;
 #[cfg(feature = "bevy-variants")]
 pub mod model;
 #[cfg(feature = "bevy-variants")]
@@ -123,7 +131,7 @@ pub struct VariantEntry {
     pub cid: String,
     /// `"texture"` or `"model"`.
     pub kind: String,
-    /// `"ktx2-bc7"`, `"ktx2-bc1"`, `"ktx2-bc5"` or `"glb"`.
+    /// `"ktx2-bc7"`, `"ktx2-bc1"`, `"ktx2-bc5"`, `"glb-meshopt"` or `"glb"`.
     pub format: String,
     /// Texture variants only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,6 +184,14 @@ impl crate::live::Proxy {
                     Ok(bytes) => self.space_put_key(&content_key(vcid), &bytes),
                     Err(e) => {
                         tracing::warn!(cid = %vcid, error = %e, "bevy variants: re-read for upload failed")
+                    }
+                }
+            }
+            for (key, path) in &out.sidecars {
+                match std::fs::read(path) {
+                    Ok(bytes) => self.space_put_key(key, &bytes),
+                    Err(e) => {
+                        tracing::warn!(key = %key, error = %e, "bevy variants: re-read for upload failed")
                     }
                 }
             }

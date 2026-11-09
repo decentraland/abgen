@@ -18,11 +18,15 @@ pub(crate) fn run_bevy_variants(
     store: &LocalContentStore,
     out_root: &Path,
     glb_variants: bool,
+    no_glb_meshopt: bool,
+    precompress_br: bool,
     zstd_level: Option<i32>,
 ) -> Result<()> {
     let env = abgen::bevyvariants::BuildOptions::from_env();
     let opts = abgen::bevyvariants::BuildOptions {
         glb_variants: glb_variants || env.glb_variants,
+        glb_meshopt: env.glb_meshopt && !no_glb_meshopt,
+        precompress_br: precompress_br || env.precompress_br,
         zstd_level: match zstd_level {
             Some(l) => abgen::ktx2_write::check_zstd_level(l)?,
             None => env.zstd_level,
@@ -30,14 +34,15 @@ pub(crate) fn run_bevy_variants(
     };
     let started = std::time::Instant::now();
     let mut all_stats: Vec<serde_json::Value> = Vec::new();
-    std::fs::create_dir_all(out_root)
-        .with_context(|| format!("mkdir {}", out_root.display()))?;
+    std::fs::create_dir_all(out_root).with_context(|| format!("mkdir {}", out_root.display()))?;
     let mut errs = 0usize;
     let mut originals = 0usize;
     let mut variants = 0usize;
     for id in ids {
         let built = (|| -> Result<abgen::bevyvariants::BuildOutput> {
-            let raw = store.fetch(id).with_context(|| format!("entity {id} not in the store"))?;
+            let raw = store
+                .fetch(id)
+                .with_context(|| format!("entity {id} not in the store"))?;
             let mut ent: serde_json::Value =
                 serde_json::from_slice(&raw).with_context(|| format!("parse entity {id}"))?;
             // The stored entity file is the deployed JSON, addressed by its hash: it carries no
@@ -83,6 +88,8 @@ pub(crate) fn run_bevy_variants(
     let stats_path = out_root.join("bevy-variants-stats.json");
     let doc = serde_json::json!({
         "zstd_level": opts.zstd_level,
+        "glb_meshopt": opts.glb_meshopt,
+        "precompress": if opts.precompress_br { "br" } else { "none" },
         "libzstd": abgen::ktx2_write::LIBZSTD_VERSION,
         "threads": rayon::current_num_threads(),
         "wall_ms": started.elapsed().as_millis() as u64,
@@ -108,6 +115,8 @@ pub(crate) fn run_bevy_variants(
     _: &[String],
     _: &LocalContentStore,
     _: &Path,
+    _: bool,
+    _: bool,
     _: bool,
     _: Option<i32>,
 ) -> Result<()> {
