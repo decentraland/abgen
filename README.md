@@ -337,8 +337,10 @@ release, never on the machine or thread count; changing either means new CIDs an
   they are (external `.bin` buffers are inlined, because the meshes live there). Draco primitives
   are left alone; a file already using `EXT_meshopt_compression` gets none. The variant is kept
   only when smaller than the original. With `ABGEN_BEVY_PRECOMPRESS=br` (`--bevy-precompress br`)
-  each one is also stored as `bevy/contents/{cid}.br` (Brotli quality 9, window 22) for the
-  route above; KTX2 variants are never Brotli'd. `cargo run --release --example
+  each one is also stored as `bevy/contents/{cid}.br` (Brotli quality 9, window 22; uploaded
+  with `Content-Encoding: br`) for the route above; KTX2 variants are never Brotli'd. On a
+  read-through miss the edge fetches the sidecar beside the variant when the client accepts
+  `br`. `cargo run --release --example
   bevy-geometry-check -- <bevy-variants-stats.json> <out>/bevy/contents <files-dir>` decodes
   every variant and compares it with its original (indices identical; positions within 1 mm,
   normals and tangents within 1 degree, UVs within 1/16384).

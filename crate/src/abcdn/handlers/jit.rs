@@ -11,7 +11,11 @@ fn record_space_read(lane: Option<&'static str>, hit: bool) {
     }
 }
 
-async fn space_materialize<F>(lane: Option<&'static str>, dst: std::path::PathBuf, fetch: F) -> bool
+pub(super) async fn space_materialize<F>(
+    lane: Option<&'static str>,
+    dst: std::path::PathBuf,
+    fetch: F,
+) -> bool
 where
     F: FnOnce() -> Option<Vec<u8>> + Send + 'static,
 {
