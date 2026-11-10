@@ -175,7 +175,7 @@ fn parse_iso8601_epoch(s: &str) -> Option<u64> {
 pub struct ObjectHeaders {
     pub content_type: &'static str,
     pub cache_control: &'static str,
-    /// `br` for a Bevy variant's Brotli sidecar (`bevy/contents/{cid}.br`), whose bytes are the
+    /// `br` for a Bevy variant's Brotli sidecar (`bevy/{prefix}/{name}.br`), whose bytes are the
     /// encoded representation of the plain object; anything reading the bucket directly then
     /// decodes it like the edge's negotiated answer.
     pub content_encoding: Option<&'static str>,
@@ -205,7 +205,10 @@ const PUBLIC_ONE_YEAR: &str = "public, max-age=31536000";
 /// Single source of truth for the metadata every upload carries.
 pub fn object_headers(key: &str) -> ObjectHeaders {
     let lower = key.to_ascii_lowercase();
-    let content_type = if lower.starts_with("bevy/contents/") {
+    // Bevy variants (`bevy/{prefix}/{name}`, their `.br` sidecars and `.json` records) are
+    // immutable within their prefix; only the manifests are rewritten in place.
+    let bevy_variant = lower.starts_with("bevy/") && !lower.starts_with("bevy/manifest/");
+    let content_type = if bevy_variant && !lower.ends_with(".json") {
         "application/octet-stream"
     } else if lower.ends_with(".json") {
         "application/json"
@@ -239,8 +242,7 @@ pub fn object_headers(key: &str) -> ObjectHeaders {
     } else {
         IMMUTABLE_SOURCE
     };
-    let content_encoding =
-        (lower.starts_with("bevy/contents/") && lower.ends_with(".br")).then_some("br");
+    let content_encoding = (bevy_variant && lower.ends_with(".br")).then_some("br");
     ObjectHeaders {
         content_type,
         cache_control,
@@ -813,20 +815,26 @@ mod tests {
                 NO_CACHE,
             ),
             (
-                "bevy/contents/bafkreivariant",
+                "bevy/t1/bafkreisource_srgb",
                 "application/octet-stream",
                 IMMUTABLE_SOURCE,
             ),
             (
-                "bevy/contents/bafkreivariant.br",
+                "bevy/m1/bafkreisource.br",
                 "application/octet-stream",
                 IMMUTABLE_SOURCE,
             ),
+            (
+                "bevy/m1/bafkreisource.json",
+                "application/json",
+                IMMUTABLE_SOURCE,
+            ),
+            ("bevy/manifest/bafkentity.json", "application/json", NO_CACHE),
         ] {
             let h = object_headers(key);
             assert_eq!(h.content_type, ct, "content type for {key}");
             assert_eq!(h.cache_control, cc, "cache control for {key}");
-            let br = key.starts_with("bevy/contents/") && key.ends_with(".br");
+            let br = key.starts_with("bevy/") && key.ends_with(".br");
             assert_eq!(h.content_encoding, br.then_some("br"), "content encoding for {key}");
         }
     }
@@ -847,7 +855,7 @@ mod tests {
                 None,
             ),
             (
-                "bevy/contents/bafkreivariant.br",
+                "bevy/m1/bafkreisource.br",
                 "application/octet-stream",
                 IMMUTABLE_SOURCE,
                 Some("br"),

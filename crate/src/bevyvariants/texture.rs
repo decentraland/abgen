@@ -168,6 +168,37 @@ pub struct Uses {
     pub linear: bool,
 }
 
+impl From<super::ImageUse> for Uses {
+    fn from(u: super::ImageUse) -> Self {
+        Uses {
+            srgb: u.srgb,
+            normal: u.normal,
+            linear: u.linear,
+        }
+    }
+}
+
+impl From<Uses> for super::ImageUse {
+    fn from(u: Uses) -> Self {
+        super::ImageUse {
+            srgb: u.srgb,
+            normal: u.normal,
+            linear: u.linear,
+        }
+    }
+}
+
+impl Slot {
+    /// The slot's name in a variant key (`{sourceCid}_{slot}`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Slot::Srgb => "srgb",
+            Slot::Linear => "linear",
+            Slot::Normal => "normal",
+        }
+    }
+}
+
 impl Uses {
     pub fn merge(&mut self, other: Uses) {
         self.srgb |= other.srgb;

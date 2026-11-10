@@ -1,6 +1,8 @@
 //! `--bevy-variants`: build only the Bevy variants lane (prototype) for the selected entities,
 //! into `<out-dir>` in the served layout (`bevy/manifest/{entity}.json`,
-//! `bevy/contents/{variantCid}`), so `ABGEN_OUT_ROOT=<out-dir> abgen` serves it as is.
+//! `bevy/{prefix}/{name}` with the `.json` record beside each), so
+//! `ABGEN_OUT_ROOT=<out-dir> abgen` serves it as is. A variant already under `<out-dir>` (an
+//! earlier run, another entity sharing the file) is reused from its record, not re-encoded.
 //!
 //! At the end it prints a JSON summary per entity (stage times summed over files, counts and
 //! bytes by format and source, no-variant reasons) and writes the full stats, per-file rows
@@ -38,6 +40,7 @@ pub(crate) fn run_bevy_variants(
     let mut errs = 0usize;
     let mut originals = 0usize;
     let mut variants = 0usize;
+    let mut reused = 0u64;
     for id in ids {
         let built = (|| -> Result<abgen::bevyvariants::BuildOutput> {
             let raw = store
@@ -53,7 +56,13 @@ pub(crate) fn run_bevy_variants(
             }
             let scene = abgen::catalyst::CatalystClient::parse_entity(&ent)?;
             let fetch = |hash: &str| store.fetch(hash).ok();
-            abgen::bevyvariants::build_entity_variants(&scene, &fetch, out_root, opts)
+            // No store to ask: records under <out-dir> are the only reuse.
+            let probe = |_: &str| None;
+            let lane = abgen::bevyvariants::Lane {
+                fetch: &fetch,
+                probe: &probe,
+            };
+            abgen::bevyvariants::build_entity_variants(&scene, &lane, out_root, opts)
         })();
         match built {
             Ok(o) => {
@@ -69,11 +78,13 @@ pub(crate) fn run_bevy_variants(
                 }
                 all_stats.push(full);
                 originals += o.manifest.files.len();
-                variants += o.variants.len();
+                variants += o.stats.unique_variants as usize;
+                reused += o.stats.reused_textures + o.stats.reused_models;
                 eprintln!(
-                    "bevy: {id}: {} originals, {} variants -> {}",
+                    "bevy: {id}: {} originals, {} variants built, {} reused -> {}",
                     o.manifest.files.len(),
-                    o.variants.len(),
+                    o.stats.unique_variants,
+                    o.stats.reused_textures + o.stats.reused_models,
                     abgen::bevyvariants::manifest_path(out_root, id)
                         .map(|p| p.display().to_string())
                         .unwrap_or_default()
@@ -98,7 +109,7 @@ pub(crate) fn run_bevy_variants(
     std::fs::write(&stats_path, serde_json::to_vec_pretty(&doc)?)
         .with_context(|| format!("write {}", stats_path.display()))?;
     println!(
-        "DONE bevy-variants entities={} originals={originals} variants={variants} errs={errs} zstd_level={} wall_ms={} stats={}",
+        "DONE bevy-variants entities={} originals={originals} variants={variants} reused={reused} errs={errs} zstd_level={} wall_ms={} stats={}",
         ids.len(),
         opts.zstd_level,
         started.elapsed().as_millis(),

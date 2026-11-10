@@ -1,7 +1,7 @@
 //! Geometry check of `glb-meshopt` variants against their originals.
 //!
 //! ```text
-//! cargo run --release --example bevy-geometry-check -- <bevy-variants-stats.json> <contents-dir> <live-files-dir>
+//! cargo run --release --example bevy-geometry-check -- <bevy-variants-stats.json> <out-root> <live-files-dir>
 //! ```
 //!
 //! For every `glb-meshopt` row of the stats file (`entities[].model_files[]`), decodes the
@@ -282,12 +282,13 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() != 3 {
         eprintln!(
-            "usage: bevy-geometry-check <bevy-variants-stats.json> <contents-dir> <live-files-dir>"
+            "usage: bevy-geometry-check <bevy-variants-stats.json> <out-root> <live-files-dir>"
         );
         std::process::exit(2);
     }
     let stats: Value =
         serde_json::from_slice(&std::fs::read(&args[0]).expect("read stats")).expect("parse stats");
+    // The out root the variants were built into: each row's `variant_path` is relative to it.
     let contents = PathBuf::from(&args[1]);
     let live = PathBuf::from(&args[2]);
     let mut rows: Vec<Row> = Vec::new();
@@ -310,7 +311,7 @@ fn main() {
             }
             let (Some(file), Some(cid)) = (
                 m.get("file").and_then(Value::as_str),
-                m.get("variant_cid").and_then(Value::as_str),
+                m.get("variant_path").and_then(Value::as_str),
             ) else {
                 continue;
             };

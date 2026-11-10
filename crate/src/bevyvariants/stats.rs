@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 /// Time spent per stage, in nanoseconds.
 #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct StageTimes {
+    /// Probe of the variant key's record (local disk, Redis, the store).
+    pub probe_ns: u64,
     /// Content fetch (local store read or network).
     pub fetch_ns: u64,
     /// PNG/JPEG decode to RGBA8.
@@ -42,6 +44,7 @@ pub struct StageTimes {
 
 impl StageTimes {
     pub fn add(&mut self, o: &StageTimes) {
+        self.probe_ns += o.probe_ns;
         self.fetch_ns += o.fetch_ns;
         self.decode_ns += o.decode_ns;
         self.resize_ns += o.resize_ns;
@@ -57,7 +60,8 @@ impl StageTimes {
     }
 
     pub fn total_ns(&self) -> u64 {
-        self.fetch_ns
+        self.probe_ns
+            + self.fetch_ns
             + self.decode_ns
             + self.resize_ns
             + self.bc1_ns
@@ -85,7 +89,7 @@ pub fn elapsed_ns(t: Instant) -> u64 {
 }
 
 /// Why an original got no variant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NoVariant {
     /// Content not available.
@@ -125,11 +129,15 @@ pub enum SourceKind {
 pub struct FileStat {
     pub hash: String,
     pub file: String,
+    /// `other` and `original_size` 0 when the variant was reused: the source was not fetched.
     pub source: SourceKind,
     pub original_size: u64,
     /// `ktx2-bc1` / `ktx2-bc5` / `ktx2-bc7`, or `None` with a `reason`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<&'static str>,
+    /// The variant's key (`bevy/{prefix}/{name}`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub variant_cid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -154,6 +162,9 @@ pub struct FileStat {
     pub bc1_psnr_db: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bc1_rejected: Option<bool>,
+    /// The outcome came from the key's record (probe hit): nothing was fetched or encoded.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub reused: bool,
     pub times: StageTimes,
 }
 
@@ -162,10 +173,14 @@ pub struct FileStat {
 pub struct ModelStat {
     pub hash: String,
     pub file: String,
+    /// 0 when the variant was reused: the source was not fetched.
     pub original_size: u64,
     /// `glb-meshopt`, or `None` with a `reason`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<&'static str>,
+    /// The variant's key (`bevy/{prefix}/{name}`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub variant_cid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -181,6 +196,9 @@ pub struct ModelStat {
     pub gated_size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<super::meshopt::NoModelVariant>,
+    /// The outcome came from the key's record (probe hit): nothing was fetched or encoded.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub reused: bool,
     pub times: StageTimes,
 }
 
@@ -229,7 +247,11 @@ pub struct BuildStats {
     pub size_gated: BTreeMap<String, CountBytes>,
     /// Opaque sRGB images whose BC1 fell below the PSNR floor and became BC7.
     pub bc1_rejected: u64,
-    /// Unique variant files written by this build and their bytes.
+    /// Outcomes taken from an existing record (probe hits): standalone textures and models
+    /// that were neither fetched nor encoded.
+    pub reused_textures: u64,
+    pub reused_models: u64,
+    /// Variant files written by this build (reused ones excluded) and their bytes.
     pub unique_variants: u64,
     pub unique_variant_bytes: u64,
     /// Originals considered (standalone textures) and their bytes.
@@ -283,6 +305,9 @@ impl BuildStats {
             if f.bc1_rejected == Some(true) {
                 s.bc1_rejected += 1;
             }
+            if f.reused {
+                s.reused_textures += 1;
+            }
         }
         s.files = files;
         s
@@ -295,6 +320,9 @@ impl BuildStats {
             g.considered += 1;
             g.original_bytes += m.original_size;
             self.stages.add(&m.times);
+            if m.reused {
+                self.reused_models += 1;
+            }
             match (&m.variant_size, m.reason) {
                 (Some(n), _) => {
                     g.variants += 1;
@@ -330,6 +358,7 @@ impl BuildStats {
             o.insert(
                 "stages_ms".into(),
                 serde_json::json!({
+                    "probe": ms(st.probe_ns),
                     "fetch": ms(st.fetch_ns),
                     "decode": ms(st.decode_ns),
                     "resize": ms(st.resize_ns),

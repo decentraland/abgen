@@ -102,11 +102,32 @@ pub(super) async fn timed_corpus_build(
     }
 }
 
-async fn probe_exists(probe: Option<std::path::PathBuf>) -> bool {
-    let Some(p) = probe else { return false };
-    tokio::task::spawn_blocking(move || p.is_file())
-        .await
-        .unwrap_or(false)
+/// How a lane tells `jit_build_entity` that the build it is queued for has already happened
+/// (a waiter on the per-entity lock then coalesces instead of building again): a file that
+/// exists once built, or a check of its own (the Bevy lane: a manifest that is also current).
+pub(super) enum JitProbe {
+    None,
+    Path(std::path::PathBuf),
+    Check(Box<dyn FnOnce() -> bool + Send + 'static>),
+}
+
+impl From<Option<std::path::PathBuf>> for JitProbe {
+    fn from(p: Option<std::path::PathBuf>) -> Self {
+        match p {
+            Some(p) => JitProbe::Path(p),
+            None => JitProbe::None,
+        }
+    }
+}
+
+async fn probe_exists(probe: JitProbe) -> bool {
+    match probe {
+        JitProbe::None => false,
+        JitProbe::Path(p) => tokio::task::spawn_blocking(move || p.is_file())
+            .await
+            .unwrap_or(false),
+        JitProbe::Check(f) => tokio::task::spawn_blocking(f).await.unwrap_or(false),
+    }
 }
 
 fn jit_build_permits() -> usize {
@@ -138,9 +159,10 @@ pub(super) async fn jit_build_entity(
     proxy: &std::sync::Arc<crate::live::Proxy>,
     entity: &str,
     platform: &str,
-    probe: Option<std::path::PathBuf>,
+    probe: impl Into<JitProbe>,
     lane: &'static str,
 ) -> JitBuild {
+    let probe = probe.into();
     let key = format!("{entity}:{platform}");
     if state.jit_fail_cache.get(&key).await.is_some() {
         metrics::counter!("abgen_jit_builds_total", "outcome" => "fail-cached").increment(1);

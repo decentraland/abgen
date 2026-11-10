@@ -118,9 +118,9 @@ fn usage_text() -> &'static str {
          abgen-corpus (--world <name>[,...] | --entity-ids <ids.txt> | --pointer <p>) <out-dir> \\\n               \
              --bevy-variants [--bevy-glb-variants] [--bevy-no-glb-meshopt] [--bevy-precompress br|none]\n               \
              [--bevy-zstd-level 1..19] [--worlds-url <url>] [--fetch-missing] [--content-dir <dir>] [-j JOBS]\n               \
-             (PROTOTYPE: builds only the Bevy variants lane - KTX2/GLB variants addressed\n               \
-              by CID plus one manifest per entity - into <out-dir>/bevy/{manifest,contents}/,\n               \
-              the layout `abgen` serves at /bevy/manifest/<entity>.json and /bevy/contents/<cid>)\n  \
+             (PROTOTYPE: builds only the Bevy variants lane - KTX2/GLB variants named by\n               \
+              source CID and generation plus one manifest per entity - into <out-dir>/bevy/,\n               \
+              the layout `abgen` serves at /bevy/manifest/<entity>.json and /bevy/<prefix>/<name>)\n  \
          abgen-corpus --live-mode <ab-cdn-reference-dir> <out-dir> \\\n               \
              [--platform windows|mac] [--per-vintage N] [--content-dir <dir>] [-j JOBS]\n\
          \n\

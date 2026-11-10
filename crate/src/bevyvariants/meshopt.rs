@@ -39,7 +39,7 @@ pub struct MeshoptVariant {
 }
 
 /// Why a model got no `glb-meshopt` variant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NoModelVariant {
     /// Content not available.

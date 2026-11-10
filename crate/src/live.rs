@@ -963,7 +963,7 @@ impl Proxy {
     }
 
     /// Bucket-scoped: a hit in one CDN bucket says nothing about another.
-    fn reuse_cache_key(&self, key: &str) -> Option<String> {
+    pub(crate) fn reuse_cache_key(&self, key: &str) -> Option<String> {
         if !crate::rediscache::enabled() {
             return None;
         }
