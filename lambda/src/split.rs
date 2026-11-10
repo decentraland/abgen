@@ -360,8 +360,11 @@ pub(crate) fn stage(cfg: &Config, env: &WorkerEnv, request: &ConvertRequest) -> 
         platforms,
         staging,
     } = request;
+    // The scratch view is derived from the CDN space built at start-up, never from the
+    // environment again: same endpoint and credentials, this job's bucket and prefix.
     let scratch = Arc::new(
-        cdn_space_from_env("worker")?
+        env.cdn
+            .same_endpoint()
             .writable_bucket(&staging.bucket)?
             .with_key_prefix(&staging.prefix)
             .logging_writes(),

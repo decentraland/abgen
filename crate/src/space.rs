@@ -422,6 +422,31 @@ impl Space {
         }
     }
 
+    /// A fresh space on this one's endpoint, region, bucket, addressing, credentials and
+    /// key prefix, with no write log: what a request derives its own view of another
+    /// bucket from ([`Space::writable_bucket`]) without reading the environment again.
+    /// Container credentials are fetched afresh by the copy.
+    pub fn same_endpoint(&self) -> Space {
+        Space {
+            scheme: self.scheme.clone(),
+            host: self.host.clone(),
+            region: self.region.clone(),
+            bucket: self.bucket.clone(),
+            path_style: self.path_style,
+            read_only: self.read_only,
+            creds: match &self.creds {
+                CredsSource::Static(c) => CredsSource::Static(c.clone()),
+                CredsSource::Container { url, auth_token, .. } => CredsSource::Container {
+                    url: url.clone(),
+                    auth_token: auth_token.clone(),
+                    cache: Mutex::new(None),
+                },
+            },
+            key_prefix: self.key_prefix.clone(),
+            written: None,
+        }
+    }
+
     pub fn creds_source(&self) -> &'static str {
         match &self.creds {
             CredsSource::Static(c) if c.session_token.is_some() => "static-env+session-token",
@@ -855,9 +880,9 @@ mod tests {
         assert_eq!(s.path("k"), "/scratch/k");
         // Virtual-hosted addressing keeps the bucket in the host: refused rather than
         // silently writing to the first bucket.
-        let err = test_space(true, None)
-            .writable_bucket("scratch")
-            .unwrap_err();
+        let Err(err) = test_space(true, None).writable_bucket("scratch") else {
+            panic!("virtual-hosted addressing was accepted for a scratch bucket");
+        };
         assert!(err.to_string().contains("ABGEN_S3_PATH_STYLE"), "{err}");
     }
 
