@@ -1002,6 +1002,7 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
     let lane = Lane {
         fetch: &fetch,
         probe: &probe,
+        stored: &|_: &str| -> Option<Vec<u8>> { None },
     };
     let out = std::env::temp_dir().join(format!("abgen-bevy-meshopt-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
@@ -1108,6 +1109,7 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
     let lane2 = Lane {
         fetch: &counting,
         probe: &probe,
+        stored: &|_: &str| -> Option<Vec<u8>> { None },
     };
     let again = build_entity_variants(
         &scene,
@@ -1188,6 +1190,7 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
     let lane5 = Lane {
         fetch: &counting,
         probe: &remote,
+        stored: &|_: &str| -> Option<Vec<u8>> { None },
     };
     fetches.store(0, std::sync::atomic::Ordering::Relaxed);
     let probed = build_entity_variants(&scene, &lane5, &out5, BuildOptions::default()).unwrap();
@@ -1247,6 +1250,7 @@ fn reused_meshopt_variant_without_br_gets_a_sidecar_without_a_fetch() {
     let lane = Lane {
         fetch: &fetch,
         probe: &probe,
+        stored: &|_: &str| -> Option<Vec<u8>> { None },
     };
     let out = std::env::temp_dir().join(format!("abgen-bevy-backfill-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
@@ -1323,6 +1327,7 @@ fn record_without_its_variant_is_rebuilt_alone() {
     let lane = Lane {
         fetch: &fetch,
         probe: &probe,
+        stored: &|_: &str| -> Option<Vec<u8>> { None },
     };
     let out = std::env::temp_dir().join(format!("abgen-bevy-evict-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
@@ -1399,6 +1404,7 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     let lane = Lane {
         fetch: &fetch,
         probe: &probe,
+        stored: &|_: &str| -> Option<Vec<u8>> { None },
     };
     let run = |tag: &str, opts: BuildOptions| {
         let out =
@@ -1605,4 +1611,38 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     let _ = std::fs::remove_dir_all(&out);
     let _ = std::fs::remove_dir_all(&out2);
     let _ = std::fs::remove_dir_all(&out3);
+}
+
+/// The store-backed build skips an entity only for a manifest that parses and was built from
+/// the prefixes it would use now.
+#[test]
+fn only_a_current_manifest_skips_the_store_backed_build() {
+    let lanes = BuildOptions::default().lanes();
+    let current = Manifest {
+        v: MANIFEST_VERSION,
+        lanes: lanes.clone(),
+        files: Default::default(),
+    };
+    assert!(super::manifest_bytes_current(
+        &serde_json::to_vec(&current).unwrap(),
+        &lanes
+    ));
+    let old_schema = Manifest {
+        v: MANIFEST_VERSION - 1,
+        ..current.clone()
+    };
+    assert!(!super::manifest_bytes_current(
+        &serde_json::to_vec(&old_schema).unwrap(),
+        &lanes
+    ));
+    let other_prefixes = BuildOptions {
+        epoch: Some(7),
+        ..BuildOptions::default()
+    }
+    .lanes();
+    assert!(!super::manifest_bytes_current(
+        &serde_json::to_vec(&current).unwrap(),
+        &other_prefixes
+    ));
+    assert!(!super::manifest_bytes_current(b"not json", &lanes));
 }

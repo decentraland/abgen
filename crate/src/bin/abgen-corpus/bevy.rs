@@ -60,9 +60,11 @@ pub(crate) fn run_bevy_variants(
             let fetch = |hash: &str| store.fetch(hash).ok();
             // No store to ask: records under <out-dir> are the only reuse.
             let probe = |_: &str| None;
+            let stored = |_: &str| None;
             let lane = abgen::bevyvariants::Lane {
                 fetch: &fetch,
                 probe: &probe,
+                stored: &stored,
             };
             abgen::bevyvariants::build_entity_variants(&scene, &lane, out_root, opts)
         })();

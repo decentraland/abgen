@@ -138,9 +138,13 @@ impl BuildOptions {
 /// unavailable: that file gets no variant and no record). `probe` returns the record of a
 /// variant key that already exists somewhere this build does not write (a shared store);
 /// `None` is a miss. Local records under `out_root` are read before `probe` is asked.
+/// `stored` returns a stored variant's bytes by key (`None` = not there); a variant under
+/// `out_root` is read before it is asked. It is only used to add a `.br` sidecar to a reused
+/// variant that has none.
 pub struct Lane<'a> {
     pub fetch: &'a (dyn Fn(&str) -> Option<Vec<u8>> + Sync),
     pub probe: &'a (dyn Fn(&str) -> Option<Record> + Sync),
+    pub stored: &'a (dyn Fn(&str) -> Option<Vec<u8>> + Sync),
 }
 
 /// One object this build wrote under `out_root`, in the order they are written (and a store
@@ -287,11 +291,12 @@ fn store(
 }
 
 /// Add the `.br` sidecar to a reused `glb-meshopt` variant whose record says it has none: read
-/// the plain bytes beside its record, check them against the record's CID,
+/// the plain bytes (local, then the lane's store), check them against the record's CID,
 /// compress, write the sidecar, then replace the record with one that says `br`. Uploads in
 /// that order (sidecar, record), so the store never has a record naming a missing sidecar.
 /// `None` when the bytes are not available or do not match: the variant is served plain.
 fn backfill_br(
+    lane: &Lane,
     out_root: &Path,
     key: &str,
     rec: &Record,
@@ -301,7 +306,7 @@ fn backfill_br(
         return Ok(None);
     };
     let dst = key_path(out_root, key).ok_or_else(|| anyhow::anyhow!("bad variant key {key:?}"))?;
-    let plain = std::fs::read(&dst).ok();
+    let plain = std::fs::read(&dst).ok().or_else(|| (lane.stored)(key));
     let Some(plain) = plain.filter(|b| cid_v1_raw_sha256(b) == v.cid) else {
         tracing::warn!(key = %key, "bevy glb-meshopt: reused variant unavailable; no .br added");
         return Ok(None);
@@ -554,7 +559,7 @@ pub fn build_entity_variants(
                     // a sidecar gets one here once precompression is on, without a re-encode.
                     if opts.precompress_br && !rec.br && rec.variant.is_some() {
                         if let Some((r, br_size, ups)) =
-                            backfill_br(out_root, &key, &rec, &mut times)?
+                            backfill_br(lane, out_root, &key, &rec, &mut times)?
                         {
                             rec = r;
                             stat.br_size = Some(br_size);

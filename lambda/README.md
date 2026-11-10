@@ -31,6 +31,7 @@ entities. The Lambda handler enables it once and clears it after each entity.
 | 5 | already-converted skip (entity-level manifest check) **and** per-file asset reuse (space probe per digest-named glb) | done |
 | 6 | container image (`nix build .#lambdaImage`) | done |
 | 7 | LOD generation — a scene conversion continues into the `lodgen` LOD lane once its bundles are notified, opt-in with `ENABLE_LODS` | done |
+| 8 | Bevy variants — every conversion continues into the Bevy variants lane (`abgen::live::Proxy::build_bevy_variants`): skip on a current manifest in the store, probe each variant in Redis and S3, encode the misses, upload, manifest last. On unless `ABGEN_BEVY_VARIANTS=0` | done |
 
 ## Local run (no AWS)
 
@@ -65,6 +66,7 @@ all hits.
 | `ABGEN_REDIS_TTL_SECONDS` | `86400` | TTL on cached positive probes |
 | `ABGEN_HTTP_SECRET` | — (**fail-closed**) | shared secret the Function URL POST path requires in `x-abgen-secret`; unset means every HTTP invocation is refused with `503` |
 | `ENABLE_LODS` | off | after a scene's asset bundles are published and notified, build (or reuse) its `LOD_LEVELS` in the same job (see [LOD generation](#lod-generation)) |
+| `ABGEN_BEVY_VARIANTS` | on | after an entity's asset bundles (and LODs), build its Bevy variants and their manifest in the same job. It is not a `PLATFORMS` member: it sends no conversion-finished event and its failure never fails the job (reported under `bevy` in the summary). `0` turns it off |
 | `LOD_LEVELS` | `1` | comma-separated LOD levels the LOD lane builds and publishes (`0,1` for both); level 2 is refused |
 | `ALLOWED_CONTENT_SERVER_HOSTS` | — (**fail-open**) | comma-separated allowlist of hosts an event's `contentServerUrl` may name; **unset means any https host is accepted**, so every deployment should set it. Scheme/shape validation (https only, no userinfo, a public DNS name: no IP literal in any notation, no single-label or `localhost` name) applies regardless. The `lambdaImage` bakes in `peer.decentraland.org`; a function env var overrides it. |
 | `ABGEN_SANDBOX_SECCOMP` | `required` (the `lambdaImage` bakes in `auto`) | scene sandbox policy for the LOD lane. Lambda's runtime refuses `prctl(PR_SET_NO_NEW_PRIVS)`, so the sandbox child cannot install its seccomp filter there; under `required` every LOD build then fails with `scene sandbox self-test failed, refusing to run scenes: seccomp is unavailable here (…); set ABGEN_SANDBOX_SECCOMP=auto …`; under `auto` scenes run in the separate process (empty environment, `RLIMIT_DATA`, `RLIMIT_NPROC=0`, own process group, parent-death kill, non-dumpable parent) **without the syscall filter**: a QuickJS escape would then have the function's ordinary file, network and exec access, though not a second process or the parent's memory. One warning is logged per process and `abgen_scene_sandbox_seccomp_total{state="unavailable"}` counts it |
@@ -333,6 +335,8 @@ extra dimensions.
 | wearable & emote bundles (entity-scoped) | `{AB_VERSION}/{entityId}/{bundleName}` |
 | manifests | `manifest/{entityId}_{platform}.json` |
 | scene sources (`main.crdt`, `scene.json`, main script; clean scene builds) | `{AB_VERSION}/{entityId}/{file}` |
+| Bevy variants (bytes, `.br` sidecar, `.json` record) | `bevy/{prefix}/{name}`, `bevy/{prefix}/{name}.br`, `bevy/{prefix}/{name}.json` |
+| Bevy variants manifest | `bevy/manifest/{entityId}.json` |
 | LOD bundles, `ENABLE_LODS=1` | `LOD/{level}/{sceneId}_{level}_{platform}` |
 | ISS descriptor, `ENABLE_LODS=1` | `lods-unity/manifests/{sceneId}_InitialSceneState.json` |
 | published LOD GLB (gltfpack layout, level 1 only), `ENABLE_LODS=1` | `lods-unity/lods/{sceneId}_1.glb` |

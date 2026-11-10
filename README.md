@@ -290,8 +290,9 @@ the original file on anything else, so the lane can be switched off at any time.
   (at most one path per class per original: a texture, a `glb-meshopt`, and a `glb` only when GLB
   variants are on). 404 while absent, and while every copy on disk was built from an older
   generation or schema (`X-Abgen-Reason: bevy-variants-stale`, see the asset lane below).
-  Nothing is built on request: the lane is built offline with `abgen-corpus --bevy-variants`,
-  and the client loads the original files until a manifest exists.
+  Nothing is built on request: the conversion lambda builds the lane for each entity after its
+  asset bundles (`lambda/src/bevy.rs`), and `abgen-corpus --bevy-variants` builds it offline. The
+  client loads the original files until a manifest exists.
   `Cache-Control: private, max-age=0, no-cache`.
 - `GET /bevy/{prefix}/{name}` (an entry's `path`) - variant bytes, `public,max-age=31536000,immutable`,
   `Range`, `ETag`, CORS (preflight allows `X-IPFS`). Never built on its own: it exists once a
@@ -303,7 +304,7 @@ the original file on anything else, so the lane can be switched off at any time.
   (`bevy/manifest/…`, `bevy/{prefix}/…`, and `{name}.br` when the client accepts `br`), so a
   corpus output synced to the bucket is served as is. Files read through count against the JIT
   disk budget one by one; an evicted one is read through again. The server never writes these
-  keys. `ABGEN_BEVY_VARIANTS=0` turns the read-through off.
+  keys: the conversion lambda does. `ABGEN_BEVY_VARIANTS=0` turns the read-through off.
 
 **Asset lane.** A variant's name is a function of its inputs, so a build knows the name before
 doing any work and looks for its record the way the Unity lanes probe
@@ -321,17 +322,26 @@ Beside every variant sits its record, `{name}.json`: the manifest entry (`varian
 there is none (`reason`: `size-gate`, `tiny`, `decode-error`, …, so a file that cannot have a
 variant is not retried by every entity that references it), whether a `.br` sidecar exists
 (`br`), and on model records how the model samples each image URI (`uses`), so a warm entity
-needs no model bytes to pick its textures' slots. A build reads each key's record from its
-output directory (a record whose variant file is gone is a miss and is deleted). A hit fills the
-manifest row; a miss fetches and encodes. Outcomes that depend on the run (content missing, a
-failed write) are never recorded. Writes go variant bytes, `.br`, record, and the manifest last,
-so a manifest never names a variant that is not there.
+needs no model bytes to pick its textures' slots.
+
+The store-backed build (`Proxy::build_bevy_variants`, run by the conversion lambda once per
+entity) works like the bundle lanes. Unless forced, an entity whose manifest in the store is
+current is skipped outright. Otherwise it probes each key's record in order: its output
+directory (a record whose variant file is gone is a miss and is deleted), Redis
+(`abgen:hit:{bucket}:{key}.json`, the record is the marker's value, 24 h, positives only,
+fail-open), the store (one GET, then marked in Redis). A hit fills the manifest row; a miss
+fetches and encodes. Outcomes that depend on the run (content missing, a failed write) are never
+recorded. Writes go variant bytes, `.br`, record (then its Redis mark), and the manifest last, so
+the store never names an object that is not there; a key whose objects did not all land is
+dropped whole, and if any upload fails the manifest is not written, so the next conversion of
+the entity tries again. The offline build (`abgen-corpus --bevy-variants`) uses only the records
+in its output directory.
 
 Versioning is two integers in `crate/src/bevyvariants/mod.rs`: `TEX_GEN` (BC encoders, mips,
 size cap, KTX2 writer, UASTC transcode) and `MESH_GEN` (meshopt codecs, filters, precision, GLB
 rewrite). Bump one when its encoder's output bytes change: every key of that class moves to a new
 prefix, the previous prefix (`bevy/t1/`, …) is garbage and can be deleted whole, and manifests
-built from it (their `lanes` name it) read as stale until the next offline build, which re-encodes only that class.
+built from it (their `lanes` name it) read as stale until the entity's next build, which re-encodes only that class.
 The generations live in code because they describe the encoders. The operator's lever is
 `ABGEN_BEVY_EPOCH` (unset by default; a number `0..=9999`): when set, every prefix gets `e{N}`
 appended (`t2e2`, `m1e2`), so every key misses, every manifest reads as stale and the lane

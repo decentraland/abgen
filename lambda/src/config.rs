@@ -15,6 +15,9 @@ pub struct Config {
     pub allowed_content_server_hosts: Option<Vec<String>>,
     pub http_secret: Option<String>,
     pub lods_enabled: bool,
+    /// Build the Bevy variants lane for every entity after its asset bundles
+    /// (`ABGEN_BEVY_VARIANTS`, on unless set to `0`).
+    pub bevy_enabled: bool,
     /// Must match the SQS redrive `maxReceiveCount`: a job failing on this
     /// receive publishes a failure tombstone instead of erroring into the DLQ.
     pub max_receive_count: u32,
@@ -72,6 +75,7 @@ impl Config {
                 .ok()
                 .filter(|v| !v.is_empty()),
             lods_enabled: abgen::clihelp::env_bool("ENABLE_LODS", false),
+            bevy_enabled: abgen::clihelp::env_bool("ABGEN_BEVY_VARIANTS", true),
             max_receive_count: max_receive_count_from_env(),
             lod_levels,
         }

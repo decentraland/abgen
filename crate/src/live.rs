@@ -984,7 +984,7 @@ impl Proxy {
     }
 
     /// Bucket-scoped: a hit in one CDN bucket says nothing about another.
-    fn reuse_cache_key(&self, key: &str) -> Option<String> {
+    pub(crate) fn reuse_cache_key(&self, key: &str) -> Option<String> {
         if !crate::rediscache::enabled() {
             return None;
         }
@@ -1183,8 +1183,9 @@ impl Proxy {
         content_server_url: &str,
     ) -> Result<Vec<String>> {
         if platform == crate::bevyvariants::BEVY_PLATFORM {
-            // No on-demand build of the Bevy lane: it is built offline.
-            bail!("the Bevy variants lane is built offline (abgen-corpus --bevy-variants)");
+            // Not a bundle platform: the Bevy lane has its own entry point, which the
+            // conversion job runs per entity. No request lane builds it.
+            bail!("bevy is not a bundle platform; the Bevy variants lane is built by Proxy::build_bevy_variants");
         }
         if platform == crate::bvwebgpu::BVW_PLATFORM {
             #[cfg(feature = "web-pack")]

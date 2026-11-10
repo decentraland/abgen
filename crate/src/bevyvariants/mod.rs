@@ -47,7 +47,8 @@
 //! reason there is no variant (so a size-gated or tiny image is not retried by every entity
 //! that references it), plus, for models, how the model samples each image URI (so a warm
 //! entity needs no model bytes to pick its textures' slots). The record is what a build
-//! reads, from its output directory, before doing any work; a miss fetches and encodes. Records and
+//! reads before doing any work: its output directory, then (the store-backed build) Redis and
+//! the store; a miss fetches and encodes. Records and
 //! variants are immutable within a generation: [`TEX_GEN`] and [`MESH_GEN`] are bumped by hand
 //! when an encoder's output bytes change (precision, level, size cap, codec), which moves
 //! every key of that class to a new prefix; the previous prefix is garbage and can be deleted
@@ -390,4 +391,177 @@ pub fn cache_key(root: &Path, path: &Path) -> Option<String> {
         key.push_str(c?);
     }
     Some(key)
+}
+
+/// What [`crate::live::Proxy::build_bevy_variants`] did for one entity.
+#[cfg(feature = "bevy-variants")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BevyBuild {
+    /// The store already had a current manifest for the entity: nothing was built.
+    pub skipped: bool,
+    /// Originals with at least one variant.
+    pub originals: usize,
+    /// Variants reused from their records (no fetch, no encode).
+    pub reused: u64,
+    /// Variants this build encoded.
+    pub built: u64,
+}
+
+/// Whether `bytes` is a manifest built from the prefixes `lanes` names ([`Manifest::is_current`]).
+#[cfg(feature = "bevy-variants")]
+fn manifest_bytes_current(bytes: &[u8], lanes: &BTreeMap<String, String>) -> bool {
+    serde_json::from_slice::<Manifest>(bytes).is_ok_and(|m| m.is_current(lanes))
+}
+
+#[cfg(feature = "bevy-variants")]
+impl crate::live::Proxy {
+    /// The lane's probe against the store: Redis first (the record is the marker's value),
+    /// then the record object. Any error is a miss, so the worst case is an encode that was
+    /// not needed. The record read from the store is marked for the next probe.
+    pub fn bevy_probe(&self, key: &str) -> Option<Record> {
+        let rk = record_key(key);
+        let cache_key = self.reuse_cache_key(&rk);
+        if let Some(ck) = &cache_key {
+            if let Some(v) = crate::rediscache::get(ck) {
+                if let Some(r) = Record::parse(v.as_bytes()) {
+                    metrics::counter!("abgen_bevy_probe_total", "outcome" => "redis").increment(1);
+                    return Some(r);
+                }
+            }
+        }
+        if !self.space_configured() {
+            return None;
+        }
+        let Some(bytes) = self.space_get_key(&rk) else {
+            metrics::counter!("abgen_bevy_probe_total", "outcome" => "miss").increment(1);
+            return None;
+        };
+        let Some(r) = Record::parse(&bytes) else {
+            tracing::warn!(key = %rk, "bevy variants: unreadable record, rebuilding");
+            metrics::counter!("abgen_bevy_probe_total", "outcome" => "miss").increment(1);
+            return None;
+        };
+        if let (Some(ck), Ok(v)) = (&cache_key, std::str::from_utf8(&bytes)) {
+            crate::rediscache::mark_with(ck, v);
+        }
+        metrics::counter!("abgen_bevy_probe_total", "outcome" => "space").increment(1);
+        Some(r)
+    }
+
+    /// Build one entity's Bevy variants against the store, the way the bundle lanes build an
+    /// entity. Called by the conversion job, once per entity; no request lane calls it.
+    ///
+    /// 1. Unless `force`, a current manifest already in the store means the entity is done:
+    ///    nothing is resolved, fetched or built.
+    /// 2. The entity is resolved through this proxy's content sources. Each variant key is
+    ///    probed ([`Self::bevy_probe`]: Redis, then its record in the store); a hit fills the
+    ///    manifest row, a miss fetches and encodes into `out_root`.
+    /// 3. What was built is written back: each variant's bytes, then its sidecar, then its
+    ///    record (marked in Redis once written), and the manifest last, so nothing in the
+    ///    store ever names an object that is not there. A key whose objects did not all land
+    ///    is dropped whole, and the manifest is not written: the next build finds what did.
+    ///
+    /// Without object storage it only builds into `out_root`.
+    pub fn build_bevy_variants(
+        self: &std::sync::Arc<Self>,
+        out_root: &Path,
+        cid: &str,
+        force: bool,
+    ) -> anyhow::Result<BevyBuild> {
+        let started = std::time::Instant::now();
+        let opts = BuildOptions::from_env();
+        if !force && self.space_configured() {
+            let current = self
+                .space_get_key(&manifest_key(cid))
+                .is_some_and(|b| manifest_bytes_current(&b, &opts.lanes()));
+            if current {
+                tracing::info!(entity = %cid, "bevy variants: current manifest in the store, skipped");
+                return Ok(BevyBuild {
+                    skipped: true,
+                    ..Default::default()
+                });
+            }
+        }
+        let ctx = self.entity_ctx(cid)?;
+        let fetch = |hash: &str| -> Option<Vec<u8>> {
+            match self.content_bytes_allow_empty(hash) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    tracing::warn!(hash = %hash, error = %format!("{e:#}"), "bevy variants: content fetch failed");
+                    None
+                }
+            }
+        };
+        let probe = |key: &str| self.bevy_probe(key);
+        let stored = |key: &str| -> Option<Vec<u8>> {
+            if self.space_configured() {
+                self.space_get_key(key)
+            } else {
+                None
+            }
+        };
+        let lane = Lane {
+            fetch: &fetch,
+            probe: &probe,
+            stored: &stored,
+        };
+        let out = build_entity_variants(&ctx.scene, &lane, out_root, opts)?;
+        if self.space_configured() {
+            // A key whose bytes, sidecar or record did not all land is dropped whole: its
+            // later objects are skipped (so the store never holds a record naming bytes it
+            // lacks), nothing is marked in Redis, and its local record is deleted so the next
+            // build here re-encodes and re-uploads it instead of reusing it.
+            let mut failed = 0usize;
+            let mut failed_owner: Option<&str> = None;
+            for obj in &out.uploads {
+                if failed_owner == Some(obj.owner.as_str()) {
+                    continue;
+                }
+                let put = std::fs::read(&obj.path)
+                    .map_err(|e| anyhow::anyhow!("re-read {}: {e}", obj.path.display()))
+                    .and_then(|bytes| {
+                        self.space_put_key_strict(&obj.key, &bytes)?;
+                        Ok(bytes)
+                    });
+                let bytes = match put {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(key = %obj.key, error = %format!("{e:#}"), "bevy variants: upload failed");
+                        failed += 1;
+                        failed_owner = Some(obj.owner.as_str());
+                        if let Some(rec) = key_path(out_root, &record_key(&obj.owner)) {
+                            let _ = std::fs::remove_file(rec);
+                        }
+                        continue;
+                    }
+                };
+                if obj.record {
+                    if let (Some(ck), Ok(v)) =
+                        (self.reuse_cache_key(&obj.key), std::str::from_utf8(&bytes))
+                    {
+                        crate::rediscache::mark_with(&ck, v);
+                    }
+                }
+            }
+            if failed > 0 {
+                anyhow::bail!("{failed} uploads failed; manifest not written");
+            }
+            self.space_put_key_strict(&manifest_key(cid), &out.manifest_bytes)?;
+        }
+        let build = BevyBuild {
+            skipped: false,
+            originals: out.entries.len(),
+            reused: out.stats.reused_textures + out.stats.reused_models,
+            built: out.stats.unique_variants,
+        };
+        tracing::info!(
+            entity = %cid,
+            originals = build.originals,
+            reused = build.reused,
+            built = build.built,
+            ms = started.elapsed().as_millis() as u64,
+            "bevy variants built"
+        );
+        Ok(build)
+    }
 }
