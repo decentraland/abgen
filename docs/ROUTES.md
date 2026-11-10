@@ -26,7 +26,7 @@ CORS `*` exposing `ETag`/`Content-Range`/`Accept-Ranges`/`Content-Length`.
 
 Deltas an operator must know:
 
-- Outside the Bevy variants lane, abgen does not generate, serve, or negotiate Brotli sidecars. Web deployments can apply HTTP compression at their own edge without changing abgen object keys. The Bevy lane's `glb-meshopt` variants can carry a `.br` sidecar (`ABGEN_BEVY_PRECOMPRESS=br`), negotiated by `Accept-Encoding`.
+- Outside the Bevy variants lane, abgen does not generate, serve, or negotiate Brotli sidecars. Web deployments can apply HTTP compression at their own edge without changing abgen object keys. The Bevy lane's `glb-meshopt` variants carry a `.br` sidecar (on by default, `ABGEN_BEVY_PRECOMPRESS=none` turns it off), negotiated by `Accept-Encoding`.
 - Manifests are `no-cache` where upstream serves a cacheable TTL. A fronting CDN must forward
   `Range` and honor the `no-cache`.
 

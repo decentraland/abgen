@@ -10,7 +10,8 @@
 //! The output is always a GLB with one BIN: external `.bin` buffers of a `.gltf` have to be read
 //! to compress their meshes, so they are inlined (only buffers; image URIs are never resolved).
 //!
-//! Also here: the Brotli precompression of a variant (`ABGEN_BEVY_PRECOMPRESS=br`), stored beside
+//! Also here: the Brotli precompression of a variant (on by default; `ABGEN_BEVY_PRECOMPRESS=none`
+//! turns it off), stored beside
 //! it as `<cid>.br` and served with `Content-Encoding: br`, and the stream decoder the geometry
 //! check (`examples/bevy_geometry_check.rs`) uses.
 

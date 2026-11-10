@@ -29,8 +29,8 @@ pub struct BuildOptions {
     /// `glb-meshopt` model variants (`super::meshopt`): on by default, independent of
     /// `glb_variants`.
     pub glb_meshopt: bool,
-    /// Store each `glb-meshopt` variant Brotli-compressed as `{key}.br` beside it, too. Only
-    /// a variant built by this run gets one: a reused variant keeps whatever its builder left.
+    /// Store each `glb-meshopt` variant Brotli-compressed as `{key}.br` beside it, too. On by
+    /// default. A reused variant whose record has no sidecar gets one added (no re-encode).
     pub precompress_br: bool,
     /// Zstandard level of every KTX2 level ([`crate::ktx2_write::DEFAULT_ZSTD_LEVEL`] by
     /// default). Part of the variant bytes, so part of the texture prefix.
@@ -45,7 +45,7 @@ impl Default for BuildOptions {
         BuildOptions {
             glb_variants: false,
             glb_meshopt: true,
-            precompress_br: false,
+            precompress_br: true,
             zstd_level: crate::ktx2_write::DEFAULT_ZSTD_LEVEL,
             epoch: None,
         }
@@ -56,13 +56,29 @@ impl Default for BuildOptions {
 pub const ZSTD_LEVEL_ENV: &str = "ABGEN_BEVY_ZSTD_LEVEL";
 /// `0` turns [`BuildOptions::glb_meshopt`] off.
 pub const GLB_MESHOPT_ENV: &str = "ABGEN_BEVY_GLB_MESHOPT";
-/// `br` turns [`BuildOptions::precompress_br`] on (anything else: off).
+/// `none` turns [`BuildOptions::precompress_br`] off; `br` (the default) keeps it on.
 pub const PRECOMPRESS_ENV: &str = "ABGEN_BEVY_PRECOMPRESS";
+
+/// [`PRECOMPRESS_ENV`]'s value: `br` (or `1`/`true`/`on`) is on, `none` (or `0`/`false`/
+/// `off`) is off, unset or empty is the default (on); anything else is logged and ignored.
+fn precompress_from_env() -> bool {
+    let Ok(v) = std::env::var(PRECOMPRESS_ENV) else {
+        return true;
+    };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" | "br" | "1" | "true" | "on" => true,
+        "none" | "0" | "false" | "off" => false,
+        _ => {
+            tracing::warn!(value = %v, "{PRECOMPRESS_ENV} ignored: expected br or none");
+            true
+        }
+    }
+}
 
 impl BuildOptions {
     /// `ABGEN_BEVY_GLB_VARIANTS=1` turns GLB variants on (default off);
     /// `ABGEN_BEVY_GLB_MESHOPT=0` turns `glb-meshopt` variants off (default on);
-    /// `ABGEN_BEVY_PRECOMPRESS=br` stores `.br` sidecars of them (default off);
+    /// `ABGEN_BEVY_PRECOMPRESS=none` stops storing `.br` sidecars of them (default on);
     /// `ABGEN_BEVY_ZSTD_LEVEL` (1..=19) sets the Zstandard level (default 19; an invalid value
     /// is logged and the default is used); `ABGEN_BEVY_EPOCH` sets the epoch (default unset).
     pub fn from_env() -> Self {
@@ -84,8 +100,7 @@ impl BuildOptions {
         BuildOptions {
             glb_variants: crate::clihelp::env_bool("ABGEN_BEVY_GLB_VARIANTS", false),
             glb_meshopt: crate::clihelp::env_bool(GLB_MESHOPT_ENV, true),
-            precompress_br: std::env::var(PRECOMPRESS_ENV)
-                .is_ok_and(|v| v.trim().eq_ignore_ascii_case("br")),
+            precompress_br: precompress_from_env(),
             zstd_level,
             epoch: super::epoch_from_env(),
         }

@@ -336,7 +336,8 @@ re-encodes into the new prefixes, without a release. Setting it back finds the o
 No per-recipe digests: skins, animations and textures referenced by a model do not change the
 model variant's bytes, so they are not in its name. The option toggles
 (`glb_meshopt`, `glb_variants`, `precompress_br`) are not generations: a reused `glb-meshopt`
-variant keeps whatever `.br` sidecar its builder left.
+variant whose record has no `.br` sidecar gets one added while precompression is on, without a
+re-encode, and turning it off leaves existing sidecars in place.
 
 Variants (all textures are KTX2 with UNORM BC blocks, each level Zstandard-supercompressed,
 `KTXorientation` `rd`; writer in `crate/src/ktx2_write.rs`). Zstandard is libzstd 1.5.7, bundled by
@@ -377,8 +378,8 @@ release, never on the machine or thread count; a new libzstd release is a `TEX_G
   their bufferViews and MIME types, external image URIs, materials, animations and extras stay as
   they are (external `.bin` buffers are inlined, because the meshes live there). Draco primitives
   are left alone; a file already using `EXT_meshopt_compression` gets none. The variant is kept
-  only when smaller than the original. With `ABGEN_BEVY_PRECOMPRESS=br` (`--bevy-precompress br`)
-  each one is also stored as `{name}.br` beside it (Brotli quality 9, window 22; uploaded
+  only when smaller than the original. Each one is also stored as `{name}.br` beside it (on by
+  default; `ABGEN_BEVY_PRECOMPRESS=none` or `--bevy-precompress none` turns it off) (Brotli quality 9, window 22; uploaded
   with `Content-Encoding: br`) for the route above; KTX2 variants are never Brotli'd. On a
   read-through miss the edge fetches the sidecar beside the variant when the client accepts
   `br`. `cargo run --release --example

@@ -1297,13 +1297,14 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
         let built = build_entity_variants(&scene, &lane, &out, opts).unwrap();
         (out, built)
     };
-    // Default: texture and glb-meshopt variants (GLB variants with KTX2 inside are opt-in).
+    // Default: texture and glb-meshopt variants with `.br` sidecars (GLB variants with KTX2
+    // inside are opt-in).
     assert_eq!(
         BuildOptions::default(),
         BuildOptions {
             glb_variants: false,
             glb_meshopt: true,
-            precompress_br: false,
+            precompress_br: true,
             zstd_level: crate::ktx2_write::DEFAULT_ZSTD_LEVEL,
             epoch: None,
         }

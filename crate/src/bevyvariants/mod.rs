@@ -21,9 +21,9 @@
 //! - Models also get a `glb-meshopt` variant (`model`, on by default, `ABGEN_BEVY_GLB_MESHOPT=0`
 //!   turns it off; [`meshopt`]): the original with its triangle meshes as
 //!   `EXT_meshopt_compression` streams and nothing else touched, kept only when smaller than the
-//!   original. With `ABGEN_BEVY_PRECOMPRESS=br` each one is also stored Brotli-compressed as
-//!   `{key}.br` beside it and served with `Content-Encoding: br` to clients that accept it; the
-//!   CID is always of the plain bytes. KTX2 variants are never Brotli'd.
+//!   original. Each one is also stored Brotli-compressed as `{key}.br` beside it (on by default,
+//!   `ABGEN_BEVY_PRECOMPRESS=none` turns it off) and served with `Content-Encoding: br` to
+//!   clients that accept it; the CID is always of the plain bytes. KTX2 variants are never Brotli'd.
 //! - Nothing else gets a variant (scene code, audio, video, source maps, unknown files).
 //!
 //! The client contract: no manifest, no entry, or any failure means the client loads the

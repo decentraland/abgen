@@ -36,7 +36,7 @@ pub struct StageTimes {
     pub zstd_ns: u64,
     /// `glb-meshopt` models: parse, meshopt encode and GLB rewrite.
     pub meshopt_ns: u64,
-    /// Brotli of a `glb-meshopt` variant (`ABGEN_BEVY_PRECOMPRESS=br`).
+    /// Brotli of a `glb-meshopt` variant (`.br` sidecar, on by default).
     pub brotli_ns: u64,
     /// CID (sha256) plus writing the variant file (and its `.br` sidecar).
     pub hash_write_ns: u64,
