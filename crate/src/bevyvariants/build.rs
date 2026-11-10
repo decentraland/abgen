@@ -140,9 +140,10 @@ impl BuildOptions {
 /// Redis); `None` is a miss. Local records under `out_root` are read before `probe` is asked.
 /// `stored` returns a stored variant's bytes by key (`None` = not there); a variant under
 /// `out_root` is read before it is asked. It is only used to add a `.br` sidecar to a reused
-/// variant that has none. `wrote` is told every file the build writes under `out_root`
-/// (variants, sidecars, records, negative records and the manifest), as it is written, so a
-/// build that fails part-way has still reported what it left on disk.
+/// variant that has none. `wrote` is told every file the build writes or reuses under
+/// `out_root` (variants, sidecars, records, negative records and the manifest), as it goes, so
+/// a build that fails part-way has still reported what it left on disk, and a reused file is
+/// bumped in the JIT cache along with the build that used it.
 pub struct Lane<'a> {
     pub fetch: &'a (dyn Fn(&str) -> Option<Vec<u8>> + Sync),
     pub probe: &'a (dyn Fn(&str) -> Option<Record> + Sync),
@@ -221,11 +222,30 @@ fn local_record(out_root: &Path, key: &str) -> Option<Record> {
     Some(rec)
 }
 
-/// Local disk, then the lane's probe.
+/// Local disk, then the lane's probe. A local hit reports the key's files (variant, `.br`
+/// sidecar, record) to the lane as reused, so the JIT cache bumps them with this build.
 fn probe(lane: &Lane, out_root: &Path, key: &str, times: &mut StageTimes) -> Option<Record> {
     timed(&mut times.probe_ns, || {
-        local_record(out_root, key).or_else(|| (lane.probe)(key))
+        if let Some(r) = local_record(out_root, key) {
+            report_local(lane, out_root, key);
+            return Some(r);
+        }
+        (lane.probe)(key)
     })
+}
+
+/// Tell the lane about a key's files already under `out_root`.
+fn report_local(lane: &Lane, out_root: &Path, key: &str) {
+    let Some(dst) = key_path(out_root, key) else {
+        return;
+    };
+    let br = meshopt::br_sidecar(&dst);
+    let rec = key_path(out_root, &record_key(key));
+    for p in [Some(dst), Some(br), rec].into_iter().flatten() {
+        if p.is_file() {
+            (lane.wrote)(&p);
+        }
+    }
 }
 
 /// Write `bytes` to `dst` through a temporary sibling, then tell the lane (`Lane::wrote`).
@@ -256,7 +276,9 @@ fn store(
     let mut out = Vec::with_capacity(3);
     let dst = key_path(out_root, key).ok_or_else(|| anyhow::anyhow!("bad variant key {key:?}"))?;
     if let Some(b) = bytes {
-        if !dst.is_file() {
+        if dst.is_file() {
+            (lane.wrote)(&dst);
+        } else {
             write_atomic(lane, &dst, b)?;
         }
         out.push(Upload {
@@ -268,7 +290,9 @@ fn store(
     }
     if let Some(b) = br {
         let br_dst = meshopt::br_sidecar(&dst);
-        if !br_dst.is_file() {
+        if br_dst.is_file() {
+            (lane.wrote)(&br_dst);
+        } else {
             write_atomic(lane, &br_dst, b)?;
         }
         out.push(Upload {
@@ -280,7 +304,9 @@ fn store(
     }
     let rk = record_key(key);
     let rec_dst = key_path(out_root, &rk).expect("a variant key's record is a valid key");
-    if !rec_dst.is_file() {
+    if rec_dst.is_file() {
+        (lane.wrote)(&rec_dst);
+    } else {
         write_atomic(
             lane,
             &rec_dst,
@@ -727,7 +753,7 @@ pub fn build_entity_variants(
                                 uses: out.uses.clone(),
                             };
                             out.uploads
-                                .extend(store(lane,out_root, &key, None, None, &rec, &mut times)?);
+                                .extend(store(lane, out_root, &key, None, None, &rec, &mut times)?);
                         }
                         Ok(Err(e)) => {
                             tracing::warn!(entity = %entity, file = %file, error = %format!("{e:#}"), "bevy model variant skipped");
@@ -834,7 +860,7 @@ pub fn build_entity_variants(
                             br: false,
                             uses: BTreeMap::new(),
                         };
-                        store(lane,out_root, &key, None, None, &rec, &mut times)?
+                        store(lane, out_root, &key, None, None, &rec, &mut times)?
                     } else {
                         Vec::new()
                     };
@@ -851,7 +877,7 @@ pub fn build_entity_variants(
                         br: false,
                         uses: BTreeMap::new(),
                     };
-                    let uploads = store(lane,out_root, &key, None, None, &rec, &mut times)?;
+                    let uploads = store(lane, out_root, &key, None, None, &rec, &mut times)?;
                     stat.times = times;
                     return Ok((row(None), stat, uploads));
                 }
@@ -867,7 +893,7 @@ pub fn build_entity_variants(
                 br: false,
                 uses: BTreeMap::new(),
             };
-            let uploads = store(lane,out_root, &key, Some(&v.bytes), None, &rec, &mut times)?;
+            let uploads = store(lane, out_root, &key, Some(&v.bytes), None, &rec, &mut times)?;
             stat.format = Some(v.format.manifest_name());
             stat.variant_path = Some(key.clone());
             stat.variant_cid = Some(e.cid.clone());

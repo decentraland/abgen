@@ -155,6 +155,8 @@ pub(super) async fn bevy_serve_local(
             let send_br = has_br && accepts_br(headers);
             let etag = format!("{prefix}/{name}");
             let mut resp = if send_br {
+                // The sidecar is its own LRU entry: keep it as warm as the bytes it encodes.
+                state.touch_if_jit(&br, from_jit);
                 let key = format!("{path}.br");
                 let etag = format!("{etag}.br");
                 serve::serve_binary(state, &key, &br, &etag, method, headers).await

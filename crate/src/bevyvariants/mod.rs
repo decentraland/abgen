@@ -375,6 +375,32 @@ impl Manifest {
 #[cfg(all(test, feature = "bevy-variants"))]
 mod tests;
 
+/// Moves the paths a Bevy build reported into `Proxy::bevy_written` when dropped, so they
+/// reach the JIT cache even when the build panics.
+#[cfg(feature = "bevy-variants")]
+struct WrittenStash<'a> {
+    proxy: &'a crate::live::Proxy,
+    entity: &'a str,
+    paths: std::sync::Mutex<Vec<PathBuf>>,
+}
+
+#[cfg(feature = "bevy-variants")]
+impl Drop for WrittenStash<'_> {
+    fn drop(&mut self) {
+        let paths = std::mem::take(self.paths.get_mut().unwrap_or_else(|e| e.into_inner()));
+        if paths.is_empty() {
+            return;
+        }
+        self.proxy
+            .bevy_written
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(self.entity.to_string())
+            .or_default()
+            .extend(paths);
+    }
+}
+
 #[cfg(feature = "bevy-variants")]
 impl crate::live::Proxy {
     /// The lane's probe against the store: Redis first (the record is the marker's value),
@@ -440,9 +466,16 @@ impl crate::live::Proxy {
                 None
             }
         };
-        let written = std::sync::Mutex::new(Vec::<PathBuf>::new());
+        // Everything the build writes or reuses, handed to the JIT cache however the build
+        // ends: on success, on error and while unwinding from a panic (the guard's drop).
+        let written = WrittenStash {
+            proxy: self,
+            entity: cid,
+            paths: std::sync::Mutex::new(Vec::new()),
+        };
         let wrote = |p: &Path| {
             written
+                .paths
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(p.to_path_buf());
@@ -454,13 +487,7 @@ impl crate::live::Proxy {
             wrote: &wrote,
         };
         let built = build_entity_variants(&ctx.scene, &lane, out_root, BuildOptions::from_env());
-        // Everything the build left on disk, success or not, for the JIT cache to account.
-        self.bevy_written
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(cid.to_string())
-            .or_default()
-            .extend(written.into_inner().unwrap_or_else(|e| e.into_inner()));
+        drop(written);
         let out = built?;
         if self.space_configured() {
             // A key whose bytes, sidecar or record did not all land is dropped whole: its

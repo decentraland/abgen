@@ -1357,6 +1357,18 @@ fn evicted_variant_is_rebuilt_alone_and_every_write_is_reported() {
     assert_eq!(again.manifest_bytes, first.manifest_bytes);
     assert!(tex_path.is_file() && tex_rec.is_file());
     assert!(again.uploads.iter().all(|u| u.owner == tex.path));
+    // The reused model's files are reported too, so the JIT cache bumps them with this build.
+    let mesh = &first.entries["bafkgrid"][0];
+    let mesh_path = key_path(&out, &mesh.path).unwrap();
+    let reported = written.lock().unwrap();
+    for p in [
+        mesh_path.clone(),
+        super::meshopt::br_sidecar(&mesh_path),
+        key_path(&out, &record_key(&mesh.path)).unwrap(),
+    ] {
+        assert!(reported.contains(&p), "{} not reported", p.display());
+    }
+    drop(reported);
     let _ = std::fs::remove_dir_all(&out);
 }
 

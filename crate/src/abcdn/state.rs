@@ -276,11 +276,17 @@ impl AppStateInner {
         }
     }
 
-    /// After a Bevy build (successful or not): account every file it wrote under the JIT root
-    /// (variants, sidecars, records, negative records, the manifest), each as its own LRU
-    /// entry. Files outside the JIT root (a corpus `out_root`) are never accounted, so never
-    /// evicted. A variant evicted while a manifest still names it makes that manifest stale
-    /// on a node without read-through (`bevy::manifest_is_current`).
+    /// After a Bevy build (successful or not): account every file it wrote or reused under the
+    /// JIT root (variants, sidecars, records, negative records, the manifest), each as its own
+    /// LRU entry. Files outside the JIT root (a corpus `out_root`) are never accounted, so
+    /// never evicted.
+    ///
+    /// The files the entity's manifest lists (each variant with its `.br` and `.json`) are
+    /// pinned while this records, and recorded after the build's other files, with the
+    /// manifest last: they end up the most recently used entries, so recording this build
+    /// cannot evict what its own manifest needs. Eviction still runs on every record, so the
+    /// budget holds; a variant evicted later makes the manifest stale on a node without
+    /// read-through (`bevy::manifest_is_current`), and the next request rebuilds that key.
     pub fn jit_record_bevy(&self, entity: &str) {
         let Some(proxy) = self.live_proxy.as_ref() else {
             return;
@@ -289,8 +295,42 @@ impl AppStateInner {
         if !self.jit_cache.enabled() {
             return;
         }
-        for p in written {
-            self.jit_record_bevy_file(&p);
+        let manifest = crate::bevyvariants::manifest_path(&self.jit_root, entity);
+        let deps: Vec<PathBuf> = manifest
+            .as_deref()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice::<crate::bevyvariants::Manifest>(&b).ok())
+            .map(|m| {
+                m.files
+                    .values()
+                    .flatten()
+                    .filter_map(|key| crate::bevyvariants::key_path(&self.jit_root, key))
+                    .flat_map(|p| {
+                        ["", ".br", ".json"].map(|suffix| {
+                            let mut os = p.clone().into_os_string();
+                            os.push(suffix);
+                            PathBuf::from(os)
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let _pins: Vec<_> = deps
+            .iter()
+            .filter_map(|p| self.jit_key_of(p))
+            .filter_map(|k| self.jit_cache.pin(&k))
+            .collect();
+        let dep_set: std::collections::HashSet<&PathBuf> = deps.iter().collect();
+        for p in &written {
+            if !dep_set.contains(p) && Some(p) != manifest.as_ref() {
+                self.jit_record_bevy_file(p);
+            }
+        }
+        for p in &deps {
+            self.jit_record_bevy_file(p);
+        }
+        if let Some(mp) = &manifest {
+            self.jit_record_bevy_file(mp);
         }
     }
 
