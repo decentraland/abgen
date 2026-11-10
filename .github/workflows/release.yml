@@ -38,12 +38,35 @@ jobs:
   # A release published before this run uploads its archives (one created in the web UI,
   # say) is immutable: every upload below would fail with HTTP 422 after a full build.
   # Fail here instead, before any target builds. Images and npm do not depend on it.
+  # The same job refuses a tag that is not the crate version: the binaries report the
+  # crate version (`--version`, `/health`) while npm publishes under the tag, so the two
+  # must agree.
   release-guard:
     name: release not yet published
     runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          sparse-checkout: |
+            Cargo.toml
+            crate/abgen-node/Cargo.toml
+          sparse-checkout-cone-mode: false
+      - name: check the tag is the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME#v}"
+          # [workspace.package] version, and the node addon's own version line
+          ws="$(awk '/^\[workspace.package\]/{s=1;next} /^\[/{s=0} s&&/^version *=/{gsub(/[" ]/,"",$0);sub(/^version=/,"");print;exit}' Cargo.toml)"
+          node="$(awk '/^\[package\]/{s=1;next} /^\[/{s=0} s&&/^version *=/{gsub(/[" ]/,"",$0);sub(/^version=/,"");print;exit}' crate/abgen-node/Cargo.toml)"
+          echo "tag $tag, Cargo.toml $ws, crate/abgen-node $node"
+          if [ "$tag" != "$ws" ] || [ "$tag" != "$node" ]; then
+            echo "::error title=tag $GITHUB_REF_NAME is not the crate version::Cargo.toml says $ws and crate/abgen-node/Cargo.toml says $node. Land a 'chore: release $tag' PR that sets both (and the lockfiles), then tag its merge commit (see DEVELOPMENT.md)."
+            exit 1
+          fi
       - name: check the release for this tag
         if: startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true
         env:
