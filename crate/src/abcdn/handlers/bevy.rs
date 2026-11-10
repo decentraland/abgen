@@ -50,14 +50,8 @@ fn disk_path(root: &std::path::Path, target: &BevyTarget) -> Option<std::path::P
 }
 
 /// A manifest on disk is served only while it was built from the current generations: one
-/// that names an older prefix counts as absent, so the miss path rebuilds it (re-encoding
-/// only the class whose generation moved, the rest comes from the records).
-///
-/// With `check_variants` (a node without object-storage read-through, where a variant the
-/// JIT cache evicted cannot come back on its own), it is also absent while any variant it
-/// names is missing under the root it was found in, so the rebuild re-encodes just those keys
-/// (`local_record` misses on a record whose variant is gone).
-fn manifest_is_current(path: &std::path::Path, check_variants: bool) -> bool {
+/// that names an older prefix counts as absent, until the offline build writes a current one.
+fn manifest_is_current(path: &std::path::Path) -> bool {
     let Ok(bytes) = std::fs::read(path) else {
         return false;
     };
@@ -65,33 +59,13 @@ fn manifest_is_current(path: &std::path::Path, check_variants: bool) -> bool {
         return false;
     };
     #[cfg(feature = "bevy-variants")]
-    let current = m.is_current(&bevyvariants::BuildOptions::from_env().lanes());
-    #[cfg(not(feature = "bevy-variants"))]
-    let current = m.v == bevyvariants::MANIFEST_VERSION;
-    if !current || !check_variants {
-        return current;
+    {
+        m.is_current(&bevyvariants::BuildOptions::from_env().lanes())
     }
-    // `{root}/bevy/manifest/{entity}.json`.
-    let Some(root) = path
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-    else {
-        return false;
-    };
-    m.files
-        .values()
-        .flatten()
-        .all(|path| bevyvariants::key_path(root, path).is_some_and(|p| p.is_file()))
-}
-
-/// Whether a manifest's variants must be on local disk for it to count as current: true
-/// unless object storage can read a missing variant through.
-fn check_local_variants(state: &AppState) -> bool {
-    !state
-        .live_proxy
-        .as_ref()
-        .is_some_and(|p| p.space_configured())
+    #[cfg(not(feature = "bevy-variants"))]
+    {
+        m.v == bevyvariants::MANIFEST_VERSION
+    }
 }
 
 /// Serve from the corpus root, then the JIT root. Manifests are `no-cache` JSON (a newer
@@ -106,8 +80,9 @@ pub(super) async fn bevy_serve_local(
         return serve::not_found();
     };
     if let BevyTarget::Manifest(_) = &target {
-        // The corpus root first, then the JIT root, but only a current copy is served: a stale
-        // corpus manifest must not hide the current one a JIT build wrote.
+        // The corpus root first, then the JIT root (copies read through from object storage),
+        // but only a current copy is served: a stale corpus manifest must not hide a current
+        // one read through.
         let mut roots = vec![(state.out_root.clone(), false)];
         if state.roots_distinct {
             roots.push((state.jit_root.clone(), true));
@@ -116,13 +91,12 @@ pub(super) async fn bevy_serve_local(
             .into_iter()
             .filter_map(|(r, j)| disk_path(&r, &target).map(|p| (p, j)))
             .collect();
-        let check = check_local_variants(state);
         let found = tokio::task::spawn_blocking(move || {
             let mut any = false;
             for (p, j) in candidates {
                 if p.is_file() {
                     any = true;
-                    if manifest_is_current(&p, check) {
+                    if manifest_is_current(&p) {
                         return (Some((p, j)), true);
                     }
                 }
@@ -196,16 +170,14 @@ pub(super) fn accepts_br(headers: &HeaderMap) -> bool {
         })
 }
 
-/// Misses: object-storage read-through for both kinds; manifests additionally build in the
-/// background (or synchronously with `?wait=1`), single-flighted and fail-cached per entity
-/// like the bvwebgpu lane. Variants are never built on their own: they exist once a manifest
-/// naming them does.
-#[allow(clippy::too_many_arguments)]
+/// Misses: object-storage read-through, for manifests and variants alike. Nothing is built on
+/// request: the lane is built offline (`abgen-corpus --bevy-variants`), so a manifest or
+/// variant that is neither on disk nor in object storage is a 404 and the client loads the
+/// original file.
 pub(super) async fn bevy_fallback(
     state: &AppState,
     path: &str,
     target: &BevyTarget,
-    wait: bool,
     method: &Method,
     headers: &HeaderMap,
     local: Response,
@@ -256,48 +228,7 @@ pub(super) async fn bevy_fallback(
             }
         }
     }
-    let BevyTarget::Manifest(entity) = target else {
-        return local;
-    };
-    let fail_key = format!("{entity}:{BEVY_PLATFORM}");
-    if state.jit_fail_cache.get(&fail_key).await.is_some() {
-        return with_reason(local, "bevy-variants-unbuildable");
-    }
-    let check = check_local_variants(state);
-    let probe = |root: &std::path::Path| -> JitProbe {
-        match bevyvariants::manifest_path(root, entity) {
-            Some(p) => JitProbe::Check(Box::new(move || manifest_is_current(&p, check))),
-            None => JitProbe::None,
-        }
-    };
-    if wait {
-        let probe = probe(&state.jit_root);
-        // `_pins` keep the manifest and every file it names in the JIT cache from before the
-        // build's output was recorded (or, coalesced, from before the probe) until this
-        // block returns, so no concurrent record can evict them before the serve below has
-        // checked the manifest (`manifest_is_current`). They drop on every path out of the
-        // block. The client's later variant fetches are not covered.
-        let (outcome, _pins) =
-            jit_build_entity_pinned(state, &proxy, entity, BEVY_PLATFORM, probe, "bevy").await;
-        match outcome {
-            JitBuild::Built | JitBuild::Coalesced => {
-                state.resolve_cache.invalidate(path).await;
-                dispatch_local(state, path, method, headers).await
-            }
-            JitBuild::Failed => with_reason(local, "bevy-variants-unbuildable"),
-        }
-    } else {
-        let st = state.clone();
-        let entity = entity.clone();
-        tokio::spawn(async move {
-            let probe = match bevyvariants::manifest_path(&st.jit_root, &entity) {
-                Some(p) => JitProbe::Check(Box::new(move || manifest_is_current(&p, check))),
-                None => JitProbe::None,
-            };
-            let _ = jit_build_entity(&st, &proxy, &entity, BEVY_PLATFORM, probe, "bevy").await;
-        });
-        with_reason(local, "bevy-variants-cold")
-    }
+    local
 }
 
 #[cfg(test)]
@@ -362,13 +293,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("m.json");
         std::fs::write(&p, b"not json").unwrap();
-        assert!(!manifest_is_current(&p, false));
+        assert!(!manifest_is_current(&p));
         std::fs::write(
             &p,
             serde_json::json!({"v": 1, "entity": "e", "generator": "g", "files": {}}).to_string(),
         )
         .unwrap();
-        assert!(!manifest_is_current(&p, false));
+        assert!(!manifest_is_current(&p));
         std::fs::write(
             &p,
             serde_json::json!({"v": 2, "entity": "e", "generator": "g",
@@ -376,7 +307,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        assert!(!manifest_is_current(&p, false));
+        assert!(!manifest_is_current(&p));
         // A v2 manifest (full entries) is stale even with current lanes: it is rebuilt as v3.
         #[cfg(feature = "bevy-variants")]
         {
@@ -389,45 +320,8 @@ mod tests {
                 .to_string(),
             )
             .unwrap();
-            assert!(!manifest_is_current(&p, false));
+            assert!(!manifest_is_current(&p));
         }
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A current manifest whose variant was evicted reads as current only where object storage
-    /// can read the variant through; without it, the manifest is rebuilt.
-    #[test]
-    fn manifest_with_an_evicted_variant_is_stale_without_read_through() {
-        let root = std::env::temp_dir().join(format!("abgen-bevy-evicted-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let lanes = {
-            #[cfg(feature = "bevy-variants")]
-            {
-                bevyvariants::BuildOptions::from_env().lanes()
-            }
-            #[cfg(not(feature = "bevy-variants"))]
-            {
-                Default::default()
-            }
-        };
-        let key = bevyvariants::variant_key("t2", "bafkreiexample_srgb");
-        let m = bevyvariants::Manifest {
-            v: bevyvariants::MANIFEST_VERSION,
-            lanes,
-            files: [("bafkreiexample".to_string(), vec![key.clone()])]
-                .into_iter()
-                .collect(),
-        };
-        let mp = bevyvariants::manifest_path(&root, "bafkent").unwrap();
-        std::fs::create_dir_all(mp.parent().unwrap()).unwrap();
-        std::fs::write(&mp, serde_json::to_vec(&m).unwrap()).unwrap();
-        let vp = bevyvariants::key_path(&root, &key).unwrap();
-        std::fs::create_dir_all(vp.parent().unwrap()).unwrap();
-        std::fs::write(&vp, b"abc").unwrap();
-        assert!(manifest_is_current(&mp, true));
-        std::fs::remove_file(&vp).unwrap();
-        assert!(!manifest_is_current(&mp, true));
-        assert!(manifest_is_current(&mp, false));
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

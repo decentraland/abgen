@@ -46,8 +46,8 @@
 //! variant gets (its CID, format, size, dimensions, whether a `.br` sidecar exists), or the
 //! reason there is no variant (so a size-gated or tiny image is not retried by every entity
 //! that references it), plus, for models, how the model samples each image URI (so a warm
-//! entity needs no model bytes to pick its textures' slots). The record is what the probe
-//! reads: local disk, then Redis, then the store; a miss fetches and encodes. Records and
+//! entity needs no model bytes to pick its textures' slots). The record is what a build
+//! reads, from its output directory, before doing any work; a miss fetches and encodes. Records and
 //! variants are immutable within a generation: [`TEX_GEN`] and [`MESH_GEN`] are bumped by hand
 //! when an encoder's output bytes change (precision, level, size cap, codec), which moves
 //! every key of that class to a new prefix; the previous prefix is garbage and can be deleted
@@ -82,7 +82,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// The platform string the JIT lane and fail cache key this lane by.
+/// The lane's name: the first segment of its routes and keys.
 pub const BEVY_PLATFORM: &str = "bevy";
 /// Longest side of a texture variant.
 pub const BEVY_TEXTURE_MAX: u32 = 1024;
@@ -375,7 +375,7 @@ impl Manifest {
 #[cfg(all(test, feature = "bevy-variants"))]
 mod tests;
 
-/// The JIT-cache key of a Bevy-lane file under `root`: its path below the root with `/`
+/// The disk-cache key of a Bevy-lane file under `root`: its path below the root with `/`
 /// separators (`bevy/t2/{name}`, `bevy/t2/{name}.json`, `bevy/manifest/{entity}.json`). `None`
 /// for a path that is not under `{root}/bevy/`.
 pub fn cache_key(root: &Path, path: &Path) -> Option<String> {
@@ -390,187 +390,4 @@ pub fn cache_key(root: &Path, path: &Path) -> Option<String> {
         key.push_str(c?);
     }
     Some(key)
-}
-
-/// What a JIT Bevy build reports as it goes: each file it writes or reuses is pinned in the
-/// JIT cache on the spot, so nothing the build depends on can be evicted while it runs. When
-/// dropped (on success, on error and while unwinding from a panic) the paths and their pins
-/// move into `Proxy::bevy_written`, where the JIT cache takes them to record the build.
-#[cfg(feature = "bevy-variants")]
-struct WrittenStash<'a> {
-    proxy: &'a crate::live::Proxy,
-    entity: &'a str,
-    out_root: &'a Path,
-    cache: std::sync::Arc<crate::jitcache::JitDiskCache>,
-    written: std::sync::Mutex<crate::live::BevyWritten>,
-}
-
-#[cfg(feature = "bevy-variants")]
-impl WrittenStash<'_> {
-    fn report(&self, path: &Path) {
-        let pin = cache_key(self.out_root, path).and_then(|k| self.cache.pin(&k));
-        let mut w = self.written.lock().unwrap_or_else(|e| e.into_inner());
-        w.paths.push(path.to_path_buf());
-        w.pins.extend(pin);
-    }
-}
-
-#[cfg(feature = "bevy-variants")]
-impl Drop for WrittenStash<'_> {
-    fn drop(&mut self) {
-        let w = std::mem::take(self.written.get_mut().unwrap_or_else(|e| e.into_inner()));
-        if w.paths.is_empty() {
-            return;
-        }
-        let mut map = self
-            .proxy
-            .bevy_written
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let slot = map.entry(self.entity.to_string()).or_default();
-        slot.paths.extend(w.paths);
-        slot.pins.extend(w.pins);
-    }
-}
-
-#[cfg(feature = "bevy-variants")]
-impl crate::live::Proxy {
-    /// The lane's probe against the store: Redis first (the record is the marker's value),
-    /// then the record object. Any error is a miss, so the worst case is an encode that was
-    /// not needed. The record read from the store is marked for the next probe.
-    pub fn bevy_probe(&self, key: &str) -> Option<Record> {
-        let rk = record_key(key);
-        let cache_key = self.reuse_cache_key(&rk);
-        if let Some(ck) = &cache_key {
-            if let Some(v) = crate::rediscache::get(ck) {
-                if let Some(r) = Record::parse(v.as_bytes()) {
-                    metrics::counter!("abgen_bevy_probe_total", "outcome" => "redis").increment(1);
-                    return Some(r);
-                }
-            }
-        }
-        if !self.space_configured() {
-            return None;
-        }
-        let Some(bytes) = self.space_get_key(&rk) else {
-            metrics::counter!("abgen_bevy_probe_total", "outcome" => "miss").increment(1);
-            return None;
-        };
-        let Some(r) = Record::parse(&bytes) else {
-            tracing::warn!(key = %rk, "bevy variants: unreadable record, rebuilding");
-            metrics::counter!("abgen_bevy_probe_total", "outcome" => "miss").increment(1);
-            return None;
-        };
-        if let (Some(ck), Ok(v)) = (&cache_key, std::str::from_utf8(&bytes)) {
-            crate::rediscache::mark_with(ck, v);
-        }
-        metrics::counter!("abgen_bevy_probe_total", "outcome" => "space").increment(1);
-        Some(r)
-    }
-
-    /// JIT entry point: resolve the entity through this proxy's content sources (the same
-    /// ones the bvwebgpu lane uses), build its variants into `out_root` and, when object
-    /// storage is configured, write them back: each variant's bytes, then its sidecar, then
-    /// its record (marked in Redis once written), and the manifest last, so nothing in the
-    /// store ever names an object that is not there. An upload failure leaves the manifest
-    /// unwritten: the entity stays cold and the next build finds what did land.
-    pub fn build_bevy_variants(
-        self: &std::sync::Arc<Self>,
-        out_root: &Path,
-        cid: &str,
-    ) -> anyhow::Result<()> {
-        let started = std::time::Instant::now();
-        let ctx = self.entity_ctx(cid)?;
-        let fetch = |hash: &str| -> Option<Vec<u8>> {
-            match self.content_bytes_allow_empty(hash) {
-                Ok(b) => Some(b),
-                Err(e) => {
-                    tracing::warn!(hash = %hash, error = %format!("{e:#}"), "bevy variants: content fetch failed");
-                    None
-                }
-            }
-        };
-        let probe = |key: &str| self.bevy_probe(key);
-        let stored = |key: &str| -> Option<Vec<u8>> {
-            if self.space_configured() {
-                self.space_get_key(key)
-            } else {
-                None
-            }
-        };
-        // With a JIT cache: everything the build writes or reuses is pinned as it is
-        // reported and handed to the cache however the build ends (`WrittenStash`).
-        let written = self.jit().map(|cache| WrittenStash {
-            proxy: self,
-            entity: cid,
-            out_root,
-            cache: cache.clone(),
-            written: Default::default(),
-        });
-        let wrote = |p: &Path| {
-            if let Some(w) = &written {
-                w.report(p);
-            }
-        };
-        let lane = Lane {
-            fetch: &fetch,
-            probe: &probe,
-            stored: &stored,
-            wrote: &wrote,
-        };
-        let built = build_entity_variants(&ctx.scene, &lane, out_root, BuildOptions::from_env());
-        drop(written);
-        let out = built?;
-        if self.space_configured() {
-            // A key whose bytes, sidecar or record did not all land is dropped whole: its
-            // later objects are skipped (so the store never holds a record naming bytes it
-            // lacks), nothing is marked in Redis, and its local record is deleted so the next
-            // build here re-encodes and re-uploads it instead of reusing it.
-            let mut failed = 0usize;
-            let mut failed_owner: Option<&str> = None;
-            for obj in &out.uploads {
-                if failed_owner == Some(obj.owner.as_str()) {
-                    continue;
-                }
-                let put = std::fs::read(&obj.path)
-                    .map_err(|e| anyhow::anyhow!("re-read {}: {e}", obj.path.display()))
-                    .and_then(|bytes| {
-                        self.space_put_key_strict(&obj.key, &bytes)?;
-                        Ok(bytes)
-                    });
-                let bytes = match put {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!(key = %obj.key, error = %format!("{e:#}"), "bevy variants: upload failed");
-                        failed += 1;
-                        failed_owner = Some(obj.owner.as_str());
-                        if let Some(rec) = key_path(out_root, &record_key(&obj.owner)) {
-                            let _ = std::fs::remove_file(rec);
-                        }
-                        continue;
-                    }
-                };
-                if obj.record {
-                    if let (Some(ck), Ok(v)) =
-                        (self.reuse_cache_key(&obj.key), std::str::from_utf8(&bytes))
-                    {
-                        crate::rediscache::mark_with(&ck, v);
-                    }
-                }
-            }
-            if failed > 0 {
-                anyhow::bail!("{failed} uploads failed; manifest not written");
-            }
-            self.space_put_key_strict(&manifest_key(cid), &out.manifest_bytes)?;
-        }
-        tracing::info!(
-            entity = %cid,
-            originals = out.entries.len(),
-            reused = out.stats.reused_textures + out.stats.reused_models,
-            built = out.stats.unique_variants,
-            ms = started.elapsed().as_millis() as u64,
-            "bevy variants built"
-        );
-        Ok(())
-    }
 }

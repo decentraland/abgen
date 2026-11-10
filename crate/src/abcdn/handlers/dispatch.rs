@@ -38,7 +38,7 @@ async fn dispatch_with_fallbacks(
         return shader_fallback(state, path, &target, method, headers, local).await;
     }
     if let Some(target) = bevy_target(path) {
-        return bevy_fallback(state, path, &target, wait, method, headers, local).await;
+        return bevy_fallback(state, path, &target, method, headers, local).await;
     }
 
     let local = if state.upstream_ab_cdn.is_some() {

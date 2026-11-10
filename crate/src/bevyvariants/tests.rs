@@ -1002,8 +1002,6 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
     let lane = Lane {
         fetch: &fetch,
         probe: &probe,
-        stored: &|_: &str| -> Option<Vec<u8>> { None },
-        wrote: &|_: &std::path::Path| {},
     };
     let out = std::env::temp_dir().join(format!("abgen-bevy-meshopt-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
@@ -1110,8 +1108,6 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
     let lane2 = Lane {
         fetch: &counting,
         probe: &probe,
-        stored: &|_: &str| -> Option<Vec<u8>> { None },
-        wrote: &|_: &std::path::Path| {},
     };
     let again = build_entity_variants(
         &scene,
@@ -1192,8 +1188,6 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
     let lane5 = Lane {
         fetch: &counting,
         probe: &remote,
-        stored: &|_: &str| -> Option<Vec<u8>> { None },
-        wrote: &|_: &std::path::Path| {},
     };
     fetches.store(0, std::sync::atomic::Ordering::Relaxed);
     let probed = build_entity_variants(&scene, &lane5, &out5, BuildOptions::default()).unwrap();
@@ -1253,8 +1247,6 @@ fn reused_meshopt_variant_without_br_gets_a_sidecar_without_a_fetch() {
     let lane = Lane {
         fetch: &fetch,
         probe: &probe,
-        stored: &|_: &str| -> Option<Vec<u8>> { None },
-        wrote: &|_: &std::path::Path| {},
     };
     let out = std::env::temp_dir().join(format!("abgen-bevy-backfill-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
@@ -1306,11 +1298,10 @@ fn reused_meshopt_variant_without_br_gets_a_sidecar_without_a_fetch() {
     let _ = std::fs::remove_dir_all(&out);
 }
 
-/// The JIT cache evicts files one at a time. A record whose variant was evicted is a miss and
-/// is deleted, so the rebuild re-encodes that key alone; every other key is reused. The lane
-/// is told about every file the build writes.
+/// A record whose variant is gone from disk is a miss and is deleted, so the rebuild
+/// re-encodes that key alone; every other key is reused.
 #[test]
-fn evicted_variant_is_rebuilt_alone_and_every_write_is_reported() {
+fn record_without_its_variant_is_rebuilt_alone() {
     let grid = grid_glb(24);
     let mut blobs: HashMap<&str, Vec<u8>> = HashMap::new();
     blobs.insert("bafkgrid", grid);
@@ -1329,24 +1320,13 @@ fn evicted_variant_is_rebuilt_alone_and_every_write_is_reported() {
         blobs.get(h).cloned()
     };
     let probe = |_: &str| None;
-    let written = std::sync::Mutex::new(Vec::<std::path::PathBuf>::new());
-    let wrote = |p: &std::path::Path| written.lock().unwrap().push(p.to_path_buf());
     let lane = Lane {
         fetch: &fetch,
         probe: &probe,
-        stored: &|_: &str| -> Option<Vec<u8>> { None },
-        wrote: &wrote,
     };
     let out = std::env::temp_dir().join(format!("abgen-bevy-evict-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
     let first = build_entity_variants(&scene, &lane, &out, BuildOptions::default()).unwrap();
-    // Every object listed for upload, plus the manifest, was reported as written.
-    let reported: std::collections::BTreeSet<_> = written.lock().unwrap().drain(..).collect();
-    for u in &first.uploads {
-        assert!(reported.contains(&u.path), "{} not reported", u.key);
-    }
-    assert!(reported.contains(&manifest_path(&out, "bafkentityev").unwrap()));
-
     let tex = first.entries["bafkgridpng"][0].clone();
     let tex_path = key_path(&out, &tex.path).unwrap();
     let tex_rec = key_path(&out, &record_key(&tex.path)).unwrap();
@@ -1357,18 +1337,6 @@ fn evicted_variant_is_rebuilt_alone_and_every_write_is_reported() {
     assert_eq!(again.manifest_bytes, first.manifest_bytes);
     assert!(tex_path.is_file() && tex_rec.is_file());
     assert!(again.uploads.iter().all(|u| u.owner == tex.path));
-    // The reused model's files are reported too, so the JIT cache bumps them with this build.
-    let mesh = &first.entries["bafkgrid"][0];
-    let mesh_path = key_path(&out, &mesh.path).unwrap();
-    let reported = written.lock().unwrap();
-    for p in [
-        mesh_path.clone(),
-        super::meshopt::br_sidecar(&mesh_path),
-        key_path(&out, &record_key(&mesh.path)).unwrap(),
-    ] {
-        assert!(reported.contains(&p), "{} not reported", p.display());
-    }
-    drop(reported);
     let _ = std::fs::remove_dir_all(&out);
 }
 
@@ -1431,8 +1399,6 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     let lane = Lane {
         fetch: &fetch,
         probe: &probe,
-        stored: &|_: &str| -> Option<Vec<u8>> { None },
-        wrote: &|_: &std::path::Path| {},
     };
     let run = |tag: &str, opts: BuildOptions| {
         let out =

@@ -288,10 +288,10 @@ the original file on anything else, so the lane can be switched off at any time.
 
 - `GET /bevy/manifest/{entity}.json` - `{"v":3,"lanes":{"mesh":"m1","texture":"t2"},"files":{"<original cid>":["bevy/t2/<original cid>_srgb"]}}`
   (at most one path per class per original: a texture, a `glb-meshopt`, and a `glb` only when GLB
-  variants are on; a v2 manifest on disk reads as stale and is rebuilt). 404 while absent, and while the manifest on disk
-  was built from an older generation (`X-Abgen-Reason: bevy-variants-stale`, see the asset lane
-  below); a miss starts a background build (`X-Abgen-Reason: bevy-variants-cold`), `?wait=1`
-  builds synchronously, failures are negative-cached for `ABGEN_JIT_FAIL_TTL_S`.
+  variants are on). 404 while absent, and while every copy on disk was built from an older
+  generation or schema (`X-Abgen-Reason: bevy-variants-stale`, see the asset lane below).
+  Nothing is built on request: the lane is built offline with `abgen-corpus --bevy-variants`,
+  and the client loads the original files until a manifest exists.
   `Cache-Control: private, max-age=0, no-cache`.
 - `GET /bevy/{prefix}/{name}` (an entry's `path`) - variant bytes, `public,max-age=31536000,immutable`,
   `Range`, `ETag`, CORS (preflight allows `X-IPFS`). Never built on its own: it exists once a
@@ -299,11 +299,14 @@ the original file on anything else, so the lane can be switched off at any time.
   below) and the request's `Accept-Encoding` includes `br`, the sidecar's bytes are sent with
   `Content-Encoding: br`; such responses carry `Vary: Accept-Encoding` either way. The CID is always
   of the plain bytes. The record beside a variant (`{name}.json`) is never served.
-- With the S3 space configured, both read through from and write back to the same keys
-  (`bevy/manifest/…`, `bevy/{prefix}/…`). `ABGEN_BEVY_VARIANTS=0` turns the JIT side off.
+- With the S3 space configured, a miss on either route reads through from the same keys
+  (`bevy/manifest/…`, `bevy/{prefix}/…`, and `{name}.br` when the client accepts `br`), so a
+  corpus output synced to the bucket is served as is. Files read through count against the JIT
+  disk budget one by one; an evicted one is read through again. The server never writes these
+  keys. `ABGEN_BEVY_VARIANTS=0` turns the read-through off.
 
 **Asset lane.** A variant's name is a function of its inputs, so a build knows the name before
-doing any work and asks the store for it the way the Unity lanes probe
+doing any work and looks for its record the way the Unity lanes probe
 `{version}/assets/{hash}_{digest}_{platform}` - no fetch, no decode, no hash of anything:
 
 - textures: `bevy/t{TEX_GEN}/{sourceCid}_{slot}`, `slot` = `srgb` | `linear` | `normal` (how the
@@ -318,19 +321,17 @@ Beside every variant sits its record, `{name}.json`: the manifest entry (`varian
 there is none (`reason`: `size-gate`, `tiny`, `decode-error`, …, so a file that cannot have a
 variant is not retried by every entity that references it), whether a `.br` sidecar exists
 (`br`), and on model records how the model samples each image URI (`uses`), so a warm entity
-needs no model bytes to pick its textures' slots. A build probes each key's record in order:
-local disk, Redis (`abgen:hit:{bucket}:{key}.json`, the record is the marker's value, 24 h,
-positives only, fail-open), the store (one GET, then marked in Redis). A hit fills the manifest
-row; a miss fetches and encodes. Outcomes that depend on the run (content missing, a failed
-write) are never recorded. Writes go variant bytes, `.br`, record (then its Redis mark), and the
-manifest last, so the store never names an object that is not there; if any upload fails the
-manifest is not written and the entity stays cold.
+needs no model bytes to pick its textures' slots. A build reads each key's record from its
+output directory (a record whose variant file is gone is a miss and is deleted). A hit fills the
+manifest row; a miss fetches and encodes. Outcomes that depend on the run (content missing, a
+failed write) are never recorded. Writes go variant bytes, `.br`, record, and the manifest last,
+so a manifest never names a variant that is not there.
 
 Versioning is two integers in `crate/src/bevyvariants/mod.rs`: `TEX_GEN` (BC encoders, mips,
 size cap, KTX2 writer, UASTC transcode) and `MESH_GEN` (meshopt codecs, filters, precision, GLB
 rewrite). Bump one when its encoder's output bytes change: every key of that class moves to a new
 prefix, the previous prefix (`bevy/t1/`, …) is garbage and can be deleted whole, and manifests
-built from it (their `lanes` name it) are rebuilt on the next request, re-encoding only that class.
+built from it (their `lanes` name it) read as stale until the next offline build, which re-encodes only that class.
 The generations live in code because they describe the encoders. The operator's lever is
 `ABGEN_BEVY_EPOCH` (unset by default; a number `0..=9999`): when set, every prefix gets `e{N}`
 appended (`t2e2`, `m1e2`), so every key misses, every manifest reads as stale and the lane
@@ -381,8 +382,8 @@ release, never on the machine or thread count; a new libzstd release is a `TEX_G
   they are (external `.bin` buffers are inlined, because the meshes live there). Draco primitives
   are left alone; a file already using `EXT_meshopt_compression` gets none. The variant is kept
   only when smaller than the original. Each one is also stored as `{name}.br` beside it (on by
-  default; `ABGEN_BEVY_PRECOMPRESS=none` or `--bevy-precompress none` turns it off) (Brotli quality 9, window 22; uploaded
-  with `Content-Encoding: br`) for the route above; KTX2 variants are never Brotli'd. On a
+  default; `ABGEN_BEVY_PRECOMPRESS=none` or `--bevy-precompress none` turns it off) (Brotli quality 9, window 22)
+  for the route above; KTX2 variants are never Brotli'd. On a
   read-through miss the edge fetches the sidecar beside the variant when the client accepts
   `br`. `cargo run --release --example
   bevy-geometry-check -- <bevy-variants-stats.json> <out> <files-dir>` decodes

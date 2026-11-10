@@ -136,23 +136,15 @@ impl BuildOptions {
 
 /// Where a build reads from. `fetch` returns a content file's bytes by hash (`None` =
 /// unavailable: that file gets no variant and no record). `probe` returns the record of a
-/// variant key that already exists somewhere this build does not write (the store, through
-/// Redis); `None` is a miss. Local records under `out_root` are read before `probe` is asked.
-/// `stored` returns a stored variant's bytes by key (`None` = not there); a variant under
-/// `out_root` is read before it is asked. It is only used to add a `.br` sidecar to a reused
-/// variant that has none. `wrote` is told every file the build writes or reuses under
-/// `out_root` (variants, sidecars, records, negative records and the manifest), as it goes, so
-/// a build that fails part-way has still reported what it left on disk, and a reused file is
-/// pinned in the JIT cache for the build and bumped along with it.
+/// variant key that already exists somewhere this build does not write (a shared store);
+/// `None` is a miss. Local records under `out_root` are read before `probe` is asked.
 pub struct Lane<'a> {
     pub fetch: &'a (dyn Fn(&str) -> Option<Vec<u8>> + Sync),
     pub probe: &'a (dyn Fn(&str) -> Option<Record> + Sync),
-    pub stored: &'a (dyn Fn(&str) -> Option<Vec<u8>> + Sync),
-    pub wrote: &'a (dyn Fn(&Path) + Sync),
 }
 
-/// One object this build wrote under `out_root`, in the order the store must receive them:
-/// a variant's bytes, then its `.br` sidecar, then its record.
+/// One object this build wrote under `out_root`, in the order they are written (and a store
+/// should receive them): a variant's bytes, then its `.br` sidecar, then its record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Upload {
     /// Object key, also the path under `out_root`.
@@ -161,7 +153,7 @@ pub struct Upload {
     /// uploads of one owner are contiguous and its record comes last.
     pub owner: String,
     pub path: PathBuf,
-    /// This is a record (`{key}.json`): once stored it is marked in Redis.
+    /// This is a record (`{key}.json`).
     pub record: bool,
 }
 
@@ -209,8 +201,8 @@ fn model_ext(file: &str) -> &'static str {
 }
 
 /// The record of `key` under `out_root`, if this or an earlier build here wrote one and the
-/// variant it names is still beside it (the JIT cache evicts files one at a time, so a record
-/// can outlive its bytes; such a record is a miss and is deleted).
+/// variant it names is still beside it (the serving node's disk cache evicts files one at a
+/// time, so a record can outlive its bytes; such a record is a miss and is deleted).
 fn local_record(out_root: &Path, key: &str) -> Option<Record> {
     let rp = key_path(out_root, &record_key(key))?;
     let bytes = std::fs::read(&rp).ok()?;
@@ -222,46 +214,20 @@ fn local_record(out_root: &Path, key: &str) -> Option<Record> {
     Some(rec)
 }
 
-/// Local disk, then the lane's probe. A local hit reports the key's files (variant, `.br`
-/// sidecar, record) to the lane as reused, so the JIT cache pins them for this build and bumps
-/// them with it. The variant is looked at again after the report: a JIT lane pins on report,
-/// so a variant still there then stays until the build is recorded, and one evicted between
-/// the record read and the pin is a miss.
+/// Local disk, then the lane's probe.
 fn probe(lane: &Lane, out_root: &Path, key: &str, times: &mut StageTimes) -> Option<Record> {
     timed(&mut times.probe_ns, || {
-        if let Some(r) = local_record(out_root, key) {
-            report_local(lane, out_root, key);
-            if r.variant.is_none() || key_path(out_root, key).is_some_and(|p| p.is_file()) {
-                return Some(r);
-            }
-        }
-        (lane.probe)(key)
+        local_record(out_root, key).or_else(|| (lane.probe)(key))
     })
 }
 
-/// Tell the lane about a key's files already under `out_root`.
-fn report_local(lane: &Lane, out_root: &Path, key: &str) {
-    let Some(dst) = key_path(out_root, key) else {
-        return;
-    };
-    let br = meshopt::br_sidecar(&dst);
-    let rec = key_path(out_root, &record_key(key));
-    for p in [Some(dst), Some(br), rec].into_iter().flatten() {
-        if p.is_file() {
-            (lane.wrote)(&p);
-        }
-    }
-}
-
-/// Write `bytes` to `dst` through a temporary sibling, then tell the lane (`Lane::wrote`).
-fn write_atomic(lane: &Lane, dst: &Path, bytes: &[u8]) -> Result<()> {
+fn write_atomic(dst: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
     let tmp = crate::tmppath::tmp_sibling(dst);
     std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, dst).with_context(|| format!("rename to {}", dst.display()))?;
-    (lane.wrote)(dst);
     Ok(())
 }
 
@@ -269,7 +235,6 @@ fn write_atomic(lane: &Lane, dst: &Path, bytes: &[u8]) -> Result<()> {
 /// `.br` sidecar (if any), its record. A file already there is left alone (a key's bytes are
 /// final within its generation). Returns the uploads in that order.
 fn store(
-    lane: &Lane,
     out_root: &Path,
     key: &str,
     bytes: Option<&[u8]>,
@@ -281,10 +246,8 @@ fn store(
     let mut out = Vec::with_capacity(3);
     let dst = key_path(out_root, key).ok_or_else(|| anyhow::anyhow!("bad variant key {key:?}"))?;
     if let Some(b) = bytes {
-        if dst.is_file() {
-            (lane.wrote)(&dst);
-        } else {
-            write_atomic(lane, &dst, b)?;
+        if !dst.is_file() {
+            write_atomic(&dst, b)?;
         }
         out.push(Upload {
             key: key.to_string(),
@@ -295,10 +258,8 @@ fn store(
     }
     if let Some(b) = br {
         let br_dst = meshopt::br_sidecar(&dst);
-        if br_dst.is_file() {
-            (lane.wrote)(&br_dst);
-        } else {
-            write_atomic(lane, &br_dst, b)?;
+        if !br_dst.is_file() {
+            write_atomic(&br_dst, b)?;
         }
         out.push(Upload {
             key: format!("{key}.br"),
@@ -309,11 +270,8 @@ fn store(
     }
     let rk = record_key(key);
     let rec_dst = key_path(out_root, &rk).expect("a variant key's record is a valid key");
-    if rec_dst.is_file() {
-        (lane.wrote)(&rec_dst);
-    } else {
+    if !rec_dst.is_file() {
         write_atomic(
-            lane,
             &rec_dst,
             &serde_json::to_vec(record).context("serialize record")?,
         )?;
@@ -329,12 +287,11 @@ fn store(
 }
 
 /// Add the `.br` sidecar to a reused `glb-meshopt` variant whose record says it has none: read
-/// the plain bytes (local, then the lane's store), check them against the record's CID,
+/// the plain bytes beside its record, check them against the record's CID,
 /// compress, write the sidecar, then replace the record with one that says `br`. Uploads in
 /// that order (sidecar, record), so the store never has a record naming a missing sidecar.
 /// `None` when the bytes are not available or do not match: the variant is served plain.
 fn backfill_br(
-    lane: &Lane,
     out_root: &Path,
     key: &str,
     rec: &Record,
@@ -344,7 +301,7 @@ fn backfill_br(
         return Ok(None);
     };
     let dst = key_path(out_root, key).ok_or_else(|| anyhow::anyhow!("bad variant key {key:?}"))?;
-    let plain = std::fs::read(&dst).ok().or_else(|| (lane.stored)(key));
+    let plain = std::fs::read(&dst).ok();
     let Some(plain) = plain.filter(|b| cid_v1_raw_sha256(b) == v.cid) else {
         tracing::warn!(key = %key, "bevy glb-meshopt: reused variant unavailable; no .br added");
         return Ok(None);
@@ -352,13 +309,12 @@ fn backfill_br(
     let br = timed(&mut times.brotli_ns, || meshopt::brotli_compress(&plain))?;
     let started = std::time::Instant::now();
     let br_dst = meshopt::br_sidecar(&dst);
-    write_atomic(lane, &br_dst, &br)?;
+    write_atomic(&br_dst, &br)?;
     let mut rec = rec.clone();
     rec.br = true;
     let rk = record_key(key);
     let rec_dst = key_path(out_root, &rk).expect("a variant key's record is a valid key");
     write_atomic(
-        lane,
         &rec_dst,
         &serde_json::to_vec(&rec).context("serialize record")?,
     )?;
@@ -598,7 +554,7 @@ pub fn build_entity_variants(
                     // a sidecar gets one here once precompression is on, without a re-encode.
                     if opts.precompress_br && !rec.br && rec.variant.is_some() {
                         if let Some((r, br_size, ups)) =
-                            backfill_br(lane, out_root, &key, &rec, &mut times)?
+                            backfill_br(out_root, &key, &rec, &mut times)?
                         {
                             rec = r;
                             stat.br_size = Some(br_size);
@@ -670,9 +626,7 @@ pub fn build_entity_variants(
                                         br: br.is_some(),
                                         uses: out.uses.clone(),
                                     };
-                                    out.uploads.extend(store(
-                                        lane,
-                                        out_root,
+                                    out.uploads.extend(store(out_root,
                                         &key,
                                         Some(&v.glb),
                                         br.as_deref(),
@@ -696,9 +650,7 @@ pub fn build_entity_variants(
                                             br: false,
                                             uses: out.uses.clone(),
                                         };
-                                        out.uploads.extend(store(
-                                            lane,
-                                            out_root, &key, None, None, &rec, &mut times,
+                                        out.uploads.extend(store(out_root, &key, None, None, &rec, &mut times,
                                         )?);
                                     }
                                 }
@@ -738,9 +690,7 @@ pub fn build_entity_variants(
                                 br: false,
                                 uses: out.uses.clone(),
                             };
-                            out.uploads.extend(store(
-                                lane,
-                                out_root,
+                            out.uploads.extend(store(out_root,
                                 &key,
                                 Some(&v.glb),
                                 None,
@@ -758,7 +708,7 @@ pub fn build_entity_variants(
                                 uses: out.uses.clone(),
                             };
                             out.uploads
-                                .extend(store(lane, out_root, &key, None, None, &rec, &mut times)?);
+                                .extend(store(out_root, &key, None, None, &rec, &mut times)?);
                         }
                         Ok(Err(e)) => {
                             tracing::warn!(entity = %entity, file = %file, error = %format!("{e:#}"), "bevy model variant skipped");
@@ -865,7 +815,7 @@ pub fn build_entity_variants(
                             br: false,
                             uses: BTreeMap::new(),
                         };
-                        store(lane, out_root, &key, None, None, &rec, &mut times)?
+                        store(out_root, &key, None, None, &rec, &mut times)?
                     } else {
                         Vec::new()
                     };
@@ -882,7 +832,7 @@ pub fn build_entity_variants(
                         br: false,
                         uses: BTreeMap::new(),
                     };
-                    let uploads = store(lane, out_root, &key, None, None, &rec, &mut times)?;
+                    let uploads = store(out_root, &key, None, None, &rec, &mut times)?;
                     stat.times = times;
                     return Ok((row(None), stat, uploads));
                 }
@@ -898,7 +848,7 @@ pub fn build_entity_variants(
                 br: false,
                 uses: BTreeMap::new(),
             };
-            let uploads = store(lane, out_root, &key, Some(&v.bytes), None, &rec, &mut times)?;
+            let uploads = store(out_root, &key, Some(&v.bytes), None, &rec, &mut times)?;
             stat.format = Some(v.format.manifest_name());
             stat.variant_path = Some(key.clone());
             stat.variant_cid = Some(e.cid.clone());
@@ -947,7 +897,7 @@ pub fn build_entity_variants(
             .collect(),
     };
     let manifest_bytes = serde_json::to_vec(&manifest).context("serialize manifest")?;
-    write_atomic(lane, &manifest_dst, &manifest_bytes)?;
+    write_atomic(&manifest_dst, &manifest_bytes)?;
     let mut stats = BuildStats::from_files(file_stats, opts.zstd_level, started.elapsed());
     stats.models = models.len() as u64;
     stats.add_models(model_stats);

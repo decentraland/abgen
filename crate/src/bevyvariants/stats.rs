@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 /// Time spent per stage, in nanoseconds.
 #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct StageTimes {
-    /// Probe of the variant key's record (local disk, Redis, the store).
+    /// Probe of the variant key's record (the output directory, then the lane's probe).
     pub probe_ns: u64,
     /// Content fetch (local store read or network).
     pub fetch_ns: u64,
