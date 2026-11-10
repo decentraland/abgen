@@ -11,8 +11,8 @@ use super::model::{image_uses, transform_model_with};
 use super::stats::{elapsed_ns, timed, BuildStats, FileStat, ModelStat, NoVariant, StageTimes};
 use super::texture::{encode_texture_with, source_kind, Miss, Slot, TexOptions, Uses};
 use super::{
-    cid_v1_raw_sha256, generator, key_path, manifest_path, record_key, variant_key, Class,
-    ImageUse, Manifest, Record, VariantEntry, MANIFEST_VERSION, RECORD_VERSION,
+    cid_v1_raw_sha256, key_path, manifest_path, record_key, variant_key, Class, ImageUse, Manifest,
+    Record, VariantEntry, MANIFEST_VERSION, RECORD_VERSION,
 };
 use crate::catalyst::Scene;
 
@@ -166,6 +166,9 @@ pub struct Upload {
 
 pub struct BuildOutput {
     pub manifest: Manifest,
+    /// Original CID -> the full entry of each variant (what the records hold; the manifest
+    /// lists only their paths).
+    pub entries: BTreeMap<String, Vec<VariantEntry>>,
     /// The manifest exactly as written to `bevy/manifest/{entity}.json`.
     pub manifest_bytes: Vec<u8>,
     /// Everything this build wrote besides the manifest, in upload order. Reused variants are
@@ -906,10 +909,11 @@ pub fn build_entity_variants(
     }
     let manifest = Manifest {
         v: MANIFEST_VERSION,
-        entity: entity.to_string(),
-        generator: generator(),
         lanes: opts.lanes(),
-        files,
+        files: files
+            .iter()
+            .map(|(cid, es)| (cid.clone(), es.iter().map(|e| e.path.clone()).collect()))
+            .collect(),
     };
     let manifest_bytes = serde_json::to_vec(&manifest).context("serialize manifest")?;
     write_atomic(lane, &manifest_dst, &manifest_bytes)?;
@@ -929,6 +933,7 @@ pub fn build_entity_variants(
     stats.unique_variant_bytes = built.values().sum();
     Ok(BuildOutput {
         manifest,
+        entries: files,
         manifest_bytes,
         uploads,
         stats,

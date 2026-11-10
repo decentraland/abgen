@@ -277,16 +277,18 @@ request waits up to the deadline, builds finish in the background. Knobs: `ABGEN
 `ABGEN_INDEX_BUILD_CONCURRENCY` (default: CPU count), `ABGEN_INDEX_BUILD_DEADLINE_MS` (default
 `20000`), `ABGEN_INDEX_BUILD_MAX_QUEUE` (default `0` = unlimited; when exceeded, new builds are skipped).
 ### Bevy variants lane (prototype)
-Per scene entity, a manifest mapping each original content CID to GPU-ready variants for the Bevy
-explorer. Each entry names where the variant is (`path`) and the CID of its bytes (`cid`: CIDv1 raw
-sha256, `bafkrei…`, the catalyst scheme, so the client verifies it with its usual content-hash
-check). The client loads a variant when the manifest lists one it supports and falls back to the
-original file on anything else, so the lane can be switched off at any time. Built by
+Per entity (scene, wearable or emote), a manifest mapping each original content CID to the paths
+of its GPU-ready variants for the Bevy explorer. A path's prefix letter is its class (`t` BC KTX2,
+`m` `glb-meshopt`, `g` GLB); the KTX2 header carries the BC format and size. The full entry of a
+variant (its CID, format, dimensions, size) lives in its record beside it, which is never served:
+a key's bytes are immutable within its generation and served `immutable`, so the client trusts
+the path. The client loads a variant when the manifest lists one it supports and falls back to
+the original file on anything else, so the lane can be switched off at any time. Built by
 `crate/src/bevyvariants` (feature `bevy-variants`, on with `server`).
 
-- `GET /bevy/manifest/{entity}.json` - `{"v":2,"entity","generator":"abgen <version>","lanes":{"texture":"t2","mesh":"m1"},"files":{"<original cid>":[{"path","cid","kind","format","width","height","mips","size"}]}}`
-  (`format`: `ktx2-bc7` | `ktx2-bc1` | `ktx2-bc5` | `glb-meshopt`, plus `glb` only when GLB variants are on;
-  `width`/`height`/`mips` only on textures). 404 while absent, and while the manifest on disk
+- `GET /bevy/manifest/{entity}.json` - `{"v":3,"lanes":{"mesh":"m1","texture":"t2"},"files":{"<original cid>":["bevy/t2/<original cid>_srgb"]}}`
+  (at most one path per class per original: a texture, a `glb-meshopt`, and a `glb` only when GLB
+  variants are on; a v2 manifest on disk reads as stale and is rebuilt). 404 while absent, and while the manifest on disk
   was built from an older generation (`X-Abgen-Reason: bevy-variants-stale`, see the asset lane
   below); a miss starts a background build (`X-Abgen-Reason: bevy-variants-cold`), `?wait=1`
   builds synchronously, failures are negative-cached for `ABGEN_JIT_FAIL_TTL_S`.

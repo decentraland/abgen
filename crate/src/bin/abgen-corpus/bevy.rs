@@ -83,12 +83,12 @@ pub(crate) fn run_bevy_variants(
                     obj.insert("summary".into(), summary);
                 }
                 all_stats.push(full);
-                originals += o.manifest.files.len();
+                originals += o.entries.len();
                 variants += o.stats.unique_variants as usize;
                 reused += o.stats.reused_textures + o.stats.reused_models;
                 eprintln!(
                     "bevy: {id}: {} originals, {} variants built, {} reused -> {}",
-                    o.manifest.files.len(),
+                    o.entries.len(),
                     o.stats.unique_variants,
                     o.stats.reused_textures + o.stats.reused_models,
                     abgen::bevyvariants::manifest_path(out_root, id)

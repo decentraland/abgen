@@ -325,8 +325,6 @@ fn lane_prefixes_follow_generations_and_the_zstd_level() {
     .contains_key("glb"));
     let m = Manifest {
         v: MANIFEST_VERSION,
-        entity: "e".into(),
-        generator: generator(),
         lanes: lanes.clone(),
         files: Default::default(),
     };
@@ -1019,8 +1017,8 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
         },
     )
     .unwrap();
-    let m = &built.manifest;
-    let entry = &m.files["bafkgrid"][0];
+    let entry = &built.entries["bafkgrid"][0];
+    assert_eq!(built.manifest.files["bafkgrid"], vec![entry.path.clone()]);
     assert_eq!(
         (entry.kind.as_str(), entry.format.as_str()),
         ("model", "glb-meshopt")
@@ -1199,10 +1197,10 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
     };
     fetches.store(0, std::sync::atomic::Ordering::Relaxed);
     let probed = build_entity_variants(&scene, &lane5, &out5, BuildOptions::default()).unwrap();
-    assert_eq!(probed.manifest.files["bafkgrid"], vec![entry.clone()]);
+    assert_eq!(probed.entries["bafkgrid"], vec![entry.clone()]);
     // The remote record says the image is a normal map, so the texture key is the normal
     // slot, whose negative record was honoured: no entry, no fetch of the image.
-    assert!(!probed.manifest.files.contains_key("bafkgridpng"));
+    assert!(!probed.entries.contains_key("bafkgridpng"));
     let png = probed
         .stats
         .files
@@ -1229,8 +1227,7 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
     )
     .unwrap();
     assert!(built2
-        .manifest
-        .files
+        .entries
         .values()
         .flatten()
         .all(|e| e.kind == "texture"));
@@ -1266,7 +1263,7 @@ fn reused_meshopt_variant_without_br_gets_a_sidecar_without_a_fetch() {
         ..BuildOptions::default()
     };
     let first = build_entity_variants(&scene, &lane, &out, plain).unwrap();
-    let entry = first.manifest.files["bafkgrid"][0].clone();
+    let entry = first.entries["bafkgrid"][0].clone();
     let vpath = key_path(&out, &entry.path).unwrap();
     let br_path = meshopt::br_sidecar(&vpath);
     assert!(!br_path.exists());
@@ -1280,7 +1277,7 @@ fn reused_meshopt_variant_without_br_gets_a_sidecar_without_a_fetch() {
     fetches.store(0, std::sync::atomic::Ordering::Relaxed);
     let again = build_entity_variants(&scene, &lane, &out, BuildOptions::default()).unwrap();
     assert_eq!(fetches.load(std::sync::atomic::Ordering::Relaxed), 0);
-    assert_eq!(again.manifest.files["bafkgrid"][0], entry);
+    assert_eq!(again.entries["bafkgrid"][0], entry);
     assert_eq!(again.stats.unique_variants, 0);
     let plain_bytes = std::fs::read(&vpath).unwrap();
     assert_eq!(
@@ -1350,7 +1347,7 @@ fn evicted_variant_is_rebuilt_alone_and_every_write_is_reported() {
     }
     assert!(reported.contains(&manifest_path(&out, "bafkentityev").unwrap()));
 
-    let tex = first.manifest.files["bafkgridpng"][0].clone();
+    let tex = first.entries["bafkgridpng"][0].clone();
     let tex_path = key_path(&out, &tex.path).unwrap();
     let tex_rec = key_path(&out, &record_key(&tex.path)).unwrap();
     std::fs::remove_file(&tex_path).unwrap();
@@ -1450,24 +1447,30 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
         ..BuildOptions::default()
     };
     let (out, built) = run("a", textures_only_opts);
-    let m = &built.manifest;
-    assert_eq!(m.v, 2);
-    assert_eq!(m.entity, "bafkentity");
-    assert!(m.generator.starts_with("abgen "));
-    assert_eq!(m.lanes, textures_only_opts.lanes());
+    let manifest = &built.manifest;
+    assert_eq!(manifest.v, 3);
+    assert_eq!(manifest.lanes, textures_only_opts.lanes());
+    // The manifest is the entries' paths and nothing else.
+    let m = &built.entries;
+    assert_eq!(
+        manifest.files,
+        m.iter()
+            .map(|(k, es)| (k.clone(), es.iter().map(|e| e.path.clone()).collect()))
+            .collect::<std::collections::BTreeMap<String, Vec<String>>>()
+    );
     let ktx_variant = encode_texture(UASTC_8, Slot::Srgb).unwrap();
-    let keys: Vec<&str> = m.files.keys().map(String::as_str).collect();
+    let keys: Vec<&str> = m.keys().map(String::as_str).collect();
     let mut expected = vec!["bafkcolor", "bafknormal"];
     if ktx_variant.is_some() {
         expected.insert(1, "bafkktx");
-        assert_eq!(m.files["bafkktx"][0].format, "ktx2-bc7");
+        assert_eq!(m["bafkktx"][0].format, "ktx2-bc7");
     }
     assert_eq!(keys, expected);
-    assert_eq!(m.files["bafkcolor"][0].format, "ktx2-bc1");
-    assert_eq!(m.files["bafknormal"][0].format, "ktx2-bc5");
+    assert_eq!(m["bafkcolor"][0].format, "ktx2-bc1");
+    assert_eq!(m["bafknormal"][0].format, "ktx2-bc5");
     // The images embedded in embed.glb get no texture variant of their own.
-    assert!(m.files.values().flatten().all(|e| e.kind == "texture"));
-    let tex = &m.files["bafkcolor"][0];
+    assert!(m.values().flatten().all(|e| e.kind == "texture"));
+    let tex = &m["bafkcolor"][0];
     assert_eq!(
         (tex.kind.as_str(), tex.width, tex.height, tex.mips),
         ("texture", Some(64), Some(64), Some(7))
@@ -1475,7 +1478,7 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
 
     // Every listed variant is stored at its path, named by source and slot, with the CID of
     // its bytes and its size; its record beside it names the same entry.
-    for (hash, entries) in &m.files {
+    for (hash, entries) in m {
         for e in entries {
             let bytes = std::fs::read(key_path(&out, &e.path).unwrap()).unwrap();
             assert_eq!(cid_v1_raw_sha256(&bytes), e.cid);
@@ -1490,11 +1493,11 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
         }
     }
     assert_eq!(
-        m.files["bafkcolor"][0].path,
+        m["bafkcolor"][0].path,
         format!("bevy/t{TEX_GEN}/bafkcolor_linear")
     );
     assert_eq!(
-        m.files["bafknormal"][0].path,
+        m["bafknormal"][0].path,
         format!("bevy/t{TEX_GEN}/bafknormal_normal")
     );
     let written: Vec<&Upload> = built.uploads.iter().filter(|u| !u.record).collect();
@@ -1516,9 +1519,16 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     let on_disk = std::fs::read(manifest_path(&out, "bafkentity").unwrap()).unwrap();
     assert_eq!(on_disk, built.manifest_bytes);
     let parsed: Manifest = serde_json::from_slice(&on_disk).unwrap();
-    assert_eq!(&parsed, m);
+    assert_eq!(&parsed, manifest);
     let raw: J = serde_json::from_slice(&on_disk).unwrap();
-    assert_eq!(raw["files"]["bafkcolor"][0]["width"], 64);
+    assert_eq!(
+        raw,
+        json!({"v": 3, "lanes": textures_only_opts.lanes(), "files": manifest.files})
+    );
+    assert_eq!(
+        raw["files"]["bafkcolor"][0],
+        m["bafkcolor"][0].path.as_str()
+    );
 
     // Stats: one row per standalone image, with the reason for each miss.
     let st = &built.stats;
@@ -1565,16 +1575,13 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
             ..textures_only_opts
         },
     );
-    let m4 = &built4.manifest;
-    assert_eq!(
-        m4.files.keys().collect::<Vec<_>>(),
-        m.files.keys().collect::<Vec<_>>()
-    );
-    assert_eq!(m4.lanes["texture"], format!("t{TEX_GEN}z3"));
-    for (k, e) in &m4.files {
+    let m4 = &built4.entries;
+    assert_eq!(m4.keys().collect::<Vec<_>>(), m.keys().collect::<Vec<_>>());
+    assert_eq!(built4.manifest.lanes["texture"], format!("t{TEX_GEN}z3"));
+    for (k, e) in m4 {
         assert!(e[0].path.starts_with(&format!("bevy/t{TEX_GEN}z3/")));
         let a = std::fs::read(key_path(&out4, &e[0].path).unwrap()).unwrap();
-        let b = std::fs::read(key_path(&out, &m.files[k][0].path).unwrap()).unwrap();
+        let b = std::fs::read(key_path(&out, &m[k][0].path).unwrap()).unwrap();
         assert_eq!(
             read_levels(&a).unwrap(),
             read_levels(&b).unwrap(),
@@ -1592,19 +1599,19 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
             ..textures_only_opts
         },
     );
-    let m3 = &built3.manifest;
-    let model = &m3.files["bafkembed"][0];
+    let m3 = &built3.entries;
+    let model = &m3["bafkembed"][0];
     assert_eq!(
         (model.kind.as_str(), model.format.as_str()),
         ("model", "glb")
     );
     assert!(model.width.is_none() && model.mips.is_none());
-    assert!(!m3.files.contains_key("bafkext"));
+    assert!(!m3.contains_key("bafkext"));
     let raw3: J = serde_json::from_slice(&built3.manifest_bytes).unwrap();
-    assert!(raw3["files"]["bafkembed"][0].get("width").is_none());
-    let mut textures_only = m3.files.clone();
+    assert_eq!(raw3["files"]["bafkembed"], json!([model.path]));
+    let mut textures_only = m3.clone();
     textures_only.remove("bafkembed");
-    assert_eq!(&textures_only, &m.files);
+    assert_eq!(&textures_only, m);
     assert_eq!(model.path, format!("bevy/g{TEX_GEN}/bafkembed"));
     let glb = std::fs::read(key_path(&out3, &model.path).unwrap()).unwrap();
     assert_eq!(cid_v1_raw_sha256(&glb), model.cid);

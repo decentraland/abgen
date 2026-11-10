@@ -27,8 +27,8 @@
 //! - Nothing else gets a variant (scene code, audio, video, source maps, unknown files).
 //!
 //! The client contract: no manifest, no entry, or any failure means the client loads the
-//! original file. A variant is fetched at the `path` its manifest entry names and verified
-//! against the entry's `cid` (CIDv1 raw sha256 of the bytes, the catalyst scheme).
+//! original file. A variant is fetched at a path its manifest lists; the path's prefix letter
+//! is its class. Its full entry (CID, format, size) stays in its record, which is not served.
 //!
 //! **Asset lane.** Variants are stored under a name computed from their *inputs*, so an entity
 //! build can ask the store whether a variant exists before fetching or encoding anything, the
@@ -86,8 +86,10 @@ use std::path::{Path, PathBuf};
 pub const BEVY_PLATFORM: &str = "bevy";
 /// Longest side of a texture variant.
 pub const BEVY_TEXTURE_MAX: u32 = 1024;
-/// Manifest schema version. 2: entries carry `path`, the manifest carries `lanes`.
-pub const MANIFEST_VERSION: u32 = 2;
+/// Manifest schema version. 2: entries carry `path`, the manifest carries `lanes`. 3: the
+/// manifest is only `v`, `lanes` and original CID -> variant paths; the full entries stay in
+/// the records.
+pub const MANIFEST_VERSION: u32 = 3;
 /// Record schema version.
 pub const RECORD_VERSION: u32 = 1;
 /// Served (and stored) prefix of manifests.
@@ -258,8 +260,8 @@ pub fn key_path(root: &Path, key: &str) -> Option<PathBuf> {
 }
 
 /// CIDv1, raw codec (0x55), sha2-256 multihash, multibase base32 lower (`b…`): the `bafkrei…`
-/// form catalysts use for content files, so the client verifies a variant with the same check
-/// it applies to originals.
+/// form catalysts use for content files. Recorded in each variant's record (`VariantEntry::cid`)
+/// for checks and tooling; the v3 manifest does not carry it.
 pub fn cid_v1_raw_sha256(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
     let digest = crate::hashes::sha256(bytes);
@@ -341,17 +343,20 @@ impl Record {
     }
 }
 
-/// The per-entity manifest (`v: 2`). `files` is keyed by original content CID and ordered, so
-/// the serialized bytes are a function of the variants alone. `lanes` names the prefix each
-/// class was built from (`{"texture":"t1","mesh":"m1"}`), read back by [`Manifest::is_current`].
+/// The per-entity manifest (`v: 3`): what the client needs and nothing else. `files` maps
+/// each original content CID to the paths of its variants (one per class, so at most one
+/// texture, one `glb-meshopt` and one `glb`), ordered, so the serialized bytes are a function
+/// of the variants alone. The class of a path is its prefix letter (`t` BC KTX2, `m`
+/// `glb-meshopt`, `g` GLB); the KTX2 header carries the BC format and size. `lanes` names
+/// the prefix each class was built from (`{"texture":"t2","mesh":"m1"}`), read back by
+/// [`Manifest::is_current`]. The full entry (CID, format, dimensions, size) of each variant
+/// is in its record.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     pub v: u32,
-    pub entity: String,
-    pub generator: String,
     #[serde(default)]
     pub lanes: BTreeMap<String, String>,
-    pub files: BTreeMap<String, Vec<VariantEntry>>,
+    pub files: BTreeMap<String, Vec<String>>,
 }
 
 impl Manifest {
@@ -501,7 +506,7 @@ impl crate::live::Proxy {
         }
         tracing::info!(
             entity = %cid,
-            originals = out.manifest.files.len(),
+            originals = out.entries.len(),
             reused = out.stats.reused_textures + out.stats.reused_models,
             built = out.stats.unique_variants,
             ms = started.elapsed().as_millis() as u64,

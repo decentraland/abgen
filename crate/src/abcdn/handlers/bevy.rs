@@ -82,7 +82,7 @@ fn manifest_is_current(path: &std::path::Path, check_variants: bool) -> bool {
     m.files
         .values()
         .flatten()
-        .all(|e| bevyvariants::key_path(root, &e.path).is_some_and(|p| p.is_file()))
+        .all(|path| bevyvariants::key_path(root, path).is_some_and(|p| p.is_file()))
 }
 
 /// Whether a manifest's variants must be on local disk for it to count as current: true
@@ -368,6 +368,20 @@ mod tests {
         )
         .unwrap();
         assert!(!manifest_is_current(&p, false));
+        // A v2 manifest (full entries) is stale even with current lanes: it is rebuilt as v3.
+        #[cfg(feature = "bevy-variants")]
+        {
+            std::fs::write(
+                &p,
+                serde_json::json!({"v": 2, "entity": "e", "generator": "g",
+                    "lanes": bevyvariants::BuildOptions::from_env().lanes(),
+                    "files": {"c": [{"path": "bevy/t2/c_srgb", "cid": "x", "kind": "texture",
+                        "format": "ktx2-bc7", "size": 1}]}})
+                .to_string(),
+            )
+            .unwrap();
+            assert!(!manifest_is_current(&p, false));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -390,24 +404,10 @@ mod tests {
         let key = bevyvariants::variant_key("t2", "bafkreiexample_srgb");
         let m = bevyvariants::Manifest {
             v: bevyvariants::MANIFEST_VERSION,
-            entity: "bafkent".into(),
-            generator: "test".into(),
             lanes,
-            files: [(
-                "bafkreiexample".to_string(),
-                vec![bevyvariants::VariantEntry {
-                    path: key.clone(),
-                    cid: "bafkreiexamplevariant".into(),
-                    kind: "texture".into(),
-                    format: "ktx2-bc7".into(),
-                    width: Some(4),
-                    height: Some(4),
-                    mips: Some(1),
-                    size: 3,
-                }],
-            )]
-            .into_iter()
-            .collect(),
+            files: [("bafkreiexample".to_string(), vec![key.clone()])]
+                .into_iter()
+                .collect(),
         };
         let mp = bevyvariants::manifest_path(&root, "bafkent").unwrap();
         std::fs::create_dir_all(mp.parent().unwrap()).unwrap();
