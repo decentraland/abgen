@@ -36,7 +36,7 @@
 //!
 //! - textures: `bevy/t{TEX_GEN}/{sourceCid}_{slot}` (`slot` = `srgb` | `linear` | `normal`,
 //!   how the entity's models sample the image; the same image used differently in two scenes
-//!   is two variants). A non-default Zstandard level is part of the prefix (`t1z9`).
+//!   is two variants). A non-default Zstandard level is part of the prefix (`t2z9`).
 //! - `glb-meshopt` models: `bevy/m{MESH_GEN}/{sourceCid}`, with the digest of the external
 //!   `.bin` buffers appended for a `.gltf` source (they are inlined, so they are an input;
 //!   image URIs are not).
@@ -95,7 +95,8 @@ pub const MANIFEST_PREFIX: &str = "bevy/manifest";
 
 /// Generation of the texture encoders (BC1/BC5/BC7 kernels, mips, size cap, KTX2 writer, the
 /// UASTC transcode). Bump when any of them changes its output bytes.
-pub const TEX_GEN: u32 = 1;
+/// 2: sources whose variant size would be under 4 px on a side get no variant (`tiny`).
+pub const TEX_GEN: u32 = 2;
 /// Generation of the `glb-meshopt` encoder (codecs, filters, precision, GLB rewrite). Bump when
 /// it changes its output bytes.
 pub const MESH_GEN: u32 = 1;
@@ -433,27 +434,48 @@ impl crate::live::Proxy {
             }
         };
         let probe = |key: &str| self.bevy_probe(key);
+        let stored = |key: &str| -> Option<Vec<u8>> {
+            if self.space_configured() {
+                self.space_get_key(key)
+            } else {
+                None
+            }
+        };
         let lane = Lane {
             fetch: &fetch,
             probe: &probe,
+            stored: &stored,
         };
         let out = build_entity_variants(&ctx.scene, &lane, out_root, BuildOptions::from_env())?;
         if self.space_configured() {
+            // A key whose bytes, sidecar or record did not all land is dropped whole: its
+            // later objects are skipped (so the store never holds a record naming bytes it
+            // lacks), nothing is marked in Redis, and its local record is deleted so the next
+            // build here re-encodes and re-uploads it instead of reusing it.
             let mut failed = 0usize;
+            let mut failed_owner: Option<&str> = None;
             for obj in &out.uploads {
-                let bytes = match std::fs::read(&obj.path) {
+                if failed_owner == Some(obj.owner.as_str()) {
+                    continue;
+                }
+                let put = std::fs::read(&obj.path)
+                    .map_err(|e| anyhow::anyhow!("re-read {}: {e}", obj.path.display()))
+                    .and_then(|bytes| {
+                        self.space_put_key_strict(&obj.key, &bytes)?;
+                        Ok(bytes)
+                    });
+                let bytes = match put {
                     Ok(b) => b,
                     Err(e) => {
-                        tracing::warn!(key = %obj.key, error = %e, "bevy variants: re-read for upload failed");
+                        tracing::warn!(key = %obj.key, error = %format!("{e:#}"), "bevy variants: upload failed");
                         failed += 1;
+                        failed_owner = Some(obj.owner.as_str());
+                        if let Some(rec) = key_path(out_root, &record_key(&obj.owner)) {
+                            let _ = std::fs::remove_file(rec);
+                        }
                         continue;
                     }
                 };
-                if let Err(e) = self.space_put_key_strict(&obj.key, &bytes) {
-                    tracing::warn!(key = %obj.key, error = %format!("{e:#}"), "bevy variants: upload failed");
-                    failed += 1;
-                    continue;
-                }
                 if obj.record {
                     if let (Some(ck), Ok(v)) =
                         (self.reuse_cache_key(&obj.key), std::str::from_utf8(&bytes))

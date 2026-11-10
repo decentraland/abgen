@@ -77,21 +77,47 @@ pub(super) async fn bevy_serve_local(
     let Some(target) = bevy_target(path) else {
         return serve::not_found();
     };
+    if let BevyTarget::Manifest(_) = &target {
+        // The corpus root first, then the JIT root, but only a current copy is served: a stale
+        // corpus manifest must not hide the current one a JIT build wrote.
+        let mut roots = vec![(state.out_root.clone(), false)];
+        if state.roots_distinct {
+            roots.push((state.jit_root.clone(), true));
+        }
+        let candidates: Vec<(std::path::PathBuf, bool)> = roots
+            .into_iter()
+            .filter_map(|(r, j)| disk_path(&r, &target).map(|p| (p, j)))
+            .collect();
+        let found = tokio::task::spawn_blocking(move || {
+            let mut any = false;
+            for (p, j) in candidates {
+                if p.is_file() {
+                    any = true;
+                    if manifest_is_current(&p) {
+                        return (Some((p, j)), true);
+                    }
+                }
+            }
+            (None, any)
+        })
+        .await
+        .unwrap_or((None, false));
+        return match found {
+            (Some((exact, from_jit)), _) => {
+                state.touch_if_jit(&exact, from_jit);
+                serve::serve_manifest(state, path, &exact, method).await
+            }
+            (None, true) => with_reason(serve::not_found(), "bevy-variants-stale"),
+            (None, false) => serve::not_found(),
+        };
+    }
     let Some((exact, from_jit)) = state.serve_lookup(|r| disk_path(r, &target)) else {
         return serve::not_found();
     };
     state.touch_if_jit(&exact, from_jit);
     match &target {
-        BevyTarget::Manifest(_) => {
-            let p = exact.clone();
-            let current = tokio::task::spawn_blocking(move || manifest_is_current(&p))
-                .await
-                .unwrap_or(false);
-            if !current {
-                return with_reason(serve::not_found(), "bevy-variants-stale");
-            }
-            serve::serve_manifest(state, path, &exact, method).await
-        }
+        // Served above.
+        BevyTarget::Manifest(_) => serve::not_found(),
         BevyTarget::Variant { prefix, name } => {
             // A `glb-meshopt` variant may have a Brotli sidecar (`{name}.br`): clients that
             // accept `br` get those bytes as the encoded representation of the same resource.
@@ -172,15 +198,20 @@ pub(super) async fn bevy_fallback(
                 if !br_dst.is_file() {
                     let p3 = proxy.clone();
                     let br_key = format!("{key}.br");
-                    space_materialize(Some("bevy-br"), br_dst, move || p3.space_get_key(&br_key))
-                        .await;
+                    if space_materialize(Some("bevy-br"), br_dst.clone(), move || {
+                        p3.space_get_key(&br_key)
+                    })
+                    .await
+                    {
+                        state.jit_record_bevy_file(&br_dst);
+                    }
                 }
             }
             let p2 = proxy.clone();
             if let Some(resp) = space_lane_serve(
                 state,
                 Some("bevy"),
-                dst,
+                dst.clone(),
                 move || p2.space_get_key(&key),
                 path,
                 path,
@@ -189,6 +220,7 @@ pub(super) async fn bevy_fallback(
             )
             .await
             {
+                state.jit_record_bevy_file(&dst);
                 return resp;
             }
         }

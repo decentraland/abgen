@@ -598,6 +598,19 @@ impl Proxy {
         v
     }
 
+    /// Whether a standalone `.ktx2` is one the Unity lanes convert: a UASTC LDR 2D texture
+    /// within the size cap (`crate::ktx2::ktx2_header_ok`). Any other KTX2 (ETC1S/BasisLZ,
+    /// UASTC HDR, arrays, cubemaps, too large) is not convertible and is skipped like any
+    /// unknown file: no bundle and no tolerated failure. Content that cannot be read is not a
+    /// verdict: the build runs and surfaces the error.
+    fn ktx2_standalone_ok(&self, hash: &str) -> bool {
+        self.ensure_content(hash).ok();
+        match self.content.fetch_mmap(hash) {
+            Ok(raw) => crate::ktx2::ktx2_header_ok(&raw),
+            Err(_) => true,
+        }
+    }
+
     /// Whether a scene font is one the font lane takes. One that is not (a web font renamed
     /// `.ttf`, a truncated upload) gets no bundle and counts as a tolerated failure; the
     /// explorer keeps its built-in font. Content that cannot be read is not a verdict: the
@@ -1240,6 +1253,19 @@ impl Proxy {
         for (idx, c) in convertible.iter().enumerate() {
             let order = idx + 1;
             let (is_glb, is_image) = is_convertible(&c.file);
+            if is_image
+                && c.file.to_lowercase().ends_with(".ktx2")
+                && !self.ktx2_standalone_ok(&c.hash)
+            {
+                tracing::info!(
+                    entity = %cid,
+                    file = %c.file,
+                    hash = %c.hash,
+                    "standalone KTX2 is not UASTC LDR 2D — skipped, no bundle"
+                );
+                done_pre += 1;
+                continue;
+            }
             let is_font = !is_glb && !is_image && is_font(&c.file);
             let case_hash = if platform == "mac" {
                 c.hash.to_lowercase()

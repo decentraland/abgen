@@ -125,9 +125,13 @@ impl BuildOptions {
 /// unavailable: that file gets no variant and no record). `probe` returns the record of a
 /// variant key that already exists somewhere this build does not write (the store, through
 /// Redis); `None` is a miss. Local records under `out_root` are read before `probe` is asked.
+/// `stored` returns a stored variant's bytes by key (`None` = not there); a variant under
+/// `out_root` is read before it is asked. It is only used to add a `.br` sidecar to a reused
+/// variant that has none.
 pub struct Lane<'a> {
     pub fetch: &'a (dyn Fn(&str) -> Option<Vec<u8>> + Sync),
     pub probe: &'a (dyn Fn(&str) -> Option<Record> + Sync),
+    pub stored: &'a (dyn Fn(&str) -> Option<Vec<u8>> + Sync),
 }
 
 /// One object this build wrote under `out_root`, in the order the store must receive them:
@@ -136,6 +140,9 @@ pub struct Lane<'a> {
 pub struct Upload {
     /// Object key, also the path under `out_root`.
     pub key: String,
+    /// The variant key this object belongs to (its own key for the variant bytes). The
+    /// uploads of one owner are contiguous and its record comes last.
+    pub owner: String,
     pub path: PathBuf,
     /// This is a record (`{key}.json`): once stored it is marked in Redis.
     pub record: bool,
@@ -181,11 +188,18 @@ fn model_ext(file: &str) -> &'static str {
     }
 }
 
-/// The record of `key` under `out_root`, if this or an earlier build here wrote one.
+/// The record of `key` under `out_root`, if this or an earlier build here wrote one and the
+/// variant it names is still beside it (the JIT cache evicts files one at a time, so a record
+/// can outlive its bytes; such a record is a miss and is deleted).
 fn local_record(out_root: &Path, key: &str) -> Option<Record> {
-    let p = key_path(out_root, &record_key(key))?;
-    let bytes = std::fs::read(p).ok()?;
-    Record::parse(&bytes)
+    let rp = key_path(out_root, &record_key(key))?;
+    let bytes = std::fs::read(&rp).ok()?;
+    let rec = Record::parse(&bytes)?;
+    if rec.variant.is_some() && !key_path(out_root, key).is_some_and(|p| p.is_file()) {
+        let _ = std::fs::remove_file(&rp);
+        return None;
+    }
+    Some(rec)
 }
 
 /// Local disk, then the lane's probe.
@@ -225,6 +239,7 @@ fn store(
         }
         out.push(Upload {
             key: key.to_string(),
+            owner: key.to_string(),
             path: dst.clone(),
             record: false,
         });
@@ -236,6 +251,7 @@ fn store(
         }
         out.push(Upload {
             key: format!("{key}.br"),
+            owner: key.to_string(),
             path: br_dst,
             record: false,
         });
@@ -247,11 +263,60 @@ fn store(
     }
     out.push(Upload {
         key: rk,
+        owner: key.to_string(),
         path: rec_dst,
         record: true,
     });
     times.hash_write_ns += elapsed_ns(started);
     Ok(out)
+}
+
+/// Add the `.br` sidecar to a reused `glb-meshopt` variant whose record says it has none: read
+/// the plain bytes (local, then the lane's store), check them against the record's CID,
+/// compress, write the sidecar, then replace the record with one that says `br`. Uploads in
+/// that order (sidecar, record), so the store never has a record naming a missing sidecar.
+/// `None` when the bytes are not available or do not match: the variant is served plain.
+fn backfill_br(
+    lane: &Lane,
+    out_root: &Path,
+    key: &str,
+    rec: &Record,
+    times: &mut StageTimes,
+) -> Result<Option<(Record, u64, Vec<Upload>)>> {
+    let Some(v) = rec.variant.as_ref() else {
+        return Ok(None);
+    };
+    let dst = key_path(out_root, key).ok_or_else(|| anyhow::anyhow!("bad variant key {key:?}"))?;
+    let plain = std::fs::read(&dst).ok().or_else(|| (lane.stored)(key));
+    let Some(plain) = plain.filter(|b| cid_v1_raw_sha256(b) == v.cid) else {
+        tracing::warn!(key = %key, "bevy glb-meshopt: reused variant unavailable; no .br added");
+        return Ok(None);
+    };
+    let br = timed(&mut times.brotli_ns, || meshopt::brotli_compress(&plain))?;
+    let started = std::time::Instant::now();
+    let br_dst = meshopt::br_sidecar(&dst);
+    write_atomic(&br_dst, &br)?;
+    let mut rec = rec.clone();
+    rec.br = true;
+    let rk = record_key(key);
+    let rec_dst = key_path(out_root, &rk).expect("a variant key's record is a valid key");
+    write_atomic(&rec_dst, &serde_json::to_vec(&rec).context("serialize record")?)?;
+    times.hash_write_ns += elapsed_ns(started);
+    let uploads = vec![
+        Upload {
+            key: format!("{key}.br"),
+            owner: key.to_string(),
+            path: br_dst,
+            record: false,
+        },
+        Upload {
+            key: rk,
+            owner: key.to_string(),
+            path: rec_dst,
+            record: true,
+        },
+    ];
+    Ok(Some((rec, br.len() as u64, uploads)))
 }
 
 fn entry(key: &str, bytes: &[u8], kind: &str, format: &str) -> VariantEntry {
@@ -456,9 +521,20 @@ pub fn build_entity_variants(
                     reused: false,
                     times: StageTimes::default(),
                 };
-                if let Some(rec) = probe(lane, out_root, &key, &mut times) {
+                if let Some(mut rec) = probe(lane, out_root, &key, &mut times) {
                     // `original_size` stays 0: the source was not fetched.
                     stat.reused = true;
+                    // The key does not name the Brotli setting: a variant first built without
+                    // a sidecar gets one here once precompression is on, without a re-encode.
+                    if opts.precompress_br && !rec.br && rec.variant.is_some() {
+                        if let Some((r, br_size, ups)) =
+                            backfill_br(lane, out_root, &key, &rec, &mut times)?
+                        {
+                            rec = r;
+                            stat.br_size = Some(br_size);
+                            out.uploads.extend(ups);
+                        }
+                    }
                     out.uses = rec.uses.clone();
                     uses_known = true;
                     match rec.variant {
@@ -488,7 +564,9 @@ pub fn build_entity_variants(
                             let outcome = match caught {
                                 Ok(Ok(Ok(v))) => {
                                     stat.streams = Some(v.streams as u64);
-                                    if v.glb.len() >= b.len() {
+                                    // Against the source plus the `.bin` buffers it
+                                    // inlines: what the client loads for the original.
+                                    if v.glb.len() as u64 >= v.source_size {
                                         stat.gated_size = Some(v.glb.len() as u64);
                                         Err(NoModelVariant::SizeGate)
                                     } else {

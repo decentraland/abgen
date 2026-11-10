@@ -211,10 +211,18 @@ pub(super) async fn jit_build_entity(
         )
         .await
         {
-            st.jit_record(&entity_owned);
+            if lane == "bevy" {
+                st.jit_record_bevy(&entity_owned);
+            } else {
+                st.jit_record(&entity_owned);
+            }
             invalidate_status_cache(&st, &entity_owned).await;
             JitBuild::Built
         } else {
+            // A Bevy build that failed on upload still wrote its manifest and variants here.
+            if lane == "bevy" {
+                st.jit_record_bevy(&entity_owned);
+            }
             st.jit_fail_cache.insert(key_owned.clone(), ()).await;
             JitBuild::Failed
         };

@@ -592,6 +592,11 @@ fn tiny_unknown_and_oversize_inputs() {
     assert!(encode_texture(b"\x89PNG\r\n\x1a\nbroken", Slot::Srgb).is_err());
     let v = ungated(&noise_png_bytes(2048, 16), Slot::Srgb);
     assert_eq!((v.width, v.height, v.mips), (1024, 8, 11));
+    // Elongated: the variant would be 1024x2, thinner than one 4x4 BC block.
+    assert_eq!(
+        miss(&noise_png_bytes(4096, 8), Slot::Srgb).reason,
+        NoVariant::Tiny
+    );
     // NPOT snaps to powers of two (whole blocks for wgpu).
     let v = ungated(&noise_png_bytes(24, 12), Slot::Srgb);
     assert_eq!((v.width, v.height), (32, 16));
@@ -942,6 +947,36 @@ fn grid_glb(n: u32) -> Vec<u8> {
 }
 
 #[test]
+fn meshopt_gltf_size_gate_counts_its_external_bin() {
+    use super::meshopt;
+    let (mut doc, bin) = split(&grid_glb(24));
+    doc["buffers"] = json!([{"uri": "grid.bin", "byteLength": bin.len()}]);
+    let gltf = serde_json::to_vec(&doc).unwrap();
+    let bin2 = bin.clone();
+    let resolve = move |uri: &str| (uri == "grid.bin").then(|| bin2.clone());
+    let v = meshopt::compress_model(&gltf, ".gltf", Some(&resolve))
+        .unwrap()
+        .unwrap();
+    assert_eq!(v.source_size, (gltf.len() + bin.len()) as u64);
+    // Larger than the JSON alone, smaller than what the client loads for the original.
+    assert!(v.glb.len() > gltf.len());
+    assert!((v.glb.len() as u64) < v.source_size);
+}
+
+#[test]
+fn meshopt_refuses_a_second_buffer_without_uri() {
+    use super::meshopt;
+    let grid = grid_glb(8);
+    let (mut doc, bin) = split(&grid);
+    let one = json!({"byteLength": bin.len()});
+    doc["buffers"] = json!([one.clone(), one]);
+    let glb = emit::glb_frame(serde_json::to_vec(&doc).unwrap(), &bin);
+    assert!(meshopt::compress_model(&glb, ".glb", None).is_err());
+    // The standard single-BIN GLB is unaffected.
+    assert!(meshopt::compress_model(&grid, ".glb", None).is_ok());
+}
+
+#[test]
 fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
     use super::meshopt::{self, read_accessor_f32, read_indices};
     let grid = grid_glb(24);
@@ -963,6 +998,7 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
     let lane = Lane {
         fetch: &fetch,
         probe: &probe,
+        stored: &|_: &str| -> Option<Vec<u8>> { None },
     };
     let out = std::env::temp_dir().join(format!("abgen-bevy-meshopt-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
@@ -1069,6 +1105,7 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
     let lane2 = Lane {
         fetch: &counting,
         probe: &probe,
+        stored: &|_: &str| -> Option<Vec<u8>> { None },
     };
     let again = build_entity_variants(
         &scene,
@@ -1148,6 +1185,7 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
     let lane5 = Lane {
         fetch: &counting,
         probe: &remote,
+        stored: &|_: &str| -> Option<Vec<u8>> { None },
     };
     fetches.store(0, std::sync::atomic::Ordering::Relaxed);
     let probed = build_entity_variants(&scene, &lane5, &out5, BuildOptions::default()).unwrap();
@@ -1250,6 +1288,7 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     let lane = Lane {
         fetch: &fetch,
         probe: &probe,
+        stored: &|_: &str| -> Option<Vec<u8>> { None },
     };
     let run = |tag: &str, opts: BuildOptions| {
         let out =

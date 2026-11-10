@@ -36,6 +36,9 @@ pub struct MeshoptVariant {
     pub glb: Vec<u8>,
     /// Compressed streams written (attribute or index accessors).
     pub streams: usize,
+    /// What a client loads for the original: the source file plus every external buffer it
+    /// inlined (data URIs are already in the source). The size gate compares against this.
+    pub source_size: u64,
 }
 
 /// Why a model got no `glb-meshopt` variant.
@@ -55,21 +58,31 @@ pub enum NoModelVariant {
 }
 
 /// Read every buffer into one 4-aligned byte space and point the views at it (buffer 0).
+/// Only `buffers[0]` may omit `uri` (the GLB's BIN chunk, per the glTF spec); any other buffer
+/// without one is refused, so one small file cannot make the BIN chunk be copied once per
+/// buffer it lists.
 fn merge_buffers(
     root: &mut Root,
     glb_bin: Vec<u8>,
     resolve: crate::gltf::Resolve,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, u64)> {
     let mut merged: Vec<u8> = Vec::new();
+    let mut external: u64 = 0;
     let mut bases: Vec<u64> = Vec::with_capacity(root.buffers.len());
+    let mut glb_bin = Some(glb_bin);
     for (bi, buf) in root.buffers.iter().enumerate() {
         let chunk: Vec<u8> = match &buf.uri {
-            None => glb_bin.clone(),
+            None if bi == 0 => glb_bin.take().unwrap_or_default(),
+            None => bail!("buffer[{bi}] has no uri; only buffer 0 may refer to the GLB BIN chunk"),
             Some(uri) if uri.starts_with("data:") => crate::gltf::decode_data_uri(uri)
                 .ok_or_else(|| anyhow!("buffer[{bi}] bad data uri"))?,
-            Some(uri) => resolve
-                .and_then(|f| f(uri))
-                .ok_or_else(|| anyhow!("buffer[{bi}] external uri {uri:?} unresolved"))?,
+            Some(uri) => {
+                let b = resolve
+                    .and_then(|f| f(uri))
+                    .ok_or_else(|| anyhow!("buffer[{bi}] external uri {uri:?} unresolved"))?;
+                external += b.len() as u64;
+                b
+            }
         };
         emit::pad4(&mut merged, 0);
         bases.push(merged.len() as u64);
@@ -85,18 +98,26 @@ fn merge_buffers(
         view.byte_offset = Some(USize64(base + view.byte_offset.map_or(0, |o| o.0)));
         view.buffer = Index::new(0);
     }
-    Ok(merged)
+    Ok((merged, external))
 }
 
 /// Parse a GLB or glTF and read every buffer into one byte space (buffer 0, views rebased):
 /// the form `compress_model` and the readers below work on. External buffer URIs go through
 /// `resolve`; image URIs are never touched.
 pub fn load_merged(bytes: &[u8], resolve: crate::gltf::Resolve) -> Result<(Root, Vec<u8>)> {
+    load_merged_sized(bytes, resolve).map(|(r, m, _)| (r, m))
+}
+
+/// [`load_merged`], plus the bytes read from external buffer URIs.
+fn load_merged_sized(
+    bytes: &[u8],
+    resolve: crate::gltf::Resolve,
+) -> Result<(Root, Vec<u8>, u64)> {
     let (json_bytes, glb_bin) = emit::split_container(bytes)?;
     let mut root: Root =
         gltf_json::deserialize::from_slice(&json_bytes).context("gltf json parse")?;
-    let merged = merge_buffers(&mut root, glb_bin, resolve)?;
-    Ok((root, merged))
+    let (merged, external) = merge_buffers(&mut root, glb_bin, resolve)?;
+    Ok((root, merged, external))
 }
 
 /// Build the `glb-meshopt` variant of `bytes`. `Ok(Err(reason))` means no variant.
@@ -106,7 +127,8 @@ pub fn compress_model(
     resolve: crate::gltf::Resolve,
 ) -> Result<std::result::Result<MeshoptVariant, NoModelVariant>> {
     let _ = ext;
-    let (mut root, merged) = load_merged(bytes, resolve)?;
+    let (mut root, merged, external) = load_merged_sized(bytes, resolve)?;
+    let source_size = bytes.len() as u64 + external;
     if root.extensions_used.iter().any(|e| e == EXT_MESHOPT)
         || root.extensions_required.iter().any(|e| e == EXT_MESHOPT)
     {
@@ -180,6 +202,7 @@ pub fn compress_model(
     Ok(Ok(MeshoptVariant {
         glb: emit::glb_frame(json.into_bytes(), &new_bin),
         streams,
+        source_size,
     }))
 }
 

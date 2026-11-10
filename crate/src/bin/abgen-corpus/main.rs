@@ -300,7 +300,7 @@ fn run() -> Result<()> {
     let mut bevy_variants = false;
     let mut bevy_glb_variants = false;
     let mut bevy_no_glb_meshopt = false;
-    let mut bevy_precompress_br = false;
+    let mut bevy_precompress_br: Option<bool> = None;
     let mut bevy_zstd_level: Option<i32> = None;
     let mut i = 0;
     while i < argv.len() {
@@ -436,8 +436,8 @@ fn run() -> Result<()> {
             "--bevy-precompress" => {
                 i += 1;
                 bevy_precompress_br = match argv.get(i).map(String::as_str) {
-                    Some("br") => true,
-                    Some("none") => false,
+                    Some("br") => Some(true),
+                    Some("none") => Some(false),
                     _ => usage(),
                 };
             }
@@ -475,7 +475,7 @@ fn run() -> Result<()> {
     }
     if (bevy_glb_variants
         || bevy_no_glb_meshopt
-        || bevy_precompress_br
+        || bevy_precompress_br.is_some()
         || bevy_zstd_level.is_some())
         && !bevy_variants
     {

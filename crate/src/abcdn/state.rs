@@ -230,14 +230,22 @@ impl AppStateInner {
         out.map(|p| (p, false))
     }
 
+    /// The LRU key of a file under the JIT root: its first path component (an entity's
+    /// directory), except under `bevy/`, whose objects are shared between entities and are
+    /// accounted one file at a time, keyed by their path (`bevy/t1/{name}`, `bevy/t1/{name}.json`).
     pub fn jit_key_of(&self, exact: &Path) -> Option<String> {
-        exact
-            .strip_prefix(&self.jit_root)
-            .ok()?
-            .components()
-            .next()
-            .and_then(|c| c.as_os_str().to_str())
-            .map(str::to_string)
+        let rel = exact.strip_prefix(&self.jit_root).ok()?;
+        let mut comps = rel.components().map(|c| c.as_os_str().to_str());
+        let first = comps.next()??;
+        if first != crate::bevyvariants::BEVY_PLATFORM {
+            return Some(first.to_string());
+        }
+        let mut key = first.to_string();
+        for c in comps {
+            key.push('/');
+            key.push_str(c?);
+        }
+        Some(key)
     }
 
     pub fn touch_if_jit(&self, exact: &Path, from_jit: bool) {
@@ -259,6 +267,42 @@ impl AppStateInner {
             return;
         }
         self.jit_cache.record(&stored, dir, bytes);
+    }
+
+    /// Account one Bevy-lane file under the JIT root by its own key (`jit_key_of`).
+    pub fn jit_record_bevy_file(&self, path: &Path) {
+        if let Some(key) = self.jit_key_of(path) {
+            self.jit_record_file(&key, path);
+        }
+    }
+
+    /// After a Bevy build: account the entity's manifest and every object it names (each
+    /// variant with its `.br` sidecar and `.json` record) as their own LRU entries. Records of
+    /// final no-variant outcomes are not named by the manifest; they are small and are
+    /// accounted when seeded at startup.
+    pub fn jit_record_bevy(&self, entity: &str) {
+        if !self.jit_cache.enabled() {
+            return;
+        }
+        let Some(mp) = crate::bevyvariants::manifest_path(&self.jit_root, entity) else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&mp) else {
+            return;
+        };
+        if let Ok(m) = serde_json::from_slice::<crate::bevyvariants::Manifest>(&bytes) {
+            for e in m.files.values().flatten() {
+                let Some(p) = crate::bevyvariants::key_path(&self.jit_root, &e.path) else {
+                    continue;
+                };
+                for suffix in ["", ".br", ".json"] {
+                    let mut os = p.clone().into_os_string();
+                    os.push(suffix);
+                    self.jit_record_bevy_file(Path::new(&os));
+                }
+            }
+        }
+        self.jit_record_bevy_file(&mp);
     }
 
     pub fn jit_record_file(&self, key: &str, path: &Path) {

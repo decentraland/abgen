@@ -284,7 +284,7 @@ check). The client loads a variant when the manifest lists one it supports and f
 original file on anything else, so the lane can be switched off at any time. Built by
 `crate/src/bevyvariants` (feature `bevy-variants`, on with `server`).
 
-- `GET /bevy/manifest/{entity}.json` - `{"v":2,"entity","generator":"abgen <version>","lanes":{"texture":"t1","mesh":"m1"},"files":{"<original cid>":[{"path","cid","kind","format","width","height","mips","size"}]}}`
+- `GET /bevy/manifest/{entity}.json` - `{"v":2,"entity","generator":"abgen <version>","lanes":{"texture":"t2","mesh":"m1"},"files":{"<original cid>":[{"path","cid","kind","format","width","height","mips","size"}]}}`
   (`format`: `ktx2-bc7` | `ktx2-bc1` | `ktx2-bc5` | `glb-meshopt`, plus `glb` only when GLB variants are on;
   `width`/`height`/`mips` only on textures). 404 while absent, and while the manifest on disk
   was built from an older generation (`X-Abgen-Reason: bevy-variants-stale`, see the asset lane
@@ -306,7 +306,7 @@ doing any work and asks the store for it the way the Unity lanes probe
 
 - textures: `bevy/t{TEX_GEN}/{sourceCid}_{slot}`, `slot` = `srgb` | `linear` | `normal` (how the
   entity's models sample the image; the same image used differently in two scenes is two
-  variants). A Zstandard level other than the default is part of the prefix (`t1z9`).
+  variants). A Zstandard level other than the default is part of the prefix (`t2z9`).
 - `glb-meshopt` models: `bevy/m{MESH_GEN}/{sourceCid}`; a `.gltf` source gets a digest of the
   external `.bin` buffers it inlines appended (`{sourceCid}_{16 hex}`), the same `.gltf` beside
   different `.bin` files being two variants. Image URIs are left untouched, so they are not inputs.
@@ -331,7 +331,7 @@ prefix, the previous prefix (`bevy/t1/`, …) is garbage and can be deleted whol
 built from it (their `lanes` name it) are rebuilt on the next request, re-encoding only that class.
 The generations live in code because they describe the encoders. The operator's lever is
 `ABGEN_BEVY_EPOCH` (unset by default; a number `0..=9999`): when set, every prefix gets `e{N}`
-appended (`t1e2`, `m1e2`), so every key misses, every manifest reads as stale and the lane
+appended (`t2e2`, `m1e2`), so every key misses, every manifest reads as stale and the lane
 re-encodes into the new prefixes, without a release. Setting it back finds the old prefixes again.
 No per-recipe digests: skins, animations and textures referenced by a model do not change the
 model variant's bytes, so they are not in its name. The option toggles

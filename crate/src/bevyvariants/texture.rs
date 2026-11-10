@@ -368,7 +368,10 @@ pub fn encode_texture_ungated(
     let img =
         timed(&mut times.decode_ns, || image::load_from_memory(bytes)).context("decode image")?;
     let img = timed(&mut times.decode_ns, || img.to_rgba8());
-    if is_tiny(img.width(), img.height()) {
+    // Tiny at the source, or at the variant size: an elongated source (4096x8) downscales to a
+    // level 0 thinner than one 4x4 BC block (1024x2), which wgpu refuses.
+    let (tw, th) = target_size(img.width(), img.height());
+    if is_tiny(img.width(), img.height()) || tw < 4 || th < 4 {
         return Ok(Err(NoVariant::Tiny.into()));
     }
     encode_rgba(img, slot, opts, times).map(Ok)

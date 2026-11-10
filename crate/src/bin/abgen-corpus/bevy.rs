@@ -21,14 +21,15 @@ pub(crate) fn run_bevy_variants(
     out_root: &Path,
     glb_variants: bool,
     no_glb_meshopt: bool,
-    precompress_br: bool,
+    precompress_br: Option<bool>,
     zstd_level: Option<i32>,
 ) -> Result<()> {
     let env = abgen::bevyvariants::BuildOptions::from_env();
     let opts = abgen::bevyvariants::BuildOptions {
         glb_variants: glb_variants || env.glb_variants,
         glb_meshopt: env.glb_meshopt && !no_glb_meshopt,
-        precompress_br: precompress_br || env.precompress_br,
+        // An explicit `--bevy-precompress` wins over `ABGEN_BEVY_PRECOMPRESS`.
+        precompress_br: precompress_br.unwrap_or(env.precompress_br),
         zstd_level: match zstd_level {
             Some(l) => abgen::ktx2_write::check_zstd_level(l)?,
             None => env.zstd_level,
@@ -59,9 +60,11 @@ pub(crate) fn run_bevy_variants(
             let fetch = |hash: &str| store.fetch(hash).ok();
             // No store to ask: records under <out-dir> are the only reuse.
             let probe = |_: &str| None;
+            let stored = |_: &str| None;
             let lane = abgen::bevyvariants::Lane {
                 fetch: &fetch,
                 probe: &probe,
+                stored: &stored,
             };
             abgen::bevyvariants::build_entity_variants(&scene, &lane, out_root, opts)
         })();
@@ -130,7 +133,7 @@ pub(crate) fn run_bevy_variants(
     _: &Path,
     _: bool,
     _: bool,
-    _: bool,
+    _: Option<bool>,
     _: Option<i32>,
 ) -> Result<()> {
     anyhow::bail!("--bevy-variants requires the bevy-variants feature (on by default via `server`)")
