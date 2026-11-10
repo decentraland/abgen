@@ -274,6 +274,15 @@ pub(super) async fn bevy_fallback(
         let probe = probe(&state.jit_root);
         match jit_build_entity(state, &proxy, entity, BEVY_PLATFORM, probe, "bevy").await {
             JitBuild::Built | JitBuild::Coalesced => {
+                // The recorder's pins are gone by now: pin the manifest and everything it
+                // names again, so a concurrent record cannot evict them before this serve
+                // checks the manifest (`manifest_is_current`). The guards drop when this arm
+                // returns, on every path. Later variant fetches are not covered.
+                let st = state.clone();
+                let ent = entity.clone();
+                let _pins = tokio::task::spawn_blocking(move || st.pin_bevy_manifest(&ent))
+                    .await
+                    .unwrap_or_default();
                 state.resolve_cache.invalidate(path).await;
                 dispatch_local(state, path, method, headers).await
             }

@@ -287,16 +287,12 @@ impl AppStateInner {
     /// cannot evict what its own manifest needs. Eviction still runs on every record, so the
     /// budget holds; a variant evicted later makes the manifest stale on a node without
     /// read-through (`bevy::manifest_is_current`), and the next request rebuilds that key.
-    pub fn jit_record_bevy(&self, entity: &str) {
-        let Some(proxy) = self.live_proxy.as_ref() else {
-            return;
-        };
-        let written = proxy.take_bevy_written(entity);
-        if !self.jit_cache.enabled() {
-            return;
-        }
+    /// The JIT-root manifest of `entity` and the files it depends on: each variant it lists
+    /// with its `.br` sidecar and `.json` record (whether or not they exist). Reads the
+    /// manifest from disk, so call it off the async threads.
+    pub fn bevy_manifest_deps(&self, entity: &str) -> (Option<PathBuf>, Vec<PathBuf>) {
         let manifest = crate::bevyvariants::manifest_path(&self.jit_root, entity);
-        let deps: Vec<PathBuf> = manifest
+        let deps = manifest
             .as_deref()
             .and_then(|p| std::fs::read(p).ok())
             .and_then(|b| serde_json::from_slice::<crate::bevyvariants::Manifest>(&b).ok())
@@ -315,11 +311,40 @@ impl AppStateInner {
                     .collect()
             })
             .unwrap_or_default();
-        let _pins: Vec<_> = deps
+        (manifest, deps)
+    }
+
+    /// Pin the LRU entries of `paths` (files under the JIT root) until the guards drop.
+    pub fn pin_jit_paths(&self, paths: &[PathBuf]) -> Vec<crate::jitcache::PinGuard> {
+        paths
             .iter()
             .filter_map(|p| self.jit_key_of(p))
             .filter_map(|k| self.jit_cache.pin(&k))
-            .collect();
+            .collect()
+    }
+
+    /// Pins on every file the JIT-root manifest of `entity` depends on, plus the manifest
+    /// itself, for the serve that follows a build: nothing it names can be evicted until the
+    /// guards drop. Empty when the cache is off.
+    pub fn pin_bevy_manifest(&self, entity: &str) -> Vec<crate::jitcache::PinGuard> {
+        if !self.jit_cache.enabled() {
+            return Vec::new();
+        }
+        let (manifest, mut deps) = self.bevy_manifest_deps(entity);
+        deps.extend(manifest);
+        self.pin_jit_paths(&deps)
+    }
+
+    pub fn jit_record_bevy(&self, entity: &str) {
+        let Some(proxy) = self.live_proxy.as_ref() else {
+            return;
+        };
+        let written = proxy.take_bevy_written(entity);
+        if !self.jit_cache.enabled() {
+            return;
+        }
+        let (manifest, deps) = self.bevy_manifest_deps(entity);
+        let _pins = self.pin_jit_paths(&deps);
         let dep_set: std::collections::HashSet<&PathBuf> = deps.iter().collect();
         for p in &written {
             if !dep_set.contains(p) && Some(p) != manifest.as_ref() {

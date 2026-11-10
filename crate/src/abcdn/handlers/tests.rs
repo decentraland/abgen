@@ -1328,3 +1328,56 @@ async fn registry_records_pass_through_upstream_versions() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The pins a `?wait=1` serve takes after a Bevy build hold the manifest and every file it
+/// names against a concurrent record; once they drop, those files are evictable again.
+#[test]
+fn bevy_manifest_pins_hold_its_dependencies_against_eviction() {
+    use crate::bevyvariants;
+    let dir = lane_temp_dir("bevy-pins");
+    let jit_root = dir.join("jit");
+    let cache = crate::jitcache::JitDiskCache::new(300);
+    let state: super::super::state::AppState = std::sync::Arc::new(
+        base_inner(
+            &dir,
+            "http://127.0.0.1:9",
+            None,
+            lane_jit(false, None, "/tmp/abgen-handlers-lane"),
+        )
+        .with_jit(jit_root.clone(), cache.clone(), true),
+    );
+    let key = bevyvariants::variant_key("t2", "bafkreiexample_srgb");
+    let vp = bevyvariants::key_path(&jit_root, &key).unwrap();
+    std::fs::create_dir_all(vp.parent().unwrap()).unwrap();
+    std::fs::write(&vp, [7u8; 40]).unwrap();
+    let mp = bevyvariants::manifest_path(&jit_root, "bafkent").unwrap();
+    std::fs::create_dir_all(mp.parent().unwrap()).unwrap();
+    let manifest = bevyvariants::Manifest {
+        v: bevyvariants::MANIFEST_VERSION,
+        lanes: Default::default(),
+        files: [("bafkreiexample".to_string(), vec![key.clone()])]
+            .into_iter()
+            .collect(),
+    };
+    std::fs::write(&mp, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    state.jit_record_bevy_file(&vp);
+    state.jit_record_bevy_file(&mp);
+
+    let filler = |name: &str| {
+        let p = bevyvariants::key_path(&jit_root, &bevyvariants::variant_key("t2", name)).unwrap();
+        std::fs::write(&p, [1u8; 200]).unwrap();
+        state.jit_record_bevy_file(&p);
+        p
+    };
+    let pins = state.pin_bevy_manifest("bafkent");
+    assert!(!pins.is_empty());
+    // Over budget while pinned: only the unpinned newcomer can go.
+    let first = filler("filler_a");
+    assert!(vp.is_file() && mp.is_file());
+    assert!(!first.exists());
+    drop(pins);
+    // Unpinned again: the oldest entries (the variant first) are evicted.
+    filler("filler_b");
+    assert!(!vp.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
