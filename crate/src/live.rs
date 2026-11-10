@@ -317,8 +317,17 @@ pub struct Proxy {
     font_ok: Mutex<HashMap<String, bool>>,
     /// Standalone `.ktx2` hash -> whether the UASTC header gate takes it.
     ktx2_ok: Mutex<HashMap<String, bool>>,
-    /// Entity -> files its Bevy builds wrote and the JIT cache has not taken yet.
-    pub(crate) bevy_written: Mutex<HashMap<String, Vec<PathBuf>>>,
+    /// Entity -> what its Bevy builds wrote or reused and the JIT cache has not taken yet.
+    /// Only filled while a JIT cache is set, and always taken by it after the build.
+    pub(crate) bevy_written: Mutex<HashMap<String, BevyWritten>>,
+}
+
+/// The files a Bevy build wrote or reused under its output root, with the JIT-cache pin taken
+/// on each one as it was reported: none of them can be evicted until the pins drop.
+#[derive(Default)]
+pub struct BevyWritten {
+    pub paths: Vec<PathBuf>,
+    pub pins: Vec<crate::jitcache::PinGuard>,
 }
 
 #[derive(Clone)]
@@ -340,7 +349,7 @@ impl Drop for ProgressGuard<'_> {
 }
 
 impl Proxy {
-    fn jit(&self) -> Option<&Arc<crate::jitcache::JitDiskCache>> {
+    pub(crate) fn jit(&self) -> Option<&Arc<crate::jitcache::JitDiskCache>> {
         self.jit_cache.get().filter(|c| c.enabled())
     }
 
@@ -348,9 +357,9 @@ impl Proxy {
         let _ = self.jit_cache.set(c);
     }
 
-    /// The files the Bevy builds of `entity` wrote since the last call, taken (so each is
-    /// reported once) by the JIT cache after a build.
-    pub fn take_bevy_written(&self, entity: &str) -> Vec<PathBuf> {
+    /// What the Bevy builds of `entity` wrote or reused since the last call, with the pins
+    /// held on it, taken (so each file is reported once) by the JIT cache after a build.
+    pub fn take_bevy_written(&self, entity: &str) -> BevyWritten {
         self.bevy_written
             .lock()
             .unwrap_or_else(|e| e.into_inner())

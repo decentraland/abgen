@@ -162,17 +162,50 @@ pub(super) async fn jit_build_entity(
     probe: impl Into<JitProbe>,
     lane: &'static str,
 ) -> JitBuild {
+    jit_build_entity_pinned(state, proxy, entity, platform, probe, lane)
+        .await
+        .0
+}
+
+/// [`jit_build_entity`], also returning the JIT-cache pins that keep the built output
+/// servable. Only the Bevy lane has any (its output is many LRU entries, not one per entity):
+/// for `Built` they are the recorder's pins on the manifest and every file it lists, handed
+/// over without a gap; for `Coalesced` they are pins on the same set, taken before the probe
+/// that found the manifest current. A `?wait=1` request holds them until it has served the
+/// manifest; a caller that drops them releases the files at once. Every other lane, and
+/// `Failed`, returns none.
+pub(super) async fn jit_build_entity_pinned(
+    state: &AppState,
+    proxy: &std::sync::Arc<crate::live::Proxy>,
+    entity: &str,
+    platform: &str,
+    probe: impl Into<JitProbe>,
+    lane: &'static str,
+) -> (JitBuild, Vec<crate::jitcache::PinGuard>) {
     let probe = probe.into();
+    let is_bevy = lane == "bevy";
     let key = format!("{entity}:{platform}");
     if state.jit_fail_cache.get(&key).await.is_some() {
         metrics::counter!("abgen_jit_builds_total", "outcome" => "fail-cached").increment(1);
-        return JitBuild::Failed;
+        return (JitBuild::Failed, Vec::new());
     }
     let lock = {
         let mut g = state.jit_inflight.lock().await;
         g.entry(key.clone()).or_default().clone()
     };
     let guard = lock.clone().lock_owned().await;
+    // Bevy: pin the manifest on disk and everything it names before probing it, while the
+    // inflight guard is held. A coalesced request then serves under these pins, and a build
+    // starts with the previous manifest's files held until its own output is recorded.
+    let pre_pins = if is_bevy {
+        let st = state.clone();
+        let ent = entity.to_string();
+        tokio::task::spawn_blocking(move || st.pin_bevy_manifest(&ent))
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let early = if state.jit_fail_cache.get(&key).await.is_some() {
         metrics::counter!("abgen_jit_builds_total", "outcome" => "fail-cached").increment(1);
         Some(JitBuild::Failed)
@@ -185,7 +218,11 @@ pub(super) async fn jit_build_entity(
     if let Some(outcome) = early {
         drop(guard);
         remove_jit_inflight(state, &key, &lock).await;
-        return outcome;
+        let pins = match outcome {
+            JitBuild::Coalesced => pre_pins,
+            _ => Vec::new(),
+        };
+        return (outcome, pins);
     }
     let st = state.clone();
     let proxy = proxy.clone();
@@ -193,13 +230,25 @@ pub(super) async fn jit_build_entity(
     let platform_owned = platform.to_string();
     let key_owned = key.clone();
     let lock_owned = lock.clone();
-    let (tx, rx) = tokio::sync::oneshot::channel::<JitBuild>();
+    let (tx, rx) = tokio::sync::oneshot::channel::<(JitBuild, Vec<crate::jitcache::PinGuard>)>();
     tokio::spawn(async move {
         let _permit = jit_build_sem().acquire().await.ok();
         let _pin = st
             .jit_cache
             .pin(&crate::naming::fs_safe_component(&entity_owned));
-        let outcome = if timed_corpus_build(
+        // Held through the build and its recording (dropped after the recorder has pinned
+        // the new manifest's files).
+        let build_pins = pre_pins;
+        // The Bevy recorder reads the manifest: off the async threads.
+        let record_bevy = |st: &AppState, entity: &str| {
+            let (st, entity) = (st.clone(), entity.to_string());
+            async move {
+                tokio::task::spawn_blocking(move || st.jit_record_bevy(&entity))
+                    .await
+                    .unwrap_or_default()
+            }
+        };
+        let (outcome, pins) = if timed_corpus_build(
             proxy,
             st.jit_root.clone(),
             entity_owned.clone(),
@@ -211,28 +260,33 @@ pub(super) async fn jit_build_entity(
         )
         .await
         {
-            if lane == "bevy" {
-                st.jit_record_bevy(&entity_owned);
+            let pins = if is_bevy {
+                record_bevy(&st, &entity_owned).await
             } else {
                 st.jit_record(&entity_owned);
-            }
+                Vec::new()
+            };
             invalidate_status_cache(&st, &entity_owned).await;
-            JitBuild::Built
+            (JitBuild::Built, pins)
         } else {
-            // A Bevy build that failed on upload still wrote its manifest and variants here.
-            if lane == "bevy" {
-                st.jit_record_bevy(&entity_owned);
+            // A Bevy build that failed (on upload, or by panicking) may still have written
+            // files here: account them, and release their pins.
+            if is_bevy {
+                drop(record_bevy(&st, &entity_owned).await);
             }
             st.jit_fail_cache.insert(key_owned.clone(), ()).await;
-            JitBuild::Failed
+            (JitBuild::Failed, Vec::new())
         };
+        drop(build_pins);
         drop(guard);
         drop(lock_owned);
-        let _ = tx.send(outcome);
+        // The pins travel with the outcome. If the waiter is gone, the send fails and they
+        // drop here.
+        let _ = tx.send((outcome, pins));
     });
-    let outcome = rx.await.unwrap_or(JitBuild::Failed);
+    let (outcome, pins) = rx.await.unwrap_or((JitBuild::Failed, Vec::new()));
     remove_jit_inflight(state, &key, &lock).await;
-    outcome
+    (outcome, pins)
 }
 
 async fn remove_jit_inflight(

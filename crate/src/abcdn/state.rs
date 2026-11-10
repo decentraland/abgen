@@ -232,20 +232,18 @@ impl AppStateInner {
 
     /// The LRU key of a file under the JIT root: its first path component (an entity's
     /// directory), except under `bevy/`, whose objects are shared between entities and are
-    /// accounted one file at a time, keyed by their path (`bevy/t1/{name}`, `bevy/t1/{name}.json`).
+    /// accounted one file at a time, keyed by their path (`bevyvariants::cache_key`).
     pub fn jit_key_of(&self, exact: &Path) -> Option<String> {
-        let rel = exact.strip_prefix(&self.jit_root).ok()?;
-        let mut comps = rel.components().map(|c| c.as_os_str().to_str());
-        let first = comps.next()??;
-        if first != crate::bevyvariants::BEVY_PLATFORM {
-            return Some(first.to_string());
+        if let Some(key) = crate::bevyvariants::cache_key(&self.jit_root, exact) {
+            return Some(key);
         }
-        let mut key = first.to_string();
-        for c in comps {
-            key.push('/');
-            key.push_str(c?);
-        }
-        Some(key)
+        exact
+            .strip_prefix(&self.jit_root)
+            .ok()?
+            .components()
+            .next()
+            .and_then(|c| c.as_os_str().to_str())
+            .map(str::to_string)
     }
 
     pub fn touch_if_jit(&self, exact: &Path, from_jit: bool) {
@@ -276,17 +274,6 @@ impl AppStateInner {
         }
     }
 
-    /// After a Bevy build (successful or not): account every file it wrote or reused under the
-    /// JIT root (variants, sidecars, records, negative records, the manifest), each as its own
-    /// LRU entry. Files outside the JIT root (a corpus `out_root`) are never accounted, so
-    /// never evicted.
-    ///
-    /// The files the entity's manifest lists (each variant with its `.br` and `.json`) are
-    /// pinned while this records, and recorded after the build's other files, with the
-    /// manifest last: they end up the most recently used entries, so recording this build
-    /// cannot evict what its own manifest needs. Eviction still runs on every record, so the
-    /// budget holds; a variant evicted later makes the manifest stale on a node without
-    /// read-through (`bevy::manifest_is_current`), and the next request rebuilds that key.
     /// The JIT-root manifest of `entity` and the files it depends on: each variant it lists
     /// with its `.br` sidecar and `.json` record (whether or not they exist). Reads the
     /// manifest from disk, so call it off the async threads.
@@ -323,9 +310,11 @@ impl AppStateInner {
             .collect()
     }
 
-    /// Pins on every file the JIT-root manifest of `entity` depends on, plus the manifest
-    /// itself, for the serve that follows a build: nothing it names can be evicted until the
-    /// guards drop. Empty when the cache is off.
+    /// Pins on the JIT-root manifest of `entity` as it is on disk now and on every file it
+    /// depends on: nothing it names can be evicted until the guards drop. Taken before a build
+    /// probes for a current manifest, so a coalesced request serves it under these pins and a
+    /// build starts with the previous manifest's files held. Empty when the cache is off.
+    /// Reads the manifest from disk, so call it off the async threads.
     pub fn pin_bevy_manifest(&self, entity: &str) -> Vec<crate::jitcache::PinGuard> {
         if !self.jit_cache.enabled() {
             return Vec::new();
@@ -335,18 +324,47 @@ impl AppStateInner {
         self.pin_jit_paths(&deps)
     }
 
-    pub fn jit_record_bevy(&self, entity: &str) {
+    /// After a Bevy build (successful or not): account every file it wrote or reused under the
+    /// JIT root (variants, sidecars, records, negative records, the manifest), each as its own
+    /// LRU entry. Files outside the JIT root (a corpus `out_root`) are never accounted, so
+    /// never evicted. Reads the manifest from disk, so call it off the async threads.
+    ///
+    /// Pins cover the whole hand-over. The build pinned each file as it reported it
+    /// (`Proxy::take_bevy_written` carries those pins, held until this returns). Before
+    /// recording anything, this pins the manifest and every file it lists (each variant with
+    /// its `.br` and `.json`); it records the build's other files first, those files next and
+    /// the manifest last, so they end up the most recently used entries and no record made
+    /// here can evict them. The returned guards keep them pinned: a `?wait=1` request holds
+    /// them until its manifest is served, everyone else drops them at once.
+    ///
+    /// Eviction still runs on every record, so the budget holds once the guards drop; a
+    /// variant evicted later makes the manifest stale on a node without read-through
+    /// (`bevy::manifest_is_current`), and the next request rebuilds that key.
+    #[must_use = "the guards pin the manifest and its files until dropped"]
+    pub fn jit_record_bevy(&self, entity: &str) -> Vec<crate::jitcache::PinGuard> {
         let Some(proxy) = self.live_proxy.as_ref() else {
-            return;
+            return Vec::new();
         };
         let written = proxy.take_bevy_written(entity);
+        self.jit_record_bevy_written(entity, written)
+    }
+
+    /// [`Self::jit_record_bevy`] for an explicit set of written files.
+    #[must_use = "the guards pin the manifest and its files until dropped"]
+    pub fn jit_record_bevy_written(
+        &self,
+        entity: &str,
+        written: crate::live::BevyWritten,
+    ) -> Vec<crate::jitcache::PinGuard> {
         if !self.jit_cache.enabled() {
-            return;
+            return Vec::new();
         }
         let (manifest, deps) = self.bevy_manifest_deps(entity);
-        let _pins = self.pin_jit_paths(&deps);
+        let mut pinned = deps.clone();
+        pinned.extend(manifest.clone());
+        let pins = self.pin_jit_paths(&pinned);
         let dep_set: std::collections::HashSet<&PathBuf> = deps.iter().collect();
-        for p in &written {
+        for p in &written.paths {
             if !dep_set.contains(p) && Some(p) != manifest.as_ref() {
                 self.jit_record_bevy_file(p);
             }
@@ -357,6 +375,8 @@ impl AppStateInner {
         if let Some(mp) = &manifest {
             self.jit_record_bevy_file(mp);
         }
+        // The build's own pins (`written.pins`) drop here, after the manifest's are taken.
+        pins
     }
 
     pub fn jit_record_file(&self, key: &str, path: &Path) {

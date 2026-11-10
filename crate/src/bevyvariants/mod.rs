@@ -375,29 +375,61 @@ impl Manifest {
 #[cfg(all(test, feature = "bevy-variants"))]
 mod tests;
 
-/// Moves the paths a Bevy build reported into `Proxy::bevy_written` when dropped, so they
-/// reach the JIT cache even when the build panics.
+/// The JIT-cache key of a Bevy-lane file under `root`: its path below the root with `/`
+/// separators (`bevy/t2/{name}`, `bevy/t2/{name}.json`, `bevy/manifest/{entity}.json`). `None`
+/// for a path that is not under `{root}/bevy/`.
+pub fn cache_key(root: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(root).ok()?;
+    let mut comps = rel.components().map(|c| c.as_os_str().to_str());
+    if comps.next()?? != BEVY_PLATFORM {
+        return None;
+    }
+    let mut key = BEVY_PLATFORM.to_string();
+    for c in comps {
+        key.push('/');
+        key.push_str(c?);
+    }
+    Some(key)
+}
+
+/// What a JIT Bevy build reports as it goes: each file it writes or reuses is pinned in the
+/// JIT cache on the spot, so nothing the build depends on can be evicted while it runs. When
+/// dropped (on success, on error and while unwinding from a panic) the paths and their pins
+/// move into `Proxy::bevy_written`, where the JIT cache takes them to record the build.
 #[cfg(feature = "bevy-variants")]
 struct WrittenStash<'a> {
     proxy: &'a crate::live::Proxy,
     entity: &'a str,
-    paths: std::sync::Mutex<Vec<PathBuf>>,
+    out_root: &'a Path,
+    cache: std::sync::Arc<crate::jitcache::JitDiskCache>,
+    written: std::sync::Mutex<crate::live::BevyWritten>,
+}
+
+#[cfg(feature = "bevy-variants")]
+impl WrittenStash<'_> {
+    fn report(&self, path: &Path) {
+        let pin = cache_key(self.out_root, path).and_then(|k| self.cache.pin(&k));
+        let mut w = self.written.lock().unwrap_or_else(|e| e.into_inner());
+        w.paths.push(path.to_path_buf());
+        w.pins.extend(pin);
+    }
 }
 
 #[cfg(feature = "bevy-variants")]
 impl Drop for WrittenStash<'_> {
     fn drop(&mut self) {
-        let paths = std::mem::take(self.paths.get_mut().unwrap_or_else(|e| e.into_inner()));
-        if paths.is_empty() {
+        let w = std::mem::take(self.written.get_mut().unwrap_or_else(|e| e.into_inner()));
+        if w.paths.is_empty() {
             return;
         }
-        self.proxy
+        let mut map = self
+            .proxy
             .bevy_written
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(self.entity.to_string())
-            .or_default()
-            .extend(paths);
+            .unwrap_or_else(|e| e.into_inner());
+        let slot = map.entry(self.entity.to_string()).or_default();
+        slot.paths.extend(w.paths);
+        slot.pins.extend(w.pins);
     }
 }
 
@@ -466,19 +498,19 @@ impl crate::live::Proxy {
                 None
             }
         };
-        // Everything the build writes or reuses, handed to the JIT cache however the build
-        // ends: on success, on error and while unwinding from a panic (the guard's drop).
-        let written = WrittenStash {
+        // With a JIT cache: everything the build writes or reuses is pinned as it is
+        // reported and handed to the cache however the build ends (`WrittenStash`).
+        let written = self.jit().map(|cache| WrittenStash {
             proxy: self,
             entity: cid,
-            paths: std::sync::Mutex::new(Vec::new()),
-        };
+            out_root,
+            cache: cache.clone(),
+            written: Default::default(),
+        });
         let wrote = |p: &Path| {
-            written
-                .paths
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(p.to_path_buf());
+            if let Some(w) = &written {
+                w.report(p);
+            }
         };
         let lane = Lane {
             fetch: &fetch,

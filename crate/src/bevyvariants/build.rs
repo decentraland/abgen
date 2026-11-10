@@ -143,7 +143,7 @@ impl BuildOptions {
 /// variant that has none. `wrote` is told every file the build writes or reuses under
 /// `out_root` (variants, sidecars, records, negative records and the manifest), as it goes, so
 /// a build that fails part-way has still reported what it left on disk, and a reused file is
-/// bumped in the JIT cache along with the build that used it.
+/// pinned in the JIT cache for the build and bumped along with it.
 pub struct Lane<'a> {
     pub fetch: &'a (dyn Fn(&str) -> Option<Vec<u8>> + Sync),
     pub probe: &'a (dyn Fn(&str) -> Option<Record> + Sync),
@@ -223,12 +223,17 @@ fn local_record(out_root: &Path, key: &str) -> Option<Record> {
 }
 
 /// Local disk, then the lane's probe. A local hit reports the key's files (variant, `.br`
-/// sidecar, record) to the lane as reused, so the JIT cache bumps them with this build.
+/// sidecar, record) to the lane as reused, so the JIT cache pins them for this build and bumps
+/// them with it. The variant is looked at again after the report: a JIT lane pins on report,
+/// so a variant still there then stays until the build is recorded, and one evicted between
+/// the record read and the pin is a miss.
 fn probe(lane: &Lane, out_root: &Path, key: &str, times: &mut StageTimes) -> Option<Record> {
     timed(&mut times.probe_ns, || {
         if let Some(r) = local_record(out_root, key) {
             report_local(lane, out_root, key);
-            return Some(r);
+            if r.variant.is_none() || key_path(out_root, key).is_some_and(|p| p.is_file()) {
+                return Some(r);
+            }
         }
         (lane.probe)(key)
     })
