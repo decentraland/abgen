@@ -333,6 +333,61 @@ impl Drop for ProgressGuard<'_> {
 }
 
 impl Proxy {
+    /// An unpublished Registry attempt has its own writable stores and mutable
+    /// conversion state. Keep the live client's source routing and exact build
+    /// settings, but never inherit Space or the served disk-cache index.
+    #[cfg(feature = "server")]
+    pub(crate) fn isolated_registry_attempt(&self, cache_root: &Path) -> Arc<Self> {
+        Arc::new_cyclic(|self_weak| Self {
+            self_weak: self_weak.clone(),
+            catalyst: self.catalyst.clone().with_content_cache(None),
+            local: self.local.clone(),
+            content: LocalContentStore::new(cache_root.join("content")),
+            bundle_dir: cache_root.join("bundles"),
+            digests_dir: cache_root.join("content-digests"),
+            version: self.version.clone(),
+            wearable_version: self.wearable_version.clone(),
+            date: self.date.clone(),
+            uri_cache: UriCache::new(),
+            space: None,
+            fallback_version: self.fallback_version.clone(),
+            entities: Mutex::new(HashMap::new()),
+            hash_index: Mutex::new(HashMap::new()),
+            entity_cap: self.entity_cap,
+            hash_index_cap: self.hash_index_cap,
+            entity_locks: KeyedLocks::default(),
+            bundle_locks: KeyedLocks::default(),
+            content_locks: KeyedLocks::default(),
+            collection_mode: self.collection_mode,
+            real_textures: self.real_textures,
+            v38_compat: self.v38_compat,
+            v38_timestamp: self.v38_timestamp,
+            magenta_missing: self.magenta_missing,
+            jit_cache: OnceLock::new(),
+            deps_digest: self.deps_digest,
+            build_progress: Mutex::new(HashMap::new()),
+            decode_ok: Mutex::new(HashMap::new()),
+            font_ok: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Call only after an isolated attempt's foreground work has stopped. Image
+    /// prefetch also writes its private content store and must finish before the
+    /// attempt directory is removed, including on conversion failure.
+    #[cfg(feature = "server")]
+    pub(crate) fn join_registry_prefetch(&self) {
+        let contexts: Vec<_> = self
+            .entities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for context in contexts {
+            context.join_prefetch();
+        }
+    }
+
     fn jit(&self) -> Option<&Arc<crate::jitcache::JitDiskCache>> {
         self.jit_cache.get().filter(|c| c.enabled())
     }
@@ -2048,6 +2103,56 @@ pub mod stub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn registry_attempt_preserves_settings_but_resets_writable_state() {
+        let root = temp_cache("registry-isolation");
+        let private = root.join("private");
+        let live = Proxy::new(ProxyConfig {
+            cache_dir: root.join("served").to_string_lossy().into_owned(),
+            version: "scene-version".into(),
+            wearable_version: "wearable-version".into(),
+            date: Some("pinned-build-date".into()),
+            parity: true,
+            magenta_missing: true,
+            deps_digest: false,
+            ..Default::default()
+        });
+        live.decode_ok.lock().unwrap().insert("hash".into(), true);
+        live.font_ok.lock().unwrap().insert("font".into(), true);
+        live.hash_index
+            .lock()
+            .unwrap()
+            .insert("hash".into(), "entity".into());
+        live.progress_update("entity", 1, 2, "file");
+        let attempt = live.isolated_registry_attempt(&private);
+        assert_eq!(attempt.version, live.version);
+        assert_eq!(attempt.wearable_version, live.wearable_version);
+        assert_eq!(attempt.date, live.date);
+        assert_eq!(attempt.collection_mode, live.collection_mode);
+        assert_eq!(attempt.real_textures, live.real_textures);
+        assert_eq!(attempt.v38_compat, live.v38_compat);
+        assert_eq!(attempt.v38_timestamp, live.v38_timestamp);
+        assert_eq!(attempt.magenta_missing, live.magenta_missing);
+        assert_eq!(attempt.deps_digest, live.deps_digest);
+        assert_eq!(attempt.entity_cap, live.entity_cap);
+        assert_eq!(attempt.hash_index_cap, live.hash_index_cap);
+        assert_eq!(
+            attempt.catalyst.fallback_bases(),
+            live.catalyst.fallback_bases()
+        );
+        assert!(attempt.space.is_none());
+        assert!(attempt.jit_cache.get().is_none());
+        assert!(attempt.decode_ok.lock().unwrap().is_empty());
+        assert!(attempt.font_ok.lock().unwrap().is_empty());
+        assert!(attempt.hash_index.lock().unwrap().is_empty());
+        assert!(attempt.build_progress.lock().unwrap().is_empty());
+        assert!(attempt.content.root().starts_with(&private));
+        assert!(attempt.bundle_dir.starts_with(&private));
+        assert!(attempt.digests_dir.starts_with(&private));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn temp_cache(tag: &str) -> PathBuf {
         let dir =

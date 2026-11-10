@@ -118,15 +118,55 @@ fn jit_build_permits() -> usize {
         .max(1)
 }
 
-fn jit_build_sem() -> &'static tokio::sync::Semaphore {
+pub(super) fn jit_build_sem() -> &'static tokio::sync::Semaphore {
     static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
     SEM.get_or_init(|| tokio::sync::Semaphore::new(jit_build_permits()))
 }
 
-async fn invalidate_status_cache(state: &AppState, entity: &str) {
-    if let Some(reg) = &state.contents_registry {
-        reg.manifests.invalidate(entity).await;
+async fn publish_registry_conversion(
+    state: &AppState,
+    entity_id: &str,
+    attempt: Option<&crate::registry::ports::records::ConversionAttempt>,
+    built: bool,
+) -> anyhow::Result<()> {
+    let Some(reg) = &state.contents_registry else {
+        return Ok(());
+    };
+    reg.manifests.invalidate(entity_id).await;
+    let Some(attempt) = attempt else {
+        return Ok(());
+    };
+    let store = state
+        .registry_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Registry store disappeared"))?;
+    let entity = reg
+        .content
+        .resolve_one(entity_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("converted entity missing from Catalyst"))?;
+    // Read this attempt's output root, never a stale preferred corpus manifest.
+    let local = dcl_contents::manifest_store::AbManifestStore::new(&state.jit_root);
+    let snapshot = local.refresh(entity_id).await;
+    let mut bundles = snapshot.bundles(false);
+    let selected = match attempt.platform.as_str() {
+        "mac" => &mut bundles.assets.mac,
+        "windows" => &mut bundles.assets.windows,
+        "webgl" => &mut bundles.assets.webgl,
+        "linux" => &mut bundles.assets.linux,
+        _ => anyhow::bail!("unsupported Registry conversion platform"),
+    };
+    if !built || *selected != dcl_contents::types::BuildStatus::Complete {
+        *selected = dcl_contents::types::BuildStatus::Failed;
     }
+    let published = store
+        .complete_conversion(&entity, attempt, None, bundles, snapshot.versions())
+        .await?;
+    anyhow::ensure!(
+        published.is_some(),
+        "Registry conversion superseded by a newer attempt"
+    );
+    Ok(())
 }
 
 pub(super) async fn jit_build_entity(
@@ -169,6 +209,21 @@ pub(super) async fn jit_build_entity(
     let lock_owned = lock.clone();
     let (tx, rx) = tokio::sync::oneshot::channel::<JitBuild>();
     tokio::spawn(async move {
+        let attempt = match st.registry_store.as_ref().filter(|store| {
+            store.enabled()
+                && crate::registry::ports::registry::RegistryStore::BUILD_PLATFORMS
+                    .contains(&platform_owned.as_str())
+        }) {
+            Some(store) => match store.begin_conversion(&entity_owned, &platform_owned).await {
+                Ok(attempt) => Some(attempt),
+                Err(error) => {
+                    tracing::error!(%error, "Registry conversion reservation failed");
+                    let _ = tx.send(JitBuild::Failed);
+                    return;
+                }
+            },
+            None => None,
+        };
         let _permit = jit_build_sem().acquire().await.ok();
         let _pin = st
             .jit_cache
@@ -177,7 +232,7 @@ pub(super) async fn jit_build_entity(
             proxy,
             st.jit_root.clone(),
             entity_owned.clone(),
-            platform_owned,
+            platform_owned.clone(),
             st.manifest_content_server_url.clone(),
             "abgen_jit_builds_total",
             "abgen_jit_build_duration_seconds",
@@ -186,11 +241,24 @@ pub(super) async fn jit_build_entity(
         .await
         {
             st.jit_record(&entity_owned);
-            invalidate_status_cache(&st, &entity_owned).await;
             JitBuild::Built
         } else {
             st.jit_fail_cache.insert(key_owned.clone(), ()).await;
             JitBuild::Failed
+        };
+        let outcome = match publish_registry_conversion(
+            &st,
+            &entity_owned,
+            attempt.as_ref(),
+            matches!(outcome, JitBuild::Built),
+        )
+        .await
+        {
+            Ok(()) => outcome,
+            Err(error) => {
+                tracing::error!(%error, entity = %entity_owned, "conversion Registry publication failed");
+                JitBuild::Failed
+            }
         };
         drop(guard);
         drop(lock_owned);
@@ -248,7 +316,9 @@ pub(super) async fn bundle_fallback(
             {
                 state.jit_record(target.entity());
                 if matches!(target, JitTarget::Manifest { .. }) {
-                    invalidate_status_cache(state, target.entity()).await;
+                    if let Some(registry) = &state.contents_registry {
+                        registry.manifests.invalidate(target.entity()).await;
+                    }
                 }
                 return resp;
             }

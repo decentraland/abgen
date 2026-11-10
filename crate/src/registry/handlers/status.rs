@@ -14,9 +14,13 @@ pub async fn get_entities_status_signed(
 ) -> ApiResult<Json<Vec<EntityStatus>>> {
     let signer = require_signed_fetch(&headers, "get", "/entities/status")?;
 
-    let ents = state.content.active_entities_by_deployer(&signer).await?;
+    let ents = state.content.resolve_by_deployer(&signer).await?;
     let mut out = Vec::with_capacity(ents.len());
     for ent in ents {
+        if let Some(status) = state.content.registered_status(&ent.entity_id).await? {
+            out.push(status);
+            continue;
+        }
         let m = state.manifests.get(&ent.entity_id).await;
         out.push(entity_status_from(&ent.entity_id, &m, ent.is_world()));
     }
@@ -28,18 +32,7 @@ pub(crate) fn require_signed_fetch(
     method: &str,
     path: &str,
 ) -> Result<String, ApiError> {
-    if let Some(signer) = headers
-        .get("x-identity-metadata-signer")
-        .and_then(|v| v.to_str().ok())
-    {
-        if signer == "decentraland-kernel-scene" {
-            return Err(ApiError::unauthorized(
-                "decentraland-kernel-scene signer is not allowed",
-            ));
-        }
-    }
-
     crate::registry::auth::require_signer(headers, method, path)
         .map(|s| s.to_lowercase())
-        .map_err(|e| ApiError::unauthorized(format!("signed-fetch verification failed: {e}")))
+        .map_err(|e| ApiError::SignedFetch(e.to_string()))
 }

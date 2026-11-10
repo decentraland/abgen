@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -6,7 +6,6 @@ use axum::Json;
 use serde_json::json;
 
 use dcl_contents::errors::{ApiError, ApiResult};
-use dcl_contents::registry::EntitySource;
 
 use crate::registry::http::auth::timing_safe_eq;
 use crate::registry::AppState;
@@ -18,20 +17,29 @@ pub async fn post_registry(
 ) -> ApiResult<Json<serde_json::Value>> {
     require_admin(&state, &headers)?;
 
-    let unique_entity_ids: BTreeSet<String> = body
+    let entity_ids = body
         .as_ref()
         .and_then(|b| b.0.get("entityIds"))
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .unwrap_or_default();
+        .ok_or_else(|| ApiError::bad_request("No entity ids provided"))?;
+    let mut seen = HashSet::new();
+    let mut unique_entity_ids = Vec::new();
+    for value in entity_ids {
+        let id = value
+            .as_str()
+            .ok_or_else(|| ApiError::bad_request("entityIds must contain strings"))?;
+        if seen.insert(id) {
+            unique_entity_ids.push(id.to_string());
+        }
+    }
 
     if unique_entity_ids.is_empty() {
         return Err(ApiError::bad_request("No entity ids provided"));
+    }
+    if !state.registry.enabled() {
+        return Err(ApiError::not_implemented(
+            "registry persistence requires the ab_registry DB",
+        ));
     }
 
     let mut failures: Vec<serde_json::Value> = Vec::new();
@@ -39,8 +47,15 @@ pub async fn post_registry(
 
     for entity_id in &unique_entity_ids {
         match state.content.resolve_one(entity_id).await {
-            Ok(Some(_entity)) => {
-                let _ = state.manifests.get(entity_id).await;
+            Ok(Some(entity)) => {
+                if let Err(err) = state
+                    .registry
+                    .refresh_and_rotate(&entity, &state.manifests)
+                    .await
+                {
+                    tracing::error!(error = %err, entity_id = %entity_id, "error persisting entity");
+                    failures.push(json!({ "entityId": entity_id, "error": err.to_string() }));
+                }
             }
             Ok(None) => {
                 failures.push(json!({
@@ -69,7 +84,9 @@ pub async fn flush_cache(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_admin(&state, &headers)?;
-    state.manifests.invalidate_all();
+    // Queue status reads durable build_jobs directly, so no derived jobs cache
+    // survives this request. Bundle manifests and durable jobs are unrelated
+    // to the upstream jobs:* cache and must remain intact.
     Ok(Json(json!({ "ok": true, "message": "Cache flushed" })))
 }
 

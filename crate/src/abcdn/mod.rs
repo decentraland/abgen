@@ -152,22 +152,11 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
         },
         None => None,
     };
-    let db_source: Option<Arc<dyn dcl_contents::registry::EntitySource>> = content_db
-        .clone()
-        .map(|c| Arc::new(c) as Arc<dyn dcl_contents::registry::EntitySource>);
-    let registry_source: Arc<dyn dcl_contents::registry::EntitySource> = match db_source {
-        Some(source) => {
-            tracing::info!("registry routes: content DB");
-            source
-        }
-        None => {
-            tracing::info!(catalyst = %cfg.content_url, "registry routes: catalyst proxy");
-            Arc::new(catalyst_source::CatalystEntitySource::new(
-                &cfg.content_url,
-                crate::worlds::content_fallback_from_env(),
-            ))
-        }
-    };
+    let registry_source: Arc<dyn dcl_contents::registry::EntitySource> =
+        Arc::new(catalyst_source::CatalystEntitySource::new(
+            &cfg.content_url,
+            crate::worlds::content_fallback_from_env(),
+        ));
     let contents_registry = Arc::new(dcl_contents::registry::RegistryStateInner {
         content: registry_source,
         manifests: {
@@ -308,15 +297,6 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
              stream from upstream before any JIT build; nothing is persisted"
         );
     }
-    if let Some(registry) = &cfg.upstream_ab_registry {
-        tracing::info!(
-            registry = %registry,
-            "upstream ab registry pass-through ENABLED (ABGEN_UPSTREAM_AB_REGISTRY): \
-             registry records for entities without local bundles are answered with the \
-             upstream registry's versions instead of this server's own"
-        );
-    }
-
     let inner = AppStateInner::new(
         out_root,
         content,
@@ -335,7 +315,6 @@ pub async fn build_state(cfg: &Config) -> Result<AppState> {
     .with_worlds_content_url(crate::worlds::content_fallback_from_env())
     .with_jit(jit_root, jit_cache, roots_distinct)
     .with_dev_lanes(cfg.jit_content_digest, cfg.upstream_ab_cdn.clone())
-    .with_upstream_ab_registry(cfg.upstream_ab_registry.clone())
     .with_registry_state(Some(contents_registry));
     let inner = inner.with_content_db(content_db);
     Ok(Arc::new(inner))
@@ -527,6 +506,7 @@ pub fn api_router() -> Router<AppState> {
         .filter(|t| !t.is_empty());
     Router::new()
         .route("/ping", get(handlers::ping))
+        .route("/status", get(handlers::registry_status))
         .route("/health", get(handlers::health))
         .route("/livez", get(handlers::livez))
         .route("/readyz", get(handlers::readyz))

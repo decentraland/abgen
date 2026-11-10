@@ -30,52 +30,60 @@ Deltas an operator must know:
 
 ## Registry (asset-bundle-registry)
 
-| Route | Upstream registry | abgen |
-|---|---|---|
-| `GET /status` | health snapshot | not served - use `GET /health` |
-| `POST /entities/active` (+`?world_name=`) | served | served; misses queue eager JIT builds; `world_name` resolves via `ABGEN_WORLDS_CONTENT_URL` |
-| `POST /entities/versions` | served | served |
-| `GET /entities/status/{id}` | served | served (content DB or catalyst proxy) |
-| `GET /entities/status` (signed list) | served, signed-fetch | not served (404) |
-| `GET /queues/status` | served (queue introspection) | not served (404) |
-| `POST /profiles` | served | served (content DB or catalyst proxy) |
-| `POST /profiles/metadata` | served | served (content DB or catalyst proxy) |
-| `GET /worlds/{worldName}/manifest` | served | served (content DB or the worlds proxy lane) |
-| `GET /denylist` | served | not served (404) |
-| `POST/DELETE /denylist/{entityId}` (signed) | served | not served (404) |
-| `POST /registry` (admin bearer) | served | not served (404) |
-| `DELETE /flush-cache` (admin bearer) | served | not served (404) |
+The source contract is pinned to `decentraland/asset-bundle-registry`
+`63c9ef2bd7365ac7312d8bd23b6759515ca999e5`. The table describes route availability
+in the current tree; it does not assert complete upstream wire parity.
 
-The not-served rows are the registry's signed/write/ops surface - they belong to a catalyst or a
-dedicated registry deployment, not this converter. Ops routes abgen adds instead: `/ping`,
-`/health`, `/livez`, `/readyz`, `/metrics` (bearer-gated when `ABGEN_METRICS_BEARER_TOKEN` is set).
+| Route | abgen behavior |
+| --- | --- |
+| `GET /status` | Registry status with nested service metadata and a millisecond timestamp. |
+| `POST /entities/active`, `POST /entities/versions` | Native conversion records over the configured Catalyst entity source; both accept `world_name`. Require Registry persistence. Active reads exclude denylisted entities; versions retains them, as the pinned source does. |
+| `GET /entities/status/{id}` | Native conversion status; accepts entity ID or pointer and optional `world_name`. |
+| `GET /entities/status` | Signed-fetch inventory of registered entities found through the shared deployer lookup; worlds deployer inventory remains incomplete. |
+| `GET /queues/status` | Native pending mac/windows job IDs from `build_jobs`. |
+| `POST /profiles`, `POST /profiles/metadata` | Mounted by the unsigned abgen component over the shared entity source. |
+| `GET /worlds/{worldName}/manifest` | Converted world availability with native denylist and spawn policy. |
+| `GET /denylist` | Public native moderation entries; returns an empty array when persistence is not configured. |
+| `POST/DELETE /denylist/{entityId}` | Signed moderator writes to native persistence; admin bearer alone is not accepted. |
+| `POST /registry` | Mounted with a nonempty admin token; reconciles local entity/manifests and persists conversion/fallback state. |
+| `DELETE /flush-cache` | Mounted with a nonempty admin token; acknowledges fresh job-status reads without deleting durable jobs or manifest caches. |
 
-`GET /health` carries two fields describing the running binary rather than its corpus: `version`
-(the crate version, matching the `abgen-v{version}-{target}` release artifact) and `pid` (this
-process's OS id). They exist for loopback supervision - a client that finds a server already bound
-to the port it wants can tell whether that server is the release it pins, and can signal it if not.
+Additional operations include bearer-protected `/queues/retry`, `/queues/pause`
+and `/queues/resume`, plus `/ping`, `/health`, `/livez`, `/readyz` and `/metrics`
+(the last is bearer-gated when `ABGEN_METRICS_BEARER_TOKEN` is set).
+The queue worker converts in private staging and commits only current-generation
+facts with its queue receipt. It recovers abandoned claims and leaves artifact
+delivery to HTTP JIT; queue conversion does not warm served files or Space. These
+additional queue controls are not in the pinned Registry router.
 
-On the index routes (`POST /entities/active|versions`), a connected content DB supplies real
-timestamps and deployer identity; without one, the built-in fallback serves the same shapes with
-`timestamp: 0` and an empty deployer.
+`GET /health` includes this binary's crate version and process ID for loopback
+supervision. Its `content_db` label describes the optional converter content-DB
+connection; `registry` reports `catalyst-proxy`. These labels alone do not prove
+native Registry database readiness.
 
-## Registry data source: content DB, catalyst proxy fallback
+## Registry authority and persistence
 
-The four unsigned registry routes (`/profiles`, `/profiles/metadata`,
-`/entities/status/{id}`, `/worlds/{world_name}/manifest`) are always mounted and pick their
-entity source at boot:
+Registry entity lookups use `ABGEN_CATALYST_URL` and the configured worlds URL.
+These should name the authoritative content/worlds services. Content history
+supplies entity timestamps and deployers; conversion status, fallback
+selection and versions are native Registry facts. No external Registry cache or
+Registry upstream URL supplies these responses.
 
-- **content DB** - build with feature `content-db` and set `CONTENT_PG_CONNECTION_STRING` (or
-  the `POSTGRES_*` parts): entities resolve from a catalyst content Postgres with real
-  timestamps and deployer identity.
-- **catalyst proxy** - otherwise the routes proxy the catalyst at `ABGEN_CATALYST_URL`: one
-  10-second upstream attempt per request; pointer and id lookups union into
-  `POST {ABGEN_CATALYST_URL}/entities/active` calls, deduped keeping the newest entity;
-  `/profiles*` filters to `type == "profile"`. An upstream 404 stays a 404; an upstream
-  transport failure returns 502. World manifests resolve through the SSRF-guarded worlds lane
-  and need `ABGEN_WORLDS_CONTENT_URL` enabled (default: the public worlds server; disabled means
-  empty world results). Proxy mode serves an empty deployer.
+`AB_REGISTRY_PG_CONNECTION_STRING` enables native moderation, conversion records,
+queue state and embedded SQLx migrations. It does not require a second content
+pool. `CONTENT_PG_CONNECTION_STRING` is optional for converter content indexing;
+it does not select the Registry data source or enable its signed routes.
+A failed configured Registry connection or migration aborts startup. Without native
+persistence, Registry entity queries and writes return 501 rather than claiming
+conversion state. The read-only denylist handler currently returns an empty collection when its
+store is disabled; queue status returns 501.
 
-In both modes the standalone server mounts an open world policy (empty denylist) - the
-`WorldPolicy` trait in `crate/dcl-contents` is the seam for a deployment that supplies one.
-`GET /health` reports the active mode: `content-db` or `catalyst-proxy`.
+`API_ADMIN_TOKEN` controls the presence of `/registry` and `/flush-cache`.
+`DENYLIST_MODERATORS` supplies the startup moderator allowlist. Signed requests
+validate timestamp freshness, authenticated metadata and the forwarded path's
+match to the actual handler route. Signatures accept the service path or its
+single `/asset-bundle-registry` alias after that binding check; EIP-1654 contract
+wallet chains are unsupported.
+
+See [native state and workload](REGISTRY-STATE.md) for persistence and migration
+semantics.

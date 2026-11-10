@@ -35,6 +35,14 @@ pub enum AuthChainError {
     InsufficientLinks,
     #[error("Missing timestamp")]
     MissingTimestamp,
+    #[error("Invalid timestamp")]
+    InvalidTimestamp,
+    #[error("Invalid metadata")]
+    InvalidMetadata,
+    #[error("Invalid request path")]
+    InvalidPath,
+    #[error("decentraland-kernel-scene signer is not allowed")]
+    ForbiddenSigner,
     #[error("Expired signature")]
     Expired {
         signed_at: i64,
@@ -54,9 +62,8 @@ pub enum AuthChainError {
 ///
 /// Folding the whole payload, as this did previously, left the metadata's casing outside the
 /// signature: two spellings of the same metadata shared one valid signature, so a key or value
-/// could be renamed or re-cased between signing and delivery and still verify. Nothing here reads
-/// the metadata beyond building this payload, so that was latent rather than exploitable, but it
-/// meant any future read of a metadata field would have been reading something unsigned.
+/// could be renamed or re-cased between signing and delivery and still verify. The signer policy
+/// below must read exactly the metadata that was authenticated.
 ///
 /// Matches `createPayload` in `@dcl/crypto-middleware` 6.x, so a client signs one payload that
 /// every Decentraland verifier reconstructs identically.
@@ -70,11 +77,30 @@ pub fn build_payload(method: &str, path: &str, timestamp: &str, metadata: &str) 
     )
 }
 
-fn signed_fetch_path<'a>(headers: &HeaderMap, fallback: &'a str) -> std::borrow::Cow<'a, str> {
-    match headers.get("x-original-path").and_then(|v| v.to_str().ok()) {
-        Some(raw) => std::borrow::Cow::Owned(raw.split('?').next().unwrap_or(raw).to_string()),
-        None => std::borrow::Cow::Borrowed(fallback),
+fn signed_fetch_path<'a>(
+    headers: &HeaderMap,
+    actual_path: &'a str,
+) -> Result<std::borrow::Cow<'a, str>, AuthChainError> {
+    let Some(original) = headers.get("x-original-path") else {
+        return Ok(std::borrow::Cow::Borrowed(actual_path));
+    };
+    let original = original.to_str().map_err(|_| AuthChainError::InvalidPath)?;
+    let original = original.split('?').next().unwrap_or(original);
+    const REGISTRY_PREFIX: &str = "/asset-bundle-registry";
+    let unprefixed = if original
+        .get(..REGISTRY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REGISTRY_PREFIX))
+    {
+        &original[REGISTRY_PREFIX.len()..]
+    } else {
+        original
+    };
+    // Nix forwards either the service path or its known Registry prefix. An
+    // arbitrary original-path header cannot move a signature to another target.
+    if !unprefixed.eq_ignore_ascii_case(actual_path) {
+        return Err(AuthChainError::InvalidPath);
     }
+    Ok(std::borrow::Cow::Owned(original.to_string()))
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -91,10 +117,7 @@ pub fn extract_auth_chain(headers: &HeaderMap) -> Result<AuthChain, AuthChainErr
         };
 
         let link: CryptoAuthLink = serde_json::from_str(raw).map_err(|e| {
-            let mut detail = e.to_string();
-            if detail.len() > 64 {
-                detail.truncate(64);
-            }
+            let detail = e.to_string().chars().take(64).collect();
             AuthChainError::MalformedChain { detail }
         })?;
 
@@ -145,17 +168,21 @@ pub fn validate_signature(
     payload: &str,
     timestamp: &str,
     expiration_secs: i64,
-    now: i64,
+    now_ms: i64,
 ) -> Result<EthAddress, AuthChainError> {
-    if let Ok(signed_at_ms) = timestamp.parse::<i64>() {
-        let signed_at = signed_at_ms / 1000;
-        if (now - signed_at).abs() > expiration_secs {
-            return Err(AuthChainError::Expired {
-                signed_at,
-                now,
-                window_secs: expiration_secs,
-            });
-        }
+    if timestamp.is_empty() || !timestamp.bytes().all(|c| c.is_ascii_digit()) {
+        return Err(AuthChainError::InvalidTimestamp);
+    }
+    let signed_at_ms = timestamp
+        .parse::<i64>()
+        .map_err(|_| AuthChainError::InvalidTimestamp)?;
+    let distance = (i128::from(now_ms) - i128::from(signed_at_ms)).abs();
+    if expiration_secs < 0 || distance > i128::from(expiration_secs) * 1000 {
+        return Err(AuthChainError::Expired {
+            signed_at: signed_at_ms / 1000,
+            now: now_ms / 1000,
+            window_secs: expiration_secs,
+        });
     }
 
     let crypto_chain: Vec<CryptoAuthLink> = chain
@@ -172,7 +199,7 @@ pub fn validate_signature(
         })
         .collect();
 
-    verify_auth_chain(&crypto_chain, payload, Some(now * 1000)).map_err(map_auth_error)?;
+    verify_auth_chain(&crypto_chain, payload, Some(now_ms)).map_err(map_auth_error)?;
     Ok(chain.signer.clone())
 }
 
@@ -204,8 +231,9 @@ pub fn require_signer(
     method: &str,
     path: &str,
 ) -> Result<String, AuthChainError> {
-    let path = signed_fetch_path(headers, path);
-    let path = path.as_ref();
+    // Validate target binding before trying the two fixed public aliases. A
+    // gateway can prepend the Registry prefix after a host-based client signed.
+    signed_fetch_path(headers, path)?;
     let chain = extract_auth_chain(headers)?;
     let ts = header_str(headers, AUTH_TIMESTAMP_HEADER)
         .ok_or(AuthChainError::MissingTimestamp)?
@@ -214,13 +242,249 @@ pub fn require_signer(
         .unwrap_or("{}")
         .to_string();
     let payload = build_payload(method, path, &ts, &metadata);
-    let now = chrono::Utc::now().timestamp();
-    validate_signature(&chain, &payload, &ts, FIVE_MINUTES, now)
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let signer =
+        validate_signature(&chain, &payload, &ts, FIVE_MINUTES, now_ms).or_else(|error| {
+            if !matches!(error, AuthChainError::InvalidSignature(_)) {
+                return Err(error);
+            }
+            let alias = format!("/asset-bundle-registry{path}");
+            validate_signature(
+                &chain,
+                &build_payload(method, &alias, &ts, &metadata),
+                &ts,
+                FIVE_MINUTES,
+                now_ms,
+            )
+        })?;
+    // Apply the policy to the metadata bytes covered by the signature, never
+    // to a separate caller-controlled header.
+    let metadata: serde_json::Value =
+        serde_json::from_str(&metadata).map_err(|_| AuthChainError::InvalidMetadata)?;
+    if metadata.get("signer").and_then(serde_json::Value::as_str)
+        == Some("decentraland-kernel-scene")
+    {
+        return Err(AuthChainError::ForbiddenSigner);
+    }
+    Ok(signer)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_non_ascii_auth_chain_returns_an_error_without_panicking() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-identity-auth-chain-0",
+            format!(
+                r#"{{"type":"{}","payload":"invalid"}}"#,
+                "\\u00e9".repeat(100)
+            )
+            .parse()
+            .unwrap(),
+        );
+        assert!(matches!(
+            extract_auth_chain(&headers),
+            Err(AuthChainError::MalformedChain { .. })
+        ));
+    }
+
+    pub(crate) fn signed_headers(
+        method: &str,
+        path: &str,
+        timestamp: &str,
+        metadata: &str,
+    ) -> (HeaderMap, String) {
+        use ethers_core::k256::ecdsa::SigningKey;
+        use ethers_core::utils::{hash_message, keccak256};
+
+        let key = SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let public_key = key.verifying_key().to_encoded_point(false);
+        let address_hash = keccak256(&public_key.as_bytes()[1..]);
+        let address = format!("0x{}", hex::encode(&address_hash[12..]));
+        let payload = build_payload(method, path, timestamp, metadata);
+        let (signature, recovery_id) = key
+            .sign_prehash_recoverable(hash_message(&payload).as_bytes())
+            .unwrap();
+        let mut signature = signature.to_bytes().to_vec();
+        signature.push(recovery_id.to_byte() + 27);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-identity-auth-chain-0",
+            serde_json::json!({"type":"SIGNER", "payload":address})
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
+        headers.insert(
+            "x-identity-auth-chain-1",
+            serde_json::json!({
+                "type":"ECDSA_SIGNED_ENTITY", "payload":payload,
+                "signature":format!("0x{}", hex::encode(signature))
+            })
+            .to_string()
+            .parse()
+            .unwrap(),
+        );
+        headers.insert(AUTH_TIMESTAMP_HEADER, timestamp.parse().unwrap());
+        headers.insert(AUTH_METADATA_HEADER, metadata.parse().unwrap());
+        (headers, address)
+    }
+
+    #[test]
+    fn signed_metadata_policy_cannot_be_bypassed_with_auxiliary_header() {
+        let timestamp = chrono::Utc::now().timestamp_millis().to_string();
+        let (mut headers, _) = signed_headers(
+            "POST",
+            "/denylist/entity",
+            &timestamp,
+            r#"{"signer":"decentraland-kernel-scene"}"#,
+        );
+        headers.insert("x-identity-metadata-signer", "explorer".parse().unwrap());
+        assert!(matches!(
+            require_signer(&headers, "post", "/denylist/entity"),
+            Err(AuthChainError::ForbiddenSigner)
+        ));
+
+        let (mut headers, address) = signed_headers(
+            "POST",
+            "/denylist/entity",
+            &timestamp,
+            r#"{"signer":"explorer"}"#,
+        );
+        assert_eq!(
+            require_signer(&headers, "post", "/denylist/entity").unwrap(),
+            address
+        );
+        headers.insert(
+            AUTH_METADATA_HEADER,
+            r#"{"signer":"other"}"#.parse().unwrap(),
+        );
+        assert!(require_signer(&headers, "post", "/denylist/entity").is_err());
+    }
+
+    #[test]
+    fn signed_requests_require_numeric_fresh_timestamps_at_millisecond_precision() {
+        let now_ms = 1_700_000_000_123i64;
+        for offset in [-300_000, 0, 300_000] {
+            let timestamp = (now_ms + offset).to_string();
+            let (headers, address) = signed_headers("get", "/entities/status", &timestamp, "{}");
+            let chain = extract_auth_chain(&headers).unwrap();
+            let payload = build_payload("get", "/entities/status", &timestamp, "{}");
+            assert_eq!(
+                validate_signature(&chain, &payload, &timestamp, FIVE_MINUTES, now_ms).unwrap(),
+                address
+            );
+        }
+        for timestamp in [
+            "NaN".to_string(),
+            "+1700000000123".to_string(),
+            "9223372036854775808".to_string(),
+            (now_ms - 300_001).to_string(),
+            (now_ms + 300_001).to_string(),
+        ] {
+            let (headers, _) = signed_headers("get", "/entities/status", &timestamp, "{}");
+            let chain = extract_auth_chain(&headers).unwrap();
+            let payload = build_payload("get", "/entities/status", &timestamp, "{}");
+            assert!(
+                validate_signature(&chain, &payload, &timestamp, FIVE_MINUTES, now_ms).is_err(),
+                "accepted {timestamp}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_signed_metadata_is_rejected_and_gateway_path_is_authenticated() {
+        let timestamp = chrono::Utc::now().timestamp_millis().to_string();
+        let (headers, _) = signed_headers("get", "/entities/status", &timestamp, "{");
+        assert!(matches!(
+            require_signer(&headers, "get", "/entities/status"),
+            Err(AuthChainError::InvalidMetadata)
+        ));
+
+        let (mut headers, address) = signed_headers(
+            "get",
+            "/asset-bundle-registry/entities/status",
+            &timestamp,
+            "{}",
+        );
+        headers.insert(
+            "x-original-path",
+            "/asset-bundle-registry/entities/status?ignored=true"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            require_signer(&headers, "get", "/entities/status").unwrap(),
+            address
+        );
+        assert!(require_signer(&headers, "delete", "/entities/status").is_err());
+    }
+
+    #[test]
+    fn host_and_path_registry_aliases_authenticate_after_gateway_rewrite() {
+        let timestamp = chrono::Utc::now().timestamp_millis().to_string();
+        for signed in ["/entities/status", "/asset-bundle-registry/entities/status"] {
+            let (mut headers, address) = signed_headers("get", signed, &timestamp, "{}");
+            headers.insert(
+                "x-original-path",
+                "/asset-bundle-registry/entities/status?ignored=1"
+                    .parse()
+                    .unwrap(),
+            );
+            assert_eq!(
+                require_signer(&headers, "get", "/entities/status").unwrap(),
+                address
+            );
+            assert!(require_signer(&headers, "get", "/denylist/entity").is_err());
+        }
+    }
+
+    #[test]
+    fn forwarded_path_cannot_replay_a_signature_for_another_denylist_entity() {
+        let timestamp = chrono::Utc::now().timestamp_millis().to_string();
+        for original in ["/denylist/id1", "/asset-bundle-registry/denylist/id1"] {
+            let (mut headers, address) = signed_headers("post", original, &timestamp, "{}");
+            headers.insert("x-original-path", original.parse().unwrap());
+            assert_eq!(
+                require_signer(&headers, "post", "/denylist/id1").unwrap(),
+                address
+            );
+            assert!(matches!(
+                require_signer(&headers, "post", "/denylist/id2"),
+                Err(AuthChainError::InvalidPath)
+            ));
+        }
+        let (mut headers, address) = signed_headers(
+            "post",
+            "/ASSET-BUNDLE-REGISTRY/DENYLIST/ID1",
+            &timestamp,
+            "{}",
+        );
+        headers.insert(
+            "x-original-path",
+            "/ASSET-BUNDLE-REGISTRY/DENYLIST/ID1?ignored=true"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            require_signer(&headers, "post", "/denylist/id1").unwrap(),
+            address
+        );
+        for unrelated in [
+            "/other-service/denylist/id1",
+            "/asset-bundle-registry/denylist/id2",
+            "/asset-bundle-registry/asset-bundle-registry/denylist/id1",
+        ] {
+            headers.insert("x-original-path", unrelated.parse().unwrap());
+            assert!(matches!(
+                require_signer(&headers, "post", "/denylist/id1"),
+                Err(AuthChainError::InvalidPath)
+            ));
+        }
+    }
 
     #[test]
     fn build_payload_lowercases_the_method_and_path() {
