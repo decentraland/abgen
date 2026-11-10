@@ -183,7 +183,9 @@ pub(super) async fn jit_build_entity_pinned(
     lane: &'static str,
 ) -> (JitBuild, Vec<crate::jitcache::PinGuard>) {
     let probe = probe.into();
-    let is_bevy = lane == "bevy";
+    // By platform, not lane name: any lane that builds the Bevy platform must record and
+    // release its pins the Bevy way.
+    let is_bevy = platform == crate::bevyvariants::BEVY_PLATFORM;
     let key = format!("{entity}:{platform}");
     if state.jit_fail_cache.get(&key).await.is_some() {
         metrics::counter!("abgen_jit_builds_total", "outcome" => "fail-cached").increment(1);
