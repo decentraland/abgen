@@ -52,7 +52,12 @@ fn disk_path(root: &std::path::Path, target: &BevyTarget) -> Option<std::path::P
 /// A manifest on disk is served only while it was built from the current generations: one
 /// that names an older prefix counts as absent, so the miss path rebuilds it (re-encoding
 /// only the class whose generation moved, the rest comes from the records).
-fn manifest_is_current(path: &std::path::Path) -> bool {
+///
+/// With `check_variants` (a node without object-storage read-through, where a variant the
+/// JIT cache evicted cannot come back on its own), it is also absent while any variant it
+/// names is missing under the root it was found in, so the rebuild re-encodes just those keys
+/// (`local_record` misses on a record whose variant is gone).
+fn manifest_is_current(path: &std::path::Path, check_variants: bool) -> bool {
     let Ok(bytes) = std::fs::read(path) else {
         return false;
     };
@@ -60,13 +65,33 @@ fn manifest_is_current(path: &std::path::Path) -> bool {
         return false;
     };
     #[cfg(feature = "bevy-variants")]
-    {
-        m.is_current(&bevyvariants::BuildOptions::from_env().lanes())
-    }
+    let current = m.is_current(&bevyvariants::BuildOptions::from_env().lanes());
     #[cfg(not(feature = "bevy-variants"))]
-    {
-        m.v == bevyvariants::MANIFEST_VERSION
+    let current = m.v == bevyvariants::MANIFEST_VERSION;
+    if !current || !check_variants {
+        return current;
     }
+    // `{root}/bevy/manifest/{entity}.json`.
+    let Some(root) = path
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+    else {
+        return false;
+    };
+    m.files
+        .values()
+        .flatten()
+        .all(|e| bevyvariants::key_path(root, &e.path).is_some_and(|p| p.is_file()))
+}
+
+/// Whether a manifest's variants must be on local disk for it to count as current: true
+/// unless object storage can read a missing variant through.
+fn check_local_variants(state: &AppState) -> bool {
+    !state
+        .live_proxy
+        .as_ref()
+        .is_some_and(|p| p.space_configured())
 }
 
 /// Serve from the corpus root, then the JIT root. Manifests are `no-cache` JSON (a newer
@@ -91,12 +116,13 @@ pub(super) async fn bevy_serve_local(
             .into_iter()
             .filter_map(|(r, j)| disk_path(&r, &target).map(|p| (p, j)))
             .collect();
+        let check = check_local_variants(state);
         let found = tokio::task::spawn_blocking(move || {
             let mut any = false;
             for (p, j) in candidates {
                 if p.is_file() {
                     any = true;
-                    if manifest_is_current(&p) {
+                    if manifest_is_current(&p, check) {
                         return (Some((p, j)), true);
                     }
                 }
@@ -235,9 +261,10 @@ pub(super) async fn bevy_fallback(
     if state.jit_fail_cache.get(&fail_key).await.is_some() {
         return with_reason(local, "bevy-variants-unbuildable");
     }
+    let check = check_local_variants(state);
     let probe = |root: &std::path::Path| -> JitProbe {
         match bevyvariants::manifest_path(root, entity) {
-            Some(p) => JitProbe::Check(Box::new(move || manifest_is_current(&p))),
+            Some(p) => JitProbe::Check(Box::new(move || manifest_is_current(&p, check))),
             None => JitProbe::None,
         }
     };
@@ -255,7 +282,7 @@ pub(super) async fn bevy_fallback(
         let entity = entity.clone();
         tokio::spawn(async move {
             let probe = match bevyvariants::manifest_path(&st.jit_root, &entity) {
-                Some(p) => JitProbe::Check(Box::new(move || manifest_is_current(&p))),
+                Some(p) => JitProbe::Check(Box::new(move || manifest_is_current(&p, check))),
                 None => JitProbe::None,
             };
             let _ = jit_build_entity(&st, &proxy, &entity, BEVY_PLATFORM, probe, "bevy").await;
@@ -326,13 +353,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("m.json");
         std::fs::write(&p, b"not json").unwrap();
-        assert!(!manifest_is_current(&p));
+        assert!(!manifest_is_current(&p, false));
         std::fs::write(
             &p,
             serde_json::json!({"v": 1, "entity": "e", "generator": "g", "files": {}}).to_string(),
         )
         .unwrap();
-        assert!(!manifest_is_current(&p));
+        assert!(!manifest_is_current(&p, false));
         std::fs::write(
             &p,
             serde_json::json!({"v": 2, "entity": "e", "generator": "g",
@@ -340,7 +367,58 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        assert!(!manifest_is_current(&p));
+        assert!(!manifest_is_current(&p, false));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A current manifest whose variant was evicted reads as current only where object storage
+    /// can read the variant through; without it, the manifest is rebuilt.
+    #[test]
+    fn manifest_with_an_evicted_variant_is_stale_without_read_through() {
+        let root = std::env::temp_dir().join(format!("abgen-bevy-evicted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let lanes = {
+            #[cfg(feature = "bevy-variants")]
+            {
+                bevyvariants::BuildOptions::from_env().lanes()
+            }
+            #[cfg(not(feature = "bevy-variants"))]
+            {
+                Default::default()
+            }
+        };
+        let key = bevyvariants::variant_key("t2", "bafkreiexample_srgb");
+        let m = bevyvariants::Manifest {
+            v: bevyvariants::MANIFEST_VERSION,
+            entity: "bafkent".into(),
+            generator: "test".into(),
+            lanes,
+            files: [(
+                "bafkreiexample".to_string(),
+                vec![bevyvariants::VariantEntry {
+                    path: key.clone(),
+                    cid: "bafkreiexamplevariant".into(),
+                    kind: "texture".into(),
+                    format: "ktx2-bc7".into(),
+                    width: Some(4),
+                    height: Some(4),
+                    mips: Some(1),
+                    size: 3,
+                }],
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let mp = bevyvariants::manifest_path(&root, "bafkent").unwrap();
+        std::fs::create_dir_all(mp.parent().unwrap()).unwrap();
+        std::fs::write(&mp, serde_json::to_vec(&m).unwrap()).unwrap();
+        let vp = bevyvariants::key_path(&root, &key).unwrap();
+        std::fs::create_dir_all(vp.parent().unwrap()).unwrap();
+        std::fs::write(&vp, b"abc").unwrap();
+        assert!(manifest_is_current(&mp, true));
+        std::fs::remove_file(&vp).unwrap();
+        assert!(!manifest_is_current(&mp, true));
+        assert!(manifest_is_current(&mp, false));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -1005,6 +1005,7 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
         fetch: &fetch,
         probe: &probe,
         stored: &|_: &str| -> Option<Vec<u8>> { None },
+        wrote: &|_: &std::path::Path| {},
     };
     let out = std::env::temp_dir().join(format!("abgen-bevy-meshopt-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
@@ -1112,6 +1113,7 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
         fetch: &counting,
         probe: &probe,
         stored: &|_: &str| -> Option<Vec<u8>> { None },
+        wrote: &|_: &std::path::Path| {},
     };
     let again = build_entity_variants(
         &scene,
@@ -1193,6 +1195,7 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
         fetch: &counting,
         probe: &remote,
         stored: &|_: &str| -> Option<Vec<u8>> { None },
+        wrote: &|_: &std::path::Path| {},
     };
     fetches.store(0, std::sync::atomic::Ordering::Relaxed);
     let probed = build_entity_variants(&scene, &lane5, &out5, BuildOptions::default()).unwrap();
@@ -1234,6 +1237,130 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
     assert!(built2.stats.model_files.is_empty());
     let _ = std::fs::remove_dir_all(&out);
     let _ = std::fs::remove_dir_all(&out2);
+}
+
+/// A variant first built without a `.br` sidecar gets one once precompression is on: the
+/// sidecar is written and listed for upload before the replaced record (`br: true`), and
+/// nothing is fetched or re-encoded.
+#[test]
+fn reused_meshopt_variant_without_br_gets_a_sidecar_without_a_fetch() {
+    use super::meshopt;
+    let grid = grid_glb(24);
+    let scene = scene_of("bafkentitybr", &[("models/grid.glb", "bafkgrid")]);
+    let fetches = std::sync::atomic::AtomicUsize::new(0);
+    let fetch = |h: &str| {
+        fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (h == "bafkgrid").then(|| grid.clone())
+    };
+    let probe = |_: &str| None;
+    let lane = Lane {
+        fetch: &fetch,
+        probe: &probe,
+        stored: &|_: &str| -> Option<Vec<u8>> { None },
+        wrote: &|_: &std::path::Path| {},
+    };
+    let out = std::env::temp_dir().join(format!("abgen-bevy-backfill-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    let plain = BuildOptions {
+        precompress_br: false,
+        ..BuildOptions::default()
+    };
+    let first = build_entity_variants(&scene, &lane, &out, plain).unwrap();
+    let entry = first.manifest.files["bafkgrid"][0].clone();
+    let vpath = key_path(&out, &entry.path).unwrap();
+    let br_path = meshopt::br_sidecar(&vpath);
+    assert!(!br_path.exists());
+    let rec_path = key_path(&out, &record_key(&entry.path)).unwrap();
+    assert!(
+        !Record::parse(&std::fs::read(&rec_path).unwrap())
+            .unwrap()
+            .br
+    );
+
+    fetches.store(0, std::sync::atomic::Ordering::Relaxed);
+    let again = build_entity_variants(&scene, &lane, &out, BuildOptions::default()).unwrap();
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(again.manifest.files["bafkgrid"][0], entry);
+    assert_eq!(again.stats.unique_variants, 0);
+    let plain_bytes = std::fs::read(&vpath).unwrap();
+    assert_eq!(
+        meshopt::brotli_decompress(&std::fs::read(&br_path).unwrap()).unwrap(),
+        plain_bytes
+    );
+    assert!(
+        Record::parse(&std::fs::read(&rec_path).unwrap())
+            .unwrap()
+            .br
+    );
+    assert_eq!(
+        again
+            .uploads
+            .iter()
+            .map(|u| (u.key.as_str(), u.owner.as_str(), u.record))
+            .collect::<Vec<_>>(),
+        vec![
+            (&*format!("{}.br", entry.path), entry.path.as_str(), false),
+            (&*format!("{}.json", entry.path), entry.path.as_str(), true),
+        ]
+    );
+    // Once it has its sidecar, the next build has nothing to add.
+    let third = build_entity_variants(&scene, &lane, &out, BuildOptions::default()).unwrap();
+    assert!(third.uploads.is_empty());
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// The JIT cache evicts files one at a time. A record whose variant was evicted is a miss and
+/// is deleted, so the rebuild re-encodes that key alone; every other key is reused. The lane
+/// is told about every file the build writes.
+#[test]
+fn evicted_variant_is_rebuilt_alone_and_every_write_is_reported() {
+    let grid = grid_glb(24);
+    let mut blobs: HashMap<&str, Vec<u8>> = HashMap::new();
+    blobs.insert("bafkgrid", grid);
+    // Noise: its BC variant is always smaller than the PNG, so it passes the size gate.
+    blobs.insert("bafkgridpng", noise_png_bytes(64, 64));
+    let scene = scene_of(
+        "bafkentityev",
+        &[
+            ("models/grid.glb", "bafkgrid"),
+            ("models/grid.png", "bafkgridpng"),
+        ],
+    );
+    let fetches = std::sync::Mutex::new(Vec::<String>::new());
+    let fetch = |h: &str| {
+        fetches.lock().unwrap().push(h.to_string());
+        blobs.get(h).cloned()
+    };
+    let probe = |_: &str| None;
+    let written = std::sync::Mutex::new(Vec::<std::path::PathBuf>::new());
+    let wrote = |p: &std::path::Path| written.lock().unwrap().push(p.to_path_buf());
+    let lane = Lane {
+        fetch: &fetch,
+        probe: &probe,
+        stored: &|_: &str| -> Option<Vec<u8>> { None },
+        wrote: &wrote,
+    };
+    let out = std::env::temp_dir().join(format!("abgen-bevy-evict-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    let first = build_entity_variants(&scene, &lane, &out, BuildOptions::default()).unwrap();
+    // Every object listed for upload, plus the manifest, was reported as written.
+    let reported: std::collections::BTreeSet<_> = written.lock().unwrap().drain(..).collect();
+    for u in &first.uploads {
+        assert!(reported.contains(&u.path), "{} not reported", u.key);
+    }
+    assert!(reported.contains(&manifest_path(&out, "bafkentityev").unwrap()));
+
+    let tex = first.manifest.files["bafkgridpng"][0].clone();
+    let tex_path = key_path(&out, &tex.path).unwrap();
+    let tex_rec = key_path(&out, &record_key(&tex.path)).unwrap();
+    std::fs::remove_file(&tex_path).unwrap();
+    fetches.lock().unwrap().clear();
+    let again = build_entity_variants(&scene, &lane, &out, BuildOptions::default()).unwrap();
+    assert_eq!(*fetches.lock().unwrap(), vec!["bafkgridpng".to_string()]);
+    assert_eq!(again.manifest_bytes, first.manifest_bytes);
+    assert!(tex_path.is_file() && tex_rec.is_file());
+    assert!(again.uploads.iter().all(|u| u.owner == tex.path));
+    let _ = std::fs::remove_dir_all(&out);
 }
 
 fn scene_of(entity: &str, content: &[(&str, &str)]) -> Scene {
@@ -1296,6 +1423,7 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
         fetch: &fetch,
         probe: &probe,
         stored: &|_: &str| -> Option<Vec<u8>> { None },
+        wrote: &|_: &std::path::Path| {},
     };
     let run = |tag: &str, opts: BuildOptions| {
         let out =

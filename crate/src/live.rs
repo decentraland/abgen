@@ -315,6 +315,10 @@ pub struct Proxy {
     decode_ok: Mutex<HashMap<String, bool>>,
     /// The same, for whether a scene font is one the font lane can bake.
     font_ok: Mutex<HashMap<String, bool>>,
+    /// Standalone `.ktx2` hash -> whether the UASTC header gate takes it.
+    ktx2_ok: Mutex<HashMap<String, bool>>,
+    /// Entity -> files its Bevy builds wrote and the JIT cache has not taken yet.
+    pub(crate) bevy_written: Mutex<HashMap<String, Vec<PathBuf>>>,
 }
 
 #[derive(Clone)]
@@ -342,6 +346,16 @@ impl Proxy {
 
     pub fn set_jit_cache(&self, c: Arc<crate::jitcache::JitDiskCache>) {
         let _ = self.jit_cache.set(c);
+    }
+
+    /// The files the Bevy builds of `entity` wrote since the last call, taken (so each is
+    /// reported once) by the JIT cache after a build.
+    pub fn take_bevy_written(&self, entity: &str) -> Vec<PathBuf> {
+        self.bevy_written
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(entity)
+            .unwrap_or_default()
     }
 
     pub fn progress_snapshot(&self, cid: &str) -> Option<BuildProgress> {
@@ -603,12 +617,18 @@ impl Proxy {
     /// UASTC HDR, arrays, cubemaps, too large) is not convertible and is skipped like any
     /// unknown file: no bundle and no tolerated failure. Content that cannot be read is not a
     /// verdict: the build runs and surfaces the error.
+    /// The verdict is memoized per hash, like `font_supported`.
     fn ktx2_standalone_ok(&self, hash: &str) -> bool {
-        self.ensure_content(hash).ok();
-        match self.content.fetch_mmap(hash) {
-            Ok(raw) => crate::ktx2::ktx2_header_ok(&raw),
-            Err(_) => true,
+        if let Some(v) = self.ktx2_ok.lock().unwrap().get(hash) {
+            return *v;
         }
+        self.ensure_content(hash).ok();
+        let Ok(raw) = self.content.fetch_mmap(hash) else {
+            return true;
+        };
+        let v = crate::ktx2::ktx2_header_ok(&raw);
+        self.ktx2_ok.lock().unwrap().insert(hash.to_string(), v);
+        v
     }
 
     /// Whether a scene font is one the font lane takes. One that is not (a web font renamed
@@ -1229,6 +1249,10 @@ impl Proxy {
             bare_name: String,
             is_image: bool,
             is_font: bool,
+            /// A standalone `.ktx2`, checked against the UASTC header gate in the probe
+            /// workers: on a miss, and on a hit too under bare naming, whose names carry no
+            /// gate policy ([`naming::STANDALONE_KTX2_POLICY`]).
+            ktx2_gate: Option<bool>,
         }
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1253,19 +1277,6 @@ impl Proxy {
         for (idx, c) in convertible.iter().enumerate() {
             let order = idx + 1;
             let (is_glb, is_image) = is_convertible(&c.file);
-            if is_image
-                && c.file.to_lowercase().ends_with(".ktx2")
-                && !self.ktx2_standalone_ok(&c.hash)
-            {
-                tracing::info!(
-                    entity = %cid,
-                    file = %c.file,
-                    hash = %c.hash,
-                    "standalone KTX2 is not UASTC LDR 2D — skipped, no bundle"
-                );
-                done_pre += 1;
-                continue;
-            }
             let is_font = !is_glb && !is_image && is_font(&c.file);
             let case_hash = if platform == "mac" {
                 c.hash.to_lowercase()
@@ -1318,6 +1329,7 @@ impl Proxy {
                 done_pre += 1;
                 continue;
             }
+            let is_ktx2 = is_image && c.file.to_lowercase().ends_with(".ktx2");
             candidates.push(ProbeCandidate {
                 order,
                 file: c.file.clone(),
@@ -1326,10 +1338,15 @@ impl Proxy {
                 bare_name,
                 is_image,
                 is_font,
+                ktx2_gate: is_ktx2.then_some(digest_naming),
             });
         }
 
-        let hit_slots: Vec<Mutex<bool>> = candidates.iter().map(|_| Mutex::new(false)).collect();
+        // Per candidate: (probe hit, skipped by the standalone KTX2 gate).
+        let hit_slots: Vec<Mutex<(bool, bool)>> = candidates
+            .iter()
+            .map(|_| Mutex::new((false, false)))
+            .collect();
         {
             let probe_workers = probe_jobs().min(candidates.len().max(1));
             let next_probe = AtomicUsize::new(0);
@@ -1341,13 +1358,31 @@ impl Proxy {
                             break;
                         };
                         let hit = self.space_probe_asset(lane_version, &cand.bundle_name);
-                        *hit_slots[i].lock().unwrap() = hit;
+                        // A non-UASTC `.ktx2` is not convertible: no bundle, no tolerated
+                        // failure. A hit under digest naming was built under the gate already.
+                        let skip = match cand.ktx2_gate {
+                            Some(named_by_policy) if !hit || !named_by_policy => {
+                                !self.ktx2_standalone_ok(&cand.hash)
+                            }
+                            _ => false,
+                        };
+                        *hit_slots[i].lock().unwrap() = (hit, skip);
                     });
                 }
             });
         }
         for (cand, hit_slot) in candidates.into_iter().zip(hit_slots) {
-            let hit = hit_slot.into_inner().unwrap();
+            let (hit, skip) = hit_slot.into_inner().unwrap();
+            if skip {
+                tracing::info!(
+                    entity = %cid,
+                    file = %cand.file,
+                    hash = %cand.hash,
+                    "standalone KTX2 is not UASTC LDR 2D — skipped, no bundle"
+                );
+                done_pre += 1;
+                continue;
+            }
             if hit {
                 prebuilt.push((cand.order, cand.bundle_name));
                 done_pre += 1;
@@ -1919,6 +1954,8 @@ impl Proxy {
             build_progress: Mutex::new(HashMap::new()),
             decode_ok: Mutex::new(HashMap::new()),
             font_ok: Mutex::new(HashMap::new()),
+            ktx2_ok: Mutex::new(HashMap::new()),
+            bevy_written: Mutex::new(HashMap::new()),
         })
     }
 

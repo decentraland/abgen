@@ -96,7 +96,8 @@ pub enum NoVariant {
     Missing,
     /// Not a PNG, JPEG or KTX2 by its bytes.
     NotAnImage,
-    /// 2 px or less on a side.
+    /// 2 px or less on a side, or under 4 px on a side at the variant size (less than one
+    /// 4x4 BC block).
     Tiny,
     /// PNG/JPEG that does not decode.
     DecodeError,

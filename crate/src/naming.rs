@@ -412,12 +412,34 @@ pub fn image_class_digest(
     normal: bool,
     key_ext: &str,
 ) -> String {
+    let recipes = recipes::digest_generations(&recipes::image_recipes());
+    if key_ext.eq_ignore_ascii_case(".ktx2") {
+        // Standalone KTX2 bundles are named under the UASTC header gate's policy, so a bundle
+        // stored before the gate (or under another policy) is never reused: a probe hit means
+        // the gate already took this file, and only a miss needs to look at its bytes.
+        return digest_inputs(
+            (
+                model_referenced,
+                linear,
+                normal,
+                key_ext,
+                STANDALONE_KTX2_POLICY,
+            ),
+            &recipes,
+            "image class",
+        );
+    }
     digest_inputs(
         (model_referenced, linear, normal, key_ext),
-        &recipes::digest_generations(&recipes::image_recipes()),
+        &recipes,
         "image class",
     )
 }
+
+/// Which standalone `.ktx2` files the Unity lanes convert, as a name input of their bundles
+/// ([`image_class_digest`]). 1: only what `crate::ktx2::ktx2_header_ok` takes (UASTC LDR 2D
+/// within the size cap); anything else gets no bundle. Bump when that rule changes.
+pub const STANDALONE_KTX2_POLICY: &str = "uastc-gate-1";
 
 /// Extension a font bundle bakes into its container key: scene fonts are TrueType only.
 pub const FONT_KEY_EXTENSION: &str = crate::fontgen::FONT_EXTENSION;

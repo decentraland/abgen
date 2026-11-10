@@ -276,33 +276,22 @@ impl AppStateInner {
         }
     }
 
-    /// After a Bevy build: account the entity's manifest and every object it names (each
-    /// variant with its `.br` sidecar and `.json` record) as their own LRU entries. Records of
-    /// final no-variant outcomes are not named by the manifest; they are small and are
-    /// accounted when seeded at startup.
+    /// After a Bevy build (successful or not): account every file it wrote under the JIT root
+    /// (variants, sidecars, records, negative records, the manifest), each as its own LRU
+    /// entry. Files outside the JIT root (a corpus `out_root`) are never accounted, so never
+    /// evicted. A variant evicted while a manifest still names it makes that manifest stale
+    /// on a node without read-through (`bevy::manifest_is_current`).
     pub fn jit_record_bevy(&self, entity: &str) {
+        let Some(proxy) = self.live_proxy.as_ref() else {
+            return;
+        };
+        let written = proxy.take_bevy_written(entity);
         if !self.jit_cache.enabled() {
             return;
         }
-        let Some(mp) = crate::bevyvariants::manifest_path(&self.jit_root, entity) else {
-            return;
-        };
-        let Ok(bytes) = std::fs::read(&mp) else {
-            return;
-        };
-        if let Ok(m) = serde_json::from_slice::<crate::bevyvariants::Manifest>(&bytes) {
-            for e in m.files.values().flatten() {
-                let Some(p) = crate::bevyvariants::key_path(&self.jit_root, &e.path) else {
-                    continue;
-                };
-                for suffix in ["", ".br", ".json"] {
-                    let mut os = p.clone().into_os_string();
-                    os.push(suffix);
-                    self.jit_record_bevy_file(Path::new(&os));
-                }
-            }
+        for p in written {
+            self.jit_record_bevy_file(&p);
         }
-        self.jit_record_bevy_file(&mp);
     }
 
     pub fn jit_record_file(&self, key: &str, path: &Path) {

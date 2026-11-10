@@ -435,12 +435,28 @@ impl crate::live::Proxy {
                 None
             }
         };
+        let written = std::sync::Mutex::new(Vec::<PathBuf>::new());
+        let wrote = |p: &Path| {
+            written
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(p.to_path_buf());
+        };
         let lane = Lane {
             fetch: &fetch,
             probe: &probe,
             stored: &stored,
+            wrote: &wrote,
         };
-        let out = build_entity_variants(&ctx.scene, &lane, out_root, BuildOptions::from_env())?;
+        let built = build_entity_variants(&ctx.scene, &lane, out_root, BuildOptions::from_env());
+        // Everything the build left on disk, success or not, for the JIT cache to account.
+        self.bevy_written
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(cid.to_string())
+            .or_default()
+            .extend(written.into_inner().unwrap_or_else(|e| e.into_inner()));
+        let out = built?;
         if self.space_configured() {
             // A key whose bytes, sidecar or record did not all land is dropped whole: its
             // later objects are skipped (so the store never holds a record naming bytes it

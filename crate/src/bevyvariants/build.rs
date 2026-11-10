@@ -140,11 +140,14 @@ impl BuildOptions {
 /// Redis); `None` is a miss. Local records under `out_root` are read before `probe` is asked.
 /// `stored` returns a stored variant's bytes by key (`None` = not there); a variant under
 /// `out_root` is read before it is asked. It is only used to add a `.br` sidecar to a reused
-/// variant that has none.
+/// variant that has none. `wrote` is told every file the build writes under `out_root`
+/// (variants, sidecars, records, negative records and the manifest), as it is written, so a
+/// build that fails part-way has still reported what it left on disk.
 pub struct Lane<'a> {
     pub fetch: &'a (dyn Fn(&str) -> Option<Vec<u8>> + Sync),
     pub probe: &'a (dyn Fn(&str) -> Option<Record> + Sync),
     pub stored: &'a (dyn Fn(&str) -> Option<Vec<u8>> + Sync),
+    pub wrote: &'a (dyn Fn(&Path) + Sync),
 }
 
 /// One object this build wrote under `out_root`, in the order the store must receive them:
@@ -222,13 +225,15 @@ fn probe(lane: &Lane, out_root: &Path, key: &str, times: &mut StageTimes) -> Opt
     })
 }
 
-fn write_atomic(dst: &Path, bytes: &[u8]) -> Result<()> {
+/// Write `bytes` to `dst` through a temporary sibling, then tell the lane (`Lane::wrote`).
+fn write_atomic(lane: &Lane, dst: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
     let tmp = crate::tmppath::tmp_sibling(dst);
     std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, dst).with_context(|| format!("rename to {}", dst.display()))?;
+    (lane.wrote)(dst);
     Ok(())
 }
 
@@ -236,6 +241,7 @@ fn write_atomic(dst: &Path, bytes: &[u8]) -> Result<()> {
 /// `.br` sidecar (if any), its record. A file already there is left alone (a key's bytes are
 /// final within its generation). Returns the uploads in that order.
 fn store(
+    lane: &Lane,
     out_root: &Path,
     key: &str,
     bytes: Option<&[u8]>,
@@ -248,7 +254,7 @@ fn store(
     let dst = key_path(out_root, key).ok_or_else(|| anyhow::anyhow!("bad variant key {key:?}"))?;
     if let Some(b) = bytes {
         if !dst.is_file() {
-            write_atomic(&dst, b)?;
+            write_atomic(lane, &dst, b)?;
         }
         out.push(Upload {
             key: key.to_string(),
@@ -260,7 +266,7 @@ fn store(
     if let Some(b) = br {
         let br_dst = meshopt::br_sidecar(&dst);
         if !br_dst.is_file() {
-            write_atomic(&br_dst, b)?;
+            write_atomic(lane, &br_dst, b)?;
         }
         out.push(Upload {
             key: format!("{key}.br"),
@@ -273,6 +279,7 @@ fn store(
     let rec_dst = key_path(out_root, &rk).expect("a variant key's record is a valid key");
     if !rec_dst.is_file() {
         write_atomic(
+            lane,
             &rec_dst,
             &serde_json::to_vec(record).context("serialize record")?,
         )?;
@@ -311,12 +318,13 @@ fn backfill_br(
     let br = timed(&mut times.brotli_ns, || meshopt::brotli_compress(&plain))?;
     let started = std::time::Instant::now();
     let br_dst = meshopt::br_sidecar(&dst);
-    write_atomic(&br_dst, &br)?;
+    write_atomic(lane, &br_dst, &br)?;
     let mut rec = rec.clone();
     rec.br = true;
     let rk = record_key(key);
     let rec_dst = key_path(out_root, &rk).expect("a variant key's record is a valid key");
     write_atomic(
+        lane,
         &rec_dst,
         &serde_json::to_vec(&rec).context("serialize record")?,
     )?;
@@ -629,6 +637,7 @@ pub fn build_entity_variants(
                                         uses: out.uses.clone(),
                                     };
                                     out.uploads.extend(store(
+                                        lane,
                                         out_root,
                                         &key,
                                         Some(&v.glb),
@@ -654,6 +663,7 @@ pub fn build_entity_variants(
                                             uses: out.uses.clone(),
                                         };
                                         out.uploads.extend(store(
+                                            lane,
                                             out_root, &key, None, None, &rec, &mut times,
                                         )?);
                                     }
@@ -695,6 +705,7 @@ pub fn build_entity_variants(
                                 uses: out.uses.clone(),
                             };
                             out.uploads.extend(store(
+                                lane,
                                 out_root,
                                 &key,
                                 Some(&v.glb),
@@ -713,7 +724,7 @@ pub fn build_entity_variants(
                                 uses: out.uses.clone(),
                             };
                             out.uploads
-                                .extend(store(out_root, &key, None, None, &rec, &mut times)?);
+                                .extend(store(lane,out_root, &key, None, None, &rec, &mut times)?);
                         }
                         Ok(Err(e)) => {
                             tracing::warn!(entity = %entity, file = %file, error = %format!("{e:#}"), "bevy model variant skipped");
@@ -820,7 +831,7 @@ pub fn build_entity_variants(
                             br: false,
                             uses: BTreeMap::new(),
                         };
-                        store(out_root, &key, None, None, &rec, &mut times)?
+                        store(lane,out_root, &key, None, None, &rec, &mut times)?
                     } else {
                         Vec::new()
                     };
@@ -837,7 +848,7 @@ pub fn build_entity_variants(
                         br: false,
                         uses: BTreeMap::new(),
                     };
-                    let uploads = store(out_root, &key, None, None, &rec, &mut times)?;
+                    let uploads = store(lane,out_root, &key, None, None, &rec, &mut times)?;
                     stat.times = times;
                     return Ok((row(None), stat, uploads));
                 }
@@ -853,7 +864,7 @@ pub fn build_entity_variants(
                 br: false,
                 uses: BTreeMap::new(),
             };
-            let uploads = store(out_root, &key, Some(&v.bytes), None, &rec, &mut times)?;
+            let uploads = store(lane,out_root, &key, Some(&v.bytes), None, &rec, &mut times)?;
             stat.format = Some(v.format.manifest_name());
             stat.variant_path = Some(key.clone());
             stat.variant_cid = Some(e.cid.clone());
@@ -901,7 +912,7 @@ pub fn build_entity_variants(
         files,
     };
     let manifest_bytes = serde_json::to_vec(&manifest).context("serialize manifest")?;
-    write_atomic(&manifest_dst, &manifest_bytes)?;
+    write_atomic(lane, &manifest_dst, &manifest_bytes)?;
     let mut stats = BuildStats::from_files(file_stats, opts.zstd_level, started.elapsed());
     stats.models = models.len() as u64;
     stats.add_models(model_stats);
