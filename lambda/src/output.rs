@@ -142,7 +142,10 @@ pub fn publish(
     entity_doc: &serde_json::Value,
     outcome: &EntityOutcome,
 ) -> Result<serde_json::Value> {
-    let total_bundles: usize = outcome.platforms.iter().map(|p| p.built.len()).sum();
+    let total_bundles: usize = outcome
+        .platforms
+        .iter()
+        .fold(0usize, |total, p| total.saturating_add(p.bundles));
     if !proxy.space_configured() {
         eprintln!(
             "output: no space configured (set ABGEN_S3_ENDPOINT/ABGEN_S3_BUCKET) — \
@@ -338,6 +341,8 @@ pub(crate) mod tests {
         std::env::set_var("ABGEN_S3_ENDPOINT", format!("http://{host}"));
         std::env::set_var("AWS_ACCESS_KEY_ID", "AKIATEST");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+        // Path style, as the deployments: a bucket, when a test sets one, is in the path.
+        std::env::set_var("ABGEN_S3_PATH_STYLE", "1");
         (lock, EnvGuard)
     }
 
@@ -348,6 +353,7 @@ pub(crate) mod tests {
                 "ABGEN_S3_ENDPOINT",
                 "AWS_ACCESS_KEY_ID",
                 "AWS_SECRET_ACCESS_KEY",
+                "ABGEN_S3_PATH_STYLE",
             ] {
                 std::env::remove_var(k);
             }
@@ -377,6 +383,7 @@ pub(crate) mod tests {
                 let method = parts.next().unwrap_or("").to_string();
                 let path = parts.next().unwrap_or("").to_string();
                 let mut content_len = 0usize;
+                let mut tenant: Option<String> = None;
                 loop {
                     let mut h = String::new();
                     if reader.read_line(&mut h).is_err() {
@@ -386,15 +393,27 @@ pub(crate) mod tests {
                     if ht.is_empty() {
                         break;
                     }
-                    if let Some(v) = ht.to_ascii_lowercase().strip_prefix("content-length:") {
+                    let lower = ht.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
                         content_len = v.trim().parse().unwrap_or(0);
+                    }
+                    // A Lambda invoke's tenant id is recorded as its own `TENANT <id>` line,
+                    // right after the request, so a test can assert who the call was for.
+                    if lower.starts_with("x-amz-tenant-id:") {
+                        tenant = Some(ht[ht.find(':').unwrap_or(0) + 1..].trim().to_string());
                     }
                 }
                 if content_len > 0 {
                     let mut body = vec![0u8; content_len];
                     let _ = reader.read_exact(&mut body);
                 }
-                seen2.lock().unwrap().push(format!("{method} {path}"));
+                {
+                    let mut seen = seen2.lock().unwrap();
+                    seen.push(format!("{method} {path}"));
+                    if let Some(tenant) = tenant {
+                        seen.push(format!("TENANT {tenant}"));
+                    }
+                }
                 let (code, body) = routes
                     .iter()
                     .find(|(p, _, _)| {

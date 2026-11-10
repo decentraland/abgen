@@ -2,12 +2,15 @@ use crate::config::Config;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
+#[derive(Debug)]
 pub struct PlatformOutcome {
     pub platform: String,
-    pub built: Vec<String>,
+    /// Bundles the platform's manifest lists, reused ones included.
+    pub bundles: usize,
     pub exit_code: i32,
 }
 
+#[derive(Debug)]
 pub struct EntityOutcome {
     pub entity_id: String,
     pub content_server: String,
@@ -27,8 +30,8 @@ impl EntityOutcome {
     }
 }
 
-pub fn make_proxy(cfg: &Config, content_server: &str) -> std::sync::Arc<abgen::live::Proxy> {
-    abgen::live::Proxy::new(abgen::live::ProxyConfig {
+fn proxy_config(cfg: &Config, content_server: &str) -> abgen::live::ProxyConfig {
+    abgen::live::ProxyConfig {
         catalyst_url: content_server.to_string(),
         cache_dir: cfg.cache_dir.clone(),
         version: cfg.version.clone(),
@@ -36,7 +39,24 @@ pub fn make_proxy(cfg: &Config, content_server: &str) -> std::sync::Arc<abgen::l
         deps_digest: true,
         use_space: true,
         ..Default::default()
-    })
+    }
+}
+
+/// The proxy a conversion runs through, reading and writing the space the environment
+/// names (`ABGEN_S3_*`).
+pub fn make_proxy(cfg: &Config, content_server: &str) -> std::sync::Arc<abgen::live::Proxy> {
+    abgen::live::Proxy::new(proxy_config(cfg, content_server))
+}
+
+/// [`make_proxy`] over given spaces: `read` answers reads and reuse probes, `write` takes
+/// every put. The worker of the publisher/worker split reads the CDN and writes scratch.
+pub fn make_proxy_with_spaces(
+    cfg: &Config,
+    content_server: &str,
+    read: std::sync::Arc<abgen::space::Space>,
+    write: std::sync::Arc<abgen::space::Space>,
+) -> std::sync::Arc<abgen::live::Proxy> {
+    abgen::live::Proxy::new_with_spaces(proxy_config(cfg, content_server), Some(read), Some(write))
 }
 
 struct TexCacheClearGuard;
@@ -84,7 +104,7 @@ pub fn convert_entity(
         let exit_code = read_exit_code(&manifest_path).unwrap_or(0);
         results.push(PlatformOutcome {
             platform: platform.clone(),
-            built,
+            bundles: built.len(),
             exit_code,
         });
     }

@@ -285,6 +285,11 @@ pub struct Proxy {
     uri_cache: UriCache,
 
     space: Option<Arc<Space>>,
+    /// Where puts go when it is set, while `space` keeps answering reads and reuse
+    /// probes: the worker of the publisher/worker split stages its build in a scratch
+    /// bucket and still asks the CDN which bundles already exist. Unset, `space` takes
+    /// both roles.
+    write_space: Option<Arc<Space>>,
     fallback_version: String,
 
     entities: Mutex<HashMap<String, Arc<EntityCtx>>>,
@@ -952,11 +957,65 @@ impl Proxy {
     }
 
     pub fn space_configured(&self) -> bool {
-        self.space.is_some()
+        self.space.is_some() || self.write_space.is_some()
     }
 
+    /// The bucket reads come from (the CDN's, for a worker with a separate write space).
     pub fn space_bucket(&self) -> Option<&str> {
         self.space.as_ref()?.bucket.as_deref()
+    }
+
+    /// The space puts go to: the write space when one is set, else the read space.
+    fn put_space(&self) -> Option<&Arc<Space>> {
+        self.write_space.as_ref().or(self.space.as_ref())
+    }
+
+    /// Whether `key` exists where reads come from. Errors propagate: the caller is
+    /// deciding whether to overwrite, and a guess is not an answer.
+    pub fn space_key_exists(&self, key: &str) -> Result<bool> {
+        let Some(space) = self.space.as_ref() else {
+            bail!("no space configured");
+        };
+        let t = std::time::Instant::now();
+        let r = space.head(key);
+        let result = match &r {
+            Ok(true) => "hit",
+            Ok(false) => "miss",
+            Err(_) => "error",
+        };
+        metrics::histogram!("abgen_space_request_duration_seconds", "op" => "head", "result" => result)
+            .record(t.elapsed().as_secs_f64());
+        if r.is_err() {
+            metrics::counter!("abgen_space_errors_total", "op" => "head").increment(1);
+        }
+        r
+    }
+
+    /// Server-side copy of an object in another bucket on the same endpoint to `key` in
+    /// the put space ([`Space::copy_from`]); `only_if_absent` leaves an existing `key`
+    /// alone and answers `false`. Hard-failing: the caller reports the key as published.
+    pub fn space_copy_from(
+        &self,
+        source_bucket: &str,
+        source_key: &str,
+        key: &str,
+        only_if_absent: bool,
+    ) -> Result<bool> {
+        let Some(space) = self.put_space() else {
+            bail!("no space configured");
+        };
+        if space.read_only {
+            bail!("space is read-only (ABGEN_S3_READ_ONLY)");
+        }
+        let t = std::time::Instant::now();
+        let r = space.copy_from(source_bucket, source_key, key, only_if_absent);
+        let result = if r.is_ok() { "ok" } else { "error" };
+        metrics::histogram!("abgen_space_request_duration_seconds", "op" => "copy", "result" => result)
+            .record(t.elapsed().as_secs_f64());
+        if r.is_err() {
+            metrics::counter!("abgen_space_errors_total", "op" => "copy").increment(1);
+        }
+        r
     }
 
     /// Bucket-scoped: a hit in one CDN bucket says nothing about another.
@@ -1062,7 +1121,7 @@ impl Proxy {
     }
 
     pub fn space_put_key(&self, key: &str, bytes: &[u8]) {
-        let Some(space) = self.space.as_ref() else {
+        let Some(space) = self.put_space() else {
             return;
         };
         if space.read_only {
@@ -1112,7 +1171,7 @@ impl Proxy {
     /// Hard-failing `space_put_manifest` for writes correctness depends on
     /// (the lambda's failure tombstone): errors propagate, not logged away.
     pub fn space_put_manifest_strict(&self, stem: &str, bytes: &[u8]) -> Result<()> {
-        let Some(space) = self.space.as_ref() else {
+        let Some(space) = self.put_space() else {
             bail!("no space configured");
         };
         if space.read_only {
@@ -1125,7 +1184,7 @@ impl Proxy {
     /// Hard-failing `space_put_key` for writes whose caller reports the key as written (the
     /// lambda's satellite rebuild records): errors propagate, not logged away.
     pub fn space_put_key_strict(&self, key: &str, bytes: &[u8]) -> Result<()> {
-        let Some(space) = self.space.as_ref() else {
+        let Some(space) = self.put_space() else {
             bail!("no space configured");
         };
         if space.read_only {
@@ -1144,7 +1203,7 @@ impl Proxy {
     /// already applies per-call, hoisted so the pool is never spun up for a
     /// build that will never PUT anything.
     fn upload_pool(&self) -> Option<crate::upload::UploadPool> {
-        let space = self.space.as_ref()?;
+        let space = self.put_space()?;
         if space.read_only {
             return None;
         }
@@ -1791,6 +1850,17 @@ impl Proxy {
     }
 
     pub fn new_with_space(cfg: ProxyConfig, injected_space: Option<Arc<Space>>) -> Arc<Self> {
+        Self::new_with_spaces(cfg, injected_space, None)
+    }
+
+    /// [`Proxy::new_with_space`] with a separate space for puts: reads and reuse probes
+    /// go to `injected_space` (or the env space when `use_space` asks for one), every
+    /// put to `write_space`. `None` for `write_space` keeps one space for both.
+    pub fn new_with_spaces(
+        cfg: ProxyConfig,
+        injected_space: Option<Arc<Space>>,
+        write_space: Option<Arc<Space>>,
+    ) -> Arc<Self> {
         crate::texencode_cache::enable_with_profile(crate::texencode_cache::CacheProfile::Client);
         crate::decode_cache::enable();
         let collection_mode = BuildOpts::env_collection_mode();
@@ -1855,6 +1925,7 @@ impl Proxy {
             date,
             uri_cache: UriCache::new(),
             space,
+            write_space,
             fallback_version: cfg.fallback_version,
             entities: Mutex::new(HashMap::new()),
             hash_index: Mutex::new(HashMap::new()),
@@ -2365,6 +2436,94 @@ mod tests {
                 "GET /v40/assets/Qmhash_windows".to_string(),
                 "GET /v40/bafkcid/Qmhash_windows".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn puts_go_to_the_write_space_and_reads_to_the_read_space() {
+        // One key exists on the fake CDN; the fake also accepts the two prefixed puts.
+        let (host, seen) = super::stub::serve(vec![
+            ("/v41/assets/Qmexists_windows".to_string(), 200, Vec::new()),
+            (
+                "/jobs/bafk/n/v41/assets/Qmnew_windows".to_string(),
+                200,
+                Vec::new(),
+            ),
+            (
+                "/jobs/bafk/n/manifest/bafk_windows.json".to_string(),
+                200,
+                Vec::new(),
+            ),
+        ]);
+        let cdn = Arc::new(crate::space::Space::with_static_creds(
+            "http",
+            &host,
+            "us-east-1",
+            None,
+            false,
+            true,
+            "AKIATEST",
+            "secret",
+        ));
+        let scratch = Arc::new(
+            crate::space::Space::with_static_creds(
+                "http",
+                &host,
+                "us-east-1",
+                None,
+                false,
+                false,
+                "AKIATEST",
+                "secret",
+            )
+            .with_key_prefix("jobs/bafk/n")
+            .logging_writes(),
+        );
+        let cfg = ProxyConfig {
+            catalyst_url: "http://127.0.0.1:9".to_string(),
+            cache_dir: temp_cache("two-spaces").to_string_lossy().into_owned(),
+            version: "v41".to_string(),
+            ..Default::default()
+        };
+        let proxy = Proxy::new_with_spaces(cfg, Some(cdn), Some(scratch.clone()));
+        assert!(proxy.space_configured());
+
+        // The read space answers probes and reads, the write space takes every put,
+        // under its prefix; the read-only read space never refuses the put.
+        assert!(proxy
+            .space_key_exists("v41/assets/Qmexists_windows")
+            .unwrap());
+        assert!(!proxy
+            .space_key_exists("v41/assets/Qmmissing_windows")
+            .unwrap());
+        proxy.space_put_bundle("v41", "bafk", "Qmnew_windows", true, b"B");
+        proxy
+            .space_put_manifest_strict("bafk_windows", b"{}")
+            .expect("the write space is writable");
+        assert!(
+            proxy.upload_pool().is_some(),
+            "the pool uploads to the write space"
+        );
+        assert_eq!(
+            scratch
+                .written_objects()
+                .iter()
+                .map(|o| o.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["v41/assets/Qmnew_windows", "manifest/bafk_windows.json"]
+        );
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.contains(&"PUT /jobs/bafk/n/v41/assets/Qmnew_windows".to_string()),
+            "{seen:?}"
+        );
+        assert!(
+            seen.contains(&"PUT /jobs/bafk/n/manifest/bafk_windows.json".to_string()),
+            "{seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|s| s == "PUT /v41/assets/Qmnew_windows"),
+            "{seen:?}"
         );
     }
 

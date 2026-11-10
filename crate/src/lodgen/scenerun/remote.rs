@@ -93,31 +93,17 @@ pub fn runner() -> Option<Result<&'static RemoteRunner>> {
 
 /// [`TIMEOUT_ENV`]: unset or blank is the default, anything else a positive integer.
 fn parse_timeout(value: Option<&str>) -> Result<Duration> {
-    match value.map(str::trim).filter(|v| !v.is_empty()) {
-        None => Ok(Duration::from_secs(DEFAULT_TIMEOUT_S)),
-        Some(v) => v
-            .parse::<u64>()
-            .ok()
-            .filter(|s| *s > 0)
-            .map(Duration::from_secs)
-            .ok_or_else(|| anyhow!("{TIMEOUT_ENV}={v:?} is not a positive integer")),
-    }
+    crate::lambda_invoke::parse_timeout_setting(
+        TIMEOUT_ENV,
+        value,
+        Duration::from_secs(DEFAULT_TIMEOUT_S),
+    )
 }
 
 /// How long one call may take: the configured timeout, capped by what is left of the
 /// caller's own invocation after [`CALLER_RESERVE`].
 fn call_budget(timeout: Duration, invocation_left: Option<Duration>) -> Result<Duration> {
-    let budget = match invocation_left {
-        Some(left) => timeout.min(left.saturating_sub(CALLER_RESERVE)),
-        None => timeout,
-    };
-    if budget < MIN_CALL_BUDGET {
-        bail!(
-            "only {}s left for the scene in this invocation, not starting it",
-            budget.as_secs()
-        );
-    }
-    Ok(budget)
+    crate::lambda_invoke::call_budget(timeout, invocation_left, CALLER_RESERVE, MIN_CALL_BUDGET)
 }
 
 /// The scene deadline the caller asks for: its call budget less [`CALL_OVERHEAD`].
