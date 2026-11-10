@@ -259,11 +259,15 @@ fn ids_and_paths_refuse_traversal_and_previews() {
         assert!(manifest_path(root, bad).is_none(), "{bad}");
         assert!(variant_path(root, "t1", bad).is_none(), "{bad}");
     }
-    for bad in ["", "manifest", "contents", "t", "x1", "t1z", "tz9", "t1/x", "t1.1"] {
+    for bad in [
+        "", "manifest", "contents", "t", "x1", "t1z", "tz9", "t1/x", "t1.1", "t1e", "te2", "t1e2z9",
+        "t1ee2",
+    ] {
         assert!(!is_prefix(bad), "{bad}");
         assert!(variant_path(root, bad, "bafkreiabc").is_none(), "{bad}");
     }
     assert!(is_prefix("t1") && is_prefix("m12") && is_prefix("g1z9") && is_prefix("t1z19"));
+    assert!(is_prefix("t1e2") && is_prefix("t1z9e2") && is_prefix("m1e0"));
     assert!(key_path(root, "bevy/contents/bafkreiabc").is_none());
     assert!(key_path(root, "bevy/t1/a/b").is_none());
     assert_eq!(manifest_key("e"), "bevy/manifest/e.json");
@@ -274,10 +278,34 @@ fn ids_and_paths_refuse_traversal_and_previews() {
 #[test]
 fn lane_prefixes_follow_generations_and_the_zstd_level() {
     let d = crate::ktx2_write::DEFAULT_ZSTD_LEVEL;
-    assert_eq!(Class::Texture.prefix(d), format!("t{TEX_GEN}"));
-    assert_eq!(Class::Texture.prefix(9), format!("t{TEX_GEN}z9"));
-    assert_eq!(Class::Mesh.prefix(9), format!("m{MESH_GEN}"));
-    assert_eq!(Class::Glb.prefix(3), format!("g{TEX_GEN}z3"));
+    assert_eq!(Class::Texture.prefix(d, None), format!("t{TEX_GEN}"));
+    assert_eq!(Class::Texture.prefix(9, None), format!("t{TEX_GEN}z9"));
+    assert_eq!(Class::Mesh.prefix(9, None), format!("m{MESH_GEN}"));
+    assert_eq!(Class::Glb.prefix(3, None), format!("g{TEX_GEN}z3"));
+    // The epoch goes last, on every class.
+    assert_eq!(Class::Texture.prefix(d, Some(2)), format!("t{TEX_GEN}e2"));
+    assert_eq!(Class::Texture.prefix(9, Some(2)), format!("t{TEX_GEN}z9e2"));
+    assert_eq!(Class::Mesh.prefix(9, Some(0)), format!("m{MESH_GEN}e0"));
+    for p in [
+        Class::Texture.prefix(9, Some(9999)),
+        Class::Mesh.prefix(d, Some(7)),
+        Class::Glb.prefix(3, Some(1)),
+    ] {
+        assert!(is_prefix(&p), "{p}");
+    }
+    assert_eq!(parse_epoch(""), Some(None));
+    assert_eq!(parse_epoch(" 3 "), Some(Some(3)));
+    assert_eq!(parse_epoch("9999"), Some(Some(9999)));
+    for bad in ["10000", "-1", "e2", "2a", "1.5"] {
+        assert_eq!(parse_epoch(bad), None, "{bad}");
+    }
+    // An epoch moves every lane, so a manifest built without one is stale under one.
+    let epoch_lanes = BuildOptions {
+        epoch: Some(2),
+        ..BuildOptions::default()
+    }
+    .lanes();
+    assert!(epoch_lanes.values().all(|p| p.ends_with("e2")));
     let lanes = BuildOptions::default().lanes();
     assert_eq!(
         lanes,
@@ -300,6 +328,7 @@ fn lane_prefixes_follow_generations_and_the_zstd_level() {
         files: Default::default(),
     };
     assert!(m.is_current(&lanes));
+    assert!(!m.is_current(&epoch_lanes));
     // A class turned off since is fine; a class the manifest lacks, or names under another
     // prefix, or an older schema, is not.
     let textures_only = BuildOptions {
@@ -1237,6 +1266,7 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
             glb_meshopt: true,
             precompress_br: false,
             zstd_level: crate::ktx2_write::DEFAULT_ZSTD_LEVEL,
+            epoch: None,
         }
     );
     // These runs look at textures only.

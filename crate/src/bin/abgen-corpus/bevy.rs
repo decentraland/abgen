@@ -33,6 +33,7 @@ pub(crate) fn run_bevy_variants(
             Some(l) => abgen::ktx2_write::check_zstd_level(l)?,
             None => env.zstd_level,
         },
+        epoch: env.epoch,
     };
     let started = std::time::Instant::now();
     let mut all_stats: Vec<serde_json::Value> = Vec::new();
@@ -99,6 +100,7 @@ pub(crate) fn run_bevy_variants(
     let stats_path = out_root.join("bevy-variants-stats.json");
     let doc = serde_json::json!({
         "zstd_level": opts.zstd_level,
+        "epoch": opts.epoch,
         "glb_meshopt": opts.glb_meshopt,
         "precompress": if opts.precompress_br { "br" } else { "none" },
         "libzstd": abgen::ktx2_write::LIBZSTD_VERSION,

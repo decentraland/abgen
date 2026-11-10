@@ -35,6 +35,9 @@ pub struct BuildOptions {
     /// Zstandard level of every KTX2 level ([`crate::ktx2_write::DEFAULT_ZSTD_LEVEL`] by
     /// default). Part of the variant bytes, so part of the texture prefix.
     pub zstd_level: i32,
+    /// Operator epoch (`ABGEN_BEVY_EPOCH`, unset by default): appended to every prefix as
+    /// `e{N}`, so setting or changing it starts every class over without a release.
+    pub epoch: Option<u32>,
 }
 
 impl Default for BuildOptions {
@@ -44,6 +47,7 @@ impl Default for BuildOptions {
             glb_meshopt: true,
             precompress_br: false,
             zstd_level: crate::ktx2_write::DEFAULT_ZSTD_LEVEL,
+            epoch: None,
         }
     }
 }
@@ -60,7 +64,7 @@ impl BuildOptions {
     /// `ABGEN_BEVY_GLB_MESHOPT=0` turns `glb-meshopt` variants off (default on);
     /// `ABGEN_BEVY_PRECOMPRESS=br` stores `.br` sidecars of them (default off);
     /// `ABGEN_BEVY_ZSTD_LEVEL` (1..=19) sets the Zstandard level (default 19; an invalid value
-    /// is logged and the default is used).
+    /// is logged and the default is used); `ABGEN_BEVY_EPOCH` sets the epoch (default unset).
     pub fn from_env() -> Self {
         let zstd_level = match std::env::var(ZSTD_LEVEL_ENV) {
             Ok(v) => match v
@@ -83,6 +87,7 @@ impl BuildOptions {
             precompress_br: std::env::var(PRECOMPRESS_ENV)
                 .is_ok_and(|v| v.trim().eq_ignore_ascii_case("br")),
             zstd_level,
+            epoch: super::epoch_from_env(),
         }
     }
 
@@ -98,18 +103,18 @@ impl BuildOptions {
         let mut out = BTreeMap::new();
         out.insert(
             Class::Texture.lane().to_string(),
-            Class::Texture.prefix(self.zstd_level),
+            Class::Texture.prefix(self.zstd_level, self.epoch),
         );
         if self.glb_meshopt {
             out.insert(
                 Class::Mesh.lane().to_string(),
-                Class::Mesh.prefix(self.zstd_level),
+                Class::Mesh.prefix(self.zstd_level, self.epoch),
             );
         }
         if self.glb_variants {
             out.insert(
                 Class::Glb.lane().to_string(),
-                Class::Glb.prefix(self.zstd_level),
+                Class::Glb.prefix(self.zstd_level, self.epoch),
             );
         }
         out
@@ -374,9 +379,9 @@ pub fn build_entity_variants(
     let content_by_file = scene.content_by_file();
     let skipped = scene.metadata_only_hashes();
     let fetch = lane.fetch;
-    let tex_prefix = Class::Texture.prefix(opts.zstd_level);
-    let mesh_prefix = Class::Mesh.prefix(opts.zstd_level);
-    let glb_prefix = Class::Glb.prefix(opts.zstd_level);
+    let tex_prefix = Class::Texture.prefix(opts.zstd_level, opts.epoch);
+    let mesh_prefix = Class::Mesh.prefix(opts.zstd_level, opts.epoch);
+    let glb_prefix = Class::Glb.prefix(opts.zstd_level, opts.epoch);
     let tex_opts = opts.tex();
 
     // One (file, kind) per hash: the lexicographically first path, so the relative URIs a

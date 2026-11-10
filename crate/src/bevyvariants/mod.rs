@@ -52,7 +52,9 @@
 //! when an encoder's output bytes change (precision, level, size cap, codec), which moves
 //! every key of that class to a new prefix; the previous prefix is garbage and can be deleted
 //! whole. The manifest records the prefixes it was built from (`lanes`), and an entity whose
-//! manifest names an older prefix is rebuilt, re-encoding only the class that moved.
+//! manifest names an older prefix is rebuilt, re-encoding only the class that moved. An
+//! operator can force a full rebuild without a release by setting `ABGEN_BEVY_EPOCH`
+//! ([`EPOCH_ENV`]), which appends `e{N}` to every prefix.
 //!
 //! **Orientation.** Rows are stored top row first (`KTXorientation` = `rd`), which is what
 //! Bevy's loaders and glTF's top-left UV origin expect. Decoded PNG/JPEG buffers and UASTC KTX2
@@ -132,35 +134,75 @@ impl Class {
     }
 
     /// The prefix a variant of this class is stored under: the encoder generation, plus the
-    /// Zstandard level when it is not the default (it is part of the bytes).
-    pub fn prefix(self, zstd_level: i32) -> String {
+    /// Zstandard level when it is not the default (it is part of the bytes), plus the
+    /// operator's epoch when one is set ([`EPOCH_ENV`]).
+    pub fn prefix(self, zstd_level: i32, epoch: Option<u32>) -> String {
         let z = if zstd_level == crate::ktx2_write::DEFAULT_ZSTD_LEVEL {
             String::new()
         } else {
             format!("z{zstd_level}")
         };
+        let e = epoch.map(|e| format!("e{e}")).unwrap_or_default();
         match self {
-            Class::Texture => format!("t{TEX_GEN}{z}"),
-            Class::Mesh => format!("m{MESH_GEN}"),
-            Class::Glb => format!("g{TEX_GEN}{z}"),
+            Class::Texture => format!("t{TEX_GEN}{z}{e}"),
+            Class::Mesh => format!("m{MESH_GEN}{e}"),
+            Class::Glb => format!("g{TEX_GEN}{z}{e}"),
         }
     }
 }
 
-/// A lane prefix as the routes take it: `t`, `m` or `g`, a generation, optionally `z` and a
-/// level. Never `manifest`.
+/// Operator switch for a full rebuild without a release: when set to a number, every prefix
+/// gets `e{N}` appended (`t1e2`, `m1e2`), so every key misses, every manifest reads as stale
+/// and the lane re-encodes into the new prefixes. Unset (the default) adds nothing. Changing
+/// it back finds the old prefixes again. The generations stay in code: they describe the
+/// encoders, the epoch describes a deployment's decision to start over.
+pub const EPOCH_ENV: &str = "ABGEN_BEVY_EPOCH";
+/// Largest accepted epoch.
+pub const EPOCH_MAX: u32 = 9999;
+
+/// [`EPOCH_ENV`], parsed: unset or empty is `None`; anything that is not a number in
+/// `0..=EPOCH_MAX` is logged and ignored.
+pub fn epoch_from_env() -> Option<u32> {
+    let v = std::env::var(EPOCH_ENV).ok()?;
+    parse_epoch(&v).unwrap_or_else(|| {
+        tracing::warn!(value = %v, "{EPOCH_ENV} ignored: expected a number 0..={EPOCH_MAX}");
+        None
+    })
+}
+
+/// `Some(None)` for an empty value, `Some(Some(n))` for a valid number, `None` if invalid.
+fn parse_epoch(v: &str) -> Option<Option<u32>> {
+    let v = v.trim();
+    if v.is_empty() {
+        return Some(None);
+    }
+    if !v.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    v.parse::<u32>()
+        .ok()
+        .filter(|n| *n <= EPOCH_MAX)
+        .map(Some)
+}
+
+/// A lane prefix as the routes take it: `t`, `m` or `g`, a generation, then optionally `z`
+/// and a level, then optionally `e` and an epoch. Never `manifest`.
 pub fn is_prefix(s: &str) -> bool {
     let b = s.as_bytes();
-    if b.len() < 2 || b.len() > 12 || !matches!(b[0], b't' | b'm' | b'g') {
+    if b.len() < 2 || b.len() > 16 || !matches!(b[0], b't' | b'm' | b'g') {
         return false;
     }
+    let digits = |d: &str| !d.is_empty() && d.bytes().all(|c| c.is_ascii_digit());
     let rest = &s[1..];
+    let (rest, epoch) = match rest.split_once('e') {
+        Some((r, e)) => (r, Some(e)),
+        None => (rest, None),
+    };
     let (gen, level) = match rest.split_once('z') {
         Some((g, l)) => (g, Some(l)),
         None => (rest, None),
     };
-    let digits = |d: &str| !d.is_empty() && d.bytes().all(|c| c.is_ascii_digit());
-    digits(gen) && level.is_none_or(digits)
+    digits(gen) && level.is_none_or(digits) && epoch.is_none_or(digits)
 }
 
 /// A variant name as the routes take it: ASCII alphanumerics and `_` (a source CID, a slot, a

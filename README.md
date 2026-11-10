@@ -329,8 +329,12 @@ size cap, KTX2 writer, UASTC transcode) and `MESH_GEN` (meshopt codecs, filters,
 rewrite). Bump one when its encoder's output bytes change: every key of that class moves to a new
 prefix, the previous prefix (`bevy/t1/`, …) is garbage and can be deleted whole, and manifests
 built from it (their `lanes` name it) are rebuilt on the next request, re-encoding only that class.
-No `AB_VERSION`-style prefix, no per-recipe digests: skins, animations and textures referenced by
-a model do not change the model variant's bytes, so they are not in its name. The option toggles
+The generations live in code because they describe the encoders. The operator's lever is
+`ABGEN_BEVY_EPOCH` (unset by default; a number `0..=9999`): when set, every prefix gets `e{N}`
+appended (`t1e2`, `m1e2`), so every key misses, every manifest reads as stale and the lane
+re-encodes into the new prefixes, without a release. Setting it back finds the old prefixes again.
+No per-recipe digests: skins, animations and textures referenced by a model do not change the
+model variant's bytes, so they are not in its name. The option toggles
 (`glb_meshopt`, `glb_variants`, `precompress_br`) are not generations: a reused `glb-meshopt`
 variant keeps whatever `.br` sidecar its builder left.
 
