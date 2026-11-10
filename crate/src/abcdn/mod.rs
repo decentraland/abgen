@@ -395,8 +395,10 @@ fn seed_bevy_files(bevy_dir: &Path, out: &mut Vec<(String, PathBuf, u64)>) {
         return;
     };
     for pre in prefixes.flatten() {
-        let (Ok(ft), Some(prefix)) = (pre.file_type(), pre.file_name().to_str().map(str::to_string))
-        else {
+        let (Ok(ft), Some(prefix)) = (
+            pre.file_type(),
+            pre.file_name().to_str().map(str::to_string),
+        ) else {
             continue;
         };
         if !ft.is_dir() {
@@ -414,7 +416,11 @@ fn seed_bevy_files(bevy_dir: &Path, out: &mut Vec<(String, PathBuf, u64)>) {
                 let _ = std::fs::remove_file(&path);
                 continue;
             }
-            let bytes = f.metadata().ok().filter(|m| m.is_file()).map_or(0, |m| m.len());
+            let bytes = f
+                .metadata()
+                .ok()
+                .filter(|m| m.is_file())
+                .map_or(0, |m| m.len());
             if bytes > 0 {
                 out.push((
                     format!("{}/{prefix}/{name}", crate::bevyvariants::BEVY_PLATFORM),

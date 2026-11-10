@@ -10,7 +10,10 @@ pub(super) enum BevyTarget {
     Manifest(String),
     /// `bevy/{prefix}/{name}`: a variant's bytes. Its `.br` sidecar is chosen by
     /// `Accept-Encoding`, never by path; its `.json` record is never served.
-    Variant { prefix: String, name: String },
+    Variant {
+        prefix: String,
+        name: String,
+    },
 }
 
 impl BevyTarget {

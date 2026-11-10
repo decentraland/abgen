@@ -260,8 +260,8 @@ fn ids_and_paths_refuse_traversal_and_previews() {
         assert!(variant_path(root, "t1", bad).is_none(), "{bad}");
     }
     for bad in [
-        "", "manifest", "contents", "t", "x1", "t1z", "tz9", "t1/x", "t1.1", "t1e", "te2", "t1e2z9",
-        "t1ee2",
+        "", "manifest", "contents", "t", "x1", "t1z", "tz9", "t1/x", "t1.1", "t1e", "te2",
+        "t1e2z9", "t1ee2",
     ] {
         assert!(!is_prefix(bad), "{bad}");
         assert!(variant_path(root, bad, "bafkreiabc").is_none(), "{bad}");
@@ -309,10 +309,13 @@ fn lane_prefixes_follow_generations_and_the_zstd_level() {
     let lanes = BuildOptions::default().lanes();
     assert_eq!(
         lanes,
-        [("texture", format!("t{TEX_GEN}")), ("mesh", format!("m{MESH_GEN}"))]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect()
+        [
+            ("texture", format!("t{TEX_GEN}")),
+            ("mesh", format!("m{MESH_GEN}"))
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
     );
     assert!(BuildOptions {
         glb_variants: true,
@@ -394,7 +397,10 @@ fn records_round_trip_and_refuse_other_versions() {
     assert_eq!(raw["reason"], "size-gate");
     assert_eq!(raw["uses"]["tex.png"], json!({"normal": true}));
     assert!(raw.get("variant").is_none() && raw.get("br").is_none());
-    assert_eq!(Record::parse(&serde_json::to_vec(&none).unwrap()), Some(none));
+    assert_eq!(
+        Record::parse(&serde_json::to_vec(&none).unwrap()),
+        Some(none)
+    );
     assert!(Record::parse(br#"{"v":99}"#).is_none());
     assert!(Record::parse(b"nope").is_none());
 }
@@ -1150,7 +1156,8 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
 
     // The lane's probe answers for keys that are not on disk: a record from elsewhere fills
     // the row without a fetch, and a negative record stops the encode.
-    let out5 = std::env::temp_dir().join(format!("abgen-bevy-meshopt-probe-{}", std::process::id()));
+    let out5 =
+        std::env::temp_dir().join(format!("abgen-bevy-meshopt-probe-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out5);
     let remote_entry = entry.clone();
     let remote = move |key: &str| -> Option<Record> {
@@ -1354,22 +1361,28 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
             assert!(e.path.starts_with(&format!("bevy/t{TEX_GEN}/{hash}_")));
         }
     }
-    assert_eq!(m.files["bafkcolor"][0].path, format!("bevy/t{TEX_GEN}/bafkcolor_linear"));
-    assert_eq!(m.files["bafknormal"][0].path, format!("bevy/t{TEX_GEN}/bafknormal_normal"));
+    assert_eq!(
+        m.files["bafkcolor"][0].path,
+        format!("bevy/t{TEX_GEN}/bafkcolor_linear")
+    );
+    assert_eq!(
+        m.files["bafknormal"][0].path,
+        format!("bevy/t{TEX_GEN}/bafknormal_normal")
+    );
     let written: Vec<&Upload> = built.uploads.iter().filter(|u| !u.record).collect();
     assert_eq!(written.len(), expected.len());
     // The tiny image has a negative record (final), the missing one has none (not final).
     let tiny = Record::parse(
-        &std::fs::read(
-            key_path(&out, &format!("bevy/t{TEX_GEN}/bafktiny_srgb.json")).unwrap(),
-        )
-        .unwrap(),
+        &std::fs::read(key_path(&out, &format!("bevy/t{TEX_GEN}/bafktiny_srgb.json")).unwrap())
+            .unwrap(),
     )
     .unwrap();
     assert_eq!((tiny.variant, tiny.reason.as_deref()), (None, Some("tiny")));
-    assert!(!key_path(&out, &format!("bevy/t{TEX_GEN}/bafkmissing_srgb.json"))
-        .unwrap()
-        .exists());
+    assert!(
+        !key_path(&out, &format!("bevy/t{TEX_GEN}/bafkmissing_srgb.json"))
+            .unwrap()
+            .exists()
+    );
 
     // The manifest on disk is the returned bytes and parses back to the same value.
     let on_disk = std::fs::read(manifest_path(&out, "bafkentity").unwrap()).unwrap();
@@ -1470,8 +1483,7 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     // The GLB nothing changes in has a negative record; the `.gltf` with no external buffer
     // keeps its plain name.
     let ext_rec = Record::parse(
-        &std::fs::read(key_path(&out3, &format!("bevy/g{TEX_GEN}/bafkext.json")).unwrap())
-            .unwrap(),
+        &std::fs::read(key_path(&out3, &format!("bevy/g{TEX_GEN}/bafkext.json")).unwrap()).unwrap(),
     )
     .unwrap();
     assert_eq!(ext_rec.reason.as_deref(), Some("nothing-to-change"));

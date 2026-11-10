@@ -180,10 +180,7 @@ fn parse_epoch(v: &str) -> Option<Option<u32>> {
     if !v.bytes().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    v.parse::<u32>()
-        .ok()
-        .filter(|n| *n <= EPOCH_MAX)
-        .map(Some)
+    v.parse::<u32>().ok().filter(|n| *n <= EPOCH_MAX).map(Some)
 }
 
 /// A lane prefix as the routes take it: `t`, `m` or `g`, a generation, then optionally `z`
@@ -209,10 +206,7 @@ pub fn is_prefix(s: &str) -> bool {
 /// A variant name as the routes take it: ASCII alphanumerics and `_` (a source CID, a slot, a
 /// digest). No dot, so a `.br` sidecar or a `.json` record is never routable.
 pub fn is_name(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 200
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    !s.is_empty() && s.len() <= 200 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 pub fn manifest_key(entity: &str) -> String {

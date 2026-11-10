@@ -53,8 +53,18 @@ fn uses_extension(doc: &J, name: &str) -> bool {
 
 fn draco_source_views(doc: &J) -> BTreeSet<usize> {
     let mut out = BTreeSet::new();
-    for m in doc.get("meshes").and_then(J::as_array).into_iter().flatten() {
-        for p in m.get("primitives").and_then(J::as_array).into_iter().flatten() {
+    for m in doc
+        .get("meshes")
+        .and_then(J::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for p in m
+            .get("primitives")
+            .and_then(J::as_array)
+            .into_iter()
+            .flatten()
+        {
             if let Some(v) = p
                 .get("extensions")
                 .and_then(|e| e.get(DRACO))
@@ -211,10 +221,10 @@ pub fn transform_model_with(
     for (vi, v) in views.iter().enumerate() {
         let b = v.get("buffer").and_then(J::as_u64).unwrap_or(0) as usize;
         let off = v.get("byteOffset").and_then(J::as_u64).unwrap_or(0) as usize;
-        let len = v
-            .get("byteLength")
-            .and_then(J::as_u64)
-            .ok_or_else(|| anyhow!("bufferView[{vi}] has no byteLength"))? as usize;
+        let len =
+            v.get("byteLength")
+                .and_then(J::as_u64)
+                .ok_or_else(|| anyhow!("bufferView[{vi}] has no byteLength"))? as usize;
         let base = *bases
             .get(b)
             .ok_or_else(|| anyhow!("bufferView[{vi}] buffer {b} out of range"))?;
@@ -251,7 +261,9 @@ pub fn transform_model_with(
                 replaced.insert(i, v);
             }
             Ok(Err(_)) => {}
-            Err(e) => tracing::warn!(image = i, error = %format!("{e:#}"), "bevy model variant: embedded image kept as is"),
+            Err(e) => {
+                tracing::warn!(image = i, error = %format!("{e:#}"), "bevy model variant: embedded image kept as is")
+            }
         }
     }
 

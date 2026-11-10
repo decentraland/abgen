@@ -829,13 +829,21 @@ mod tests {
                 "application/json",
                 IMMUTABLE_SOURCE,
             ),
-            ("bevy/manifest/bafkentity.json", "application/json", NO_CACHE),
+            (
+                "bevy/manifest/bafkentity.json",
+                "application/json",
+                NO_CACHE,
+            ),
         ] {
             let h = object_headers(key);
             assert_eq!(h.content_type, ct, "content type for {key}");
             assert_eq!(h.cache_control, cc, "cache control for {key}");
             let br = key.starts_with("bevy/") && key.ends_with(".br");
-            assert_eq!(h.content_encoding, br.then_some("br"), "content encoding for {key}");
+            assert_eq!(
+                h.content_encoding,
+                br.then_some("br"),
+                "content encoding for {key}"
+            );
         }
     }
 

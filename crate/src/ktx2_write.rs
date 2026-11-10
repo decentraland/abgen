@@ -90,7 +90,11 @@ pub fn split_chain(format: BcFormat, w: u32, h: u32, mips: u32, data: &[u8]) -> 
     for m in 0..mips {
         let n = level_bytes(format, (w >> m).max(1), (h >> m).max(1));
         let Some(level) = data.get(at..at + n) else {
-            bail!("mip chain is {} bytes, level {m} needs {}", data.len(), at + n);
+            bail!(
+                "mip chain is {} bytes, level {m} needs {}",
+                data.len(),
+                at + n
+            );
         };
         out.push(level);
         at += n;
@@ -363,7 +367,10 @@ mod tests {
             assert_eq!(read_levels(&a).unwrap(), levels, "level {level} round trip");
             sizes.push(a.len());
         }
-        assert!(sizes[3] <= sizes[0], "level 19 not larger than level 1: {sizes:?}");
+        assert!(
+            sizes[3] <= sizes[0],
+            "level 19 not larger than level 1: {sizes:?}"
+        );
         // No checksum, no dictionary id: frame header descriptor bit 2 and bits 0-1 clear.
         let frame = zstd(&levels[0], 19).unwrap();
         assert_eq!(&frame[..4], &[0x28, 0xB5, 0x2F, 0xFD]);

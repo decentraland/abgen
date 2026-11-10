@@ -285,20 +285,23 @@ fn attr_stream(
             let rows = read_f32_rows::<3>(root, bin, ai)?;
             if rows.iter().all(|r| oct_encodable(r[0], r[1], r[2])) {
                 let quads: Vec<[f32; 4]> = rows.iter().map(|r| [r[0], r[1], r[2], 1.0]).collect();
-                codec_vertex(&filter_oct(&quads, precision.oct_bits), rows.len(), oct_stride).map(
-                    |b| {
-                        stream(
-                            ai,
-                            b,
-                            Some("OCTAHEDRAL"),
-                            oct_stride,
-                            rows.len(),
-                            oct_ct,
-                            Type::Vec3,
-                            true,
-                        )
-                    },
+                codec_vertex(
+                    &filter_oct(&quads, precision.oct_bits),
+                    rows.len(),
+                    oct_stride,
                 )
+                .map(|b| {
+                    stream(
+                        ai,
+                        b,
+                        Some("OCTAHEDRAL"),
+                        oct_stride,
+                        rows.len(),
+                        oct_ct,
+                        Type::Vec3,
+                        true,
+                    )
+                })
             } else {
                 None
             }

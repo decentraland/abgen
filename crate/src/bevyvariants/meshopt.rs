@@ -110,10 +110,7 @@ pub fn load_merged(bytes: &[u8], resolve: crate::gltf::Resolve) -> Result<(Root,
 }
 
 /// [`load_merged`], plus the bytes read from external buffer URIs.
-fn load_merged_sized(
-    bytes: &[u8],
-    resolve: crate::gltf::Resolve,
-) -> Result<(Root, Vec<u8>, u64)> {
+fn load_merged_sized(bytes: &[u8], resolve: crate::gltf::Resolve) -> Result<(Root, Vec<u8>, u64)> {
     let (json_bytes, glb_bin) = emit::split_container(bytes)?;
     let mut root: Root =
         gltf_json::deserialize::from_slice(&json_bytes).context("gltf json parse")?;

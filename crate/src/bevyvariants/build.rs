@@ -8,9 +8,7 @@ use std::path::{Path, PathBuf};
 
 use super::meshopt::{self, NoModelVariant};
 use super::model::{image_uses, transform_model_with};
-use super::stats::{
-    elapsed_ns, timed, BuildStats, FileStat, ModelStat, NoVariant, StageTimes,
-};
+use super::stats::{elapsed_ns, timed, BuildStats, FileStat, ModelStat, NoVariant, StageTimes};
 use super::texture::{encode_texture_with, source_kind, Miss, Slot, TexOptions, Uses};
 use super::{
     cid_v1_raw_sha256, generator, key_path, manifest_path, record_key, variant_key, Class,
@@ -274,7 +272,10 @@ fn store(
     let rk = record_key(key);
     let rec_dst = key_path(out_root, &rk).expect("a variant key's record is a valid key");
     if !rec_dst.is_file() {
-        write_atomic(&rec_dst, &serde_json::to_vec(record).context("serialize record")?)?;
+        write_atomic(
+            &rec_dst,
+            &serde_json::to_vec(record).context("serialize record")?,
+        )?;
     }
     out.push(Upload {
         key: rk,
@@ -315,7 +316,10 @@ fn backfill_br(
     rec.br = true;
     let rk = record_key(key);
     let rec_dst = key_path(out_root, &rk).expect("a variant key's record is a valid key");
-    write_atomic(&rec_dst, &serde_json::to_vec(&rec).context("serialize record")?)?;
+    write_atomic(
+        &rec_dst,
+        &serde_json::to_vec(&rec).context("serialize record")?,
+    )?;
     times.hash_write_ns += elapsed_ns(started);
     let uploads = vec![
         Upload {
@@ -378,7 +382,12 @@ fn static_format(name: &str) -> Option<&'static str> {
 /// The variant name of a model: its source CID, plus, for a `.gltf`, a digest of the external
 /// buffers it inlines (`uri` -> content hash, sorted), so the same `.gltf` beside different
 /// `.bin` files is two variants. Image URIs are not inputs: the variant leaves them as they are.
-fn model_name(hash: &str, file: &str, bytes: Option<&[u8]>, by_file: &HashMap<String, String>) -> String {
+fn model_name(
+    hash: &str,
+    file: &str,
+    bytes: Option<&[u8]>,
+    by_file: &HashMap<String, String>,
+) -> String {
     let Some(bytes) = bytes else {
         return hash.to_string();
     };
@@ -415,7 +424,11 @@ fn model_name(hash: &str, file: &str, bytes: Option<&[u8]>, by_file: &HashMap<St
 }
 
 /// A model's uses of its images, by URI, from its bytes.
-fn uses_by_uri(bytes: &[u8], ext: &str, resolve: crate::gltf::Resolve) -> BTreeMap<String, ImageUse> {
+fn uses_by_uri(
+    bytes: &[u8],
+    ext: &str,
+    resolve: crate::gltf::Resolve,
+) -> BTreeMap<String, ImageUse> {
     let mut out: BTreeMap<String, ImageUse> = BTreeMap::new();
     let Some((per_image, uris)) = image_uses(bytes, ext, resolve) else {
         return out;
@@ -895,7 +908,11 @@ pub fn build_entity_variants(
     let built: BTreeMap<&str, u64> = uploads
         .iter()
         .filter(|u| !u.record && !u.key.ends_with(".br"))
-        .filter_map(|u| std::fs::metadata(&u.path).ok().map(|m| (u.key.as_str(), m.len())))
+        .filter_map(|u| {
+            std::fs::metadata(&u.path)
+                .ok()
+                .map(|m| (u.key.as_str(), m.len()))
+        })
         .collect();
     stats.unique_variants = built.len() as u64;
     stats.unique_variant_bytes = built.values().sum();
