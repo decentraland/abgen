@@ -311,8 +311,13 @@ pub fn uri_content_hash<'a>(
     content_by_file.get(&key)
 }
 
-pub const GLB_DEP_EXTENSIONS: [&str; 11] = [
+/// Content files whose hash names a GLB bundle: change one and the GLB that references it
+/// rebuilds under a new digest. `.ktx2` joined with KTX2 ingest: adding it renames exactly the
+/// GLBs that reference an external `.ktx2` (whose texture slot built empty before), and leaves
+/// every other digest where it was.
+pub const GLB_DEP_EXTENSIONS: [&str; 12] = [
     ".bin", ".jpg", ".png", ".jpeg", ".tga", ".gif", ".bmp", ".psd", ".tiff", ".iff", ".ktx",
+    ".ktx2",
 ];
 
 fn short_digest(payload: &[u8]) -> String {
@@ -385,7 +390,7 @@ pub fn image_key_extension(file: &str) -> String {
         let ext = &last_seg[dot..];
         if matches!(
             ext.to_ascii_lowercase().as_str(),
-            ".png" | ".jpg" | ".jpeg" | ".psd"
+            ".png" | ".jpg" | ".jpeg" | ".psd" | ".ktx2"
         ) {
             return ext.to_string();
         }
@@ -407,12 +412,34 @@ pub fn image_class_digest(
     normal: bool,
     key_ext: &str,
 ) -> String {
+    let recipes = recipes::digest_generations(&recipes::image_recipes());
+    if key_ext.eq_ignore_ascii_case(".ktx2") {
+        // Standalone KTX2 bundles are named under the UASTC header gate's policy, so a bundle
+        // stored before the gate (or under another policy) is never reused: a probe hit means
+        // the gate already took this file, and only a miss needs to look at its bytes.
+        return digest_inputs(
+            (
+                model_referenced,
+                linear,
+                normal,
+                key_ext,
+                STANDALONE_KTX2_POLICY,
+            ),
+            &recipes,
+            "image class",
+        );
+    }
     digest_inputs(
         (model_referenced, linear, normal, key_ext),
-        &recipes::digest_generations(&recipes::image_recipes()),
+        &recipes,
         "image class",
     )
 }
+
+/// Which standalone `.ktx2` files the Unity lanes convert, as a name input of their bundles
+/// ([`image_class_digest`]). 1: only what `crate::ktx2::ktx2_header_ok` takes (UASTC LDR 2D
+/// within the size cap); anything else gets no bundle. Bump when that rule changes.
+pub const STANDALONE_KTX2_POLICY: &str = "uastc-gate-1";
 
 /// Extension a font bundle bakes into its container key: scene fonts are TrueType only.
 pub const FONT_KEY_EXTENSION: &str = crate::fontgen::FONT_EXTENSION;
@@ -722,13 +749,36 @@ mod tests {
         let base = compute_deps_digest(&[("a/b.bin".to_string(), "hashX".to_string())]);
         let with_extra = compute_deps_digest(&[
             ("a/b.bin".to_string(), "hashX".to_string()),
-            ("a/env.ktx2".to_string(), "hashY".to_string()),
+            ("a/env.hdr".to_string(), "hashY".to_string()),
         ]);
         assert_eq!(base, with_extra);
         assert_eq!(
-            compute_deps_digest(&[("only.ktx2".to_string(), "hashY".to_string())]),
+            compute_deps_digest(&[("only.mp3".to_string(), "hashY".to_string())]),
             compute_deps_digest(&[])
         );
+    }
+
+    #[test]
+    fn deps_digest_covers_external_ktx2_textures() {
+        // A GLB's external KTX2 (`KHR_texture_basisu`) is decoded into its bundle, so a new
+        // upload of it has to rename the GLB like a changed PNG does.
+        assert!(GLB_DEP_EXTENSIONS.contains(&".ktx2"));
+        let base = compute_deps_digest(&[("a/b.bin".to_string(), "hashX".to_string())]);
+        let with_ktx2 = |h: &str| {
+            compute_deps_digest(&[
+                ("a/b.bin".to_string(), "hashX".to_string()),
+                ("a/albedo.ktx2".to_string(), h.to_string()),
+            ])
+        };
+        assert_ne!(with_ktx2("hashY"), base);
+        assert_ne!(with_ktx2("hashY"), with_ktx2("hashZ"));
+    }
+
+    #[test]
+    fn ktx2_is_a_standalone_image_key_extension() {
+        assert_eq!(image_key_extension("textures/albedo.ktx2"), ".ktx2");
+        assert_eq!(image_key_extension("textures/Albedo.KTX2"), ".KTX2");
+        assert_eq!(image_key_extension("textures/env.hdr"), "");
     }
 
     #[test]

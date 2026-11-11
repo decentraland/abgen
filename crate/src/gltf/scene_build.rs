@@ -14,6 +14,9 @@ use anyhow::Result;
 use serde_json::Value as J;
 
 fn decode_glb_image(r: &[u8]) -> Option<image::RgbaImage> {
+    if crate::ktx2::is_ktx2(r) {
+        return crate::ktx2::decode_ktx2_uastc(r);
+    }
     let is_jpeg = r.len() >= 2 && r[0] == 0xFF && r[1] == 0xD8;
     if is_jpeg {
         if std::env::var_os("ABGEN_JPEG_GLB_9C").is_some() {
@@ -39,6 +42,21 @@ fn glb_decode_params() -> &'static [u8] {
     } else {
         b"glb"
     }
+}
+
+/// The image a glTF texture samples: its core `source` when it has one, else the
+/// `KHR_texture_basisu` image.
+///
+/// `source` wins whenever it is present. A file that ships a PNG/JPEG fallback alongside its
+/// KTX2 keeps building from the exact bytes it built from before KTX2 was read at all, so its
+/// bundle stays byte-identical; only a texture that has nothing but the extension (allowed when
+/// `KHR_texture_basisu` is in `extensionsRequired`) is routed to the KTX2 image.
+fn texture_source(tex: &J) -> Option<i64> {
+    ji(tex, "source").or_else(|| {
+        tex.get("extensions")
+            .and_then(|e| e.get("KHR_texture_basisu"))
+            .and_then(|b| ji(b, "source"))
+    })
 }
 
 pub(super) fn parse_impl(
@@ -137,7 +155,7 @@ pub(super) fn parse_impl(
     let mut image_sampler: Vec<(Option<i64>, Option<i64>)> = vec![(None, None); images.len()];
     let mut image_wrap: Vec<(Option<i64>, Option<i64>)> = vec![(None, None); images.len()];
     for tex in jarr(gltf, "textures").unwrap_or(&empty_vec) {
-        let src = match ji(tex, "source") {
+        let src = match texture_source(tex) {
             Some(s) if (s as usize) < image_sampler.len() => s as usize,
             _ => continue,
         };
@@ -160,7 +178,7 @@ pub(super) fn parse_impl(
     let texture_refs: Vec<TexRef> = textures
         .iter()
         .filter_map(|tex| {
-            let image = tex.get("source").and_then(|s| s.as_i64())? as usize;
+            let image = texture_source(tex)? as usize;
             let sampler = tex
                 .get("sampler")
                 .and_then(|s| s.as_i64())
@@ -222,7 +240,7 @@ pub(super) fn parse_impl(
             return None;
         }
         let tex = &textures[ti as usize];
-        let image = tex.get("source").and_then(|s| s.as_i64())? as usize;
+        let image = texture_source(tex)? as usize;
         let sampler = tex
             .get("sampler")
             .and_then(|s| s.as_i64())

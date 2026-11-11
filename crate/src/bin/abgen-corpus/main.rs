@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+mod bevy;
 mod build;
 mod dedup;
 mod sources;
@@ -114,6 +115,12 @@ fn usage_text() -> &'static str {
              (resolves via --worlds-url, else ABGEN_WORLDS_URL, else the public\n               \
               worlds-content-server;\n               \
               fetches scene entities + content into the store, then converts)\n  \
+         abgen-corpus (--world <name>[,...] | --entity-ids <ids.txt> | --pointer <p>) <out-dir> \\\n               \
+             --bevy-variants [--bevy-glb-variants] [--bevy-no-models] [--bevy-precompress br|none]\n               \
+             [--bevy-zstd-level 1..19] [--worlds-url <url>] [--fetch-missing] [--content-dir <dir>] [-j JOBS]\n               \
+             (PROTOTYPE: builds only the Bevy variants lane - KTX2/GLB variants named by\n               \
+              source CID and generation plus one manifest per entity - into <out-dir>/bevy/,\n               \
+              the layout `abgen` serves at /bevy/manifest/<entity>.json and /bevy/<prefix>/<name>)\n  \
          abgen-corpus --live-mode <ab-cdn-reference-dir> <out-dir> \\\n               \
              [--platform windows|mac] [--per-vintage N] [--content-dir <dir>] [-j JOBS]\n\
          \n\
@@ -290,6 +297,11 @@ fn run() -> Result<()> {
     let mut no_deps_digest = false;
     let mut pointer_target: Option<String> = None;
     let mut gpu_flag = false;
+    let mut bevy_variants = false;
+    let mut bevy_glb_variants = false;
+    let mut bevy_no_models = false;
+    let mut bevy_precompress_br: Option<bool> = None;
+    let mut bevy_zstd_level: Option<i32> = None;
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -404,6 +416,31 @@ fn run() -> Result<()> {
             "--force" => {
                 force = true;
             }
+            "--bevy-variants" => {
+                bevy_variants = true;
+            }
+            "--bevy-zstd-level" => {
+                i += 1;
+                bevy_zstd_level = Some(
+                    argv.get(i)
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| usage()),
+                );
+            }
+            "--bevy-glb-variants" => {
+                bevy_glb_variants = true;
+            }
+            "--bevy-no-models" => {
+                bevy_no_models = true;
+            }
+            "--bevy-precompress" => {
+                i += 1;
+                bevy_precompress_br = match argv.get(i).map(String::as_str) {
+                    Some("br") => Some(true),
+                    Some("none") => Some(false),
+                    _ => usage(),
+                };
+            }
             "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
             "-V" | "--version" => abgen::clihelp::print_version(BIN_NAME),
             other if other.starts_with("--") => {
@@ -435,6 +472,32 @@ fn run() -> Result<()> {
             usage();
         }
         client_mode = true;
+    }
+    if (bevy_glb_variants
+        || bevy_no_models
+        || bevy_precompress_br.is_some()
+        || bevy_zstd_level.is_some())
+        && !bevy_variants
+    {
+        eprintln!(
+            "error: --bevy-glb-variants, --bevy-no-models, --bevy-precompress and \
+             --bevy-zstd-level require --bevy-variants"
+        );
+        usage();
+    }
+    if bevy_variants
+        && (live_mode.is_some()
+            || cdn_layout
+            || flat_output
+            || from_ref.is_some()
+            || collection_urn.is_some()
+            || (entity_ids_path.is_none() && pointer_target.is_none() && worlds.is_empty()))
+    {
+        eprintln!(
+            "error: --bevy-variants takes --world, --entity-ids or --pointer, and conflicts with \
+             --live-mode/--cdn-layout/--flat/--from-reference/--collection-urn"
+        );
+        usage();
     }
     if collection_urn.is_some() {
         collection_mode = true;
@@ -596,6 +659,21 @@ fn run() -> Result<()> {
             eprintln!("pointer {target:?} -> entity {}", scene.entity_id);
             vec![scene.entity_id]
         };
+        if bevy_variants {
+            let store = LocalContentStore::new(&cdir);
+            if fetch_missing {
+                fetch_ids_into_store(&store, &content_server_url, &ids);
+            }
+            return bevy::run_bevy_variants(
+                &ids,
+                &store,
+                &out_root,
+                bevy_glb_variants,
+                bevy_no_models,
+                bevy_precompress_br,
+                bevy_zstd_level,
+            );
+        }
         if cdn_layout {
             let store = LocalContentStore::new(&cdir);
             if fetch_missing {
@@ -688,6 +766,17 @@ fn run() -> Result<()> {
         }
         if ids.is_empty() {
             return Err(anyhow!("--world resolved no scene entities"));
+        }
+        if bevy_variants {
+            return bevy::run_bevy_variants(
+                &ids,
+                &store,
+                &out_root,
+                bevy_glb_variants,
+                bevy_no_models,
+                bevy_precompress_br,
+                bevy_zstd_level,
+            );
         }
         let m = manifest_from_ids(&ids, &cdir, &platform, cdn_layout, toggles)?;
         (m, out_root)

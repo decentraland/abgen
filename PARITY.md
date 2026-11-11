@@ -49,6 +49,19 @@ dimensions and mip counts**: our encoder and upstream's pick different blocks/pa
 input. Not closable byte-wise — two compliant BC7 encoders may disagree — and it lands in the
 render-noise class, not a change in what a texture depicts.
 
+## KTX2 ingest: no upstream to match, and no change for PNG/JPEG
+
+The legacy converter never decoded KTX2 (`KHR_texture_basisu`), so a UASTC KTX2 texture has no
+reference bundle to be byte-gated against. Its decoded RGBA8 is the full-resolution picture, top row
+first (KTX2's default `"rd"` orientation, which the extension requires), and goes through the same
+encoders as a PNG: the gate for it is the visual one below, against the same picture shipped as PNG.
+
+The regression contract is the other direction: **every PNG/JPEG-only scene must stay
+byte-identical.** KTX2 handling only engages on KTX2 bytes (magic sniffed before any other decoder),
+on a texture with no core `source`, or on a `.ktx2` file name, so the byte gates above are unchanged.
+Bundle *names* move only for glTFs that declare `KHR_texture_basisu` or carry a KTX2 image (the
+`ktx2` recipe) and GLBs that reference an external `.ktx2` (a new dependency extension).
+
 ## Wearables: render parity, not byte parity
 
 Wearable bundles **cannot be byte-gated against upstream by anyone**: upstream does not serve the

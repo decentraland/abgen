@@ -37,13 +37,38 @@ env:
 jobs:
   # A release published before this run uploads its archives (one created in the web UI,
   # say) is immutable: every upload below would fail with HTTP 422 after a full build.
-  # Fail here instead, before any target builds. Images and npm do not depend on it.
+  # Fail here instead, before any target builds.
+  # The same job refuses a tag that is not the crate version: the binaries report the
+  # crate version (`--version`, `/health`) while npm publishes under the tag, so the two
+  # must agree. Everything that publishes (the release, npm, the ghcr and ECR images) needs
+  # it, so a failure here publishes nothing. Off a `v*` tag its steps are skipped and it
+  # succeeds.
   release-guard:
     name: release not yet published
     runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          sparse-checkout: |
+            Cargo.toml
+            crate/abgen-node/Cargo.toml
+          sparse-checkout-cone-mode: false
+      - name: check the tag is the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME#v}"
+          # [workspace.package] version, and the node addon's own version line
+          ws="$(awk '/^\[workspace.package\]/{s=1;next} /^\[/{s=0} s&&/^version *=/{gsub(/[" ]/,"",$0);sub(/^version=/,"");print;exit}' Cargo.toml)"
+          node="$(awk '/^\[package\]/{s=1;next} /^\[/{s=0} s&&/^version *=/{gsub(/[" ]/,"",$0);sub(/^version=/,"");print;exit}' crate/abgen-node/Cargo.toml)"
+          echo "tag $tag, Cargo.toml $ws, crate/abgen-node $node"
+          if [ "$tag" != "$ws" ] || [ "$tag" != "$node" ]; then
+            echo "::error title=tag $GITHUB_REF_NAME is not the crate version::Cargo.toml says $ws and crate/abgen-node/Cargo.toml says $node. Land a 'chore: release $tag' PR that sets both (and the lockfiles), then tag its merge commit (see DEVELOPMENT.md)."
+            exit 1
+          fi
       - name: check the release for this tag
         if: startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true
         env:
@@ -826,13 +851,14 @@ jobs:
 
   image:
     name: ghcr image
-    needs: [build-id, ci-green]
+    needs: [build-id, ci-green, release-guard]
     # Tags always run (they push) but only with a green ci verdict for the
     # commit; otherwise only when no prebuilt artifact exists yet — a
     # non-tag run with a prebuilt would skip every step and burn a runner
     # fetching an artifact it discards.
     if: >-
       !cancelled() && needs.build-id.result == 'success' &&
+      needs.release-guard.result == 'success' &&
       ((startsWith(github.ref, 'refs/tags/') && needs.ci-green.result == 'success') ||
        (!startsWith(github.ref, 'refs/tags/') && needs.build-id.outputs.image_docker == ''))
     runs-on: ubuntu-24.04
@@ -943,10 +969,11 @@ jobs:
           if-no-files-found: error
   lambda-image-push:
     name: push lambda image to ECR
-    needs: [build-id, lambda-image]
+    needs: [build-id, lambda-image, release-guard]
     # Separate job: `environment` is job-level, and lambda-image also runs untagged.
     if: >-
       !cancelled() && needs.lambda-image.result == 'success' &&
+      needs.release-guard.result == 'success' &&
       startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
     runs-on: ubuntu-24.04-arm
     environment: biz
@@ -1032,11 +1059,12 @@ jobs:
 
   napi-publish:
     name: publish @dcl/abgen-node
-    needs: [build-id, napi, ci-green]
+    needs: [build-id, napi, ci-green, release-guard]
     runs-on: ubuntu-24.04
     if: >-
       !cancelled() &&
       startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true &&
+      needs.release-guard.result == 'success' &&
       needs.ci-green.result == 'success' &&
       (needs.napi.result == 'success' ||
        (needs.napi.result == 'skipped' && needs.build-id.outputs.napi_promote == 'true'))

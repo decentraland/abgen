@@ -970,6 +970,7 @@ mod follow_up_tests {
     fn follow_up_is_off_without_enable_lods() {
         let cfg = Config {
             lods_enabled: false,
+            bevy_enabled: false,
             ..tests::cfg()
         };
         let proxy = crate::convert::make_proxy(&cfg, "https://c/content");
@@ -1081,6 +1082,7 @@ pub(crate) mod tests {
             allowed_content_server_hosts: None,
             http_secret: None,
             lods_enabled: true,
+            bevy_enabled: false,
             max_receive_count: 3,
             lod_levels: crate::config::default_levels(),
         }

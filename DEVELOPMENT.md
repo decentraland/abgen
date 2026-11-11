@@ -20,9 +20,13 @@ Linux, including NixOS); Windows and macOS via the pinned rustup toolchain with
 a fixed `SOURCE_DATE_EPOCH`. Every release operation is idempotent, so job
 re-runs converge on the full asset set.
 
-1. Land a `chore: release X.Y.Z` PR bumping the crate version (Cargo.toml + Cargo.lock).
+1. Land a `chore: release X.Y.Z` PR bumping the crate version (Cargo.toml +
+   crate/abgen-node/Cargo.toml + the lockfiles), or a feature PR that bumps it.
 2. Tag the merge commit and push the tag:
    `git tag vX.Y.Z <merge-sha> && git push origin vX.Y.Z`
+   The tag must be the crate version: the `release not yet published` job fails the run at
+   the start when `vX.Y.Z` differs from either `Cargo.toml` version, because the binaries
+   report the crate version while npm publishes under the tag.
    Don't create or publish the release in the web UI: releases here are immutable once
    published, so a release published before the pipeline uploads its archives can never
    get them. The `release not yet published` job fails the run at the start in that case

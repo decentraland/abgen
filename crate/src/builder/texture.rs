@@ -76,6 +76,8 @@ fn source_extension(raw: &[u8]) -> &'static str {
         ".jpg"
     } else if is_psd(raw) {
         ".psd"
+    } else if crate::ktx2::is_ktx2(raw) {
+        ".ktx2"
     } else {
         ".png"
     }
@@ -103,6 +105,10 @@ fn decode_source_image_uncached(raw: &[u8]) -> Option<RgbaImage> {
         return RgbaImage::from_raw(w, h, rgba);
     }
 
+    if crate::ktx2::is_ktx2(raw) {
+        return crate::ktx2::decode_ktx2_uastc(raw);
+    }
+
     if raw.len() >= 2 && raw[0] == 0xFF && raw[1] == 0xD8 {
         if let Ok((rgba, w, h)) = crate::ffi::decode_jpeg_rgba_box(raw) {
             return RgbaImage::from_raw(w, h, rgba);
@@ -123,7 +129,7 @@ pub(super) fn standalone_key_extension(source_file: Option<&str>, raw: &[u8]) ->
             let ext = &last_seg[dot..];
 
             let lo = ext.to_ascii_lowercase();
-            if matches!(lo.as_str(), ".png" | ".jpg" | ".jpeg" | ".psd") {
+            if matches!(lo.as_str(), ".png" | ".jpg" | ".jpeg" | ".psd" | ".ktx2") {
                 return ext.to_string();
             }
         }
@@ -356,6 +362,8 @@ pub(crate) fn detect_container(raw: &[u8]) -> String {
         "PNG".to_string()
     } else if raw.len() >= 2 && raw[0] == 0xFF && raw[1] == 0xD8 {
         "JPEG".to_string()
+    } else if crate::ktx2::is_ktx2(raw) {
+        "KTX2".to_string()
     } else {
         String::new()
     }
@@ -1225,5 +1233,41 @@ mod external_dep_bundle_file_tests {
             external_dep_bundle_file(&d, "Qmtex", "windows").unwrap(),
             "Qmtex_windows"
         );
+    }
+}
+
+#[cfg(test)]
+mod ktx2_source_tests {
+    use super::*;
+
+    // Copied from decentraland/dcl-one,
+    // `rendering/bevy-explorer/source/crates/image_processing/testdata/`.
+    const UASTC_8: &[u8] = include_bytes!("../../testdata/uastc_8.ktx2");
+
+    #[test]
+    fn a_ktx2_content_file_decodes_like_any_source_image() {
+        let img = decode_source_image_uncached(UASTC_8).expect("UASTC decodes");
+        assert_eq!(img.dimensions(), (8, 8));
+        // Same pixels as the shared decoder: no PNG gamma, no flip at decode time.
+        assert_eq!(
+            img.as_raw(),
+            crate::ktx2::decode_ktx2_uastc(UASTC_8).unwrap().as_raw()
+        );
+        assert!(decode_source_image_uncached(&UASTC_8[..40]).is_none());
+    }
+
+    #[test]
+    fn ktx2_is_its_own_container_and_key_extension() {
+        assert_eq!(detect_container(UASTC_8), "KTX2");
+        assert_eq!(source_extension(UASTC_8), ".ktx2");
+        assert_eq!(
+            standalone_key_extension(Some("t/Albedo.ktx2"), UASTC_8),
+            ".ktx2"
+        );
+        assert_eq!(standalone_key_extension(None, UASTC_8), ".ktx2");
+        // PNG and JPEG detection is untouched.
+        assert_eq!(detect_container(b"\x89PNG\r\n\x1a\n...."), "PNG");
+        assert_eq!(detect_container(&[0xFF, 0xD8, 0xFF]), "JPEG");
+        assert_eq!(detect_container(b"8BPS"), "");
     }
 }

@@ -230,7 +230,13 @@ impl AppStateInner {
         out.map(|p| (p, false))
     }
 
+    /// The LRU key of a file under the JIT root: its first path component (an entity's
+    /// directory), except under `bevy/`, whose objects are shared between entities and are
+    /// accounted one file at a time, keyed by their path (`bevyvariants::cache_key`).
     pub fn jit_key_of(&self, exact: &Path) -> Option<String> {
+        if let Some(key) = crate::bevyvariants::cache_key(&self.jit_root, exact) {
+            return Some(key);
+        }
         exact
             .strip_prefix(&self.jit_root)
             .ok()?
@@ -259,6 +265,15 @@ impl AppStateInner {
             return;
         }
         self.jit_cache.record(&stored, dir, bytes);
+    }
+
+    /// Account one Bevy-lane file under the JIT root (a manifest, variant or `.br` sidecar
+    /// read through from object storage) by its own key (`jit_key_of`). Evicting one only
+    /// means the next request reads it through again.
+    pub fn jit_record_bevy_file(&self, path: &Path) {
+        if let Some(key) = self.jit_key_of(path) {
+            self.jit_record_file(&key, path);
+        }
     }
 
     pub fn jit_record_file(&self, key: &str, path: &Path) {

@@ -324,6 +324,7 @@ pub(crate) mod tests {
             allowed_content_server_hosts: None,
             http_secret: None,
             lods_enabled: false,
+            bevy_enabled: false,
             max_receive_count: 3,
             lod_levels: vec![1],
         }

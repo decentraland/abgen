@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-const CONVERTIBLE_EXTS: [&str; 5] = [".glb", ".gltf", ".png", ".jpg", ".jpeg"];
+const CONVERTIBLE_EXTS: [&str; 6] = [".glb", ".gltf", ".png", ".jpg", ".jpeg", ".ktx2"];
 
 const DEPENDENCY_EXTS: [&str; 1] = [".bin"];
 
@@ -45,7 +45,10 @@ fn emit_build_telemetry(t: &BuildTelemetry) {
 fn is_convertible(file: &str) -> (bool, bool) {
     let fl = file.to_lowercase();
     let is_glb = fl.ends_with(".glb") || fl.ends_with(".gltf");
-    let is_image = fl.ends_with(".png") || fl.ends_with(".jpg") || fl.ends_with(".jpeg");
+    let is_image = fl.ends_with(".png")
+        || fl.ends_with(".jpg")
+        || fl.ends_with(".jpeg")
+        || fl.ends_with(".ktx2");
     (is_glb, is_image)
 }
 
@@ -312,6 +315,8 @@ pub struct Proxy {
     decode_ok: Mutex<HashMap<String, bool>>,
     /// The same, for whether a scene font is one the font lane can bake.
     font_ok: Mutex<HashMap<String, bool>>,
+    /// Standalone `.ktx2` hash -> whether the UASTC header gate takes it.
+    ktx2_ok: Mutex<HashMap<String, bool>>,
 }
 
 #[derive(Clone)]
@@ -592,6 +597,25 @@ impl Proxy {
         };
         let v = crate::builder::source_image_decodes(&raw);
         self.decode_ok.lock().unwrap().insert(hash.to_string(), v);
+        v
+    }
+
+    /// Whether a standalone `.ktx2` is one the Unity lanes convert: a UASTC LDR 2D texture
+    /// within the size cap (`crate::ktx2::ktx2_header_ok`). Any other KTX2 (ETC1S/BasisLZ,
+    /// UASTC HDR, arrays, cubemaps, too large) is not convertible and is skipped like any
+    /// unknown file: no bundle and no tolerated failure. Content that cannot be read is not a
+    /// verdict: the build runs and surfaces the error.
+    /// The verdict is memoized per hash, like `font_supported`.
+    fn ktx2_standalone_ok(&self, hash: &str) -> bool {
+        if let Some(v) = self.ktx2_ok.lock().unwrap().get(hash) {
+            return *v;
+        }
+        self.ensure_content(hash).ok();
+        let Ok(raw) = self.content.fetch_mmap(hash) else {
+            return true;
+        };
+        let v = crate::ktx2::ktx2_header_ok(&raw);
+        self.ktx2_ok.lock().unwrap().insert(hash.to_string(), v);
         v
     }
 
@@ -960,7 +984,7 @@ impl Proxy {
     }
 
     /// Bucket-scoped: a hit in one CDN bucket says nothing about another.
-    fn reuse_cache_key(&self, key: &str) -> Option<String> {
+    pub(crate) fn reuse_cache_key(&self, key: &str) -> Option<String> {
         if !crate::rediscache::enabled() {
             return None;
         }
@@ -1158,6 +1182,11 @@ impl Proxy {
         platform: &str,
         content_server_url: &str,
     ) -> Result<Vec<String>> {
+        if platform == crate::bevyvariants::BEVY_PLATFORM {
+            // Not a bundle platform: the Bevy lane has its own entry point, which the
+            // conversion job runs per entity. No request lane builds it.
+            bail!("bevy is not a bundle platform; the Bevy variants lane is built by Proxy::build_bevy_variants");
+        }
         if platform == crate::bvwebgpu::BVW_PLATFORM {
             #[cfg(feature = "web-pack")]
             {
@@ -1204,6 +1233,10 @@ impl Proxy {
             bare_name: String,
             is_image: bool,
             is_font: bool,
+            /// A standalone `.ktx2`, checked against the UASTC header gate in the probe
+            /// workers: on a miss, and on a hit too under bare naming, whose names carry no
+            /// gate policy ([`naming::STANDALONE_KTX2_POLICY`]).
+            ktx2_gate: Option<bool>,
         }
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1280,6 +1313,7 @@ impl Proxy {
                 done_pre += 1;
                 continue;
             }
+            let is_ktx2 = is_image && c.file.to_lowercase().ends_with(".ktx2");
             candidates.push(ProbeCandidate {
                 order,
                 file: c.file.clone(),
@@ -1288,10 +1322,15 @@ impl Proxy {
                 bare_name,
                 is_image,
                 is_font,
+                ktx2_gate: is_ktx2.then_some(digest_naming),
             });
         }
 
-        let hit_slots: Vec<Mutex<bool>> = candidates.iter().map(|_| Mutex::new(false)).collect();
+        // Per candidate: (probe hit, skipped by the standalone KTX2 gate).
+        let hit_slots: Vec<Mutex<(bool, bool)>> = candidates
+            .iter()
+            .map(|_| Mutex::new((false, false)))
+            .collect();
         {
             let probe_workers = probe_jobs().min(candidates.len().max(1));
             let next_probe = AtomicUsize::new(0);
@@ -1303,13 +1342,31 @@ impl Proxy {
                             break;
                         };
                         let hit = self.space_probe_asset(lane_version, &cand.bundle_name);
-                        *hit_slots[i].lock().unwrap() = hit;
+                        // A non-UASTC `.ktx2` is not convertible: no bundle, no tolerated
+                        // failure. A hit under digest naming was built under the gate already.
+                        let skip = match cand.ktx2_gate {
+                            Some(named_by_policy) if !hit || !named_by_policy => {
+                                !self.ktx2_standalone_ok(&cand.hash)
+                            }
+                            _ => false,
+                        };
+                        *hit_slots[i].lock().unwrap() = (hit, skip);
                     });
                 }
             });
         }
         for (cand, hit_slot) in candidates.into_iter().zip(hit_slots) {
-            let hit = hit_slot.into_inner().unwrap();
+            let (hit, skip) = hit_slot.into_inner().unwrap();
+            if skip {
+                tracing::info!(
+                    entity = %cid,
+                    file = %cand.file,
+                    hash = %cand.hash,
+                    "standalone KTX2 is not UASTC LDR 2D — skipped, no bundle"
+                );
+                done_pre += 1;
+                continue;
+            }
             if hit {
                 prebuilt.push((cand.order, cand.bundle_name));
                 done_pre += 1;
@@ -1881,6 +1938,7 @@ impl Proxy {
             build_progress: Mutex::new(HashMap::new()),
             decode_ok: Mutex::new(HashMap::new()),
             font_ok: Mutex::new(HashMap::new()),
+            ktx2_ok: Mutex::new(HashMap::new()),
         })
     }
 

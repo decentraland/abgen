@@ -1,3 +1,4 @@
+mod bevy;
 mod catalyst;
 mod config;
 mod convert;
@@ -385,6 +386,11 @@ fn handle_job(cfg: &config::Config, job: &event::Job) -> Result<serde_json::Valu
     if let Some(lods) = lod::follow_up(cfg, &proxy, &job.entity_id, content_server) {
         summary["lods"] = lods;
     }
+    // The Bevy variants lane runs for every entity, after its bundles, on the same terms:
+    // its failure is logged and reported in the summary and never fails the job.
+    if let Some(variants) = bevy::follow_up(cfg, &proxy, &job.entity_id, job.force) {
+        summary["bevy"] = variants;
+    }
     Ok(summary)
 }
 
@@ -636,6 +642,7 @@ mod tests {
             allowed_content_server_hosts: None,
             http_secret: None,
             lods_enabled: false,
+            bevy_enabled: false,
             max_receive_count: 3,
             lod_levels: vec![1],
         }

@@ -7,7 +7,12 @@ pub async fn dispatch(
     uri: Uri,
 ) -> Response {
     let path = uri.path().trim_start_matches('/').to_string();
-    if method == Method::OPTIONS && path.split('/').next() == Some(crate::bvwebgpu::BVW_PLATFORM) {
+    if method == Method::OPTIONS
+        && matches!(
+            path.split('/').next(),
+            Some(crate::bvwebgpu::BVW_PLATFORM | crate::bevyvariants::BEVY_PLATFORM)
+        )
+    {
         return bvpk_preflight();
     }
     revalidate_if_stale(&state, &path).await;
@@ -31,6 +36,9 @@ async fn dispatch_with_fallbacks(
 
     if let Some(target) = routes::shader_target(path) {
         return shader_fallback(state, path, &target, method, headers, local).await;
+    }
+    if let Some(target) = bevy_target(path) {
+        return bevy_fallback(state, path, &target, method, headers, local).await;
     }
 
     let local = if state.upstream_ab_cdn.is_some() {
@@ -74,6 +82,9 @@ pub(super) async fn dispatch_local(
 
     if segments.first() == Some(&crate::bvwebgpu::BVW_PLATFORM) {
         return bvpk_serve_local(state, path, method, headers).await;
+    }
+    if segments.first() == Some(&crate::bevyvariants::BEVY_PLATFORM) {
+        return bevy_serve_local(state, path, method, headers).await;
     }
 
     if segments.first() == Some(&"manifest") && segments.len() == 2 {

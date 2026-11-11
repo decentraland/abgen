@@ -84,15 +84,21 @@ pub enum Recipe {
     /// Scene font bundles: the baked atlas, the glyph and face metrics, and the font asset
     /// layout the explorer loads (`builder::font`, `fontgen`).
     Font,
+    /// KTX2 (`KHR_texture_basisu`) ingest: UASTC decode (`crate::ktx2`), the texture-image
+    /// lookup through the extension, and the cap a decoded KTX2 takes. Applies to a glTF that
+    /// declares the extension or carries a KTX2 image. Rare, like [`Recipe::Skin`]: almost no
+    /// deployed scene ships KTX2, so a bump here leaves the rest of the GLB lane alone.
+    Ktx2,
 }
 
 impl Recipe {
-    pub const ALL: [Recipe; 5] = [
+    pub const ALL: [Recipe; 6] = [
         Recipe::Glb,
         Recipe::Texture,
         Recipe::Skin,
         Recipe::Animation,
         Recipe::Font,
+        Recipe::Ktx2,
     ];
 
     /// Stable key this recipe is recorded under, in digests and in manifests. Renaming one
@@ -104,12 +110,31 @@ impl Recipe {
             Recipe::Skin => "skin",
             Recipe::Animation => "animation",
             Recipe::Font => "font",
+            Recipe::Ktx2 => "ktx2",
         }
     }
 
     /// The current generation. Bump by one, in the commit that changes the output.
     ///
     /// History, newest first — a bump is only legible next to the change it names:
+    /// - `Ktx2` 1, introduced at 1: abgen decodes UASTC KTX2 and reads `KHR_texture_basisu`.
+    ///   Before, a texture with only the extension resolved no image and its slot shipped
+    ///   empty, and a KTX2 image never decoded, so every GLB that declares the
+    ///   extension or carries a KTX2 image may have published wrong bytes under its current
+    ///   name. A GLB *embedding* its KTX2 has no dependency to move its digest, so only a
+    ///   recipe can rename it; one referencing an external `.ktx2` is renamed anyway, since
+    ///   `.ktx2` joined `naming::GLB_DEP_EXTENSIONS` in the same change. Starting the new
+    ///   recipe at 1 rather than bumping `Texture` renames only the KTX2-bearing glTFs instead
+    ///   of the whole scene texture lane; bumping `Glb` would have renamed every model. A glTF
+    ///   that keeps a PNG/JPEG `source` beside the extension still builds from the fallback
+    ///   and is renamed for nothing — the over-approximation the module accepts.
+    ///   The cost of introducing a recipe above baseline: a manifest written before it cannot
+    ///   name it, so [`recorded_is_current`] reads an old KTX2 entity's block as current and
+    ///   the lambda's skip gate keeps it. Those entities need a `force` re-enqueue; the JIT
+    ///   lane is unaffected, since it probes the renamed bundle and rebuilds on the miss.
+    ///   The decode always takes level 0, as a PNG decodes its full picture, so a KTX2 is
+    ///   sized like the same image as a PNG; a process-wide budget (`ktx2::KTX2_DECODE_BUDGET`)
+    ///   bounds the memory of decodes in flight without changing any bytes.
     /// - `Skin` 1: skinned renderer bounds are baked over every animation clip instead of
     ///   the bind pose (#119). The fix is gated on a glTF that declares a skin *and*
     ///   carries clips (`builder::nodes`: `skin_idx` plus `has_gltf_animations`), and no
@@ -143,6 +168,7 @@ impl Recipe {
             Recipe::Skin => 1,
             Recipe::Animation => 0,
             Recipe::Font => 0,
+            Recipe::Ktx2 => 1,
         }
     }
 
@@ -204,11 +230,12 @@ fn has_entries(doc: &serde_json::Value, key: &str) -> bool {
 /// The recipes a glTF's bundle bytes are a function of, read off the document's own
 /// structure.
 ///
-/// [`Recipe::Glb`] always applies — the bundle is a GLB. The other two are the narrowing
-/// ones, and they are read coarsely on purpose: a `skins` array earns [`Recipe::Skin`]
-/// whether or not any clip poses it, an `images` array earns [`Recipe::Texture`] whether the
-/// image is embedded or referenced. Over-approximating costs a rebuild that was not strictly
-/// needed; under-approximating ships stale bytes.
+/// [`Recipe::Glb`] always applies — the bundle is a GLB. The others are read coarsely on
+/// purpose: a `skins` array earns [`Recipe::Skin`] whether or not any clip poses it, an
+/// `images` array earns [`Recipe::Texture`] whether the image is embedded or referenced, and
+/// any KTX2 signal earns [`Recipe::Ktx2`] whether or not a texture samples it.
+/// Over-approximating costs a rebuild that was not strictly needed; under-approximating ships
+/// stale bytes.
 ///
 /// A fix gated on two traits at once (#119 needed skins *and* clips) may bump either of
 /// them: each covers a superset of the assets the fix touched, so both are safe.
@@ -223,7 +250,40 @@ pub fn gltf_recipes(doc: &serde_json::Value) -> Vec<Recipe> {
     if has_entries(doc, "animations") {
         out.push(Recipe::Animation);
     }
+    if uses_ktx2(doc) {
+        out.push(Recipe::Ktx2);
+    }
     out
+}
+
+/// Whether a glTF declares `KHR_texture_basisu` or carries a KTX2 image, read off its own
+/// JSON: the extension in `extensionsUsed`/`extensionsRequired`, an image whose `mimeType` is
+/// `image/ktx2`, or one whose URI is a `.ktx2` file or a KTX2 data URI. Any one is enough —
+/// over-approximation is the safe direction.
+fn uses_ktx2(doc: &serde_json::Value) -> bool {
+    let declared = ["extensionsUsed", "extensionsRequired"].iter().any(|key| {
+        doc.get(*key)
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| a.iter().any(|e| e.as_str() == Some("KHR_texture_basisu")))
+    });
+    declared
+        || doc
+            .get("images")
+            .and_then(|v| v.as_array())
+            .is_some_and(|images| {
+                images.iter().any(|img| {
+                    let mime = img.get("mimeType").and_then(|m| m.as_str());
+                    let uri = img
+                        .get("uri")
+                        .and_then(|u| u.as_str())
+                        .map(str::to_ascii_lowercase);
+                    mime == Some("image/ktx2")
+                        || uri.is_some_and(|u| {
+                            u.starts_with("data:image/ktx2")
+                                || u.split(['?', '#']).next().unwrap_or("").ends_with(".ktx2")
+                        })
+                })
+            })
 }
 
 /// The recipes a standalone image bundle's bytes are a function of.
@@ -366,6 +426,37 @@ mod tests {
             gltf_recipes(&json!({"animations": [{}]})),
             vec![Recipe::Glb, Recipe::Animation]
         );
+    }
+
+    #[test]
+    fn ktx2_gltfs_and_only_they_take_the_ktx2_recipe() {
+        let required = json!({
+            "extensionsUsed": ["KHR_texture_basisu"],
+            "extensionsRequired": ["KHR_texture_basisu"],
+            "images": [{"bufferView": 0, "mimeType": "image/ktx2"}],
+            "textures": [{"extensions": {"KHR_texture_basisu": {"source": 0}}}],
+        });
+        assert_eq!(
+            gltf_recipes(&required),
+            vec![Recipe::Glb, Recipe::Texture, Recipe::Ktx2]
+        );
+        // Each signal alone is enough.
+        for doc in [
+            json!({"extensionsUsed": ["KHR_texture_basisu"]}),
+            json!({"images": [{"mimeType": "image/ktx2", "bufferView": 0}]}),
+            json!({"images": [{"uri": "textures/Albedo.KTX2"}]}),
+            json!({"images": [{"uri": "data:image/ktx2;base64,AAAA"}]}),
+        ] {
+            assert!(gltf_recipes(&doc).contains(&Recipe::Ktx2), "{doc}");
+        }
+        // PNG/JPEG glTFs keep exactly the recipes, and so the digests, they had.
+        for doc in [
+            json!({"images": [{"uri": "t.png"}, {"mimeType": "image/jpeg", "bufferView": 0}]}),
+            json!({"extensionsUsed": ["KHR_texture_transform"], "images": [{"uri": "a.ktx"}]}),
+        ] {
+            assert!(!gltf_recipes(&doc).contains(&Recipe::Ktx2), "{doc}");
+        }
+        assert_eq!(Recipe::from_name("ktx2"), Some(Recipe::Ktx2));
     }
 
     #[test]

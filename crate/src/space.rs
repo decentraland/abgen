@@ -175,6 +175,10 @@ fn parse_iso8601_epoch(s: &str) -> Option<u64> {
 pub struct ObjectHeaders {
     pub content_type: &'static str,
     pub cache_control: &'static str,
+    /// `br` for a Bevy variant's Brotli sidecar (`bevy/{prefix}/{name}.br`), whose bytes are the
+    /// encoded representation of the plain object; anything reading the bucket directly then
+    /// decodes it like the edge's negotiated answer.
+    pub content_encoding: Option<&'static str>,
 }
 
 /// Verbatim from what the production writers put on the same keys:
@@ -201,7 +205,12 @@ const PUBLIC_ONE_YEAR: &str = "public, max-age=31536000";
 /// Single source of truth for the metadata every upload carries.
 pub fn object_headers(key: &str) -> ObjectHeaders {
     let lower = key.to_ascii_lowercase();
-    let content_type = if lower.ends_with(".json") {
+    // Bevy variants (`bevy/{prefix}/{name}`, their `.br` sidecars and `.json` records) are
+    // immutable within their prefix; only the manifests are rewritten in place.
+    let bevy_variant = lower.starts_with("bevy/") && !lower.starts_with("bevy/manifest/");
+    let content_type = if bevy_variant && !lower.ends_with(".json") {
+        "application/octet-stream"
+    } else if lower.ends_with(".json") {
         "application/json"
     } else if lower.ends_with(".js") {
         "application/javascript"
@@ -216,6 +225,7 @@ pub fn object_headers(key: &str) -> ObjectHeaders {
     };
     let uploader_lane = matches!(content_type, "application/wasm" | "text/cache-manifest");
     let cache_control = if key.starts_with("manifest/")
+        || key.starts_with("bevy/manifest/")
         || key.starts_with("LOD/lod-reuse/")
         || key.starts_with("SatelliteMaps/rebuild/")
     {
@@ -232,9 +242,11 @@ pub fn object_headers(key: &str) -> ObjectHeaders {
     } else {
         IMMUTABLE_SOURCE
     };
+    let content_encoding = (bevy_variant && lower.ends_with(".br")).then_some("br");
     ObjectHeaders {
         content_type,
         cache_control,
+        content_encoding,
     }
 }
 
@@ -567,6 +579,9 @@ impl Space {
         if let Some(token) = &c.session_token {
             req = req.header("x-amz-security-token", token);
         }
+        if let Some(encoding) = headers.content_encoding {
+            req = req.header("Content-Encoding", encoding);
+        }
         req.send(body)
             .map_err(|e| crate::anyhow!("space PUT {key}: {e}"))?;
         Ok(())
@@ -799,22 +814,60 @@ mod tests {
                 "application/json",
                 NO_CACHE,
             ),
+            (
+                "bevy/t1/bafkreisource_srgb",
+                "application/octet-stream",
+                IMMUTABLE_SOURCE,
+            ),
+            (
+                "bevy/m1/bafkreisource.br",
+                "application/octet-stream",
+                IMMUTABLE_SOURCE,
+            ),
+            (
+                "bevy/m1/bafkreisource.json",
+                "application/json",
+                IMMUTABLE_SOURCE,
+            ),
+            (
+                "bevy/manifest/bafkentity.json",
+                "application/json",
+                NO_CACHE,
+            ),
         ] {
             let h = object_headers(key);
             assert_eq!(h.content_type, ct, "content type for {key}");
             assert_eq!(h.cache_control, cc, "cache control for {key}");
+            let br = key.starts_with("bevy/") && key.ends_with(".br");
+            assert_eq!(
+                h.content_encoding,
+                br.then_some("br"),
+                "content encoding for {key}"
+            );
         }
     }
 
     #[test]
     fn put_sends_key_derived_content_type_and_cache_control() {
-        for (key, ct, cc) in [
+        for (key, ct, cc, ce) in [
             (
                 "v41/cid/Qmhash_windows",
                 "application/wasm",
                 IMMUTABLE_BUNDLE,
+                None,
             ),
-            ("manifest/cid_windows.json", "application/json", NO_CACHE),
+            (
+                "manifest/cid_windows.json",
+                "application/json",
+                NO_CACHE,
+                None,
+            ),
+            (
+                "bevy/m1/bafkreisource.br",
+                "application/octet-stream",
+                IMMUTABLE_SOURCE,
+                Some("br"),
+            ),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
@@ -834,7 +887,7 @@ mod tests {
             };
             assert_eq!(value("content-type").as_deref(), Some(ct), "{head}");
             assert_eq!(value("cache-control").as_deref(), Some(cc), "{head}");
-            assert_eq!(value("content-encoding"), None, "{head}");
+            assert_eq!(value("content-encoding").as_deref(), ce, "{head}");
         }
     }
 

@@ -624,7 +624,7 @@ pub(crate) fn run_fused_entity_ids(
     }
 }
 
-pub(crate) const IMAGE_EXTS: [&str; 3] = [".png", ".jpg", ".jpeg"];
+pub(crate) const IMAGE_EXTS: [&str; 4] = [".png", ".jpg", ".jpeg", ".ktx2"];
 
 pub(crate) fn load_entity_json(store: &LocalContentStore, cid: &str) -> Option<serde_json::Value> {
     let bytes = store.fetch(cid).ok()?;

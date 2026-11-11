@@ -369,6 +369,10 @@ fn seed_jit_cache(jit_root: &Path) -> Vec<(String, PathBuf, u64)> {
         ) {
             continue;
         }
+        if name == crate::bevyvariants::BEVY_PLATFORM && ft.is_dir() {
+            seed_bevy_files(&path, &mut out);
+            continue;
+        }
         if ft.is_dir() {
             let bytes = jitcache::dir_size(&path);
             out.push((name.to_string(), path, bytes));
@@ -381,6 +385,51 @@ fn seed_jit_cache(jit_root: &Path) -> Vec<(String, PathBuf, u64)> {
         }
     }
     out
+}
+
+/// The Bevy lane's objects (`bevy/{prefix}/{file}`, `bevy/manifest/{entity}.json`) are shared
+/// between entities, so each file is its own LRU entry, keyed by its path under the JIT root
+/// (`AppState::jit_key_of`). Leftover quarantined and temporary files are removed.
+fn seed_bevy_files(bevy_dir: &Path, out: &mut Vec<(String, PathBuf, u64)>) {
+    let Ok(prefixes) = std::fs::read_dir(bevy_dir) else {
+        return;
+    };
+    for pre in prefixes.flatten() {
+        let (Ok(ft), Some(prefix)) = (
+            pre.file_type(),
+            pre.file_name().to_str().map(str::to_string),
+        ) else {
+            continue;
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(pre.path()) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let path = f.path();
+            let Some(name) = f.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if name.contains(jitcache::EVICTED_SUFFIX) || name.contains(".tmp.") {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            let bytes = f
+                .metadata()
+                .ok()
+                .filter(|m| m.is_file())
+                .map_or(0, |m| m.len());
+            if bytes > 0 {
+                out.push((
+                    format!("{}/{prefix}/{name}", crate::bevyvariants::BEVY_PLATFORM),
+                    path,
+                    bytes,
+                ));
+            }
+        }
+    }
 }
 
 fn prune_stale_bundle_dirs(current: &Path) {
