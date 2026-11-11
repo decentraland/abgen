@@ -9,8 +9,16 @@
 //! (`crate/third_party/basisu`, UASTC only) bounds every size and offset it reads from the
 //! container; this gate keeps the accepted formats and sizes to what the explorer takes.
 //!
-//! Level 0 is transcoded, so the decoded image is the full-resolution picture, the same one a
-//! PNG of it would decode to; mips are rebuilt by the existing encoders.
+//! **Which level.** The decoded level is the first one no larger than [`KTX2_DECODE_MAX`] on a
+//! side: level 0 for every file within that cap (the full-resolution picture, the same one a
+//! PNG of it would decode to), otherwise the file's own smaller mip. The transcoder only
+//! produces whole levels (and Zstandard-decompresses a whole level first), so the level picked
+//! is what bounds memory: a few-KB file declaring an 8192 level 0 would otherwise allocate a
+//! 256 MB RGBA8 buffer, per image, with a GLB's images decoded in parallel. A file with no
+//! level within the cap (in practice a single-level file) decodes its first level no larger
+//! than [`KTX2_LEVEL_MAX`] and is capped downstream like any large PNG; one with no level even
+//! that small is refused by the header gate and does not decode, the outcome of a broken
+//! image. Mips below the decoded level are rebuilt by the existing encoders.
 //!
 //! **Orientation.** A KTX2 image's row order is given by its `KTXorientation` key, defaulting
 //! to `"rd"` (x right, y down: the first row is the top of the picture), and
@@ -27,9 +35,25 @@ use image::RgbaImage;
 /// The KTX 2.0 file identifier.
 pub const KTX2_MAGIC: &[u8; 12] = b"\xABKTX 20\xBB\r\n\x1A\n";
 
-/// The largest width or height taken. Its RGBA8 decode is 256 MB, within what `image` allows a
-/// PNG, and the same bound the explorer applies.
+/// The largest level-0 width or height taken, the same bound the explorer applies. Level 0 is
+/// only transcoded when it is within [`KTX2_LEVEL_MAX`]; above that the file must carry a
+/// smaller mip.
 pub const KTX2_MAX_SIZE: u32 = 8192;
+
+/// The decode cap: the first level whose longest side is at most this is the one decoded. It
+/// is the largest texture any Unity lane outputs (`texprofile::max_texture_size_for`: 1024 on
+/// Windows and macOS, 512 on Linux and WebGL), so a file within it decodes exactly as before
+/// and a larger one is downscaled by every lane anyway. It is also the level the explorer's
+/// own KTX2 path picks (`bevyvariants::BEVY_TEXTURE_MAX`). A 4 MB RGBA8 decode.
+pub const KTX2_DECODE_MAX: u32 = 1024;
+
+/// The largest level ever transcoded, for a file with no level within [`KTX2_DECODE_MAX`]
+/// (a single-level file, or a truncated mip chain). 2048 is the Unity importer default
+/// (`texprofile::TEXTURE_IMPORTER_DEFAULT_MAX`), the largest size any Unity lane's import
+/// produces; its RGBA8 decode is 16 MB, a sixteenth of the old 8192 bound. A file whose
+/// smallest level is larger is refused by [`ktx2_header_ok`]: the transcoder has no partial
+/// decode, so there is no way to take it with bounded memory.
+pub const KTX2_LEVEL_MAX: u32 = 2048;
 
 /// `KHR_DF_MODEL_UASTC` in the data format descriptor's colour-model byte.
 const KHR_DF_MODEL_UASTC: u8 = 166;
@@ -112,9 +136,18 @@ pub fn dfd<'a>(bytes: &'a [u8], header: &Ktx2Header) -> Option<&'a [u8]> {
     bytes.get(start..start.checked_add(len)?)
 }
 
+/// The longest side of the smallest level the header declares (level `levelCount - 1`, or
+/// level 0 for a `levelCount` of 0 or 1).
+fn smallest_level_side(h: &Ktx2Header) -> u32 {
+    let last = h.levels.max(1) - 1;
+    h.width.max(h.height).checked_shr(last).unwrap_or(0).max(1)
+}
+
 /// The header gate: a single 2D UASTC image, supercompression none (0) or Zstandard (2),
-/// 1..=[`KTX2_MAX_SIZE`] on each side. The data format descriptor is checked before the
-/// transcoder is built, so no other codec's tables are ever initialized for a rejected file.
+/// 1..=[`KTX2_MAX_SIZE`] on each side, whose smallest declared level is within
+/// [`KTX2_LEVEL_MAX`] (so [`decode_ktx2_uastc`] always has a level it may transcode). The data
+/// format descriptor is checked before the transcoder is built, so no other codec's tables are
+/// ever initialized for a rejected file.
 pub fn ktx2_header_ok(bytes: &[u8]) -> bool {
     let valid = || -> Option<bool> {
         let h = read_header(bytes)?;
@@ -126,6 +159,7 @@ pub fn ktx2_header_ok(bytes: &[u8]) -> bool {
                 && matches!(h.supercompression, 0 | 2)
                 && (1..=KTX2_MAX_SIZE).contains(&h.width)
                 && (1..=KTX2_MAX_SIZE).contains(&h.height)
+                && smallest_level_side(&h) <= KTX2_LEVEL_MAX
                 && h.depth == 0
                 && h.layers <= 1
                 && h.faces == 1,
@@ -134,9 +168,10 @@ pub fn ktx2_header_ok(bytes: &[u8]) -> bool {
     valid() == Some(true)
 }
 
-/// Decode a UASTC KTX2 to RGBA8, top row first. `None` for anything that is not a KTX2 the
-/// header gate accepts, or that the transcoder rejects; never panics on malformed input that
-/// the vendored transcoder bounds.
+/// Decode a UASTC KTX2 to RGBA8, top row first, at the first level no larger than
+/// [`KTX2_DECODE_MAX`] on a side, else the first no larger than [`KTX2_LEVEL_MAX`] (see the
+/// module docs). `None` for anything that is not a KTX2 the header gate accepts, or that the
+/// transcoder rejects; never panics on malformed input that the vendored transcoder bounds.
 pub fn decode_ktx2_uastc(raw: &[u8]) -> Option<RgbaImage> {
     use basisu::{DecodeFlags, TargetFormat, Transcoder};
 
@@ -144,9 +179,17 @@ pub fn decode_ktx2_uastc(raw: &[u8]) -> Option<RgbaImage> {
         return None;
     }
     let texture = Transcoder::new(raw).ok()?;
-    let info = texture.image_level_info(0).ok()?;
+    let first_within = |cap: u32| {
+        (0..texture.level_count()).find(|&l| {
+            texture
+                .image_level_info(l)
+                .is_ok_and(|i| i.width.max(i.height) <= cap)
+        })
+    };
+    let level = first_within(KTX2_DECODE_MAX).or_else(|| first_within(KTX2_LEVEL_MAX))?;
+    let info = texture.image_level_info(level).ok()?;
     let rgba = texture
-        .transcode(0, TargetFormat::Rgba32, DecodeFlags::NONE)
+        .transcode(level, TargetFormat::Rgba32, DecodeFlags::NONE)
         .ok()?;
     RgbaImage::from_raw(info.width, info.height, rgba)
 }
@@ -235,5 +278,170 @@ mod tests {
         }
         // A DFD offset past the end.
         assert!(!ktx2_header_ok(&patched(48, &u32::MAX.to_le_bytes())));
+    }
+
+    #[test]
+    fn the_decode_cap_is_the_largest_unity_output() {
+        let largest = ["windows", "mac", "osx", "linux", "webgl"]
+            .into_iter()
+            .map(crate::texprofile::max_texture_size_for)
+            .max();
+        assert_eq!(Some(KTX2_DECODE_MAX), largest);
+        assert_eq!(
+            KTX2_LEVEL_MAX,
+            crate::texprofile::TEXTURE_IMPORTER_DEFAULT_MAX
+        );
+    }
+
+    /// The fixture's four 16-byte UASTC blocks (its decompressed level 0, row-major 2x2).
+    fn fixture_blocks() -> Vec<Vec<u8>> {
+        let levels = crate::ktx2_write::read_levels(UASTC_8).expect("fixture levels");
+        levels[0].chunks_exact(16).map(<[u8]>::to_vec).collect()
+    }
+
+    /// A Zstandard-supercompressed UASTC KTX2 of `w`x`h` declaring `levels` levels, level `m`
+    /// tiled with fixture block `m % 4` so the decoded level can be told apart. Only the
+    /// container is built here; the blocks are the fixture's own `basisu` output.
+    fn tiled_uastc(w: u32, h: u32, levels: u32) -> Vec<u8> {
+        let blocks = fixture_blocks();
+        let header = read_header(UASTC_8).unwrap();
+        let descriptor = dfd(UASTC_8, &header).unwrap();
+        let payload: Vec<(Vec<u8>, usize)> = (0..levels)
+            .map(|m| {
+                let (lw, lh) = ((w >> m).max(1), (h >> m).max(1));
+                let n = lw.div_ceil(4) as usize * lh.div_ceil(4) as usize;
+                let raw = blocks[m as usize % blocks.len()].repeat(n);
+                (zstd::bulk::compress(&raw, 3).unwrap(), raw.len())
+            })
+            .collect();
+        let dfd_offset = 80 + 24 * levels as usize;
+        let mut at = (dfd_offset + descriptor.len()) as u64;
+        let mut out = KTX2_MAGIC.to_vec();
+        for v in [
+            0u32, // vkFormat undefined
+            1,    // typeSize
+            w,
+            h,
+            0, // depth
+            0, // layers
+            1, // faces
+            levels,
+            2, // Zstandard
+            dfd_offset as u32,
+            descriptor.len() as u32,
+            0, // kvd offset
+            0, // kvd length
+        ] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&[0u8; 16]); // no supercompression global data
+        for (comp, raw) in &payload {
+            for v in [at, comp.len() as u64, *raw as u64] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            at += comp.len() as u64;
+        }
+        out.extend_from_slice(descriptor);
+        for (comp, _) in &payload {
+            out.extend_from_slice(comp);
+        }
+        out
+    }
+
+    /// What a level tiled with fixture block `block` decodes to at `w`x`h`.
+    fn tiled_pixels(block: usize, w: u32, h: u32) -> RgbaImage {
+        let src = decode_ktx2_uastc(UASTC_8).unwrap();
+        let (bx, by) = ((block % 2) as u32 * 4, (block / 2) as u32 * 4);
+        RgbaImage::from_fn(w, h, |x, y| *src.get_pixel(bx + x % 4, by + y % 4))
+    }
+
+    /// Level 0 transcoded directly, the decode before the cap.
+    fn level0(raw: &[u8]) -> RgbaImage {
+        use basisu::{DecodeFlags, TargetFormat, Transcoder};
+        let t = Transcoder::new(raw).unwrap();
+        let i = t.image_level_info(0).unwrap();
+        let rgba = t
+            .transcode(0, TargetFormat::Rgba32, DecodeFlags::NONE)
+            .unwrap();
+        RgbaImage::from_raw(i.width, i.height, rgba).unwrap()
+    }
+
+    #[test]
+    fn the_fixture_blocks_decode_to_distinct_tiles() {
+        // Otherwise the level tests below could not tell which level was decoded.
+        let tiles: Vec<_> = (0..4).map(|b| tiled_pixels(b, 4, 4)).collect();
+        for a in 0..4 {
+            for b in a + 1..4 {
+                assert_ne!(tiles[a], tiles[b], "blocks {a} and {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_large_file_with_mips_decodes_its_first_level_within_the_cap() {
+        // 4096x2048, four levels: level 2 (1024x512) is the first within 1024.
+        let raw = tiled_uastc(4096, 2048, 4);
+        assert!(ktx2_header_ok(&raw));
+        let img = decode_ktx2_uastc(&raw).expect("decodes");
+        assert_eq!(img.dimensions(), (1024, 512));
+        assert_eq!(img, tiled_pixels(2, 1024, 512));
+        // Square, two levels: level 1.
+        let img = decode_ktx2_uastc(&tiled_uastc(2048, 2048, 2)).expect("decodes");
+        assert_eq!(img, tiled_pixels(1, 1024, 1024));
+    }
+
+    #[test]
+    fn a_file_within_the_cap_decodes_level_0_exactly_as_before() {
+        for raw in [
+            UASTC_8.to_vec(),
+            UASTC_6.to_vec(),
+            tiled_uastc(1024, 1024, 2),
+            tiled_uastc(1024, 256, 11),
+            tiled_uastc(12, 1024, 1),
+        ] {
+            let img = decode_ktx2_uastc(&raw).expect("decodes");
+            assert_eq!(img, level0(&raw));
+        }
+        assert_eq!(
+            decode_ktx2_uastc(&tiled_uastc(1024, 1024, 2)).unwrap(),
+            tiled_pixels(0, 1024, 1024)
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_level_within_the_cap_decodes_up_to_the_level_max() {
+        // Single level 2048: no smaller level to take, decoded at its own size as before.
+        let raw = tiled_uastc(2048, 1024, 1);
+        assert_eq!(decode_ktx2_uastc(&raw).unwrap(), level0(&raw));
+        // A truncated chain whose last level is 2048: that level, not level 0.
+        let img = decode_ktx2_uastc(&tiled_uastc(4096, 4096, 2)).unwrap();
+        assert_eq!(img, tiled_pixels(1, 2048, 2048));
+    }
+
+    #[test]
+    fn the_header_gate_refuses_a_file_whose_smallest_level_is_past_the_level_max() {
+        let dims = |w: u32, h: u32, levels: u32| {
+            let mut bytes = patched(20, &[&w.to_le_bytes()[..], &h.to_le_bytes()].concat());
+            bytes[40..44].copy_from_slice(&levels.to_le_bytes());
+            bytes
+        };
+        // Single level: within the level max taken, past it refused.
+        assert!(ktx2_header_ok(&dims(2048, 2048, 1)));
+        assert!(ktx2_header_ok(&dims(2048, 64, 0)));
+        assert!(!ktx2_header_ok(&dims(2049, 16, 1)));
+        assert!(!ktx2_header_ok(&dims(16, 4096, 0)));
+        assert!(!ktx2_header_ok(&dims(8192, 8192, 1)));
+        // 8192 with mips down to 2048 or below: taken, only the small level is decoded.
+        assert!(ktx2_header_ok(&dims(8192, 8192, 3)));
+        assert!(ktx2_header_ok(&dims(8192, 4096, 14)));
+        assert!(!ktx2_header_ok(&dims(8192, 8192, 2)));
+        // A level count past any mip chain still gates on size alone (the transcoder rejects
+        // it), and never overflows the shift.
+        assert!(ktx2_header_ok(&dims(8192, 8192, 40)));
+        // Level 0 past the explorer bound, whatever its mips.
+        assert!(!ktx2_header_ok(&dims(16384, 16384, 15)));
+        let raw = tiled_uastc(4096, 4096, 1);
+        assert!(!ktx2_header_ok(&raw));
+        assert!(decode_ktx2_uastc(&raw).is_none());
     }
 }

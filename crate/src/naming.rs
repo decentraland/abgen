@@ -438,7 +438,8 @@ pub fn image_class_digest(
 
 /// Which standalone `.ktx2` files the Unity lanes convert, as a name input of their bundles
 /// ([`image_class_digest`]). 1: only what `crate::ktx2::ktx2_header_ok` takes (UASTC LDR 2D
-/// within the size cap); anything else gets no bundle. Bump when that rule changes.
+/// within the size cap, smallest level within `crate::ktx2::KTX2_LEVEL_MAX`); anything else
+/// gets no bundle. Bump when that rule changes once a release has published under it.
 pub const STANDALONE_KTX2_POLICY: &str = "uastc-gate-1";
 
 /// Extension a font bundle bakes into its container key: scene fonts are TrueType only.
