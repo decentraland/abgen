@@ -132,10 +132,9 @@ impl Recipe {
     ///   name it, so [`recorded_is_current`] reads an old KTX2 entity's block as current and
     ///   the lambda's skip gate keeps it. Those entities need a `force` re-enqueue; the JIT
     ///   lane is unaffected, since it probes the renamed bundle and rebuilds on the miss.
-    ///   The decode cap (`ktx2::KTX2_DECODE_MAX`: a file larger than 1024 decodes its first
-    ///   mip within 1024, else its smallest level, instead of level 0) changes bytes only for
-    ///   those over-cap files with a smaller mip and is still generation 1: it landed before
-    ///   any release published a generation-1 bundle.
+    ///   The decode always takes level 0, as a PNG decodes its full picture, so a KTX2 is
+    ///   sized like the same image as a PNG; a process-wide budget (`ktx2::KTX2_DECODE_BUDGET`)
+    ///   bounds the memory of decodes in flight without changing any bytes.
     /// - `Skin` 1: skinned renderer bounds are baked over every animation clip instead of
     ///   the bind pose (#119). The fix is gated on a glTF that declares a skin *and*
     ///   carries clips (`builder::nodes`: `skin_idx` plus `has_gltf_animations`), and no

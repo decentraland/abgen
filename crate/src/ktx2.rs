@@ -9,21 +9,20 @@
 //! (`crate/third_party/basisu`, UASTC only) bounds every size and offset it reads from the
 //! container; this gate keeps the accepted formats and sizes to what the explorer takes.
 //!
-//! **Which level.** The decoded level is the first one no larger than [`KTX2_DECODE_MAX`] on a
-//! side: level 0 for every file within that cap (the full-resolution picture, the same one a
-//! PNG of it would decode to), otherwise the file's own smaller mip. A file with no level
-//! within the cap (a single-level file, or a mip chain that stops early) decodes its smallest
-//! level, up to [`KTX2_MAX_SIZE`], and the builder caps it like any large PNG: a decodable
-//! texture is never dropped for its size. Mips below the decoded level are rebuilt by the
-//! existing encoders.
+//! **Which level.** Always level 0, the full-resolution picture: the same pixels a PNG of the
+//! image decodes to. The builder sizes a texture from the decoded image (its platform cap,
+//! power-of-two target, oversized-texture placeholder), so decoding a smaller mip would give a
+//! KTX2 a lower resolution than the same image as a PNG. A decodable texture is never dropped
+//! for its size; the builder caps it like any large PNG, and the encoders rebuild the mips.
 //!
 //! **Memory.** The transcoder only produces whole levels (Zstandard-decompressing a whole level
-//! first), so a few-KB file declaring an 8192 level with no smaller mip still decodes to a
-//! 256 MB RGBA8 buffer. Picking the capped mip makes that rare; the rest is bounded by a
-//! process-wide budget ([`KTX2_DECODE_BUDGET`]) every decode reserves before it allocates, so
-//! a GLB decoding its images in parallel, or several JIT builds sharing one abcdn process,
-//! wait for each other instead of allocating together. A decode larger than the whole budget
-//! waits until it can run alone, and still runs.
+//! first), so a few-KB file declaring an 8192 level decodes to a 256 MB RGBA8 buffer, the same
+//! as an 8192 PNG. What a KTX2 adds is that such a file is tiny, so a GLB can carry many of
+//! them and decode them all at once. That burst is bounded by a process-wide budget
+//! ([`KTX2_DECODE_BUDGET`]) every decode reserves before it allocates: a GLB decoding its
+//! images in parallel, or several JIT builds sharing one abcdn process, wait for each other
+//! instead of allocating together. A decode larger than the whole budget waits until it can
+//! run alone, and still runs.
 //!
 //! **Orientation.** A KTX2 image's row order is given by its `KTXorientation` key, defaulting
 //! to `"rd"` (x right, y down: the first row is the top of the picture), and
@@ -44,18 +43,11 @@ pub const KTX2_MAGIC: &[u8; 12] = b"\xABKTX 20\xBB\r\n\x1A\n";
 /// PNG, and the same bound the explorer applies.
 pub const KTX2_MAX_SIZE: u32 = 8192;
 
-/// The decode cap: the first level whose longest side is at most this is the one decoded. It
-/// is the largest texture any Unity lane outputs (`texprofile::max_texture_size_for`: 1024 on
-/// Windows and macOS, 512 on Linux and WebGL), so a file within it decodes exactly as before
-/// and a larger one is downscaled by every lane anyway. It is also the level the explorer's
-/// own KTX2 path picks (`bevyvariants::BEVY_TEXTURE_MAX`). A 4 MB RGBA8 decode.
-pub const KTX2_DECODE_MAX: u32 = 1024;
-
 /// The bytes all in-flight [`decode_ktx2_uastc`] calls may hold at once, process-wide.
 /// 512 MiB is `image`'s default allocation limit for a single PNG decode, so KTX2 decodes
 /// together never reserve more than one PNG decode may take alone; it fits one worst-case
 /// 8192x8192 decode (256 MiB RGBA8 plus 64 MiB of decompressed UASTC level), or about a hundred
-/// capped 1024 ones at once.
+/// 1024x1024 ones at once.
 pub const KTX2_DECODE_BUDGET: u64 = 512 << 20;
 
 static DECODE_BUDGET: DecodeBudget = DecodeBudget::new(KTX2_DECODE_BUDGET);
@@ -219,8 +211,7 @@ pub fn ktx2_header_ok(bytes: &[u8]) -> bool {
     valid() == Some(true)
 }
 
-/// Decode a UASTC KTX2 to RGBA8, top row first, at the first level no larger than
-/// [`KTX2_DECODE_MAX`] on a side, else at its smallest level (see the module docs). `None` for
+/// Decode a UASTC KTX2 to RGBA8, top row first, at level 0 (see the module docs). `None` for
 /// anything that is not a KTX2 the header gate accepts, or that the transcoder rejects; never
 /// panics on malformed input that the vendored transcoder bounds.
 ///
@@ -241,16 +232,7 @@ fn decode_ktx2_uastc_in(raw: &[u8], budget: &DecodeBudget) -> Option<RgbaImage> 
         return None;
     }
     let texture = Transcoder::new(raw).ok()?;
-    let side = |l: u32| {
-        texture
-            .image_level_info(l)
-            .ok()
-            .map(|i| i.width.max(i.height))
-    };
-    let levels = texture.level_count();
-    let level = (0..levels)
-        .find(|&l| side(l).is_some_and(|s| s <= KTX2_DECODE_MAX))
-        .unwrap_or(levels.checked_sub(1)?);
+    let level = 0;
     let info = texture.image_level_info(level).ok()?;
     let (w, h) = (u64::from(info.width), u64::from(info.height));
     // RGBA8 out, plus 16 bytes per 4x4 UASTC block for the decompressed level.
@@ -347,15 +329,6 @@ mod tests {
         assert!(!ktx2_header_ok(&patched(48, &u32::MAX.to_le_bytes())));
     }
 
-    #[test]
-    fn the_decode_cap_is_the_largest_unity_output() {
-        let largest = ["windows", "mac", "osx", "linux", "webgl"]
-            .into_iter()
-            .map(crate::texprofile::max_texture_size_for)
-            .max();
-        assert_eq!(Some(KTX2_DECODE_MAX), largest);
-    }
-
     /// The fixture's four 16-byte UASTC blocks (its decompressed level 0, row-major 2x2).
     fn fixture_blocks() -> Vec<Vec<u8>> {
         let levels = crate::ktx2_write::read_levels(UASTC_8).expect("fixture levels");
@@ -418,7 +391,7 @@ mod tests {
         RgbaImage::from_fn(w, h, |x, y| *src.get_pixel(bx + x % 4, by + y % 4))
     }
 
-    /// Level 0 transcoded directly, the decode before the cap.
+    /// Level 0 transcoded directly.
     fn level0(raw: &[u8]) -> RgbaImage {
         use basisu::{DecodeFlags, TargetFormat, Transcoder};
         let t = Transcoder::new(raw).unwrap();
@@ -440,51 +413,44 @@ mod tests {
         }
     }
 
+    /// Every file decodes level 0, the full-resolution picture, whatever mips it carries: the
+    /// builder sizes the texture from the decoded image, so a KTX2 gets the same platform cap,
+    /// power-of-two target and oversized-texture placeholder as the same image as a PNG.
     #[test]
-    fn a_large_file_with_mips_decodes_its_first_level_within_the_cap() {
-        // 4096x2048, four levels: level 2 (1024x512) is the first within 1024.
-        let raw = tiled_uastc(4096, 2048, 4);
-        assert!(ktx2_header_ok(&raw));
-        let img = decode_ktx2_uastc(&raw).expect("decodes");
-        assert_eq!(img.dimensions(), (1024, 512));
-        assert_eq!(img, tiled_pixels(2, 1024, 512));
-        // Square, two levels: level 1.
-        let img = decode_ktx2_uastc(&tiled_uastc(2048, 2048, 2)).expect("decodes");
-        assert_eq!(img, tiled_pixels(1, 1024, 1024));
-    }
-
-    #[test]
-    fn a_file_within_the_cap_decodes_level_0_exactly_as_before() {
-        for raw in [
-            UASTC_8.to_vec(),
-            UASTC_6.to_vec(),
-            tiled_uastc(1024, 1024, 2),
-            tiled_uastc(1024, 256, 11),
-            tiled_uastc(12, 1024, 1),
+    fn every_file_decodes_level_0_at_its_full_size() {
+        for (w, h, levels) in [
+            (8, 8, 1),
+            (1024, 1024, 2),
+            (1024, 256, 11),
+            (12, 1024, 1),
+            (2048, 1024, 1),
+            (3000, 1500, 3),
+            (4096, 2048, 4),
+            (4096, 4096, 2),
         ] {
+            let raw = tiled_uastc(w, h, levels);
+            assert!(ktx2_header_ok(&raw), "{w}x{h}");
             let img = decode_ktx2_uastc(&raw).expect("decodes");
-            assert_eq!(img, level0(&raw));
+            assert_eq!(img.dimensions(), (w, h), "{w}x{h} with {levels} levels");
+            assert_eq!(img, tiled_pixels(0, w, h), "{w}x{h}: not level 0");
         }
-        assert_eq!(
-            decode_ktx2_uastc(&tiled_uastc(1024, 1024, 2)).unwrap(),
-            tiled_pixels(0, 1024, 1024)
-        );
+        for raw in [UASTC_8, UASTC_6] {
+            assert_eq!(decode_ktx2_uastc(raw).unwrap(), level0(raw));
+        }
     }
 
+    /// A large KTX2 with mips is sized like the same image as a PNG: the 3000 px case from the
+    /// review, which a mip-picking decode turned into 512 instead of 1024.
     #[test]
-    fn a_file_with_no_level_within_the_cap_decodes_its_smallest_level() {
-        // Single level: no smaller level to take, decoded at its own size as before; the
-        // builder caps it like any large PNG.
-        for (w, h) in [(2048, 1024), (4096, 4096)] {
-            let raw = tiled_uastc(w, h, 1);
-            assert!(ktx2_header_ok(&raw));
-            let img = decode_ktx2_uastc(&raw).expect("decodes");
-            assert_eq!(img.dimensions(), (w, h));
-            assert_eq!(img, level0(&raw));
-        }
-        // A chain that stops at 2048: its smallest level, not level 0.
-        let img = decode_ktx2_uastc(&tiled_uastc(4096, 4096, 2)).unwrap();
-        assert_eq!(img, tiled_pixels(1, 2048, 2048));
+    fn a_large_ktx2_with_mips_gets_the_png_target_size() {
+        let raw = tiled_uastc(3000, 3000, 3);
+        let img = decode_ktx2_uastc(&raw).expect("decodes");
+        let png_like = crate::texprofile::bc7_target_size(3000, 3000, 1024);
+        assert_eq!(
+            crate::texprofile::bc7_target_size(img.width(), img.height(), 1024),
+            png_like
+        );
+        assert_eq!(png_like, (1024, 1024));
     }
 
     #[test]
