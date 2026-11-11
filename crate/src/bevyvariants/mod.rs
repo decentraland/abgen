@@ -1,11 +1,12 @@
 //! **Prototype.** The Bevy variants lane: per scene entity, a manifest that maps each original
 //! content CID to GPU-ready variants for the Bevy explorer.
 //!
-//! - PNG/JPEG textures become KTX2 (`crate::ktx2_write`): BC1 / BC5 / BC7 UNORM blocks, each
-//!   level Zstandard-supercompressed, full mip chain, longest side at most [`BEVY_TEXTURE_MAX`]
-//!   (powers of two). BC5 for images the entity's models use only as normal maps, BC1 for fully
-//!   opaque images whose BC1 level 0 stays within `texture::BC1_MIN_PSNR_DB` of the source
-//!   (linear ORM images keep BC1 regardless), BC7 otherwise.
+//! - PNG/JPEG textures become KTX2 (`crate::ktx2_write`): BC1 / BC5 / BC7 UNORM blocks,
+//!   Zstandard-supercompressed, level 0 only (no mip chain, like the single-level creator UASTC
+//!   files), longest side at most [`BEVY_TEXTURE_MAX`] (powers of two). BC5 for images the
+//!   entity's models use only as normal maps, BC1 for fully opaque images whose BC1 level 0
+//!   stays within `texture::BC1_MIN_PSNR_DB` of the source (linear ORM images keep BC1
+//!   regardless), BC7 otherwise.
 //! - Every texture variant must be smaller than its original file, or the original is served
 //!   as is (`size-gate` in the stats).
 //! - Creator UASTC KTX2 textures (standalone or embedded in a GLB) are only ever transcoded block
@@ -36,7 +37,7 @@
 //!
 //! - textures: `bevy/t{TEX_GEN}/{sourceCid}_{slot}` (`slot` = `srgb` | `linear` | `normal`,
 //!   how the entity's models sample the image; the same image used differently in two scenes
-//!   is two variants). A non-default Zstandard level is part of the prefix (`t2z9`).
+//!   is two variants). A non-default Zstandard level is part of the prefix (`t3z9`).
 //! - `glb-br` models: `bevy/m{MESH_GEN}/{sourceCid}`.
 //! - GLB variants (opt-in): `bevy/g{TEX_GEN}/{sourceCid}`, with the digest of the external
 //!   `.bin` buffers appended for a `.gltf` source (they are inlined, so they are an input;
@@ -99,7 +100,8 @@ pub const MANIFEST_PREFIX: &str = "bevy/manifest";
 /// Generation of the texture encoders (BC1/BC5/BC7 kernels, mips, size cap, KTX2 writer, the
 /// UASTC transcode). Bump when any of them changes its output bytes.
 /// 2: sources whose variant size would be under 4 px on a side get no variant (`tiny`).
-pub const TEX_GEN: u32 = 2;
+/// 3: texture variants are single-level, no mip chain.
+pub const TEX_GEN: u32 = 3;
 /// Generation of the model variants. Bump when their output bytes change.
 /// 2: a model variant is the original `.glb` unchanged, with its `.br` sidecar (format
 /// `glb-br`; geometry is not re-encoded, so the client needs only its glTF loader).
@@ -350,7 +352,7 @@ impl Record {
 /// texture, one `glb-br` and one `glb`), ordered, so the serialized bytes are a function
 /// of the variants alone. The class of a path is its prefix letter (`t` BC KTX2, `m`
 /// `glb-br`, `g` GLB); the KTX2 header carries the BC format and size. `lanes` names
-/// the prefix each class was built from (`{"texture":"t2","mesh":"m2"}`), read back by
+/// the prefix each class was built from (`{"texture":"t3","mesh":"m2"}`), read back by
 /// [`Manifest::is_current`]. The full entry (CID, format, dimensions, size) of each variant
 /// is in its record.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -378,7 +380,7 @@ impl Manifest {
 mod tests;
 
 /// The disk-cache key of a Bevy-lane file under `root`: its path below the root with `/`
-/// separators (`bevy/t2/{name}`, `bevy/t2/{name}.json`, `bevy/manifest/{entity}.json`). `None`
+/// separators (`bevy/t3/{name}`, `bevy/t3/{name}.json`, `bevy/manifest/{entity}.json`). `None`
 /// for a path that is not under `{root}/bevy/`.
 pub fn cache_key(root: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;

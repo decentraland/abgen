@@ -315,7 +315,7 @@ mod tests {
                 &p,
                 serde_json::json!({"v": 2, "entity": "e", "generator": "g",
                     "lanes": bevyvariants::BuildOptions::from_env().lanes(),
-                    "files": {"c": [{"path": "bevy/t2/c_srgb", "cid": "x", "kind": "texture",
+                    "files": {"c": [{"path": "bevy/t3/c_srgb", "cid": "x", "kind": "texture",
                         "format": "ktx2-bc7", "size": 1}]}})
                 .to_string(),
             )

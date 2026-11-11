@@ -286,7 +286,7 @@ the path. The client loads a variant when the manifest lists one it supports and
 the original file on anything else, so the lane can be switched off at any time. Built by
 `crate/src/bevyvariants` (feature `bevy-variants`, on with `server`).
 
-- `GET /bevy/manifest/{entity}.json` - `{"v":3,"lanes":{"mesh":"m2","texture":"t2"},"files":{"<original cid>":["bevy/t2/<original cid>_srgb"]}}`
+- `GET /bevy/manifest/{entity}.json` - `{"v":3,"lanes":{"mesh":"m2","texture":"t3"},"files":{"<original cid>":["bevy/t3/<original cid>_srgb"]}}`
   (at most one path per class per original: a texture, a `glb-br`, and a `glb` only when GLB
   variants are on). 404 while absent, and while every copy on disk was built from an older
   generation or schema (`X-Abgen-Reason: bevy-variants-stale`, see the asset lane below).
@@ -312,7 +312,7 @@ doing any work and looks for its record the way the Unity lanes probe
 
 - textures: `bevy/t{TEX_GEN}/{sourceCid}_{slot}`, `slot` = `srgb` | `linear` | `normal` (how the
   entity's models sample the image; the same image used differently in two scenes is two
-  variants). A Zstandard level other than the default is part of the prefix (`t2z9`).
+  variants). A Zstandard level other than the default is part of the prefix (`t3z9`).
 - `glb-br` models: `bevy/m{MESH_GEN}/{sourceCid}` (a `.gltf` source only ever gets a `not-glb`
   record there).
 - GLB variants (opt-in): `bevy/g{TEX_GEN}/{sourceCid}`; a `.gltf` source gets a digest of the
@@ -339,14 +339,14 @@ the entity tries again. Records left in its output directory are not trusted (an
 may have died before uploading). The offline build (`abgen-corpus --bevy-variants`) uses only the records
 in its output directory.
 
-Versioning is two integers in `crate/src/bevyvariants/mod.rs`: `TEX_GEN` (BC encoders, mips,
+Versioning is two integers in `crate/src/bevyvariants/mod.rs`: `TEX_GEN` (BC encoders, levels,
 size cap, KTX2 writer, UASTC transcode) and `MESH_GEN` (model variants: 2 = the original `.glb`
 plus its `.br` sidecar). Bump one when its encoder's output bytes change: every key of that class moves to a new
 prefix, the previous prefix (`bevy/t1/`, …) is garbage and can be deleted whole, and manifests
 built from it (their `lanes` name it) read as stale until the entity's next build, which re-encodes only that class.
 The generations live in code because they describe the encoders. The operator's lever is
 `ABGEN_BEVY_EPOCH` (unset by default; a number `0..=9999`): when set, every prefix gets `e{N}`
-appended (`t2e2`, `m2e2`), so every key misses, every manifest reads as stale and the lane
+appended (`t3e2`, `m2e2`), so every key misses, every manifest reads as stale and the lane
 re-encodes into the new prefixes, without a release. Setting it back finds the old prefixes again.
 No per-recipe digests: skins, animations and textures referenced by a model do not change the
 model variant's bytes, so they are not in its name. The option toggles
@@ -354,13 +354,14 @@ model variant's bytes, so they are not in its name. The option toggles
 record has no `.br` sidecar gets one added, and turning precompression off stops building model
 variants but leaves existing sidecars in place.
 
-Variants (all textures are KTX2 with UNORM BC blocks, each level Zstandard-supercompressed,
-`KTXorientation` `rd`; writer in `crate/src/ktx2_write.rs`). Zstandard is libzstd 1.5.7, bundled by
+Variants (all textures are single-level KTX2 - level 0 only, no mipmaps - with UNORM BC blocks,
+Zstandard-supercompressed, `KTXorientation` `rd`; writer in `crate/src/ktx2_write.rs`). Zstandard is libzstd 1.5.7, bundled by
 the exactly pinned `zstd-sys` (`=2.0.16`): one single-threaded frame per level, no dictionary, no
 checksum. The level is 19 unless set (`ABGEN_BEVY_ZSTD_LEVEL` on the server, `--bevy-zstd-level`
 on `abgen-corpus`, 1..=19). Variant bytes, and so CIDs, depend on the level and the libzstd
 release, never on the machine or thread count; a new libzstd release is a `TEX_GEN` bump.
-- PNG/JPEG textures (sniffed by bytes): full mip chain, longest side capped at 1024 and snapped
+- PNG/JPEG textures (sniffed by bytes): level 0 only, no mip chain (like the single-level
+  creator UASTC files, so sizes compare like for like), longest side capped at 1024 and snapped
   to powers of two (whole 4x4 blocks). `ktx2-bc5` for images the entity's models use only as
   normal maps (x in R, y in G - Bevy's two-channel normal path), `ktx2-bc1` for fully opaque
   images, `ktx2-bc7` otherwise. An opaque colour (sRGB) image keeps BC1 only when its BC1
@@ -405,7 +406,7 @@ ABGEN_OUT_ROOT=./out ./target/release/abgen   # serves /bevy/manifest/... and /b
 A second run into the same `./out` (or another entity sharing files) reuses every variant whose
 record is there and encodes only the rest. `abgen-corpus --bevy-variants` prints one
 `BEVY_STATS {json}` line per entity (stage times summed over files - probe, fetch, decode, resize,
-BC1/BC5/BC7 encode with mips, the BC1 PSNR check, UASTC->BC7 transcode, zstd, brotli,
+BC1/BC5/BC7 encode, the BC1 PSNR check, UASTC->BC7 transcode, zstd, brotli,
 hash+write - counts and bytes by format and source, no-variant reasons, size-gated variants by
 format, BC1 rejections, `reused_textures` / `reused_models`, and the `model_variants` totals:
 models, variant and `.br` bytes, size-gated attempts) and writes the full stats, per-file rows included, to

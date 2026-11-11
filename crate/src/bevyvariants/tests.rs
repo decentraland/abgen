@@ -367,7 +367,7 @@ fn records_round_trip_and_refuse_other_versions() {
             format: "ktx2-bc1".into(),
             width: Some(64),
             height: Some(32),
-            mips: Some(7),
+            mips: Some(1),
             size: 1234,
         }),
         reason: None,
@@ -443,13 +443,13 @@ fn opaque_png_becomes_bc1_alpha_png_bc7_normal_bc5() {
     let v = ungated(&opaque, Slot::Srgb);
     assert_eq!(
         (v.format, v.width, v.height, v.mips),
-        (TexFormat::Bc1, 32, 32, 6)
+        (TexFormat::Bc1, 32, 32, 1)
     );
     assert!(!v.bc1_rejected);
     // Near-lossless: the encoder's endpoint pick is not exact on every block.
     assert!(v.bc1_psnr_db.unwrap() > 50.0, "{:?}", v.bc1_psnr_db);
     let (h, levels) = ktx(&v.bytes, BcFormat::Bc1Rgb);
-    assert_eq!((h.width, h.height, h.levels), (32, 32, 6));
+    assert_eq!((h.width, h.height, h.levels), (32, 32, 1));
     assert_eq!(levels[0].len(), 64 * 8);
     let src = image::load_from_memory(&opaque)
         .unwrap()
@@ -462,12 +462,12 @@ fn opaque_png_becomes_bc1_alpha_png_bc7_normal_bc5() {
     assert_eq!(v.format, TexFormat::Bc7);
     assert!(v.bc1_psnr_db.is_none() && !v.bc1_rejected);
     let (h, _) = ktx(&v.bytes, BcFormat::Bc7);
-    assert_eq!((h.width, h.height, h.levels), (32, 16, 6));
+    assert_eq!((h.width, h.height, h.levels), (32, 16, 1));
 
     let v = ungated(&noise_png_bytes(32, 32), Slot::Normal);
     assert_eq!(v.format, TexFormat::Bc5);
     let (h, _) = ktx(&v.bytes, BcFormat::Bc5);
-    assert_eq!(h.levels, 6);
+    assert_eq!((v.mips, h.levels), (1, 1));
 }
 
 #[test]
@@ -556,8 +556,8 @@ fn size_gate_drops_a_variant_not_smaller_than_its_original() {
 }
 
 #[test]
-fn encoded_levels_equal_the_encoders_chain() {
-    // The container is a lossless wrapper: its levels concatenate to the encoder's output.
+fn encoded_level_equals_the_encoders_single_level() {
+    // The container is a lossless wrapper around the encoder's one level: no mip chain.
     let png = noise_alpha_png(16, 16);
     let v = ungated(&png, Slot::Linear);
     assert_eq!(v.format, TexFormat::Bc7);
@@ -568,15 +568,15 @@ fn encoded_levels_equal_the_encoders_chain() {
         &bled,
         16,
         16,
-        None,
+        Some(1),
         false,
         false,
         false,
         crate::bc7_pure::Bc7Profile::Basic,
     );
-    assert_eq!(mips, 5);
+    assert_eq!((mips, v.mips), (1, 1));
     let (_, levels) = ktx(&v.bytes, BcFormat::Bc7);
-    assert_eq!(levels.concat(), chain);
+    assert_eq!(levels, vec![chain]);
 }
 
 #[test]
@@ -595,7 +595,7 @@ fn tiny_unknown_and_oversize_inputs() {
     // Sniffed by bytes: PNG magic with a broken body is an error, not "no variant".
     assert!(encode_texture(b"\x89PNG\r\n\x1a\nbroken", Slot::Srgb).is_err());
     let v = ungated(&noise_png_bytes(2048, 16), Slot::Srgb);
-    assert_eq!((v.width, v.height, v.mips), (1024, 8, 11));
+    assert_eq!((v.width, v.height, v.mips), (1024, 8, 1));
     // Elongated: the variant would be 1024x2, thinner than one 4x4 BC block.
     assert_eq!(
         miss(&noise_png_bytes(4096, 8), Slot::Srgb).reason,
@@ -1445,7 +1445,7 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     let tex = &m["bafkcolor"][0];
     assert_eq!(
         (tex.kind.as_str(), tex.width, tex.height, tex.mips),
-        ("texture", Some(64), Some(64), Some(7))
+        ("texture", Some(64), Some(64), Some(1))
     );
 
     // Every listed variant is stored at its path, named by source and slot, with the CID of
