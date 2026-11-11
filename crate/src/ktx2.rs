@@ -11,14 +11,19 @@
 //!
 //! **Which level.** The decoded level is the first one no larger than [`KTX2_DECODE_MAX`] on a
 //! side: level 0 for every file within that cap (the full-resolution picture, the same one a
-//! PNG of it would decode to), otherwise the file's own smaller mip. The transcoder only
-//! produces whole levels (and Zstandard-decompresses a whole level first), so the level picked
-//! is what bounds memory: a few-KB file declaring an 8192 level 0 would otherwise allocate a
-//! 256 MB RGBA8 buffer, per image, with a GLB's images decoded in parallel. A file with no
-//! level within the cap (in practice a single-level file) decodes its first level no larger
-//! than [`KTX2_LEVEL_MAX`] and is capped downstream like any large PNG; one with no level even
-//! that small is refused by the header gate and does not decode, the outcome of a broken
-//! image. Mips below the decoded level are rebuilt by the existing encoders.
+//! PNG of it would decode to), otherwise the file's own smaller mip. A file with no level
+//! within the cap (a single-level file, or a mip chain that stops early) decodes its smallest
+//! level, up to [`KTX2_MAX_SIZE`], and the builder caps it like any large PNG: a decodable
+//! texture is never dropped for its size. Mips below the decoded level are rebuilt by the
+//! existing encoders.
+//!
+//! **Memory.** The transcoder only produces whole levels (Zstandard-decompressing a whole level
+//! first), so a few-KB file declaring an 8192 level with no smaller mip still decodes to a
+//! 256 MB RGBA8 buffer. Picking the capped mip makes that rare; the rest is bounded by a
+//! process-wide budget ([`KTX2_DECODE_BUDGET`]) every decode reserves before it allocates, so
+//! a GLB decoding its images in parallel, or several JIT builds sharing one abcdn process,
+//! wait for each other instead of allocating together. A decode larger than the whole budget
+//! waits until it can run alone, and still runs.
 //!
 //! **Orientation.** A KTX2 image's row order is given by its `KTXorientation` key, defaulting
 //! to `"rd"` (x right, y down: the first row is the top of the picture), and
@@ -35,9 +40,8 @@ use image::RgbaImage;
 /// The KTX 2.0 file identifier.
 pub const KTX2_MAGIC: &[u8; 12] = b"\xABKTX 20\xBB\r\n\x1A\n";
 
-/// The largest level-0 width or height taken, the same bound the explorer applies. Level 0 is
-/// only transcoded when it is within [`KTX2_LEVEL_MAX`]; above that the file must carry a
-/// smaller mip.
+/// The largest width or height taken. Its RGBA8 decode is 256 MB, within what `image` allows a
+/// PNG, and the same bound the explorer applies.
 pub const KTX2_MAX_SIZE: u32 = 8192;
 
 /// The decode cap: the first level whose longest side is at most this is the one decoded. It
@@ -47,13 +51,70 @@ pub const KTX2_MAX_SIZE: u32 = 8192;
 /// own KTX2 path picks (`bevyvariants::BEVY_TEXTURE_MAX`). A 4 MB RGBA8 decode.
 pub const KTX2_DECODE_MAX: u32 = 1024;
 
-/// The largest level ever transcoded, for a file with no level within [`KTX2_DECODE_MAX`]
-/// (a single-level file, or a truncated mip chain). 2048 is the Unity importer default
-/// (`texprofile::TEXTURE_IMPORTER_DEFAULT_MAX`), the largest size any Unity lane's import
-/// produces; its RGBA8 decode is 16 MB, a sixteenth of the old 8192 bound. A file whose
-/// smallest level is larger is refused by [`ktx2_header_ok`]: the transcoder has no partial
-/// decode, so there is no way to take it with bounded memory.
-pub const KTX2_LEVEL_MAX: u32 = 2048;
+/// The bytes all in-flight [`decode_ktx2_uastc`] calls may hold at once, process-wide.
+/// 512 MiB is `image`'s default allocation limit for a single PNG decode, so KTX2 decodes
+/// together never reserve more than one PNG decode may take alone; it fits one worst-case
+/// 8192x8192 decode (256 MiB RGBA8 plus 64 MiB of decompressed UASTC level), or about a hundred
+/// capped 1024 ones at once.
+pub const KTX2_DECODE_BUDGET: u64 = 512 << 20;
+
+static DECODE_BUDGET: DecodeBudget = DecodeBudget::new(KTX2_DECODE_BUDGET);
+
+/// A counting byte budget: [`DecodeBudget::acquire`] blocks until the bytes asked for fit, and
+/// the returned guard gives them back on drop. A request larger than the whole budget is
+/// charged the whole budget, so it waits until nothing else holds any and then runs alone; it
+/// is never refused.
+pub struct DecodeBudget {
+    cap: u64,
+    used: std::sync::Mutex<u64>,
+    freed: std::sync::Condvar,
+}
+
+/// Bytes held from a [`DecodeBudget`] until dropped.
+pub struct BudgetGuard<'a> {
+    budget: &'a DecodeBudget,
+    bytes: u64,
+}
+
+impl DecodeBudget {
+    pub const fn new(cap: u64) -> Self {
+        Self {
+            cap,
+            used: std::sync::Mutex::new(0),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Reserve `bytes` (at most the whole budget), waiting while other holders leave too
+    /// little. A holder that panicked still releases through its guard's drop, so a poisoned
+    /// lock carries a correct count and is used as is.
+    pub fn acquire(&self, bytes: u64) -> BudgetGuard<'_> {
+        let bytes = bytes.min(self.cap);
+        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        while *used + bytes > self.cap {
+            used = self.freed.wait(used).unwrap_or_else(|e| e.into_inner());
+        }
+        *used += bytes;
+        BudgetGuard {
+            budget: self,
+            bytes,
+        }
+    }
+
+    /// Bytes currently reserved.
+    pub fn in_use(&self) -> u64 {
+        *self.used.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Drop for BudgetGuard<'_> {
+    fn drop(&mut self) {
+        let mut used = self.budget.used.lock().unwrap_or_else(|e| e.into_inner());
+        *used -= self.bytes;
+        drop(used);
+        self.budget.freed.notify_all();
+    }
+}
 
 /// `KHR_DF_MODEL_UASTC` in the data format descriptor's colour-model byte.
 const KHR_DF_MODEL_UASTC: u8 = 166;
@@ -136,18 +197,9 @@ pub fn dfd<'a>(bytes: &'a [u8], header: &Ktx2Header) -> Option<&'a [u8]> {
     bytes.get(start..start.checked_add(len)?)
 }
 
-/// The longest side of the smallest level the header declares (level `levelCount - 1`, or
-/// level 0 for a `levelCount` of 0 or 1).
-fn smallest_level_side(h: &Ktx2Header) -> u32 {
-    let last = h.levels.max(1) - 1;
-    h.width.max(h.height).checked_shr(last).unwrap_or(0).max(1)
-}
-
 /// The header gate: a single 2D UASTC image, supercompression none (0) or Zstandard (2),
-/// 1..=[`KTX2_MAX_SIZE`] on each side, whose smallest declared level is within
-/// [`KTX2_LEVEL_MAX`] (so [`decode_ktx2_uastc`] always has a level it may transcode). The data
-/// format descriptor is checked before the transcoder is built, so no other codec's tables are
-/// ever initialized for a rejected file.
+/// 1..=[`KTX2_MAX_SIZE`] on each side. The data format descriptor is checked before the
+/// transcoder is built, so no other codec's tables are ever initialized for a rejected file.
 pub fn ktx2_header_ok(bytes: &[u8]) -> bool {
     let valid = || -> Option<bool> {
         let h = read_header(bytes)?;
@@ -159,7 +211,6 @@ pub fn ktx2_header_ok(bytes: &[u8]) -> bool {
                 && matches!(h.supercompression, 0 | 2)
                 && (1..=KTX2_MAX_SIZE).contains(&h.width)
                 && (1..=KTX2_MAX_SIZE).contains(&h.height)
-                && smallest_level_side(&h) <= KTX2_LEVEL_MAX
                 && h.depth == 0
                 && h.layers <= 1
                 && h.faces == 1,
@@ -169,25 +220,41 @@ pub fn ktx2_header_ok(bytes: &[u8]) -> bool {
 }
 
 /// Decode a UASTC KTX2 to RGBA8, top row first, at the first level no larger than
-/// [`KTX2_DECODE_MAX`] on a side, else the first no larger than [`KTX2_LEVEL_MAX`] (see the
-/// module docs). `None` for anything that is not a KTX2 the header gate accepts, or that the
-/// transcoder rejects; never panics on malformed input that the vendored transcoder bounds.
+/// [`KTX2_DECODE_MAX`] on a side, else at its smallest level (see the module docs). `None` for
+/// anything that is not a KTX2 the header gate accepts, or that the transcoder rejects; never
+/// panics on malformed input that the vendored transcoder bounds.
+///
+/// The decode holds [`KTX2_DECODE_BUDGET`] for its peak (the RGBA8 output plus the level's
+/// decompressed blocks) and releases it on return, not when the caller drops the image.
+/// Callers keep decoded images for a whole build (the per-entity decode cache, a scene's
+/// `images`), so a guard tied to the buffer would let one build's retained images hold the
+/// budget and deadlock its own next decode. What the budget bounds is the burst: decodes in
+/// flight at once, across a GLB's parallel image decodes and abcdn's concurrent builds.
 pub fn decode_ktx2_uastc(raw: &[u8]) -> Option<RgbaImage> {
+    decode_ktx2_uastc_in(raw, &DECODE_BUDGET)
+}
+
+fn decode_ktx2_uastc_in(raw: &[u8], budget: &DecodeBudget) -> Option<RgbaImage> {
     use basisu::{DecodeFlags, TargetFormat, Transcoder};
 
     if !ktx2_header_ok(raw) {
         return None;
     }
     let texture = Transcoder::new(raw).ok()?;
-    let first_within = |cap: u32| {
-        (0..texture.level_count()).find(|&l| {
-            texture
-                .image_level_info(l)
-                .is_ok_and(|i| i.width.max(i.height) <= cap)
-        })
+    let side = |l: u32| {
+        texture
+            .image_level_info(l)
+            .ok()
+            .map(|i| i.width.max(i.height))
     };
-    let level = first_within(KTX2_DECODE_MAX).or_else(|| first_within(KTX2_LEVEL_MAX))?;
+    let levels = texture.level_count();
+    let level = (0..levels)
+        .find(|&l| side(l).is_some_and(|s| s <= KTX2_DECODE_MAX))
+        .unwrap_or(levels.checked_sub(1)?);
     let info = texture.image_level_info(level).ok()?;
+    let (w, h) = (u64::from(info.width), u64::from(info.height));
+    // RGBA8 out, plus 16 bytes per 4x4 UASTC block for the decompressed level.
+    let _held = budget.acquire(w * h * 4 + w.div_ceil(4) * h.div_ceil(4) * 16);
     let rgba = texture
         .transcode(level, TargetFormat::Rgba32, DecodeFlags::NONE)
         .ok()?;
@@ -287,10 +354,6 @@ mod tests {
             .map(crate::texprofile::max_texture_size_for)
             .max();
         assert_eq!(Some(KTX2_DECODE_MAX), largest);
-        assert_eq!(
-            KTX2_LEVEL_MAX,
-            crate::texprofile::TEXTURE_IMPORTER_DEFAULT_MAX
-        );
     }
 
     /// The fixture's four 16-byte UASTC blocks (its decompressed level 0, row-major 2x2).
@@ -409,39 +472,101 @@ mod tests {
     }
 
     #[test]
-    fn a_file_with_no_level_within_the_cap_decodes_up_to_the_level_max() {
-        // Single level 2048: no smaller level to take, decoded at its own size as before.
-        let raw = tiled_uastc(2048, 1024, 1);
-        assert_eq!(decode_ktx2_uastc(&raw).unwrap(), level0(&raw));
-        // A truncated chain whose last level is 2048: that level, not level 0.
+    fn a_file_with_no_level_within_the_cap_decodes_its_smallest_level() {
+        // Single level: no smaller level to take, decoded at its own size as before; the
+        // builder caps it like any large PNG.
+        for (w, h) in [(2048, 1024), (4096, 4096)] {
+            let raw = tiled_uastc(w, h, 1);
+            assert!(ktx2_header_ok(&raw));
+            let img = decode_ktx2_uastc(&raw).expect("decodes");
+            assert_eq!(img.dimensions(), (w, h));
+            assert_eq!(img, level0(&raw));
+        }
+        // A chain that stops at 2048: its smallest level, not level 0.
         let img = decode_ktx2_uastc(&tiled_uastc(4096, 4096, 2)).unwrap();
         assert_eq!(img, tiled_pixels(1, 2048, 2048));
     }
 
     #[test]
-    fn the_header_gate_refuses_a_file_whose_smallest_level_is_past_the_level_max() {
+    fn the_header_gate_takes_any_level_count_within_the_max_size() {
         let dims = |w: u32, h: u32, levels: u32| {
             let mut bytes = patched(20, &[&w.to_le_bytes()[..], &h.to_le_bytes()].concat());
             bytes[40..44].copy_from_slice(&levels.to_le_bytes());
             bytes
         };
-        // Single level: within the level max taken, past it refused.
-        assert!(ktx2_header_ok(&dims(2048, 2048, 1)));
-        assert!(ktx2_header_ok(&dims(2048, 64, 0)));
-        assert!(!ktx2_header_ok(&dims(2049, 16, 1)));
-        assert!(!ktx2_header_ok(&dims(16, 4096, 0)));
-        assert!(!ktx2_header_ok(&dims(8192, 8192, 1)));
-        // 8192 with mips down to 2048 or below: taken, only the small level is decoded.
-        assert!(ktx2_header_ok(&dims(8192, 8192, 3)));
-        assert!(ktx2_header_ok(&dims(8192, 4096, 14)));
-        assert!(!ktx2_header_ok(&dims(8192, 8192, 2)));
-        // A level count past any mip chain still gates on size alone (the transcoder rejects
-        // it), and never overflows the shift.
-        assert!(ktx2_header_ok(&dims(8192, 8192, 40)));
-        // Level 0 past the explorer bound, whatever its mips.
+        for levels in [0, 1, 2, 14] {
+            assert!(ktx2_header_ok(&dims(8192, 8192, levels)), "{levels}");
+            assert!(ktx2_header_ok(&dims(4096, 16, levels)), "{levels}");
+        }
         assert!(!ktx2_header_ok(&dims(16384, 16384, 15)));
-        let raw = tiled_uastc(4096, 4096, 1);
-        assert!(!ktx2_header_ok(&raw));
-        assert!(decode_ktx2_uastc(&raw).is_none());
+    }
+
+    #[test]
+    fn the_budget_serializes_decodes_that_do_not_fit_together() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let budget = DecodeBudget::new(100);
+        let first = budget.acquire(60);
+        let second_done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _g = budget.acquire(60);
+                second_done.store(true, Ordering::SeqCst);
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                !second_done.load(Ordering::SeqCst),
+                "60 + 60 > 100 must wait"
+            );
+            assert_eq!(budget.in_use(), 60);
+            drop(first);
+        });
+        assert!(second_done.load(Ordering::SeqCst));
+        assert_eq!(budget.in_use(), 0);
+        // Requests that fit together do not wait.
+        let a = budget.acquire(40);
+        let b = budget.acquire(60);
+        assert_eq!(budget.in_use(), 100);
+        drop((a, b));
+    }
+
+    #[test]
+    fn a_request_larger_than_the_budget_runs_alone_and_is_never_refused() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let budget = DecodeBudget::new(100);
+        let small = budget.acquire(10);
+        let big_done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _g = budget.acquire(1 << 40);
+                assert_eq!(budget.in_use(), 100, "charged the whole budget");
+                big_done.store(true, Ordering::SeqCst);
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                !big_done.load(Ordering::SeqCst),
+                "waits for the other holder"
+            );
+            drop(small);
+        });
+        assert!(big_done.load(Ordering::SeqCst));
+        assert_eq!(budget.in_use(), 0);
+    }
+
+    #[test]
+    fn a_decode_larger_than_the_budget_still_decodes() {
+        // 2048x2048 single level needs 16 MiB + 4 MiB; a 1 KiB budget still lets it through,
+        // and gives everything back.
+        let budget = DecodeBudget::new(1024);
+        let raw = tiled_uastc(2048, 2048, 1);
+        let img = decode_ktx2_uastc_in(&raw, &budget).expect("decodes");
+        assert_eq!(img, level0(&raw));
+        assert_eq!(budget.in_use(), 0);
+        // A rejected file releases too (it never reserves).
+        assert!(decode_ktx2_uastc_in(&UASTC_8[..40], &budget).is_none());
+        assert_eq!(budget.in_use(), 0);
     }
 }

@@ -133,9 +133,9 @@ impl Recipe {
     ///   the lambda's skip gate keeps it. Those entities need a `force` re-enqueue; the JIT
     ///   lane is unaffected, since it probes the renamed bundle and rebuilds on the miss.
     ///   The decode cap (`ktx2::KTX2_DECODE_MAX`: a file larger than 1024 decodes its first
-    ///   mip within 1024 instead of level 0, and one whose smallest level is past 2048 does
-    ///   not decode) changes bytes only for those over-cap files and is still generation 1:
-    ///   it landed before any release published a generation-1 bundle.
+    ///   mip within 1024, else its smallest level, instead of level 0) changes bytes only for
+    ///   those over-cap files with a smaller mip and is still generation 1: it landed before
+    ///   any release published a generation-1 bundle.
     /// - `Skin` 1: skinned renderer bounds are baked over every animation clip instead of
     ///   the bind pose (#119). The fix is gated on a glTF that declares a skin *and*
     ///   carries clips (`builder::nodes`: `skin_idx` plus `has_gltf_animations`), and no
