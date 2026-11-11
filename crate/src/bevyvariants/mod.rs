@@ -18,12 +18,12 @@
 //!   `KHR_texture_basisu` resolved and every embedded image replaced by its KTX2 variant
 //!   (`image/ktx2`). External image URIs are left as they are: they resolve to their own
 //!   original CID, which has its own texture variant.
-//! - Models also get a `glb-meshopt` variant (`model`, on by default, `ABGEN_BEVY_GLB_MESHOPT=0`
-//!   turns it off; [`meshopt`]): the original with its triangle meshes as
-//!   `EXT_meshopt_compression` streams and nothing else touched, kept only when smaller than the
-//!   original. Each one is also stored Brotli-compressed as `{key}.br` beside it (on by default,
-//!   `ABGEN_BEVY_PRECOMPRESS=none` turns it off) and served with `Content-Encoding: br` to
-//!   clients that accept it; the CID is always of the plain bytes. KTX2 variants are never Brotli'd.
+//! - Every `.glb` also gets a `glb-br` model variant (`model`, on by default,
+//!   `ABGEN_BEVY_MODELS=0` or `ABGEN_BEVY_PRECOMPRESS=none` turns it off; [`glbbr`]): the
+//!   original `.glb`, byte for byte, plus its Brotli sidecar `{key}.br`, kept only when the
+//!   sidecar is smaller than the original, and served with `Content-Encoding: br` to clients
+//!   that accept it. The CID is always of the plain bytes. A `.gltf` gets none (`not-glb`).
+//!   KTX2 variants are never Brotli'd.
 //! - Nothing else gets a variant (scene code, audio, video, source maps, unknown files).
 //!
 //! The client contract: no manifest, no entry, or any failure means the client loads the
@@ -37,10 +37,10 @@
 //! - textures: `bevy/t{TEX_GEN}/{sourceCid}_{slot}` (`slot` = `srgb` | `linear` | `normal`,
 //!   how the entity's models sample the image; the same image used differently in two scenes
 //!   is two variants). A non-default Zstandard level is part of the prefix (`t2z9`).
-//! - `glb-meshopt` models: `bevy/m{MESH_GEN}/{sourceCid}`, with the digest of the external
+//! - `glb-br` models: `bevy/m{MESH_GEN}/{sourceCid}`.
+//! - GLB variants (opt-in): `bevy/g{TEX_GEN}/{sourceCid}`, with the digest of the external
 //!   `.bin` buffers appended for a `.gltf` source (they are inlined, so they are an input;
 //!   image URIs are not).
-//! - GLB variants (opt-in): `bevy/g{TEX_GEN}/{sourceCid}`.
 //!
 //! Beside every name sits its **record**, `{key}.json` ([`Record`]): the manifest entry the
 //! variant gets (its CID, format, size, dimensions, whether a `.br` sidecar exists), or the
@@ -68,7 +68,7 @@
 #[cfg(feature = "bevy-variants")]
 mod build;
 #[cfg(feature = "bevy-variants")]
-pub mod meshopt;
+pub mod glbbr;
 #[cfg(feature = "bevy-variants")]
 pub mod model;
 #[cfg(feature = "bevy-variants")]
@@ -100,9 +100,10 @@ pub const MANIFEST_PREFIX: &str = "bevy/manifest";
 /// UASTC transcode). Bump when any of them changes its output bytes.
 /// 2: sources whose variant size would be under 4 px on a side get no variant (`tiny`).
 pub const TEX_GEN: u32 = 2;
-/// Generation of the `glb-meshopt` encoder (codecs, filters, precision, GLB rewrite). Bump when
-/// it changes its output bytes.
-pub const MESH_GEN: u32 = 1;
+/// Generation of the model variants. Bump when their output bytes change.
+/// 2: a model variant is the original `.glb` unchanged, with its `.br` sidecar (format
+/// `glb-br`; geometry is not re-encoded, so the client needs only its glTF loader).
+pub const MESH_GEN: u32 = 2;
 
 /// `"abgen <crate version>"`, stamped into every manifest.
 pub fn generator() -> String {
@@ -296,7 +297,7 @@ pub struct VariantEntry {
     pub cid: String,
     /// `"texture"` or `"model"`.
     pub kind: String,
-    /// `"ktx2-bc7"`, `"ktx2-bc1"`, `"ktx2-bc5"`, `"glb-meshopt"` or `"glb"`.
+    /// `"ktx2-bc7"`, `"ktx2-bc1"`, `"ktx2-bc5"`, `"glb-br"` or `"glb"`.
     pub format: String,
     /// Texture variants only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -346,10 +347,10 @@ impl Record {
 
 /// The per-entity manifest (`v: 3`): what the client needs and nothing else. `files` maps
 /// each original content CID to the paths of its variants (one per class, so at most one
-/// texture, one `glb-meshopt` and one `glb`), ordered, so the serialized bytes are a function
+/// texture, one `glb-br` and one `glb`), ordered, so the serialized bytes are a function
 /// of the variants alone. The class of a path is its prefix letter (`t` BC KTX2, `m`
-/// `glb-meshopt`, `g` GLB); the KTX2 header carries the BC format and size. `lanes` names
-/// the prefix each class was built from (`{"texture":"t2","mesh":"m1"}`), read back by
+/// `glb-br`, `g` GLB); the KTX2 header carries the BC format and size. `lanes` names
+/// the prefix each class was built from (`{"texture":"t2","mesh":"m2"}`), read back by
 /// [`Manifest::is_current`]. The full entry (CID, format, dimensions, size) of each variant
 /// is in its record.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

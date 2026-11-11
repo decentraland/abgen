@@ -122,9 +122,9 @@ pub(super) async fn bevy_serve_local(
         // Served above.
         BevyTarget::Manifest(_) => serve::not_found(),
         BevyTarget::Variant { prefix, name } => {
-            // A `glb-meshopt` variant may have a Brotli sidecar (`{name}.br`): clients that
+            // A `glb-br` model variant has a Brotli sidecar (`{name}.br`): clients that
             // accept `br` get those bytes as the encoded representation of the same resource.
-            let br = bevyvariants::meshopt::br_sidecar(&exact);
+            let br = bevyvariants::glbbr::br_sidecar(&exact);
             let has_br = br.is_file();
             let send_br = has_br && accepts_br(headers);
             let etag = format!("{prefix}/{name}");
@@ -197,7 +197,7 @@ pub(super) async fn bevy_fallback(
             // disk this path is not taken again, so a sidecar first wanted by a later client is
             // not fetched; the plain bytes are still served.
             if matches!(target, BevyTarget::Variant { .. }) && accepts_br(headers) {
-                let br_dst = bevyvariants::meshopt::br_sidecar(&dst);
+                let br_dst = bevyvariants::glbbr::br_sidecar(&dst);
                 if !br_dst.is_file() {
                     let p3 = proxy.clone();
                     let br_key = format!("{key}.br");

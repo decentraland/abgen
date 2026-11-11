@@ -20,14 +20,14 @@ pub(crate) fn run_bevy_variants(
     store: &LocalContentStore,
     out_root: &Path,
     glb_variants: bool,
-    no_glb_meshopt: bool,
+    no_models: bool,
     precompress_br: Option<bool>,
     zstd_level: Option<i32>,
 ) -> Result<()> {
     let env = abgen::bevyvariants::BuildOptions::from_env();
     let opts = abgen::bevyvariants::BuildOptions {
         glb_variants: glb_variants || env.glb_variants,
-        glb_meshopt: env.glb_meshopt && !no_glb_meshopt,
+        models: env.models && !no_models,
         // An explicit `--bevy-precompress` wins over `ABGEN_BEVY_PRECOMPRESS`.
         precompress_br: precompress_br.unwrap_or(env.precompress_br),
         zstd_level: match zstd_level {
@@ -105,7 +105,7 @@ pub(crate) fn run_bevy_variants(
     let doc = serde_json::json!({
         "zstd_level": opts.zstd_level,
         "epoch": opts.epoch,
-        "glb_meshopt": opts.glb_meshopt,
+        "models": opts.models,
         "precompress": if opts.precompress_br { "br" } else { "none" },
         "libzstd": abgen::ktx2_write::LIBZSTD_VERSION,
         "threads": rayon::current_num_threads(),

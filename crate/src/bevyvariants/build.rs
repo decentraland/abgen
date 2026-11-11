@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use super::meshopt::{self, NoModelVariant};
+use super::glbbr::{self, NoModelVariant};
 use super::model::{image_uses, transform_model_with};
 use super::stats::{elapsed_ns, timed, BuildStats, FileStat, ModelStat, NoVariant, StageTimes};
 use super::texture::{encode_texture_with, source_kind, Miss, Slot, TexOptions, Uses};
@@ -24,11 +24,13 @@ pub struct BuildOptions {
     /// load), so the manifest lists texture variants only. Images embedded in GLBs never get a
     /// texture variant of their own either way.
     pub glb_variants: bool,
-    /// `glb-meshopt` model variants (`super::meshopt`): on by default, independent of
-    /// `glb_variants`.
-    pub glb_meshopt: bool,
-    /// Store each `glb-meshopt` variant Brotli-compressed as `{key}.br` beside it, too. On by
-    /// default. A reused variant whose record has no sidecar gets one added (no re-encode).
+    /// Model variants (`glb-br`, the `m` class, [`super::glbbr`]): each `.glb` stored
+    /// unchanged with a Brotli `.br` sidecar, kept when the sidecar is smaller than the
+    /// original. On by default, independent of `glb_variants`.
+    pub models: bool,
+    /// Store `.br` sidecars of model variants. On by default. A model variant is only worth
+    /// anything through its sidecar, so with this off no model variants are built at all
+    /// ([`BuildOptions::builds_models`]). A reused variant whose record has no sidecar gets one added.
     pub precompress_br: bool,
     /// Zstandard level of every KTX2 level ([`crate::ktx2_write::DEFAULT_ZSTD_LEVEL`] by
     /// default). Part of the variant bytes, so part of the texture prefix.
@@ -42,7 +44,7 @@ impl Default for BuildOptions {
     fn default() -> Self {
         BuildOptions {
             glb_variants: false,
-            glb_meshopt: true,
+            models: true,
             precompress_br: true,
             zstd_level: crate::ktx2_write::DEFAULT_ZSTD_LEVEL,
             epoch: None,
@@ -52,8 +54,8 @@ impl Default for BuildOptions {
 
 /// The env var that sets [`BuildOptions::zstd_level`].
 pub const ZSTD_LEVEL_ENV: &str = "ABGEN_BEVY_ZSTD_LEVEL";
-/// `0` turns [`BuildOptions::glb_meshopt`] off.
-pub const GLB_MESHOPT_ENV: &str = "ABGEN_BEVY_GLB_MESHOPT";
+/// `0` turns [`BuildOptions::models`] off.
+pub const MODELS_ENV: &str = "ABGEN_BEVY_MODELS";
 /// `none` turns [`BuildOptions::precompress_br`] off; `br` (the default) keeps it on.
 pub const PRECOMPRESS_ENV: &str = "ABGEN_BEVY_PRECOMPRESS";
 
@@ -75,8 +77,9 @@ fn precompress_from_env() -> bool {
 
 impl BuildOptions {
     /// `ABGEN_BEVY_GLB_VARIANTS=1` turns GLB variants on (default off);
-    /// `ABGEN_BEVY_GLB_MESHOPT=0` turns `glb-meshopt` variants off (default on);
-    /// `ABGEN_BEVY_PRECOMPRESS=none` stops storing `.br` sidecars of them (default on);
+    /// `ABGEN_BEVY_MODELS=0` turns `glb-br` model variants off (default on);
+    /// `ABGEN_BEVY_PRECOMPRESS=none` stops storing `.br` sidecars, so model variants too
+    /// (default on);
     /// `ABGEN_BEVY_ZSTD_LEVEL` (1..=19) sets the Zstandard level (default 19; an invalid value
     /// is logged and the default is used); `ABGEN_BEVY_EPOCH` sets the epoch (default unset).
     pub fn from_env() -> Self {
@@ -97,11 +100,16 @@ impl BuildOptions {
         };
         BuildOptions {
             glb_variants: crate::clihelp::env_bool("ABGEN_BEVY_GLB_VARIANTS", false),
-            glb_meshopt: crate::clihelp::env_bool(GLB_MESHOPT_ENV, true),
+            models: crate::clihelp::env_bool(MODELS_ENV, true),
             precompress_br: precompress_from_env(),
             zstd_level,
             epoch: super::epoch_from_env(),
         }
+    }
+
+    /// Whether model variants are built: they need both switches.
+    pub fn builds_models(self) -> bool {
+        self.models && self.precompress_br
     }
 
     fn tex(self) -> TexOptions {
@@ -118,7 +126,7 @@ impl BuildOptions {
             Class::Texture.lane().to_string(),
             Class::Texture.prefix(self.zstd_level, self.epoch),
         );
-        if self.glb_meshopt {
+        if self.builds_models() {
             out.insert(
                 Class::Mesh.lane().to_string(),
                 Class::Mesh.prefix(self.zstd_level, self.epoch),
@@ -270,7 +278,7 @@ fn store(
         });
     }
     if let Some(b) = br {
-        let br_dst = meshopt::br_sidecar(&dst);
+        let br_dst = glbbr::br_sidecar(&dst);
         if !br_dst.is_file() {
             write_atomic(&br_dst, b)?;
         }
@@ -299,7 +307,7 @@ fn store(
     Ok(out)
 }
 
-/// Add the `.br` sidecar to a reused `glb-meshopt` variant whose record says it has none: read
+/// Add the `.br` sidecar to a reused `glb-br` variant whose record says it has none: read
 /// the plain bytes (local, then the lane's store), check them against the record's CID,
 /// compress, write the sidecar, then replace the record with one that says `br`. Uploads in
 /// that order (sidecar, record), so the store never has a record naming a missing sidecar.
@@ -317,12 +325,12 @@ fn backfill_br(
     let dst = key_path(out_root, key).ok_or_else(|| anyhow::anyhow!("bad variant key {key:?}"))?;
     let plain = std::fs::read(&dst).ok().or_else(|| (lane.stored)(key));
     let Some(plain) = plain.filter(|b| cid_v1_raw_sha256(b) == v.cid) else {
-        tracing::warn!(key = %key, "bevy glb-meshopt: reused variant unavailable; no .br added");
+        tracing::warn!(key = %key, "bevy glb-br: reused variant unavailable; no .br added");
         return Ok(None);
     };
-    let br = timed(&mut times.brotli_ns, || meshopt::brotli_compress(&plain))?;
+    let br = timed(&mut times.brotli_ns, || glbbr::brotli_compress(&plain))?;
     let started = std::time::Instant::now();
-    let br_dst = meshopt::br_sidecar(&dst);
+    let br_dst = glbbr::br_sidecar(&dst);
     write_atomic(&br_dst, &br)?;
     let mut rec = rec.clone();
     rec.br = true;
@@ -386,13 +394,19 @@ fn model_reason_is_final(r: NoModelVariant) -> bool {
 
 /// The `&'static str` the stats carry for a format name read back from a record.
 fn static_format(name: &str) -> Option<&'static str> {
-    ["ktx2-bc1", "ktx2-bc5", "ktx2-bc7", meshopt::FORMAT, "glb"]
-        .into_iter()
-        .find(|f| *f == name)
+    [
+        "ktx2-bc1",
+        "ktx2-bc5",
+        "ktx2-bc7",
+        glbbr::GLB_BR_FORMAT,
+        "glb",
+    ]
+    .into_iter()
+    .find(|f| *f == name)
 }
 
-/// The variant name of a model: its source CID, plus, for a `.gltf`, a digest of the external
-/// buffers it inlines (`uri` -> content hash, sorted), so the same `.gltf` beside different
+/// The name of a model's GLB variant: its source CID, plus, for a `.gltf`, a digest of the
+/// external buffers it inlines (`uri` -> content hash, sorted), so the same `.gltf` beside different
 /// `.bin` files is two variants. Image URIs are not inputs: the variant leaves them as they are.
 fn model_name(
     hash: &str,
@@ -529,13 +543,6 @@ pub fn build_entity_variants(
             let mut times = StageTimes::default();
             let mut bytes: Option<Vec<u8>> = None;
             let mut fetched = false;
-            // A `.gltf` names its buffers in its JSON: read it to name the variant.
-            let name = if ext == ".gltf" {
-                let b = ensure_bytes(&mut bytes, &mut fetched, fetch, hash, &mut times);
-                model_name(hash, file, b, &content_by_file)
-            } else {
-                hash.to_string()
-            };
             let mut out = ModelOut {
                 row: (hash.to_string(), Vec::new()),
                 stat: None,
@@ -544,8 +551,9 @@ pub fn build_entity_variants(
             };
             let mut uses_known = false;
 
-            if opts.glb_meshopt {
-                let key = variant_key(&mesh_prefix, &name);
+            if opts.builds_models() {
+                // The original's bytes are the only input, so its CID is the name.
+                let key = variant_key(&mesh_prefix, hash);
                 let mut stat = ModelStat {
                     hash: hash.to_string(),
                     file: file.to_string(),
@@ -555,7 +563,6 @@ pub fn build_entity_variants(
                     variant_cid: None,
                     variant_size: None,
                     br_size: None,
-                    streams: None,
                     gated_size: None,
                     reason: None,
                     reused: false,
@@ -564,9 +571,9 @@ pub fn build_entity_variants(
                 if let Some(mut rec) = probe(lane, out_root, &key, &mut times) {
                     // `original_size` stays 0: the source was not fetched.
                     stat.reused = true;
-                    // The key does not name the Brotli setting: a variant first built without
-                    // a sidecar gets one here once precompression is on, without a re-encode.
-                    if opts.precompress_br && !rec.br && rec.variant.is_some() {
+                    // A variant whose record says it has no sidecar (lost, or a record from
+                    // before sidecars) gets one here, without a fetch.
+                    if !rec.br && rec.variant.is_some() {
                         if let Some((r, br_size, ups)) =
                             backfill_br(lane, out_root, &key, &rec, &mut times)?
                         {
@@ -596,62 +603,44 @@ pub fn build_entity_variants(
                             stat.original_size = b.len() as u64;
                             out.uses = uses_by_uri(b, ext, Some(&resolve));
                             uses_known = true;
-                            let caught = timed(&mut times.meshopt_ns, || {
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    meshopt::compress_model(b, ext, Some(&resolve))
-                                }))
-                            });
-                            let outcome = match caught {
-                                Ok(Ok(Ok(v))) => {
-                                    stat.streams = Some(v.streams as u64);
-                                    // Against the source plus the `.bin` buffers it
-                                    // inlines: what the client loads for the original.
-                                    if v.glb.len() as u64 >= v.source_size {
-                                        stat.gated_size = Some(v.glb.len() as u64);
-                                        Err(NoModelVariant::SizeGate)
-                                    } else {
-                                        Ok(v)
-                                    }
-                                }
-                                Ok(Ok(Err(reason))) => Err(reason),
-                                Ok(Err(e)) => {
-                                    tracing::warn!(entity = %entity, file = %file, error = %format!("{e:#}"), "bevy glb-meshopt variant skipped");
-                                    Err(NoModelVariant::Error)
-                                }
-                                Err(_) => {
-                                    tracing::warn!(entity = %entity, file = %file, "bevy glb-meshopt variant panicked; skipped");
-                                    Err(NoModelVariant::Error)
+                            // The variant is the `.glb` as it is; what it saves is its
+                            // Brotli sidecar, kept only when smaller than the original.
+                            let outcome = if ext != ".glb" {
+                                Err(NoModelVariant::NotGlb)
+                            } else {
+                                let br = timed(&mut times.brotli_ns, || {
+                                    glbbr::brotli_compress(b)
+                                })?;
+                                if br.len() >= b.len() {
+                                    stat.gated_size = Some(br.len() as u64);
+                                    Err(NoModelVariant::SizeGate)
+                                } else {
+                                    Ok(br)
                                 }
                             };
                             match outcome {
-                                Ok(v) => {
-                                    let br = if opts.precompress_br {
-                                        Some(timed(&mut times.brotli_ns, || {
-                                            meshopt::brotli_compress(&v.glb)
-                                        })?)
-                                    } else {
-                                        None
-                                    };
-                                    let e = entry(&key, &v.glb, "model", meshopt::FORMAT);
+                                Ok(br) => {
+                                    let e = entry(&key, b, "model", glbbr::GLB_BR_FORMAT);
                                     let rec = Record {
                                         v: RECORD_VERSION,
                                         variant: Some(e.clone()),
                                         reason: None,
-                                        br: br.is_some(),
+                                        br: true,
                                         uses: out.uses.clone(),
                                     };
-                                    out.uploads.extend(store(out_root,
+                                    out.uploads.extend(store(
+                                        out_root,
                                         &key,
-                                        Some(&v.glb),
-                                        br.as_deref(),
+                                        Some(b),
+                                        Some(&br),
                                         &rec,
                                         &mut times,
                                     )?);
-                                    stat.format = Some(meshopt::FORMAT);
+                                    stat.format = Some(glbbr::GLB_BR_FORMAT);
                                     stat.variant_path = Some(key.clone());
                                     stat.variant_cid = Some(e.cid.clone());
                                     stat.variant_size = Some(e.size);
-                                    stat.br_size = br.map(|b| b.len() as u64);
+                                    stat.br_size = Some(br.len() as u64);
                                     out.row.1.push(e);
                                 }
                                 Err(reason) => {
@@ -676,6 +665,13 @@ pub fn build_entity_variants(
             }
 
             if opts.glb_variants {
+                // A `.gltf` names its buffers in its JSON: read it to name the variant.
+                let name = if ext == ".gltf" {
+                    let b = ensure_bytes(&mut bytes, &mut fetched, fetch, hash, &mut times);
+                    model_name(hash, file, b, &content_by_file)
+                } else {
+                    hash.to_string()
+                };
                 let key = variant_key(&glb_prefix, &name);
                 if let Some(rec) = probe(lane, out_root, &key, &mut times) {
                     if !uses_known {

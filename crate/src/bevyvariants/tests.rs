@@ -333,7 +333,7 @@ fn lane_prefixes_follow_generations_and_the_zstd_level() {
     // A class turned off since is fine; a class the manifest lacks, or names under another
     // prefix, or an older schema, is not.
     let textures_only = BuildOptions {
-        glb_meshopt: false,
+        models: false,
         ..BuildOptions::default()
     }
     .lanes();
@@ -865,7 +865,7 @@ fn draco_glb_is_decoded_and_keeps_geometry() {
 }
 
 /// An `n x n` vertex grid with positions, normals, UVs and u16 indices, plus an external image:
-/// big enough that its meshopt variant is smaller than the original.
+/// big enough that its Brotli sidecar is smaller than the original.
 fn grid_glb(n: u32) -> Vec<u8> {
     let mut bin: Vec<u8> = Vec::new();
     fn put(bin: &mut Vec<u8>, v: &[f32]) {
@@ -951,43 +951,16 @@ fn grid_glb(n: u32) -> Vec<u8> {
 }
 
 #[test]
-fn meshopt_gltf_size_gate_counts_its_external_bin() {
-    use super::meshopt;
-    let (mut doc, bin) = split(&grid_glb(24));
-    doc["buffers"] = json!([{"uri": "grid.bin", "byteLength": bin.len()}]);
-    let gltf = serde_json::to_vec(&doc).unwrap();
-    let bin2 = bin.clone();
-    let resolve = move |uri: &str| (uri == "grid.bin").then(|| bin2.clone());
-    let v = meshopt::compress_model(&gltf, ".gltf", Some(&resolve))
-        .unwrap()
-        .unwrap();
-    assert_eq!(v.source_size, (gltf.len() + bin.len()) as u64);
-    // Larger than the JSON alone, smaller than what the client loads for the original.
-    assert!(v.glb.len() > gltf.len());
-    assert!((v.glb.len() as u64) < v.source_size);
-}
-
-#[test]
-fn meshopt_refuses_a_second_buffer_without_uri() {
-    use super::meshopt;
-    let grid = grid_glb(8);
-    let (mut doc, bin) = split(&grid);
-    let one = json!({"byteLength": bin.len()});
-    doc["buffers"] = json!([one.clone(), one]);
-    let glb = emit::glb_frame(serde_json::to_vec(&doc).unwrap(), &bin);
-    assert!(meshopt::compress_model(&glb, ".glb", None).is_err());
-    // The standard single-BIN GLB is unaffected.
-    assert!(meshopt::compress_model(&grid, ".glb", None).is_ok());
-}
-
-#[test]
-fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
-    use super::meshopt::{self, read_accessor_f32, read_indices};
+fn entity_build_adds_glb_br_model_variants() {
+    use super::glbbr;
     let grid = grid_glb(24);
     let (quad, _) = textured_quad_glb();
+    // A `.gltf` gets no model variant: only a `.glb` is one file.
+    let gltf = serde_json::to_vec(&json!({"asset": {"version": "2.0"}})).unwrap();
     let mut blobs: HashMap<&str, Vec<u8>> = HashMap::new();
     blobs.insert("bafkgrid", grid.clone());
     blobs.insert("bafkquad", quad);
+    blobs.insert("bafkgltf", gltf);
     blobs.insert("bafkgridpng", smooth_png_bytes(64, 64));
     let scene = scene_of(
         "bafkentitym",
@@ -995,6 +968,7 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
             ("models/grid.glb", "bafkgrid"),
             ("models/grid.png", "bafkgridpng"),
             ("models/quad.glb", "bafkquad"),
+            ("models/plain.gltf", "bafkgltf"),
         ],
     );
     let fetch = |h: &str| blobs.get(h).cloned();
@@ -1005,7 +979,7 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
         stored: &|_: &str| -> Option<Vec<u8>> { None },
         local_records: true,
     };
-    let out = std::env::temp_dir().join(format!("abgen-bevy-meshopt-{}", std::process::id()));
+    let out = std::env::temp_dir().join(format!("abgen-bevy-models-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
     let built = build_entity_variants(
         &scene,
@@ -1021,20 +995,22 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
     assert_eq!(built.manifest.files["bafkgrid"], vec![entry.path.clone()]);
     assert_eq!(
         (entry.kind.as_str(), entry.format.as_str()),
-        ("model", "glb-meshopt")
+        ("model", "glb-br")
     );
     assert!(entry.width.is_none() && entry.mips.is_none());
     assert_eq!(entry.path, format!("bevy/m{MESH_GEN}/bafkgrid"));
+    // The variant is the original, byte for byte.
     let glb = std::fs::read(key_path(&out, &entry.path).unwrap()).unwrap();
+    assert_eq!(glb, grid);
     assert_eq!(cid_v1_raw_sha256(&glb), entry.cid);
     assert_eq!(glb.len() as u64, entry.size);
-    assert!(glb.len() < grid.len());
-    // The sidecar holds the Brotli of the plain bytes; bytes, sidecar and record are listed
-    // for upload in that order, and the record says the sidecar exists and how the model
-    // samples its image.
-    let br_path = meshopt::br_sidecar(&key_path(&out, &entry.path).unwrap());
+    // The sidecar holds the Brotli of the plain bytes and is smaller; bytes, sidecar and record
+    // are listed for upload in that order, and the record says the sidecar exists and how the
+    // model samples its image.
+    let br_path = glbbr::br_sidecar(&key_path(&out, &entry.path).unwrap());
     let br = std::fs::read(&br_path).unwrap();
-    assert_eq!(meshopt::brotli_decompress(&br).unwrap(), glb);
+    assert!(br.len() < grid.len());
+    assert_eq!(glbbr::brotli_decompress(&br).unwrap(), grid);
     let grid_uploads: Vec<&Upload> = built
         .uploads
         .iter()
@@ -1062,32 +1038,33 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
             ..Default::default()
         })
     );
-    // Geometry round-trips; the external image URI is untouched.
-    let (o, ob) = meshopt::load_merged(&grid, None).unwrap();
-    let (v, vb) = meshopt::load_merged(&glb, None).unwrap();
-    assert_eq!(v.images[0].uri.as_deref(), Some("grid.png"));
-    // Same triangles, same winding; the index codec may rotate a triangle's vertices.
-    let (ia, ib) = (
-        read_indices(&o, &ob, 3).unwrap(),
-        read_indices(&v, &vb, 3).unwrap(),
+    // The `.gltf` has a final `not-glb` record and no entry.
+    assert!(!built.entries.contains_key("bafkgltf"));
+    let gltf_row = built
+        .stats
+        .model_files
+        .iter()
+        .find(|r| r.hash == "bafkgltf")
+        .unwrap();
+    assert_eq!(gltf_row.reason, Some(glbbr::NoModelVariant::NotGlb));
+    let gltf_rec = key_path(&out, &record_key(&format!("bevy/m{MESH_GEN}/bafkgltf"))).unwrap();
+    assert_eq!(
+        Record::parse(&std::fs::read(&gltf_rec).unwrap())
+            .unwrap()
+            .reason
+            .as_deref(),
+        Some("not-glb")
     );
-    assert!(meshopt::same_triangles(&ia, &ib).is_ok());
-    let (a, b) = (
-        read_accessor_f32(&o, &ob, 0).unwrap(),
-        read_accessor_f32(&v, &vb, 0).unwrap(),
-    );
-    for (ra, rb) in a.iter().zip(&b) {
-        for (x, y) in ra.iter().zip(rb) {
-            assert!((x - y).abs() <= 1e-3, "{x} vs {y}");
-        }
-    }
     // Stats: one row per model, totals, stage times.
     let st = &built.stats;
-    assert_eq!(st.glb_meshopt.considered, 2);
-    assert_eq!(st.glb_meshopt.variants + st.glb_meshopt.size_gated.count, 2);
-    assert_eq!(st.glb_meshopt.variant_bytes, glb.len() as u64);
-    assert_eq!(st.glb_meshopt.br_bytes, br.len() as u64);
-    assert!(st.stages.meshopt_ns > 0 && st.stages.brotli_ns > 0);
+    let mv = &st.model_variants;
+    assert_eq!(mv.considered, 3);
+    assert_eq!(mv.variants + mv.size_gated.count, 2);
+    assert_eq!(mv.no_variant.get("not-glb"), Some(&1));
+    assert_eq!(mv.variants_original_bytes, mv.variant_bytes);
+    assert!(mv.variant_bytes >= grid.len() as u64);
+    assert!(mv.br_bytes >= br.len() as u64);
+    assert!(st.stages.brotli_ns > 0);
     let row = st
         .model_files
         .iter()
@@ -1095,7 +1072,7 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
         .unwrap();
     assert_eq!(
         (row.format, row.br_size),
-        (Some("glb-meshopt"), Some(br.len() as u64))
+        (Some("glb-br"), Some(br.len() as u64))
     );
     assert!(st.summary_json().get("model_files").is_none());
     assert_eq!((st.reused_models, st.reused_textures), (0, 0));
@@ -1126,10 +1103,10 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
     assert_eq!(again.manifest_bytes, built.manifest_bytes);
     assert_eq!(fetches.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert!(again.uploads.is_empty());
-    assert_eq!(again.stats.reused_models, 2);
+    assert_eq!(again.stats.reused_models, 3);
     assert_eq!(again.stats.reused_textures, 1);
     assert_eq!(again.stats.unique_variants, 0);
-    assert!(again.stats.stages.meshopt_ns == 0 && again.stats.stages.probe_ns > 0);
+    assert!(again.stats.stages.brotli_ns == 0 && again.stats.stages.probe_ns > 0);
     let row = again
         .stats
         .model_files
@@ -1137,27 +1114,19 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
         .find(|r| r.hash == "bafkgrid")
         .unwrap();
     assert!(row.reused && row.variant_path.as_deref() == Some(entry.path.as_str()));
-    // The size-gated model's record is reused too: its reason survives the round trip.
+    // The `.gltf`'s negative record is reused too: its reason survives the round trip.
     let gated = again
         .stats
         .model_files
         .iter()
-        .find(|r| r.hash == "bafkquad")
+        .find(|r| r.hash == "bafkgltf")
         .unwrap();
     assert!(gated.reused);
-    assert_eq!(
-        gated.reason,
-        st.model_files
-            .iter()
-            .find(|r| r.hash == "bafkquad")
-            .unwrap()
-            .reason
-    );
+    assert_eq!(gated.reason, Some(glbbr::NoModelVariant::NotGlb));
 
     // The lane's probe answers for keys that are not on disk: a record from elsewhere fills
     // the row without a fetch, and a negative record stops the encode.
-    let out5 =
-        std::env::temp_dir().join(format!("abgen-bevy-meshopt-probe-{}", std::process::id()));
+    let out5 = std::env::temp_dir().join(format!("abgen-bevy-models-probe-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out5);
     let remote_entry = entry.clone();
     let remote = move |key: &str| -> Option<Record> {
@@ -1208,20 +1177,23 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
         .find(|f| f.hash == "bafkgridpng")
         .unwrap();
     assert!(png.reused && png.reason == Some(NoVariant::SizeGate));
-    // Only the quad model (no record anywhere) was fetched.
-    assert_eq!(fetches.load(std::sync::atomic::Ordering::Relaxed), 1);
-    assert!(probed.uploads.iter().all(|u| u.key.contains("/bafkquad")));
+    // Only the quad and the `.gltf` (no record anywhere) were fetched.
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert!(probed
+        .uploads
+        .iter()
+        .all(|u| u.key.contains("/bafkquad") || u.key.contains("/bafkgltf")));
     let _ = std::fs::remove_dir_all(&out5);
 
     // Off: no model entries at all.
-    let out2 = std::env::temp_dir().join(format!("abgen-bevy-meshopt-off-{}", std::process::id()));
+    let out2 = std::env::temp_dir().join(format!("abgen-bevy-models-off-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out2);
     let built2 = build_entity_variants(
         &scene,
         &lane,
         &out2,
         BuildOptions {
-            glb_meshopt: false,
+            models: false,
             ..BuildOptions::default()
         },
     )
@@ -1232,16 +1204,30 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
         .flatten()
         .all(|e| e.kind == "texture"));
     assert!(built2.stats.model_files.is_empty());
+    // Without `.br` sidecars there are no model variants either.
+    let _ = std::fs::remove_dir_all(&out2);
+    let built3 = build_entity_variants(
+        &scene,
+        &lane,
+        &out2,
+        BuildOptions {
+            precompress_br: false,
+            ..BuildOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(built3.stats.model_files.is_empty());
+    assert!(!built3.manifest.lanes.contains_key("mesh"));
     let _ = std::fs::remove_dir_all(&out);
     let _ = std::fs::remove_dir_all(&out2);
 }
 
-/// A variant first built without a `.br` sidecar gets one once precompression is on: the
-/// sidecar is written and listed for upload before the replaced record (`br: true`), and
-/// nothing is fetched or re-encoded.
+/// A reused model variant whose record says it has no `.br` sidecar (the sidecar was lost, or
+/// the record predates it) gets one: the sidecar is written and listed for upload before the
+/// replaced record (`br: true`), and nothing is fetched.
 #[test]
-fn reused_meshopt_variant_without_br_gets_a_sidecar_without_a_fetch() {
-    use super::meshopt;
+fn reused_model_variant_without_br_gets_a_sidecar_without_a_fetch() {
+    use super::glbbr;
     let grid = grid_glb(24);
     let scene = scene_of("bafkentitybr", &[("models/grid.glb", "bafkgrid")]);
     let fetches = std::sync::atomic::AtomicUsize::new(0);
@@ -1258,21 +1244,17 @@ fn reused_meshopt_variant_without_br_gets_a_sidecar_without_a_fetch() {
     };
     let out = std::env::temp_dir().join(format!("abgen-bevy-backfill-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
-    let plain = BuildOptions {
-        precompress_br: false,
-        ..BuildOptions::default()
-    };
-    let first = build_entity_variants(&scene, &lane, &out, plain).unwrap();
+    let first = build_entity_variants(&scene, &lane, &out, BuildOptions::default()).unwrap();
     let entry = first.entries["bafkgrid"][0].clone();
     let vpath = key_path(&out, &entry.path).unwrap();
-    let br_path = meshopt::br_sidecar(&vpath);
-    assert!(!br_path.exists());
+    let br_path = glbbr::br_sidecar(&vpath);
     let rec_path = key_path(&out, &record_key(&entry.path)).unwrap();
-    assert!(
-        !Record::parse(&std::fs::read(&rec_path).unwrap())
-            .unwrap()
-            .br
-    );
+    // Drop the sidecar and say so in the record.
+    std::fs::remove_file(&br_path).unwrap();
+    let mut rec = Record::parse(&std::fs::read(&rec_path).unwrap()).unwrap();
+    assert!(rec.br);
+    rec.br = false;
+    std::fs::write(&rec_path, serde_json::to_vec(&rec).unwrap()).unwrap();
 
     fetches.store(0, std::sync::atomic::Ordering::Relaxed);
     let again = build_entity_variants(&scene, &lane, &out, BuildOptions::default()).unwrap();
@@ -1281,7 +1263,7 @@ fn reused_meshopt_variant_without_br_gets_a_sidecar_without_a_fetch() {
     assert_eq!(again.stats.unique_variants, 0);
     let plain_bytes = std::fs::read(&vpath).unwrap();
     assert_eq!(
-        meshopt::brotli_decompress(&std::fs::read(&br_path).unwrap()).unwrap(),
+        glbbr::brotli_decompress(&std::fs::read(&br_path).unwrap()).unwrap(),
         plain_bytes
     );
     assert!(
@@ -1419,13 +1401,13 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
         let built = build_entity_variants(&scene, &lane, &out, opts).unwrap();
         (out, built)
     };
-    // Default: texture and glb-meshopt variants with `.br` sidecars (GLB variants with KTX2
+    // Default: texture and `glb-br` model variants (GLB variants with KTX2
     // inside are opt-in).
     assert_eq!(
         BuildOptions::default(),
         BuildOptions {
             glb_variants: false,
-            glb_meshopt: true,
+            models: true,
             precompress_br: true,
             zstd_level: crate::ktx2_write::DEFAULT_ZSTD_LEVEL,
             epoch: None,
@@ -1433,7 +1415,7 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     );
     // These runs look at textures only.
     let textures_only_opts = BuildOptions {
-        glb_meshopt: false,
+        models: false,
         ..BuildOptions::default()
     };
     let (out, built) = run("a", textures_only_opts);

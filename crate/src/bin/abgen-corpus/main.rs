@@ -116,7 +116,7 @@ fn usage_text() -> &'static str {
               worlds-content-server;\n               \
               fetches scene entities + content into the store, then converts)\n  \
          abgen-corpus (--world <name>[,...] | --entity-ids <ids.txt> | --pointer <p>) <out-dir> \\\n               \
-             --bevy-variants [--bevy-glb-variants] [--bevy-no-glb-meshopt] [--bevy-precompress br|none]\n               \
+             --bevy-variants [--bevy-glb-variants] [--bevy-no-models] [--bevy-precompress br|none]\n               \
              [--bevy-zstd-level 1..19] [--worlds-url <url>] [--fetch-missing] [--content-dir <dir>] [-j JOBS]\n               \
              (PROTOTYPE: builds only the Bevy variants lane - KTX2/GLB variants named by\n               \
               source CID and generation plus one manifest per entity - into <out-dir>/bevy/,\n               \
@@ -299,7 +299,7 @@ fn run() -> Result<()> {
     let mut gpu_flag = false;
     let mut bevy_variants = false;
     let mut bevy_glb_variants = false;
-    let mut bevy_no_glb_meshopt = false;
+    let mut bevy_no_models = false;
     let mut bevy_precompress_br: Option<bool> = None;
     let mut bevy_zstd_level: Option<i32> = None;
     let mut i = 0;
@@ -430,8 +430,8 @@ fn run() -> Result<()> {
             "--bevy-glb-variants" => {
                 bevy_glb_variants = true;
             }
-            "--bevy-no-glb-meshopt" => {
-                bevy_no_glb_meshopt = true;
+            "--bevy-no-models" => {
+                bevy_no_models = true;
             }
             "--bevy-precompress" => {
                 i += 1;
@@ -474,13 +474,13 @@ fn run() -> Result<()> {
         client_mode = true;
     }
     if (bevy_glb_variants
-        || bevy_no_glb_meshopt
+        || bevy_no_models
         || bevy_precompress_br.is_some()
         || bevy_zstd_level.is_some())
         && !bevy_variants
     {
         eprintln!(
-            "error: --bevy-glb-variants, --bevy-no-glb-meshopt, --bevy-precompress and \
+            "error: --bevy-glb-variants, --bevy-no-models, --bevy-precompress and \
              --bevy-zstd-level require --bevy-variants"
         );
         usage();
@@ -669,7 +669,7 @@ fn run() -> Result<()> {
                 &store,
                 &out_root,
                 bevy_glb_variants,
-                bevy_no_glb_meshopt,
+                bevy_no_models,
                 bevy_precompress_br,
                 bevy_zstd_level,
             );
@@ -773,7 +773,7 @@ fn run() -> Result<()> {
                 &store,
                 &out_root,
                 bevy_glb_variants,
-                bevy_no_glb_meshopt,
+                bevy_no_models,
                 bevy_precompress_br,
                 bevy_zstd_level,
             );

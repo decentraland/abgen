@@ -279,15 +279,15 @@ request waits up to the deadline, builds finish in the background. Knobs: `ABGEN
 ### Bevy variants lane (prototype)
 Per entity (scene, wearable or emote), a manifest mapping each original content CID to the paths
 of its GPU-ready variants for the Bevy explorer. A path's prefix letter is its class (`t` BC KTX2,
-`m` `glb-meshopt`, `g` GLB); the KTX2 header carries the BC format and size. The full entry of a
+`m` `glb-br`, `g` GLB); the KTX2 header carries the BC format and size. The full entry of a
 variant (its CID, format, dimensions, size) lives in its record beside it, which is never served:
 a key's bytes are immutable within its generation and served `immutable`, so the client trusts
 the path. The client loads a variant when the manifest lists one it supports and falls back to
 the original file on anything else, so the lane can be switched off at any time. Built by
 `crate/src/bevyvariants` (feature `bevy-variants`, on with `server`).
 
-- `GET /bevy/manifest/{entity}.json` - `{"v":3,"lanes":{"mesh":"m1","texture":"t2"},"files":{"<original cid>":["bevy/t2/<original cid>_srgb"]}}`
-  (at most one path per class per original: a texture, a `glb-meshopt`, and a `glb` only when GLB
+- `GET /bevy/manifest/{entity}.json` - `{"v":3,"lanes":{"mesh":"m2","texture":"t2"},"files":{"<original cid>":["bevy/t2/<original cid>_srgb"]}}`
+  (at most one path per class per original: a texture, a `glb-br`, and a `glb` only when GLB
   variants are on). 404 while absent, and while every copy on disk was built from an older
   generation or schema (`X-Abgen-Reason: bevy-variants-stale`, see the asset lane below).
   Nothing is built on request: the conversion lambda builds the lane for each entity after its
@@ -296,7 +296,7 @@ the original file on anything else, so the lane can be switched off at any time.
   `Cache-Control: private, max-age=0, no-cache`.
 - `GET /bevy/{prefix}/{name}` (an entry's `path`) - variant bytes, `public,max-age=31536000,immutable`,
   `Range`, `ETag`, CORS (preflight allows `X-IPFS`). Never built on its own: it exists once a
-  manifest naming it does. When the variant has a Brotli sidecar (`{name}.br`, see `glb-meshopt`
+  manifest naming it does. When the variant has a Brotli sidecar (`{name}.br`, see `glb-br`
   below) and the request's `Accept-Encoding` includes `br`, the sidecar's bytes are sent with
   `Content-Encoding: br`; such responses carry `Vary: Accept-Encoding` either way. The CID is always
   of the plain bytes. The record beside a variant (`{name}.json`) is never served.
@@ -313,10 +313,11 @@ doing any work and looks for its record the way the Unity lanes probe
 - textures: `bevy/t{TEX_GEN}/{sourceCid}_{slot}`, `slot` = `srgb` | `linear` | `normal` (how the
   entity's models sample the image; the same image used differently in two scenes is two
   variants). A Zstandard level other than the default is part of the prefix (`t2z9`).
-- `glb-meshopt` models: `bevy/m{MESH_GEN}/{sourceCid}`; a `.gltf` source gets a digest of the
+- `glb-br` models: `bevy/m{MESH_GEN}/{sourceCid}` (a `.gltf` source only ever gets a `not-glb`
+  record there).
+- GLB variants (opt-in): `bevy/g{TEX_GEN}/{sourceCid}`; a `.gltf` source gets a digest of the
   external `.bin` buffers it inlines appended (`{sourceCid}_{16 hex}`), the same `.gltf` beside
   different `.bin` files being two variants. Image URIs are left untouched, so they are not inputs.
-- GLB variants (opt-in): `bevy/g{TEX_GEN}/{sourceCid}`.
 
 Beside every variant sits its record, `{name}.json`: the manifest entry (`variant`) or the reason
 there is none (`reason`: `size-gate`, `tiny`, `decode-error`, …, so a file that cannot have a
@@ -339,19 +340,19 @@ may have died before uploading). The offline build (`abgen-corpus --bevy-variant
 in its output directory.
 
 Versioning is two integers in `crate/src/bevyvariants/mod.rs`: `TEX_GEN` (BC encoders, mips,
-size cap, KTX2 writer, UASTC transcode) and `MESH_GEN` (meshopt codecs, filters, precision, GLB
-rewrite). Bump one when its encoder's output bytes change: every key of that class moves to a new
+size cap, KTX2 writer, UASTC transcode) and `MESH_GEN` (model variants: 2 = the original `.glb`
+plus its `.br` sidecar). Bump one when its encoder's output bytes change: every key of that class moves to a new
 prefix, the previous prefix (`bevy/t1/`, …) is garbage and can be deleted whole, and manifests
 built from it (their `lanes` name it) read as stale until the entity's next build, which re-encodes only that class.
 The generations live in code because they describe the encoders. The operator's lever is
 `ABGEN_BEVY_EPOCH` (unset by default; a number `0..=9999`): when set, every prefix gets `e{N}`
-appended (`t2e2`, `m1e2`), so every key misses, every manifest reads as stale and the lane
+appended (`t2e2`, `m2e2`), so every key misses, every manifest reads as stale and the lane
 re-encodes into the new prefixes, without a release. Setting it back finds the old prefixes again.
 No per-recipe digests: skins, animations and textures referenced by a model do not change the
 model variant's bytes, so they are not in its name. The option toggles
-(`glb_meshopt`, `glb_variants`, `precompress_br`) are not generations: a reused `glb-meshopt`
-variant whose record has no `.br` sidecar gets one added while precompression is on, without a
-re-encode, and turning it off leaves existing sidecars in place.
+(`models`, `glb_variants`, `precompress_br`) are not generations: a reused `glb-br` variant whose
+record has no `.br` sidecar gets one added, and turning precompression off stops building model
+variants but leaves existing sidecars in place.
 
 Variants (all textures are KTX2 with UNORM BC blocks, each level Zstandard-supercompressed,
 `KTXorientation` `rd`; writer in `crate/src/ktx2_write.rs`). Zstandard is libzstd 1.5.7, bundled by
@@ -381,25 +382,17 @@ release, never on the machine or thread count; a new libzstd release is a `TEX_G
   variant of their own. When on, `.glb`/`.gltf` become a GLB with Draco decoded, `KHR_texture_basisu` resolved to a core
   `source` (an existing PNG/JPEG `source` wins), external buffers inlined and every embedded image
   replaced by its texture variant (`image/ktx2`, rules above). External image URIs are left as
-  they are. A model nothing changes in gets no variant; `EXT_meshopt_compression` models are not
-  handled yet.
-- `glb-meshopt` models, **on by default** (`ABGEN_BEVY_GLB_MESHOPT=0` on the server,
-  `--bevy-no-glb-meshopt` on `abgen-corpus`, independent of the GLB variants above): every
-  `.glb`/`.gltf` becomes a GLB whose triangle meshes are `EXT_meshopt_compression` streams
-  (vertex and index codecs; EXPONENTIAL positions and UVs with the bits chosen per stream so the
-  error stays within 2^-11 units (0.49 mm) and 2^-15, OCTAHEDRAL 10-bit normals and tangents as
-  normalized shorts; `KHR_mesh_quantization` is declared too) and nothing else is touched: images,
-  their bufferViews and MIME types, external image URIs, materials, animations and extras stay as
-  they are (external `.bin` buffers are inlined, because the meshes live there). Draco primitives
-  are left alone; a file already using `EXT_meshopt_compression` gets none. The variant is kept
-  only when smaller than the original. Each one is also stored as `{name}.br` beside it (on by
-  default; `ABGEN_BEVY_PRECOMPRESS=none` or `--bevy-precompress none` turns it off) (Brotli quality 9, window 22)
-  for the route above; KTX2 variants are never Brotli'd. On a
-  read-through miss the edge fetches the sidecar beside the variant when the client accepts
-  `br`. `cargo run --release --example
-  bevy-geometry-check -- <bevy-variants-stats.json> <out> <files-dir>` decodes
-  every variant and compares it with its original (indices identical; positions within 1 mm,
-  normals and tangents within 1 degree, UVs within 1/16384).
+  they are. A model nothing changes in gets no variant; models whose meshes are already compressed by
+  an extension other than Draco are not handled yet.
+- `glb-br` models (format `glb-br`, class `m`, generation 2), **on by default**
+  (`ABGEN_BEVY_MODELS=0` on the server, `--bevy-no-models` on `abgen-corpus`, independent of the
+  GLB variants above): every `.glb` gets a variant that is the original `.glb`, byte for byte,
+  plus its Brotli sidecar `{name}.br` (quality 9, window 22) for the route above. Geometry is not
+  re-encoded, so the client needs only its glTF loader. The variant is kept only when the sidecar
+  is smaller than the original (`size-gate` otherwise); a `.gltf` gets none (`not-glb`). Without
+  precompression (`ABGEN_BEVY_PRECOMPRESS=none` or `--bevy-precompress none`) no model variants
+  are built, since the sidecar is all they add. KTX2 variants are never Brotli'd. On a
+  read-through miss the edge fetches the sidecar beside the variant when the client accepts `br`.
 - nothing for scene code, source maps, audio, video or display-only thumbnails.
 
 Rows are top-down (Bevy and glTF's top-left UV origin), unlike the Unity lanes, which flip.
@@ -412,10 +405,10 @@ ABGEN_OUT_ROOT=./out ./target/release/abgen   # serves /bevy/manifest/... and /b
 A second run into the same `./out` (or another entity sharing files) reuses every variant whose
 record is there and encodes only the rest. `abgen-corpus --bevy-variants` prints one
 `BEVY_STATS {json}` line per entity (stage times summed over files - probe, fetch, decode, resize,
-BC1/BC5/BC7 encode with mips, the BC1 PSNR check, UASTC->BC7 transcode, zstd, meshopt, brotli,
+BC1/BC5/BC7 encode with mips, the BC1 PSNR check, UASTC->BC7 transcode, zstd, brotli,
 hash+write - counts and bytes by format and source, no-variant reasons, size-gated variants by
-format, BC1 rejections, `reused_textures` / `reused_models`, and the `glb_meshopt` totals: models,
-variant and `.br` bytes, size-gated attempts) and writes the full stats, per-file rows included, to
+format, BC1 rejections, `reused_textures` / `reused_models`, and the `model_variants` totals:
+models, variant and `.br` bytes, size-gated attempts) and writes the full stats, per-file rows included, to
 `./out/bevy-variants-stats.json`.
 ### LOD JIT lane
 `ABGEN_LOD_JIT=1` enables JIT LOD builds on `GET /LOD/1/...` misses (level 1 only, the production
