@@ -1,7 +1,7 @@
 #[cfg(feature = "web-pack")]
 pub mod emit;
 #[cfg(feature = "web-pack")]
-pub(crate) mod meshcomp;
+mod meshcomp;
 pub mod pack;
 
 #[cfg(feature = "web-pack")]

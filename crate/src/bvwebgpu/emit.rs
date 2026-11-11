@@ -692,7 +692,7 @@ pub(crate) fn transform_glb(
     }
 
     let mesh_plan = if mesh_compress {
-        super::meshcomp::plan(&root, &merged, super::meshcomp::Precision::PACK)
+        super::meshcomp::plan(&root, &merged)
     } else {
         None
     };
