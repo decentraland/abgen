@@ -334,8 +334,9 @@ fail-open), the store (one GET, then marked in Redis). A hit fills the manifest 
 fetches and encodes. Outcomes that depend on the run (content missing, a failed write) are never
 recorded. Writes go variant bytes, `.br`, record (then its Redis mark), and the manifest last, so
 the store never names an object that is not there; a key whose objects did not all land is
-dropped whole, and if any upload fails the manifest is not written, so the next conversion of
-the entity tries again. Records left in its output directory are not trusted (an earlier run
+dropped whole, and if any upload fails, or any file could not be fetched or encoded, the
+manifest is not written (what did build is still uploaded): no manifest means the client uses
+the originals, and the next conversion of the entity tries again. Records left in its output directory are not trusted (an earlier run
 may have died before uploading). The offline build (`abgen-corpus --bevy-variants`) uses only the records
 in its output directory.
 

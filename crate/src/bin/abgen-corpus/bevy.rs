@@ -43,6 +43,8 @@ pub(crate) fn run_bevy_variants(
     let mut originals = 0usize;
     let mut variants = 0usize;
     let mut reused = 0u64;
+    // Entities with a file that could not be fetched or built: no manifest, so not done.
+    let mut incomplete = 0usize;
     for id in ids {
         let built = (|| -> Result<abgen::bevyvariants::BuildOutput> {
             let raw = store
@@ -74,6 +76,9 @@ pub(crate) fn run_bevy_variants(
                 let mut summary = o.stats.summary_json();
                 if let Some(obj) = summary.as_object_mut() {
                     obj.insert("entity".into(), serde_json::Value::String(id.clone()));
+                    if !o.incomplete.is_empty() {
+                        obj.insert("incomplete".into(), serde_json::json!(o.incomplete));
+                    }
                 }
                 println!("BEVY_STATS {summary}");
                 let mut full = serde_json::to_value(&o.stats)?;
@@ -85,6 +90,16 @@ pub(crate) fn run_bevy_variants(
                 originals += o.entries.len();
                 variants += o.stats.unique_variants as usize;
                 reused += o.stats.reused_textures + o.stats.reused_models;
+                if !o.incomplete.is_empty() {
+                    incomplete += 1;
+                    errs += 1;
+                    eprintln!(
+                        "bevy: {id}: {} files could not be fetched or built ({}); manifest not written",
+                        o.incomplete.len(),
+                        o.incomplete.join(", ")
+                    );
+                    continue;
+                }
                 eprintln!(
                     "bevy: {id}: {} originals, {} variants built, {} reused -> {}",
                     o.entries.len(),
@@ -115,7 +130,7 @@ pub(crate) fn run_bevy_variants(
     std::fs::write(&stats_path, serde_json::to_vec_pretty(&doc)?)
         .with_context(|| format!("write {}", stats_path.display()))?;
     println!(
-        "DONE bevy-variants entities={} originals={originals} variants={variants} reused={reused} errs={errs} zstd_level={} wall_ms={} stats={}",
+        "DONE bevy-variants entities={} originals={originals} variants={variants} reused={reused} incomplete={incomplete} errs={errs} zstd_level={} wall_ms={} stats={}",
         ids.len(),
         opts.zstd_level,
         started.elapsed().as_millis(),

@@ -180,8 +180,15 @@ pub struct BuildOutput {
     /// Original CID -> the full entry of each variant (what the records hold; the manifest
     /// lists only their paths).
     pub entries: BTreeMap<String, Vec<VariantEntry>>,
-    /// The manifest exactly as written to `bevy/manifest/{entity}.json`.
+    /// The manifest exactly as written to `bevy/manifest/{entity}.json` (when the build is
+    /// complete; otherwise what it would have been, and nothing is written).
     pub manifest_bytes: Vec<u8>,
+    /// The files (content paths) whose outcome is not final: a content fetch failed, an encode
+    /// failed or panicked, or a model whose image uses were needed could not be read. Empty for
+    /// a complete build. When not empty the manifest is not written (and an older one at its
+    /// path is removed): no manifest tells the client to use the originals, and the entity's
+    /// next build retries these files, reusing everything else from its records.
+    pub incomplete: Vec<String>,
     /// Everything this build wrote besides the manifest, in upload order. Reused variants are
     /// not here: they are already where the probe found them.
     pub uploads: Vec<Upload>,
@@ -478,12 +485,16 @@ struct ModelOut {
     uploads: Vec<Upload>,
     /// Image URI -> use, from the mesh record or the bytes.
     uses: BTreeMap<String, ImageUse>,
+    /// Some outcome of this model is not final (see [`BuildOutput::incomplete`]).
+    incomplete: bool,
 }
 
 /// Build every variant of `scene` and its manifest under `out_root`, in the served layout.
 /// Per-file failures are logged and leave that file without a variant; only I/O errors on
 /// `out_root` fail the build. Variants and records are written before the manifest, so a
-/// manifest on disk never names a variant that is not.
+/// manifest on disk never names a variant that is not. A file whose outcome is not final (a
+/// failed fetch or encode) makes the build incomplete ([`BuildOutput::incomplete`]): what did
+/// build is still written, but the manifest is not.
 pub fn build_entity_variants(
     scene: &Scene,
     lane: &Lane,
@@ -548,6 +559,7 @@ pub fn build_entity_variants(
                 stat: None,
                 uploads: Vec::new(),
                 uses: BTreeMap::new(),
+                incomplete: false,
             };
             let mut uses_known = false;
 
@@ -598,7 +610,10 @@ pub fn build_entity_variants(
                     }
                 } else {
                     match ensure_bytes(&mut bytes, &mut fetched, fetch, hash, &mut times) {
-                        None => stat.reason = Some(NoModelVariant::Missing),
+                        None => {
+                            stat.reason = Some(NoModelVariant::Missing);
+                            out.incomplete = true;
+                        }
                         Some(b) => {
                             stat.original_size = b.len() as u64;
                             out.uses = uses_by_uri(b, ext, Some(&resolve));
@@ -645,6 +660,7 @@ pub fn build_entity_variants(
                                 }
                                 Err(reason) => {
                                     stat.reason = Some(reason);
+                                    out.incomplete |= !model_reason_is_final(reason);
                                     if model_reason_is_final(reason) {
                                         let rec = Record {
                                             v: RECORD_VERSION,
@@ -668,6 +684,8 @@ pub fn build_entity_variants(
                 // A `.gltf` names its buffers in its JSON: read it to name the variant.
                 let name = if ext == ".gltf" {
                     let b = ensure_bytes(&mut bytes, &mut fetched, fetch, hash, &mut times);
+                    // Unread, its name (and so its key) is not known.
+                    out.incomplete |= b.is_none();
                     model_name(hash, file, b, &content_by_file)
                 } else {
                     hash.to_string()
@@ -722,17 +740,25 @@ pub fn build_entity_variants(
                         }
                         Ok(Err(e)) => {
                             tracing::warn!(entity = %entity, file = %file, error = %format!("{e:#}"), "bevy model variant skipped");
+                            out.incomplete = true;
                         }
                         Err(_) => {
                             tracing::warn!(entity = %entity, file = %file, "bevy model variant panicked; skipped");
+                            out.incomplete = true;
                         }
                     }
+                } else {
+                    // Not fetched: no outcome for this key.
+                    out.incomplete = true;
                 }
             }
 
             if !uses_known {
-                if let Some(b) = ensure_bytes(&mut bytes, &mut fetched, fetch, hash, &mut times) {
-                    out.uses = uses_by_uri(b, ext, Some(&resolve));
+                // Without the model its images' slots are unknown, and the defaults may be
+                // wrong (a normal map encoded as sRGB): the build is not complete.
+                match ensure_bytes(&mut bytes, &mut fetched, fetch, hash, &mut times) {
+                    Some(b) => out.uses = uses_by_uri(b, ext, Some(&resolve)),
+                    None => out.incomplete = true,
                 }
             }
             if let Some(s) = out.stat.as_mut() {
@@ -886,6 +912,17 @@ pub fn build_entity_variants(
     let mut files: BTreeMap<String, Vec<VariantEntry>> = BTreeMap::new();
     let mut uploads: Vec<Upload> = tex_uploads.into_iter().flatten().collect();
     let mut model_stats: Vec<ModelStat> = Vec::with_capacity(model_outs.len());
+    let mut incomplete: Vec<String> = file_stats
+        .iter()
+        .filter(|s| s.reason.is_some_and(|r| !texture_reason_is_final(r)))
+        .map(|s| s.file.clone())
+        .collect();
+    for (&(_, file), m) in models.iter().zip(&model_outs) {
+        if m.incomplete {
+            incomplete.push(file.to_string());
+        }
+    }
+    incomplete.sort();
     for (hash, entries) in textures {
         if !entries.is_empty() {
             files.insert(hash, entries);
@@ -907,7 +944,20 @@ pub fn build_entity_variants(
             .collect(),
     };
     let manifest_bytes = serde_json::to_vec(&manifest).context("serialize manifest")?;
-    write_atomic(&manifest_dst, &manifest_bytes)?;
+    if incomplete.is_empty() {
+        write_atomic(&manifest_dst, &manifest_bytes)?;
+    } else {
+        tracing::warn!(entity = %entity, files = ?incomplete, "bevy variants: incomplete build; manifest not written");
+        // An older manifest here was not built from everything this build needs (or it would
+        // have reused its records instead of fetching): nothing serves a partial manifest.
+        match std::fs::remove_file(&manifest_dst) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("remove {}", manifest_dst.display()));
+            }
+        }
+    }
     let mut stats = BuildStats::from_files(file_stats, opts.zstd_level, started.elapsed());
     stats.models = models.len() as u64;
     stats.add_models(model_stats);
@@ -926,6 +976,7 @@ pub fn build_entity_variants(
         manifest,
         entries: files,
         manifest_bytes,
+        incomplete,
         uploads,
         stats,
     })

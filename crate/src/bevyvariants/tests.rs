@@ -1487,12 +1487,14 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
             .exists()
     );
 
-    // The manifest on disk is the returned bytes and parses back to the same value.
-    let on_disk = std::fs::read(manifest_path(&out, "bafkentity").unwrap()).unwrap();
-    assert_eq!(on_disk, built.manifest_bytes);
-    let parsed: Manifest = serde_json::from_slice(&on_disk).unwrap();
+    // The missing image leaves the build incomplete: everything else is written, the manifest
+    // is not (a rebuild once it can be fetched writes it).
+    assert_eq!(built.incomplete, vec!["missing.png".to_string()]);
+    assert!(!manifest_path(&out, "bafkentity").unwrap().exists());
+    // The manifest bytes parse back to the same value.
+    let parsed: Manifest = serde_json::from_slice(&built.manifest_bytes).unwrap();
     assert_eq!(&parsed, manifest);
-    let raw: J = serde_json::from_slice(&on_disk).unwrap();
+    let raw: J = serde_json::from_slice(&built.manifest_bytes).unwrap();
     assert_eq!(
         raw,
         json!({"v": 3, "lanes": textures_only_opts.lanes(), "files": manifest.files})
@@ -1674,5 +1676,164 @@ fn local_records_do_not_count_for_a_store_backed_build() {
     let local = build_entity_variants(&scene, &lane(true), &out, BuildOptions::default()).unwrap();
     assert_eq!(fetches.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert!(local.uploads.is_empty());
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A texture whose content cannot be fetched leaves the build incomplete: the other variants
+/// and records are written, the manifest is not (and an older one is removed). Once the fetch
+/// works, the rebuild encodes only that texture and writes the manifest.
+#[test]
+fn texture_fetch_failure_writes_no_manifest_until_a_rebuild_completes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut blobs: HashMap<&str, Vec<u8>> = HashMap::new();
+    blobs.insert("bafkgridpng", noise_png_bytes(64, 64));
+    blobs.insert("bafklate", noise_png_bytes(64, 64));
+    let scene = scene_of(
+        "bafkentityinc",
+        &[
+            ("tex/grid.png", "bafkgridpng"),
+            ("tex/late.png", "bafklate"),
+        ],
+    );
+    let late_ok = AtomicBool::new(false);
+    let fetches = std::sync::Mutex::new(Vec::<String>::new());
+    let fetch = |h: &str| {
+        fetches.lock().unwrap().push(h.to_string());
+        if h == "bafklate" && !late_ok.load(Ordering::Relaxed) {
+            return None;
+        }
+        blobs.get(h).cloned()
+    };
+    let probe = |_: &str| None;
+    let lane = Lane {
+        fetch: &fetch,
+        probe: &probe,
+        stored: &|_: &str| -> Option<Vec<u8>> { None },
+        local_records: true,
+    };
+    let out = std::env::temp_dir().join(format!("abgen-bevy-incomplete-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    let mpath = manifest_path(&out, "bafkentityinc").unwrap();
+    std::fs::create_dir_all(mpath.parent().unwrap()).unwrap();
+    std::fs::write(&mpath, b"{}").unwrap();
+
+    let first = build_entity_variants(&scene, &lane, &out, BuildOptions::default()).unwrap();
+    assert_eq!(first.incomplete, vec!["tex/late.png".to_string()]);
+    assert!(!mpath.exists());
+    // The grid's variant and record are written and listed for upload; the failed fetch has
+    // no record.
+    let grid = first.entries["bafkgridpng"][0].clone();
+    assert!(key_path(&out, &grid.path).unwrap().is_file());
+    assert!(key_path(&out, &record_key(&grid.path)).unwrap().is_file());
+    assert!(first.uploads.iter().all(|u| u.owner == grid.path));
+    assert!(!first.entries.contains_key("bafklate"));
+    assert!(
+        !key_path(&out, &format!("bevy/t{TEX_GEN}/bafklate_srgb.json"))
+            .unwrap()
+            .exists()
+    );
+
+    // The fetch works now: only the late texture is fetched and encoded, and the manifest is
+    // written.
+    late_ok.store(true, Ordering::Relaxed);
+    fetches.lock().unwrap().clear();
+    let again = build_entity_variants(&scene, &lane, &out, BuildOptions::default()).unwrap();
+    assert!(again.incomplete.is_empty());
+    assert_eq!(*fetches.lock().unwrap(), vec!["bafklate".to_string()]);
+    assert_eq!(again.entries["bafkgridpng"][0], grid);
+    let late = &again.entries["bafklate"][0];
+    assert!(again.uploads.iter().all(|u| u.owner == late.path));
+    assert_eq!(std::fs::read(&mpath).unwrap(), again.manifest_bytes);
+    assert_eq!(
+        again.manifest.files.keys().collect::<Vec<_>>(),
+        vec!["bafkgridpng", "bafklate"]
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A model whose content cannot be fetched leaves its images' slots unknown: the build is
+/// incomplete and writes no manifest, though the textures' variants and records (correct for
+/// the keys they are under) are written. Once the model can be fetched, the rebuild reads its
+/// uses, encodes the normal map in its slot and writes the manifest; the unrelated texture is
+/// reused.
+#[test]
+fn model_fetch_failure_writes_no_manifest_until_a_rebuild_completes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let gltf = serde_json::to_vec(&json!({
+        "asset": {"version": "2.0"},
+        "images": [{"uri": "../tex/normal.png"}],
+        "textures": [{"source": 0}],
+        "materials": [{"normalTexture": {"index": 0}}]
+    }))
+    .unwrap();
+    let mut blobs: HashMap<&str, Vec<u8>> = HashMap::new();
+    blobs.insert("bafkmodel", gltf);
+    blobs.insert("bafknormal", noise_png_bytes(64, 64));
+    blobs.insert("bafkcolor", smooth_png_bytes(64, 64));
+    let scene = scene_of(
+        "bafkentitymodelinc",
+        &[
+            ("models/ext.gltf", "bafkmodel"),
+            ("tex/normal.png", "bafknormal"),
+            ("color.png", "bafkcolor"),
+        ],
+    );
+    let model_ok = AtomicBool::new(false);
+    let fetches = std::sync::Mutex::new(Vec::<String>::new());
+    let fetch = |h: &str| {
+        fetches.lock().unwrap().push(h.to_string());
+        if h == "bafkmodel" && !model_ok.load(Ordering::Relaxed) {
+            return None;
+        }
+        blobs.get(h).cloned()
+    };
+    let probe = |_: &str| None;
+    let lane = Lane {
+        fetch: &fetch,
+        probe: &probe,
+        stored: &|_: &str| -> Option<Vec<u8>> { None },
+        local_records: true,
+    };
+    let out = std::env::temp_dir().join(format!(
+        "abgen-bevy-incomplete-model-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&out);
+    let mpath = manifest_path(&out, "bafkentitymodelinc").unwrap();
+
+    let first = build_entity_variants(&scene, &lane, &out, BuildOptions::default()).unwrap();
+    assert_eq!(first.incomplete, vec!["models/ext.gltf".to_string()]);
+    assert!(!mpath.exists());
+    // Without the model the normal map falls back to the sRGB slot; that key's record is still
+    // written (it is what the image is in that slot).
+    assert!(
+        key_path(&out, &format!("bevy/t{TEX_GEN}/bafknormal_srgb.json"))
+            .unwrap()
+            .is_file()
+    );
+    let color = first.entries["bafkcolor"][0].clone();
+    assert!(key_path(&out, &record_key(&color.path)).unwrap().is_file());
+    // The failed fetch has no record.
+    assert!(!key_path(&out, &format!("bevy/m{MESH_GEN}/bafkmodel.json"))
+        .unwrap()
+        .exists());
+
+    model_ok.store(true, Ordering::Relaxed);
+    fetches.lock().unwrap().clear();
+    let again = build_entity_variants(&scene, &lane, &out, BuildOptions::default()).unwrap();
+    assert!(again.incomplete.is_empty());
+    let fetched: std::collections::BTreeSet<String> =
+        fetches.lock().unwrap().iter().cloned().collect();
+    assert!(fetched.contains("bafkmodel") && fetched.contains("bafknormal"));
+    assert!(!fetched.contains("bafkcolor"));
+    let normal = &again.entries["bafknormal"][0];
+    assert_eq!(normal.path, format!("bevy/t{TEX_GEN}/bafknormal_normal"));
+    assert_eq!(normal.format, "ktx2-bc5");
+    assert_eq!(again.entries["bafkcolor"][0], color);
+    assert!(again
+        .uploads
+        .iter()
+        .all(|u| u.owner == normal.path || u.owner.ends_with("/bafkmodel")));
+    assert_eq!(std::fs::read(&mpath).unwrap(), again.manifest_bytes);
     let _ = std::fs::remove_dir_all(&out);
 }

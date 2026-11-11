@@ -17,10 +17,11 @@ fn clear_output(cfg: &Config) {
 }
 
 /// `None` when the lane is off (`ABGEN_BEVY_VARIANTS=0`). Otherwise its summary, for the
-/// conversion summary's `bevy` key: `{"skipped": "current-manifest"}`, the build's counts, or
-/// `{"error": …}`. A failure (or a panic in an encoder) is logged and reported there and never
-/// fails the job, whose bundles are already published and notified; the entity's next
-/// conversion is the next attempt.
+/// conversion summary's `bevy` key: `{"skipped": "current-manifest"}`, the build's counts,
+/// `{"skipped": "incomplete", "missing": N, …counts}` when files could not be fetched or built
+/// (what did build is uploaded, the manifest is not), or `{"error": …}`. A failure (or a panic
+/// in an encoder) is logged and reported there and never fails the job, whose bundles are
+/// already published and notified; the entity's next conversion is the next attempt.
 pub fn follow_up(
     cfg: &Config,
     proxy: &Arc<Proxy>,
@@ -45,6 +46,7 @@ pub fn follow_up(
     let outcome = match &result {
         Err(_) => "error",
         Ok(b) if b.skipped => "skipped",
+        Ok(b) if b.incomplete > 0 => "incomplete",
         Ok(_) => "built",
     };
     if let Err(e) = &result {
@@ -65,6 +67,13 @@ fn summary(result: &anyhow::Result<BevyBuild>) -> serde_json::Value {
     match result {
         Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
         Ok(b) if b.skipped => serde_json::json!({ "skipped": "current-manifest" }),
+        Ok(b) if b.incomplete > 0 => serde_json::json!({
+            "skipped": "incomplete",
+            "missing": b.incomplete,
+            "originals": b.originals,
+            "reused": b.reused,
+            "built": b.built,
+        }),
         Ok(b) => serde_json::json!({
             "originals": b.originals,
             "reused": b.reused,
@@ -78,7 +87,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn summary_names_a_skip_the_counts_or_the_error() {
+    fn summary_names_a_skip_the_counts_an_incomplete_build_or_the_error() {
         assert_eq!(
             summary(&Ok(BevyBuild {
                 skipped: true,
@@ -92,8 +101,26 @@ mod tests {
                 originals: 3,
                 reused: 2,
                 built: 1,
+                incomplete: 0,
             })),
             serde_json::json!({ "originals": 3, "reused": 2, "built": 1 })
+        );
+        // Files that could not be fetched or built: no manifest, reported, not an error.
+        assert_eq!(
+            summary(&Ok(BevyBuild {
+                skipped: false,
+                originals: 3,
+                reused: 2,
+                built: 1,
+                incomplete: 2,
+            })),
+            serde_json::json!({
+                "skipped": "incomplete",
+                "missing": 2,
+                "originals": 3,
+                "reused": 2,
+                "built": 1,
+            })
         );
         let err = summary(&Err(anyhow::anyhow!("uploads failed")));
         assert_eq!(err["error"], "uploads failed");

@@ -408,6 +408,10 @@ pub struct BevyBuild {
     pub reused: u64,
     /// Variants this build encoded.
     pub built: u64,
+    /// Files whose content could not be fetched or whose variant could not be built
+    /// ([`BuildOutput::incomplete`]). When not zero the manifest was not written (what did
+    /// build was uploaded): the client uses the originals and the next conversion retries.
+    pub incomplete: usize,
 }
 
 /// Whether `bytes` is a manifest built from the prefixes `lanes` names ([`Manifest::is_current`]).
@@ -463,6 +467,8 @@ impl crate::live::Proxy {
     ///    record (marked in Redis once written), and the manifest last, so nothing in the
     ///    store ever names an object that is not there. A key whose objects did not all land
     ///    is dropped whole, and the manifest is not written: the next build finds what did.
+    ///    Nor is it written when a file could not be fetched or built
+    ///    ([`BevyBuild::incomplete`]): the client uses the originals, the next build retries.
     ///
     /// With object storage the store is the only record of what exists: records left under
     /// `out_root` by an earlier run are not trusted (that run may have died before its
@@ -553,19 +559,33 @@ impl crate::live::Proxy {
             if failed > 0 {
                 anyhow::bail!("{failed} uploads failed; manifest not written");
             }
-            self.space_put_key_strict(&manifest_key(cid), &out.manifest_bytes)?;
+            // What did build is uploaded above (content-addressed, correct for its keys); the
+            // manifest waits for a build in which every file has a final outcome.
+            if out.incomplete.is_empty() {
+                self.space_put_key_strict(&manifest_key(cid), &out.manifest_bytes)?;
+            }
         }
         let build = BevyBuild {
             skipped: false,
             originals: out.entries.len(),
             reused: out.stats.reused_textures + out.stats.reused_models,
             built: out.stats.unique_variants,
+            incomplete: out.incomplete.len(),
         };
+        if build.incomplete > 0 {
+            tracing::warn!(
+                entity = %cid,
+                incomplete = build.incomplete,
+                files = ?out.incomplete,
+                "bevy variants: files could not be fetched or built; manifest not written"
+            );
+        }
         tracing::info!(
             entity = %cid,
             originals = build.originals,
             reused = build.reused,
             built = build.built,
+            incomplete = build.incomplete,
             ms = started.elapsed().as_millis() as u64,
             "bevy variants built"
         );
