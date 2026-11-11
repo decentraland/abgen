@@ -1,7 +1,7 @@
 //! Texture variants: PNG / JPEG in, KTX2 (BC1 / BC5 / BC7 payload, Zstandard-supercompressed,
-//! full mip chain, at most [`BEVY_TEXTURE_MAX`] on a side, top-down rows) out; creator UASTC
-//! KTX2 in, a single-level pure block transcode to BC7 KTX2 out. Every variant must be smaller
-//! than its original ([`size_gate`]). See the module docs of [`super`].
+//! level 0 only with no mip chain, at most [`BEVY_TEXTURE_MAX`] on a side, top-down rows) out;
+//! creator UASTC KTX2 in, a single-level pure block transcode to BC7 KTX2 out. Every variant
+//! must be smaller than its original ([`size_gate`]). See the module docs of [`super`].
 
 use anyhow::{Context, Result};
 use image::RgbaImage;
@@ -443,6 +443,10 @@ pub fn transcode_uastc_bc7_with(
     })
 }
 
+/// Levels the PNG/JPEG encode writes: level 0 only, no mip chain, so the variant compares like
+/// for like with the single-level creator UASTC KTX2 files (and the UASTC transcode path).
+const LEVELS: Option<i32> = Some(1);
+
 fn encode_rgba(
     img: RgbaImage,
     slot: Slot,
@@ -476,7 +480,7 @@ fn encode_rgba(
             // Opaque blocks only: the encoder always orders endpoints c0 > c1 (four-colour
             // mode), so no texel decodes as BC1's transparent black.
             TexFormat::Bc1 => {
-                crate::dxt1_pure::encode_dxt1_mip_chain(buf, tw, th, None, false, srgb)
+                crate::dxt1_pure::encode_dxt1_mip_chain(buf, tw, th, LEVELS, false, srgb)
             }
             TexFormat::Bc5 => {
                 // The BC5 kernel packs (A, G) into (R, G) - Unity's DXT5nm layout. Bevy reads
@@ -484,7 +488,7 @@ fn encode_rgba(
                 for px in buf.chunks_exact_mut(4) {
                     px[3] = px[0];
                 }
-                crate::bc5_pure::encode_bc5_mip_chain(buf, tw, th, None, false)
+                crate::bc5_pure::encode_bc5_mip_chain(buf, tw, th, LEVELS, false)
             }
             TexFormat::Bc7 => {
                 if !opaque {
@@ -494,7 +498,7 @@ fn encode_rgba(
                     buf,
                     tw,
                     th,
-                    None,
+                    LEVELS,
                     false,
                     srgb,
                     srgb,

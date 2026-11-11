@@ -22,8 +22,7 @@ pub struct StageTimes {
     pub decode_ns: u64,
     /// Downscale to the variant size (only when the source is larger or not a power of two).
     pub resize_ns: u64,
-    /// BC encode of the full chain, mip generation included (the encoders build each mip
-    /// while encoding), alpha bleed included for BC7.
+    /// BC encode of the single level (no mip chain), alpha bleed included for BC7.
     pub bc1_ns: u64,
     /// BC1 quality check of an opaque sRGB image: level 0 decoded and compared with the source
     /// (`texture::BC1_MIN_PSNR_DB`); a rejected BC1 is followed by a BC7 encode (`bc7_ns`).
