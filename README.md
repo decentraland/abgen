@@ -334,7 +334,8 @@ fetches and encodes. Outcomes that depend on the run (content missing, a failed 
 recorded. Writes go variant bytes, `.br`, record (then its Redis mark), and the manifest last, so
 the store never names an object that is not there; a key whose objects did not all land is
 dropped whole, and if any upload fails the manifest is not written, so the next conversion of
-the entity tries again. The offline build (`abgen-corpus --bevy-variants`) uses only the records
+the entity tries again. Records left in its output directory are not trusted (an earlier run
+may have died before uploading). The offline build (`abgen-corpus --bevy-variants`) uses only the records
 in its output directory.
 
 Versioning is two integers in `crate/src/bevyvariants/mod.rs`: `TEX_GEN` (BC encoders, mips,

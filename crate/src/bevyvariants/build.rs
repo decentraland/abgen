@@ -141,10 +141,16 @@ impl BuildOptions {
 /// `stored` returns a stored variant's bytes by key (`None` = not there); a variant under
 /// `out_root` is read before it is asked. It is only used to add a `.br` sidecar to a reused
 /// variant that has none.
+///
+/// `local_records` says whether records already under `out_root` count. A build whose output
+/// directory is the store of record (the offline corpus) sets it. A build that writes to a
+/// shared store must not: a local record proves nothing about what the store holds (an
+/// earlier run may have been killed before uploading), so only `probe` is asked.
 pub struct Lane<'a> {
     pub fetch: &'a (dyn Fn(&str) -> Option<Vec<u8>> + Sync),
     pub probe: &'a (dyn Fn(&str) -> Option<Record> + Sync),
     pub stored: &'a (dyn Fn(&str) -> Option<Vec<u8>> + Sync),
+    pub local_records: bool,
 }
 
 /// One object this build wrote under `out_root`, in the order they are written (and a store
@@ -218,10 +224,13 @@ fn local_record(out_root: &Path, key: &str) -> Option<Record> {
     Some(rec)
 }
 
-/// Local disk, then the lane's probe.
+/// Local disk (when the lane counts local records), then the lane's probe.
 fn probe(lane: &Lane, out_root: &Path, key: &str, times: &mut StageTimes) -> Option<Record> {
     timed(&mut times.probe_ns, || {
-        local_record(out_root, key).or_else(|| (lane.probe)(key))
+        lane.local_records
+            .then(|| local_record(out_root, key))
+            .flatten()
+            .or_else(|| (lane.probe)(key))
     })
 }
 

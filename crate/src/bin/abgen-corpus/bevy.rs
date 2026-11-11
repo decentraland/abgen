@@ -65,6 +65,7 @@ pub(crate) fn run_bevy_variants(
                 fetch: &fetch,
                 probe: &probe,
                 stored: &stored,
+                local_records: true,
             };
             abgen::bevyvariants::build_entity_variants(&scene, &lane, out_root, opts)
         })();

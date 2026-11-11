@@ -1003,6 +1003,7 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
         fetch: &fetch,
         probe: &probe,
         stored: &|_: &str| -> Option<Vec<u8>> { None },
+        local_records: true,
     };
     let out = std::env::temp_dir().join(format!("abgen-bevy-meshopt-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
@@ -1110,6 +1111,7 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
         fetch: &counting,
         probe: &probe,
         stored: &|_: &str| -> Option<Vec<u8>> { None },
+        local_records: true,
     };
     let again = build_entity_variants(
         &scene,
@@ -1191,6 +1193,7 @@ fn entity_build_adds_glb_meshopt_variants_with_br_sidecars() {
         fetch: &counting,
         probe: &remote,
         stored: &|_: &str| -> Option<Vec<u8>> { None },
+        local_records: true,
     };
     fetches.store(0, std::sync::atomic::Ordering::Relaxed);
     let probed = build_entity_variants(&scene, &lane5, &out5, BuildOptions::default()).unwrap();
@@ -1251,6 +1254,7 @@ fn reused_meshopt_variant_without_br_gets_a_sidecar_without_a_fetch() {
         fetch: &fetch,
         probe: &probe,
         stored: &|_: &str| -> Option<Vec<u8>> { None },
+        local_records: true,
     };
     let out = std::env::temp_dir().join(format!("abgen-bevy-backfill-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
@@ -1328,6 +1332,7 @@ fn record_without_its_variant_is_rebuilt_alone() {
         fetch: &fetch,
         probe: &probe,
         stored: &|_: &str| -> Option<Vec<u8>> { None },
+        local_records: true,
     };
     let out = std::env::temp_dir().join(format!("abgen-bevy-evict-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
@@ -1405,6 +1410,7 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
         fetch: &fetch,
         probe: &probe,
         stored: &|_: &str| -> Option<Vec<u8>> { None },
+        local_records: true,
     };
     let run = |tag: &str, opts: BuildOptions| {
         let out =
@@ -1645,4 +1651,46 @@ fn only_a_current_manifest_skips_the_store_backed_build() {
         &other_prefixes
     ));
     assert!(!super::manifest_bytes_current(b"not json", &lanes));
+}
+
+/// A build that writes to a shared store does not count records left in its output directory
+/// (an earlier run may have died before uploading): with `local_records` off every key is
+/// asked of the probe, and a miss there is rebuilt and listed for upload again.
+#[test]
+fn local_records_do_not_count_for_a_store_backed_build() {
+    let mut blobs: HashMap<&str, Vec<u8>> = HashMap::new();
+    blobs.insert("bafkgridpng", noise_png_bytes(64, 64));
+    let scene = scene_of("bafkentitylr", &[("tex/grid.png", "bafkgridpng")]);
+    let fetches = std::sync::atomic::AtomicUsize::new(0);
+    let fetch = |h: &str| {
+        fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        blobs.get(h).cloned()
+    };
+    let probe = |_: &str| None;
+    let out = std::env::temp_dir().join(format!("abgen-bevy-localrec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    let stored = |_: &str| -> Option<Vec<u8>> { None };
+    let lane = |local_records: bool| Lane {
+        fetch: &fetch,
+        probe: &probe,
+        stored: &stored,
+        local_records,
+    };
+    let first = build_entity_variants(&scene, &lane(false), &out, BuildOptions::default()).unwrap();
+    assert!(!first.uploads.is_empty());
+    // The output directory now holds the variant and its record, but the "store" (the probe)
+    // has nothing: a store-backed build builds and lists it again.
+    fetches.store(0, std::sync::atomic::Ordering::Relaxed);
+    let again = build_entity_variants(&scene, &lane(false), &out, BuildOptions::default()).unwrap();
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        again.uploads.iter().map(|u| &u.key).collect::<Vec<_>>(),
+        first.uploads.iter().map(|u| &u.key).collect::<Vec<_>>()
+    );
+    // A build whose directory is the store of record reuses it.
+    fetches.store(0, std::sync::atomic::Ordering::Relaxed);
+    let local = build_entity_variants(&scene, &lane(true), &out, BuildOptions::default()).unwrap();
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(local.uploads.is_empty());
+    let _ = std::fs::remove_dir_all(&out);
 }

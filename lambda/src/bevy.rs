@@ -8,8 +8,13 @@
 //! no conversion-finished event, so the registry never hears of a `bevy` platform.
 
 use crate::config::Config;
+use abgen::bevyvariants::BevyBuild;
 use abgen::live::Proxy;
 use std::sync::Arc;
+
+fn clear_output(cfg: &Config) {
+    let _ = std::fs::remove_dir_all(cfg.out_root.join(abgen::bevyvariants::BEVY_PLATFORM));
+}
 
 /// `None` when the lane is off (`ABGEN_BEVY_VARIANTS=0`). Otherwise its summary, for the
 /// conversion summary's `bevy` key: `{"skipped": "current-manifest"}`, the build's counts, or
@@ -26,22 +31,21 @@ pub fn follow_up(
         return None;
     }
     let started = std::time::Instant::now();
+    // The store is the only record of what exists. A warm container keeps `/tmp`, and a run
+    // that was killed never reached its cleanup: start from an empty directory.
+    clear_output(cfg);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         proxy.build_bevy_variants(&cfg.out_root, entity_id, force)
     }))
     .unwrap_or_else(|_| Err(anyhow::anyhow!("bevy variants build panicked")));
-    // Everything that matters is in the store: nothing under `bevy/` outlives the job, so a
-    // warm container never reuses a local record instead of probing the store.
     if !cfg.keep_output {
-        let _ = std::fs::remove_dir_all(cfg.out_root.join(abgen::bevyvariants::BEVY_PLATFORM));
+        clear_output(cfg);
     }
     let summary = summary(&result);
-    let outcome = if summary.get("error").is_some() {
-        "error"
-    } else if summary.get("skipped").is_some() {
-        "skipped"
-    } else {
-        "built"
+    let outcome = match &result {
+        Err(_) => "error",
+        Ok(b) if b.skipped => "skipped",
+        Ok(_) => "built",
     };
     if let Err(e) = &result {
         eprintln!("bevy: {entity_id}: variants build failed ({e:#}); the conversion stands");
@@ -57,7 +61,7 @@ pub fn follow_up(
     Some(summary)
 }
 
-fn summary(result: &anyhow::Result<abgen::bevyvariants::BevyBuild>) -> serde_json::Value {
+fn summary(result: &anyhow::Result<BevyBuild>) -> serde_json::Value {
     match result {
         Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
         Ok(b) if b.skipped => serde_json::json!({ "skipped": "current-manifest" }),
@@ -75,7 +79,6 @@ mod tests {
 
     #[test]
     fn summary_names_a_skip_the_counts_or_the_error() {
-        use abgen::bevyvariants::BevyBuild;
         assert_eq!(
             summary(&Ok(BevyBuild {
                 skipped: true,

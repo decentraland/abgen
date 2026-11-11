@@ -461,7 +461,10 @@ impl crate::live::Proxy {
     ///    store ever names an object that is not there. A key whose objects did not all land
     ///    is dropped whole, and the manifest is not written: the next build finds what did.
     ///
-    /// Without object storage it only builds into `out_root`.
+    /// With object storage the store is the only record of what exists: records left under
+    /// `out_root` by an earlier run are not trusted (that run may have died before its
+    /// uploads), so every key is probed in the store. Without object storage it only builds
+    /// into `out_root`, reusing the records there.
     pub fn build_bevy_variants(
         self: &std::sync::Arc<Self>,
         out_root: &Path,
@@ -504,6 +507,7 @@ impl crate::live::Proxy {
             fetch: &fetch,
             probe: &probe,
             stored: &stored,
+            local_records: !self.space_configured(),
         };
         let out = build_entity_variants(&ctx.scene, &lane, out_root, opts)?;
         if self.space_configured() {
