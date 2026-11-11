@@ -1,5 +1,13 @@
 use super::*;
 
+pub async fn registry_status() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"data": {
+        "version": std::env::var("CURRENT_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string()),
+        "currentTime": chrono::Utc::now().timestamp_millis(),
+        "commitHash": std::env::var("COMMIT_HASH").unwrap_or_default(),
+    }}))
+}
+
 pub async fn ping() -> &'static str {
     "ok"
 }
@@ -80,12 +88,8 @@ fn content_db_status(state: &AppState) -> &'static str {
     }
 }
 
-fn registry_mode(state: &AppState) -> &'static str {
-    if state.content_db.is_some() {
-        "content-db"
-    } else {
-        "catalyst-proxy"
-    }
+fn registry_mode(_state: &AppState) -> &'static str {
+    "catalyst-proxy"
 }
 
 /// `version` is this binary's crate version and `pid` its OS process id: the two fields a
@@ -152,6 +156,19 @@ pub async fn health(State(state): State<AppState>) -> Response {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn registry_status_uses_nested_local_metadata_and_millisecond_time() {
+        let before = chrono::Utc::now().timestamp_millis();
+        let axum::Json(body) = super::registry_status().await;
+        let after = chrono::Utc::now().timestamp_millis();
+        assert_eq!(body.as_object().unwrap().len(), 1);
+        let data = &body["data"];
+        assert_eq!(data.as_object().unwrap().len(), 3);
+        assert!(data["version"].is_string());
+        assert!(data["commitHash"].is_string());
+        assert!((before..=after).contains(&data["currentTime"].as_i64().unwrap()));
+    }
+
     use super::*;
 
     #[test]

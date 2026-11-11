@@ -16,6 +16,9 @@ pub enum ApiError {
     Unauthorized(String),
 
     #[error("{0}")]
+    SignedFetch(String),
+
+    #[error("{0}")]
     Forbidden(String),
 
     #[error("not implemented: {0}")]
@@ -61,6 +64,16 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(m) => (400u16, m.clone()),
             ApiError::NotFound(m) => (404, m.clone()),
             ApiError::Unauthorized(m) => (401, m.clone()),
+            ApiError::SignedFetch(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": error,
+                        "message": "This endpoint requires a signed fetch request. See ADR-44."
+                    })),
+                )
+                    .into_response();
+            }
             ApiError::Forbidden(m) => (403, m.clone()),
             ApiError::NotImplemented(m) => (501, m.clone()),
             ApiError::Database(e) => {

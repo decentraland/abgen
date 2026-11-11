@@ -31,9 +31,14 @@ use upstream::*;
 
 pub use dispatch::dispatch;
 pub use entities::{post_entities_active, post_entities_versions};
-pub use status::{get_build_progress, health, livez, metrics, ping, readyz};
+pub use status::{get_build_progress, health, livez, metrics, ping, readyz, registry_status};
 
 #[cfg(test)]
 mod bvpk_tests;
 #[cfg(test)]
 mod tests;
+
+pub(crate) async fn registry_conversion_permit(
+) -> Result<tokio::sync::SemaphorePermit<'static>, tokio::sync::AcquireError> {
+    jit::jit_build_sem().acquire().await
+}

@@ -5,7 +5,7 @@ use axum::Json;
 
 use crate::errors::{ApiError, ApiResult};
 use crate::registry::RegistryAppState;
-use crate::types::{Coordinate, WorldManifest};
+use crate::types::{BuildStatus, Coordinate, WorldManifest};
 
 pub async fn get_world_manifest(
     State(state): State<RegistryAppState>,
@@ -19,8 +19,6 @@ pub async fn get_world_manifest(
     let denylist = state.world_policy.denylist().await?;
 
     let mut occupied_set: BTreeSet<String> = BTreeSet::new();
-    let mut matched = false;
-    let mut base_coordinate: Option<String> = None;
     for ent in &ents {
         if ent.entity_type != "scene" {
             continue;
@@ -35,27 +33,24 @@ pub async fn get_world_manifest(
             continue;
         }
 
-        let m = state.manifests.get(&ent.entity_id).await;
-        if !m.registry_status(true).is_servable() {
+        let complete = match state.content.registered_status(&ent.entity_id).await? {
+            Some(status) => status.complete,
+            None => {
+                let m = state.manifests.get(&ent.entity_id).await;
+                matches!(m.windows_status(), BuildStatus::Complete)
+                    && matches!(m.mac_status(), BuildStatus::Complete)
+            }
+        };
+        if !complete {
             continue;
         }
-        matched = true;
-        if base_coordinate.is_none() {
-            base_coordinate = scene_base_coordinate(&ent.metadata);
-        }
-        for p in parcels(&ent.metadata) {
-            occupied_set.insert(p);
-        }
-    }
-
-    if !matched {
-        return Err(ApiError::not_found("world not found"));
+        occupied_set.extend(ent.pointers.iter().cloned());
     }
 
     let occupied: Vec<String> = occupied_set.into_iter().collect();
     let total = occupied.len();
 
-    let spawn = compute_spawn(&state, &world_name, &occupied, base_coordinate.as_deref()).await?;
+    let spawn = compute_spawn(&state, &world_name, &occupied).await?;
 
     Ok(Json(WorldManifest {
         occupied,
@@ -65,8 +60,7 @@ pub async fn get_world_manifest(
 }
 
 fn is_world_name_valid(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    let Some(mut head) = lower.strip_suffix(".eth") else {
+    let Some(mut head) = name.strip_suffix(".eth") else {
         return false;
     };
 
@@ -80,7 +74,6 @@ async fn compute_spawn(
     state: &RegistryAppState,
     world_name: &str,
     occupied: &[String],
-    base_coordinate: Option<&str>,
 ) -> Result<Coordinate, ApiError> {
     if occupied.is_empty() {
         return Ok(Coordinate { x: 0, y: 0 });
@@ -92,29 +85,7 @@ async fn compute_spawn(
             return Ok(c);
         }
     }
-    Ok(auto_spawn(base_coordinate, occupied))
-}
-
-fn auto_spawn(base_coordinate: Option<&str>, occupied: &[String]) -> Coordinate {
-    if let Some(coord) = base_coordinate.and_then(parse_coordinate) {
-        return coord;
-    }
-    centroid_parcel(occupied)
-}
-
-fn scene_base_coordinate(metadata: &serde_json::Value) -> Option<String> {
-    let scene = metadata.get("scene");
-    if let Some(base) = scene.and_then(|s| s.get("base")).and_then(|b| b.as_str()) {
-        if !base.trim().is_empty() {
-            return Some(base.to_string());
-        }
-    }
-    scene
-        .and_then(|s| s.get("parcels"))
-        .and_then(|p| p.as_array())
-        .and_then(|a| a.first())
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    Ok(centroid_parcel(occupied))
 }
 
 fn bounds_from_parcels(parcels: &[String]) -> (i64, i64, i64, i64) {
@@ -163,19 +134,6 @@ fn parse_coordinate(s: &str) -> Option<Coordinate> {
     Some(Coordinate { x, y })
 }
 
-fn parcels(metadata: &serde_json::Value) -> Vec<String> {
-    metadata
-        .get("scene")
-        .and_then(|s| s.get("parcels"))
-        .and_then(|p| p.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +164,8 @@ mod tests {
             ".dcl.eth",
             "foo.dcl.dcl.eth",
             "foo..eth",
+            "foo.ETH",
+            "foo.DCL.eth",
         ] {
             assert!(!is_world_name_valid(bad), "should be invalid: {bad}");
         }
@@ -263,31 +223,6 @@ mod tests {
         assert!(set.contains(&format!("{},{}", c.x, c.y)));
     }
 
-    #[test]
-    fn parcels_extracts_scene_parcels_array() {
-        let md = serde_json::json!({"scene": {"parcels": ["0,0", "0,1"]}});
-        assert_eq!(parcels(&md), v(&["0,0", "0,1"]));
-        assert_eq!(parcels(&serde_json::json!({})), Vec::<String>::new());
-    }
-
-    #[test]
-    fn scene_base_coordinate_prefers_base_then_first_parcel() {
-        let md = serde_json::json!({"scene": {"base": "10,20", "parcels": ["11,21", "10,20"]}});
-        assert_eq!(scene_base_coordinate(&md).as_deref(), Some("10,20"));
-
-        let md = serde_json::json!({"scene": {"parcels": ["3,4", "5,6"]}});
-        assert_eq!(scene_base_coordinate(&md).as_deref(), Some("3,4"));
-
-        let md = serde_json::json!({"scene": {"base": "  ", "parcels": ["7,8"]}});
-        assert_eq!(scene_base_coordinate(&md).as_deref(), Some("7,8"));
-
-        assert_eq!(
-            scene_base_coordinate(&serde_json::json!({"scene": {}})),
-            None
-        );
-        assert_eq!(scene_base_coordinate(&serde_json::json!({})), None);
-    }
-
     mod manifest {
         use std::collections::HashSet;
         use std::sync::Arc;
@@ -298,13 +233,14 @@ mod tests {
 
         use super::super::get_world_manifest;
         use crate::registry::testutil::{entity, open_state, state_with, StubPolicy};
+        use crate::registry::{RegistryAppState, WorldPolicy};
         use crate::types::ActiveEntity;
 
         fn world_scene(id: &str, name: &str) -> ActiveEntity {
             entity(
                 id,
                 "scene",
-                &[name],
+                &["1,1", "1,2"],
                 json!({
                     "worldConfiguration": {"name": name},
                     "scene": {"base": "1,1", "parcels": ["1,1", "1,2"]},
@@ -316,10 +252,67 @@ mod tests {
             std::env::temp_dir().join(format!("dclc_worlds_{tag}_{}", std::process::id()))
         }
 
+        fn ready_state(entities: Vec<ActiveEntity>, root: &std::path::Path) -> RegistryAppState {
+            prepare_manifests(&entities, root);
+            open_state(entities, root)
+        }
+
+        fn ready_state_with_policy(
+            entities: Vec<ActiveEntity>,
+            policy: Arc<dyn WorldPolicy>,
+            root: &std::path::Path,
+        ) -> RegistryAppState {
+            prepare_manifests(&entities, root);
+            state_with(entities, policy, root)
+        }
+
+        fn prepare_manifests(entities: &[ActiveEntity], root: &std::path::Path) {
+            for entity in entities {
+                let dir = root.join(&entity.entity_id);
+                std::fs::create_dir_all(&dir).unwrap();
+                for platform in ["mac", "windows"] {
+                    std::fs::write(
+                        dir.join(format!("{platform}.manifest.json")),
+                        r#"{"version":"v1","exitCode":0}"#,
+                    )
+                    .unwrap();
+                }
+            }
+        }
+
         #[tokio::test]
-        async fn happy_path_returns_occupied_and_base_spawn() {
+        async fn pending_world_is_empty_until_both_platforms_complete() {
+            let tmp = tmp_root("pending");
+            let scene = world_scene("bafkworldpending", "myworld.dcl.eth");
+            let dir = tmp.join(&scene.entity_id);
+            let _ = std::fs::remove_dir_all(&tmp);
+            let state = open_state(vec![scene.clone()], &tmp);
+            let axum::Json(manifest) =
+                get_world_manifest(State(state), Path("myworld.dcl.eth".to_string()))
+                    .await
+                    .unwrap();
+            assert_eq!(manifest.total, 0);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("mac.manifest.json"), r#"{"exitCode":0}"#).unwrap();
+            let state = open_state(vec![scene.clone()], &tmp);
+            let axum::Json(manifest) =
+                get_world_manifest(State(state), Path("myworld.dcl.eth".to_string()))
+                    .await
+                    .unwrap();
+            assert_eq!(manifest.total, 0);
+            let state = ready_state(vec![scene], &tmp);
+            let axum::Json(manifest) =
+                get_world_manifest(State(state), Path("myworld.dcl.eth".to_string()))
+                    .await
+                    .unwrap();
+            assert_eq!(manifest.total, 2);
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        #[tokio::test]
+        async fn happy_path_returns_occupied_and_centroid_spawn() {
             let tmp = tmp_root("happy");
-            let state = open_state(vec![world_scene("bafkworldhappy", "myworld.dcl.eth")], &tmp);
+            let state = ready_state(vec![world_scene("bafkworldhappy", "myworld.dcl.eth")], &tmp);
 
             let axum::Json(m) =
                 get_world_manifest(State(state), Path("myworld.dcl.eth".to_string()))
@@ -331,9 +324,9 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn denylisted_scene_yields_404() {
+        async fn denylisted_scene_yields_empty_manifest() {
             let tmp = tmp_root("deny");
-            let state = state_with(
+            let state = ready_state_with_policy(
                 vec![world_scene("bafkworlddenied", "myworld.dcl.eth")],
                 Arc::new(StubPolicy {
                     denylist: HashSet::from(["bafkworlddenied".to_string()]),
@@ -342,26 +335,35 @@ mod tests {
                 &tmp,
             );
 
-            let err = get_world_manifest(State(state), Path("myworld.dcl.eth".to_string()))
-                .await
-                .err()
-                .unwrap();
-            assert_eq!(err.into_response().status().as_u16(), 404);
+            let axum::Json(manifest) =
+                get_world_manifest(State(state), Path("myworld.dcl.eth".to_string()))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(manifest).unwrap(),
+                json!({
+                    "occupied": [], "spawn_coordinate": { "x": 0, "y": 0 }, "total": 0
+                })
+            );
         }
 
         #[tokio::test]
-        async fn unknown_world_404_and_invalid_name_400() {
+        async fn unknown_world_returns_empty_manifest_and_invalid_name_400() {
             let tmp = tmp_root("miss");
-            let state = open_state(Vec::new(), &tmp);
+            let state = ready_state(Vec::new(), &tmp);
 
-            let missing = get_world_manifest(
+            let axum::Json(missing) = get_world_manifest(
                 State(state.clone()),
                 Path("nosuchworld.dcl.eth".to_string()),
             )
             .await
-            .err()
             .unwrap();
-            assert_eq!(missing.into_response().status().as_u16(), 404);
+            assert_eq!(
+                serde_json::to_value(missing).unwrap(),
+                json!({
+                    "occupied": [], "spawn_coordinate": { "x": 0, "y": 0 }, "total": 0
+                })
+            );
 
             let invalid = get_world_manifest(State(state), Path("not_a_world".to_string()))
                 .await
@@ -371,10 +373,57 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn spawn_uses_pointer_centroid_instead_of_metadata_base_and_parcels() {
+            let tmp = tmp_root("centroid");
+            let mut scene = world_scene("bafkworldcentroid", "myworld.dcl.eth");
+            scene.pointers = vec!["0,0".into(), "4,0".into(), "2,2".into()];
+            scene.metadata["scene"] = json!({
+                "base": "0,0", "parcels": ["0,0"]
+            });
+            let state = ready_state(vec![scene], &tmp);
+            let axum::Json(manifest) =
+                get_world_manifest(State(state), Path("myworld.dcl.eth".to_string()))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                (manifest.spawn_coordinate.x, manifest.spawn_coordinate.y),
+                (2, 2)
+            );
+        }
+
+        #[tokio::test]
+        async fn shared_parcel_survives_denylist_and_stored_spawn_may_be_between_parcels() {
+            let tmp = tmp_root("shared");
+            let mut denied = world_scene("bafkworlddeniedshared", "myworld.dcl.eth");
+            denied.pointers = vec!["0,0".into(), "1,1".into()];
+            let mut allowed = world_scene("bafkworldallowedshared", "myworld.dcl.eth");
+            allowed.pointers = vec!["1,1".into(), "2,2".into()];
+            let state = ready_state_with_policy(
+                vec![denied, allowed],
+                Arc::new(StubPolicy {
+                    denylist: HashSet::from(["bafkworlddeniedshared".into()]),
+                    spawn: Some((1, 2)),
+                }),
+                &tmp,
+            );
+            let axum::Json(manifest) =
+                get_world_manifest(State(state), Path("myworld.dcl.eth".into()))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(manifest).unwrap(),
+                json!({
+                    "occupied": ["1,1", "2,2"], "spawn_coordinate": {"x": 1, "y": 2}, "total": 2
+                })
+            );
+            let _ = std::fs::remove_dir_all(tmp);
+        }
+
+        #[tokio::test]
         async fn spawn_override_applies_only_in_bounds() {
             let tmp = tmp_root("spawn");
             let mk = |spawn| {
-                state_with(
+                ready_state_with_policy(
                     vec![world_scene("bafkworldspawn", "myworld.dcl.eth")],
                     Arc::new(StubPolicy {
                         denylist: HashSet::new(),
@@ -396,22 +445,5 @@ mod tests {
                     .unwrap();
             assert_eq!((m.spawn_coordinate.x, m.spawn_coordinate.y), (1, 1));
         }
-    }
-
-    #[test]
-    fn auto_spawn_prefers_base_over_centroid() {
-        let occupied = v(&["0,0", "4,0", "2,2"]);
-
-        let c = auto_spawn(Some("0,0"), &occupied);
-        assert_eq!((c.x, c.y), (0, 0));
-
-        let c = auto_spawn(Some("-5,7"), &occupied);
-        assert_eq!((c.x, c.y), (-5, 7));
-
-        let c = auto_spawn(None, &occupied);
-        assert_eq!((c.x, c.y), (2, 2));
-
-        let c = auto_spawn(Some("my-world.dcl.eth"), &occupied);
-        assert_eq!((c.x, c.y), (2, 2));
     }
 }
