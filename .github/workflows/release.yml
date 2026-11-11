@@ -37,10 +37,12 @@ env:
 jobs:
   # A release published before this run uploads its archives (one created in the web UI,
   # say) is immutable: every upload below would fail with HTTP 422 after a full build.
-  # Fail here instead, before any target builds. Images and npm do not depend on it.
+  # Fail here instead, before any target builds.
   # The same job refuses a tag that is not the crate version: the binaries report the
   # crate version (`--version`, `/health`) while npm publishes under the tag, so the two
-  # must agree.
+  # must agree. Everything that publishes (the release, npm, the ghcr and ECR images) needs
+  # it, so a failure here publishes nothing. Off a `v*` tag its steps are skipped and it
+  # succeeds.
   release-guard:
     name: release not yet published
     runs-on: ubuntu-24.04
@@ -849,13 +851,14 @@ jobs:
 
   image:
     name: ghcr image
-    needs: [build-id, ci-green]
+    needs: [build-id, ci-green, release-guard]
     # Tags always run (they push) but only with a green ci verdict for the
     # commit; otherwise only when no prebuilt artifact exists yet — a
     # non-tag run with a prebuilt would skip every step and burn a runner
     # fetching an artifact it discards.
     if: >-
       !cancelled() && needs.build-id.result == 'success' &&
+      needs.release-guard.result == 'success' &&
       ((startsWith(github.ref, 'refs/tags/') && needs.ci-green.result == 'success') ||
        (!startsWith(github.ref, 'refs/tags/') && needs.build-id.outputs.image_docker == ''))
     runs-on: ubuntu-24.04
@@ -966,10 +969,11 @@ jobs:
           if-no-files-found: error
   lambda-image-push:
     name: push lambda image to ECR
-    needs: [build-id, lambda-image]
+    needs: [build-id, lambda-image, release-guard]
     # Separate job: `environment` is job-level, and lambda-image also runs untagged.
     if: >-
       !cancelled() && needs.lambda-image.result == 'success' &&
+      needs.release-guard.result == 'success' &&
       startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
     runs-on: ubuntu-24.04-arm
     environment: biz
@@ -1055,11 +1059,12 @@ jobs:
 
   napi-publish:
     name: publish @dcl/abgen-node
-    needs: [build-id, napi, ci-green]
+    needs: [build-id, napi, ci-green, release-guard]
     runs-on: ubuntu-24.04
     if: >-
       !cancelled() &&
       startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true &&
+      needs.release-guard.result == 'success' &&
       needs.ci-green.result == 'success' &&
       (needs.napi.result == 'success' ||
        (needs.napi.result == 'skipped' && needs.build-id.outputs.napi_promote == 'true'))
