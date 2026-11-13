@@ -15,6 +15,8 @@ Upstream is a pure static bucket behind a CDN. abgen forwards `Range` and `Origi
 | `GET /{version}/{file}` (flat, incl. `{hash}_{platform}`) | static object | served; unresolvable flat hashes are negative-cached (`ABGEN_HASH_RESOLVE_FAIL_TTL_S`) |
 | `GET /LOD/{level}/{file}` | static object | served; JIT only with `ABGEN_LOD_JIT=1` + `gltfpack`, otherwise 404 until primed |
 | `GET /lods-unity/manifests/{scene}_InitialSceneState.json` | static object | served, with an ISS JIT fallback |
+| `GET /LOD/lods-unity/lods/{scene}_1.glb` | static object (far LOD, gltfpack layout) | written by the LOD lane; the abgen server has no fallback for it (no JIT, no read-through) |
+| `GET /LOD/lods-bevy/lods/{scene}_1.glb` (+ `.glb.br`, `.stats.json`) | none | the Bevy far LOD copy (BC KTX2 atlases with mips), written beside the plain GLB by the LOD lane and by `abgen-lod bevy-far-lod`; no fallback on the abgen server, like the plain GLB; the `.br` object is stored with `Content-Encoding: br`, so a client fetches `{key}.br` by name; `public, max-age=31536000` like the plain GLB. See README, *Bevy far LOD copy* |
 | `GET /bvwebgpu/{profile}/{entity}.pack` | browser pack object | served/generated as a range-friendly uncompressed object |
 | `GET /bevy/manifest/{entity}.json` (prototype) | none | Bevy variants manifest; 404 until built (by the conversion lambda per entity, or offline with `abgen-corpus --bevy-variants`; nothing is built on request), and 404 `X-Abgen-Reason: bevy-variants-stale` while every copy on disk was built from an older generation; S3 read-through; `no-cache`. See README, *Bevy variants lane* |
 | `GET /bevy/{prefix}/{name}` (prototype) | none | variant bytes (BC KTX2 with Zstandard levels, or GLB) at the `path` its manifest entry names (keys are named by the variant's inputs, not its CID); `immutable`, `Range`, CORS incl. `X-IPFS` preflight; S3 read-through; a `.br` sidecar is sent with `Content-Encoding: br` to clients that accept it |
@@ -26,7 +28,7 @@ CORS `*` exposing `ETag`/`Content-Range`/`Accept-Ranges`/`Content-Length`.
 
 Deltas an operator must know:
 
-- Outside the Bevy variants lane, abgen does not generate, serve, or negotiate Brotli sidecars. Web deployments can apply HTTP compression at their own edge without changing abgen object keys. The Bevy lane's `glb-br` model variants (the original `.glb` plus a Brotli `.br` sidecar, on by default; `ABGEN_BEVY_MODELS=0` or `ABGEN_BEVY_PRECOMPRESS=none` turns them off) and its GLB variants' `.br` sidecars (when smaller than the variant; `ABGEN_BEVY_PRECOMPRESS=none` turns them off) are negotiated by `Accept-Encoding`.
+- Outside the Bevy variants lane, abgen does not generate, serve, or negotiate Brotli sidecars. Web deployments can apply HTTP compression at their own edge without changing abgen object keys. The Bevy lane's `glb-br` model variants (the original `.glb` plus a Brotli `.br` sidecar, on by default; `ABGEN_BEVY_MODELS=0` or `ABGEN_BEVY_PRECOMPRESS=none` turns them off) and its GLB variants' `.br` sidecars (when smaller than the variant; `ABGEN_BEVY_PRECOMPRESS=none` turns them off) are negotiated by `Accept-Encoding`. The Bevy far LOD copy's `.br` is a separate object, stored with `Content-Encoding: br` and fetched by name.
 - Manifests are `no-cache` where upstream serves a cacheable TTL. A fronting CDN must forward
   `Range` and honor the `no-cache`.
 

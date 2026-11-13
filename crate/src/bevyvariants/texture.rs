@@ -1,9 +1,9 @@
 //! Texture variants: PNG / JPEG in, KTX2 (BC1 / BC5 / BC7 payload, Zstandard-supercompressed,
-//! level 0 only with no mip chain, at most [`BEVY_TEXTURE_MAX`] on a side, top-down rows) out;
-//! creator UASTC KTX2 in, a single-level pure block transcode to BC7 KTX2 out. There is no
-//! size gate: a variant larger than its original is still the one served, because the explorer
-//! never draws a PNG/JPEG as is (it decodes it to RGBA8 and converts it on the player's CPU).
-//! See the module docs of [`super`].
+//! level 0 only with no mip chain unless `TexOptions::mips`, at most [`BEVY_TEXTURE_MAX`] on a
+//! side by default, top-down rows) out; creator UASTC KTX2 in, a single-level pure block
+//! transcode to BC7 KTX2 out. There is no size gate: a variant larger than its original is still
+//! the one served, because the explorer never draws a PNG/JPEG as is (it decodes it to RGBA8 and
+//! converts it on the player's CPU). See the module docs of [`super`].
 
 use anyhow::{Context, Result};
 use image::RgbaImage;
@@ -13,17 +13,31 @@ use super::BEVY_TEXTURE_MAX;
 use crate::bc7_pure::Bc7Profile;
 use crate::ktx2_write::{split_chain, write_ktx2, BcFormat, DEFAULT_ZSTD_LEVEL};
 
-/// Encoder settings that change variant bytes (and so CIDs).
+/// Encoder settings that change variant bytes (and so CIDs). The scene lanes use the defaults
+/// apart from `zstd_level`; the far LOD copy ([`super::farlod`]) turns on mips and the
+/// unused-alpha rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TexOptions {
     /// Zstandard level of every KTX2 level (`crate::ktx2_write::check_zstd_level`).
     pub zstd_level: i32,
+    /// Longest side of a PNG/JPEG encode (powers of two). The UASTC transcode ignores it: it
+    /// picks the level the explorer's local path picks.
+    pub max_side: u32,
+    /// Write the full mip chain down to 1x1 instead of level 0 only (PNG/JPEG encodes only).
+    pub mips: bool,
+    /// GLB rewrites only: an embedded image whose alpha channel no material reads (see
+    /// `model::alpha_unused_images`) is encoded as opaque, so it can take BC1. Standalone
+    /// texture variants never see it: their key does not say how the alpha is used.
+    pub drop_unused_alpha: bool,
 }
 
 impl Default for TexOptions {
     fn default() -> Self {
         TexOptions {
             zstd_level: DEFAULT_ZSTD_LEVEL,
+            max_side: BEVY_TEXTURE_MAX,
+            mips: false,
+            drop_unused_alpha: false,
         }
     }
 }
@@ -261,6 +275,23 @@ pub struct TextureVariant {
     pub bc1_psnr_db: Option<f64>,
     /// The BC1 encode fell below [`BC1_MIN_PSNR_DB`] and this variant is BC7 instead.
     pub bc1_rejected: bool,
+    /// The source had non-opaque texels, but no material reads its alpha, so it was encoded
+    /// as opaque (`TexOptions::drop_unused_alpha`).
+    pub alpha_dropped: bool,
+}
+
+impl TextureVariant {
+    /// GPU bytes of every level the KTX2 carries.
+    pub fn gpu_bytes(&self) -> u64 {
+        chain_gpu_bytes(self.format.bc(), self.width, self.height, self.mips)
+    }
+}
+
+/// GPU bytes of a BC level 0 of `w x h` and its first `mips - 1` mips.
+pub fn chain_gpu_bytes(format: BcFormat, w: u32, h: u32, mips: u32) -> u64 {
+    (0..mips.max(1))
+        .map(|m| crate::ktx2_write::level_bytes(format, (w >> m).max(1), (h >> m).max(1)) as u64)
+        .sum()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -301,13 +332,6 @@ pub fn is_tiny(w: u32, h: u32) -> bool {
     w <= 2 || h <= 2
 }
 
-/// The variant size: capped to [`BEVY_TEXTURE_MAX`] and snapped to powers of two, as the
-/// bvwebgpu lane does. Powers of two of at least 4 are whole 4x4 blocks, which wgpu requires of
-/// a block-compressed level 0.
-pub fn target_size(w: u32, h: u32) -> (u32, u32) {
-    crate::texprofile::bc7_target_size(w, h, BEVY_TEXTURE_MAX)
-}
-
 /// Build the texture variant of `bytes` for `slot`. `Ok(None)` means "no variant": not a PNG,
 /// JPEG or UASTC KTX2 (sniffed by bytes, never by name), tiny, or a KTX2 the pure transcode
 /// does not take. `Err` is a PNG/JPEG that does not decode.
@@ -326,6 +350,18 @@ pub fn encode_texture(bytes: &[u8], slot: Slot) -> Result<Option<TextureVariant>
 pub fn encode_texture_with(
     bytes: &[u8],
     slot: Slot,
+    opts: TexOptions,
+    times: &mut StageTimes,
+) -> Result<std::result::Result<TextureVariant, Miss>> {
+    encode_image(bytes, slot, false, opts, times)
+}
+
+/// [`encode_texture_with`] for an image whose caller knows how its alpha is used:
+/// `alpha_unused` (honoured only with `opts.drop_unused_alpha`) encodes it as opaque.
+pub fn encode_image(
+    bytes: &[u8],
+    slot: Slot,
+    alpha_unused: bool,
     opts: TexOptions,
     times: &mut StageTimes,
 ) -> Result<std::result::Result<TextureVariant, Miss>> {
@@ -351,11 +387,14 @@ pub fn encode_texture_with(
     let img = timed(&mut times.decode_ns, || img.into_rgba8());
     // Tiny at the source, or at the variant size: an elongated source (4096x8) downscales to a
     // level 0 thinner than one 4x4 BC block (1024x2), which wgpu refuses.
-    let (tw, th) = target_size(img.width(), img.height());
+    // Capped to `opts.max_side` and snapped to powers of two, as the bvwebgpu lane does: powers
+    // of two of at least 4 are whole 4x4 blocks, which wgpu requires of a BC level 0.
+    let (tw, th) = crate::texprofile::bc7_target_size(img.width(), img.height(), opts.max_side);
     if is_tiny(img.width(), img.height()) || tw < 4 || th < 4 {
         return Ok(Err(NoVariant::Tiny.into()));
     }
-    encode_rgba(img, slot, opts, times).map(Ok)
+    let alpha_unused = alpha_unused && opts.drop_unused_alpha;
+    encode_rgba(img, slot, alpha_unused, opts, times).map(Ok)
 }
 
 /// The creator-KTX2 rule: a pure block-for-block UASTC -> BC7 transcode of exactly the one level
@@ -420,21 +459,25 @@ pub fn transcode_uastc_bc7_with(
         path: EncodePath::Ktx2Transcode,
         bc1_psnr_db: None,
         bc1_rejected: false,
+        alpha_dropped: false,
     })
 }
 
-/// Levels the PNG/JPEG encode writes: level 0 only, no mip chain, so the variant compares like
-/// for like with the single-level creator UASTC KTX2 files (and the UASTC transcode path).
+/// Levels the PNG/JPEG encode writes by default: level 0 only, no mip chain, so the variant
+/// compares like for like with the single-level creator UASTC KTX2 files (and the UASTC
+/// transcode path). `TexOptions::mips` writes the full chain instead (`None`).
 const LEVELS: Option<i32> = Some(1);
 
 fn encode_rgba(
     img: RgbaImage,
     slot: Slot,
+    alpha_unused: bool,
     opts: TexOptions,
     times: &mut StageTimes,
 ) -> Result<TextureVariant> {
+    let levels = if opts.mips { None } else { LEVELS };
     let (w, h) = img.dimensions();
-    let (tw, th) = target_size(w, h);
+    let (tw, th) = crate::texprofile::bc7_target_size(w, h, opts.max_side);
     let srgb = slot == Slot::Srgb;
     let mut buf = if (tw, th) != (w, h) {
         timed(&mut times.resize_ns, || {
@@ -450,7 +493,16 @@ fn encode_rgba(
     } else {
         img.into_raw()
     };
-    let opaque = buf.iter().skip(3).step_by(4).all(|&a| a == 255);
+    let mut opaque = buf.iter().skip(3).step_by(4).all(|&a| a == 255);
+    // No material reads the alpha: make it opaque, so the image takes the opaque rules (BC1
+    // behind the PSNR check, else an opaque BC7 with no alpha bleed).
+    let alpha_dropped = alpha_unused && !opaque;
+    if alpha_dropped {
+        for a in buf.iter_mut().skip(3).step_by(4) {
+            *a = 255;
+        }
+        opaque = true;
+    }
     let mut format = choose_format(slot, opaque);
     let mut bc1_psnr_db = None;
     let mut bc1_rejected = false;
@@ -460,7 +512,7 @@ fn encode_rgba(
             // Opaque blocks only: the encoder always orders endpoints c0 > c1 (four-colour
             // mode), so no texel decodes as BC1's transparent black.
             TexFormat::Bc1 => {
-                crate::dxt1_pure::encode_dxt1_mip_chain(buf, tw, th, LEVELS, false, srgb)
+                crate::dxt1_pure::encode_dxt1_mip_chain(buf, tw, th, levels, false, srgb)
             }
             TexFormat::Bc5 => {
                 // The BC5 kernel packs (A, G) into (R, G) - Unity's DXT5nm layout. Bevy reads
@@ -468,7 +520,7 @@ fn encode_rgba(
                 for px in buf.chunks_exact_mut(4) {
                     px[3] = px[0];
                 }
-                crate::bc5_pure::encode_bc5_mip_chain(buf, tw, th, LEVELS, false)
+                crate::bc5_pure::encode_bc5_mip_chain(buf, tw, th, levels, false)
             }
             TexFormat::Bc7 => {
                 if !opaque {
@@ -478,7 +530,7 @@ fn encode_rgba(
                     buf,
                     tw,
                     th,
-                    LEVELS,
+                    levels,
                     false,
                     srgb,
                     srgb,
@@ -522,5 +574,6 @@ fn encode_rgba(
         path: EncodePath::Encode,
         bc1_psnr_db,
         bc1_rejected,
+        alpha_dropped,
     })
 }

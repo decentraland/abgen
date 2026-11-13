@@ -340,6 +340,7 @@ extra dimensions.
 | LOD bundles, `ENABLE_LODS=1` | `LOD/{level}/{sceneId}_{level}_{platform}` |
 | ISS descriptor, `ENABLE_LODS=1` | `lods-unity/manifests/{sceneId}_InitialSceneState.json` |
 | published LOD GLB (gltfpack layout, level 1 only), `ENABLE_LODS=1` | `lods-unity/lods/{sceneId}_1.glb` |
+| Bevy far LOD copy (BC KTX2 atlases with mips, `.br`, stats), `ENABLE_LODS=1` and `ABGEN_BEVY_VARIANTS` on | `lods-bevy/lods/{sceneId}_1.glb`, `…_1.glb.br`, `…_1.stats.json` |
 | satellite rebuild records | `SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json` |
 | LOD reuse index, `ENABLE_LODS=1` | `lod-reuse/by-inputs/{digest}.json`, `lod-reuse/by-state/{digest}.json` (see [Reusing an unchanged build](#reusing-an-unchanged-build)) |
 
@@ -542,6 +543,9 @@ Every per-scene object is published twice: under its scene-id-only key and under
 content-addressed twin in the same directory, `{sid}_{digest}_…` where `digest` is the first
 32 hex characters of the build's LOD state digest (`LOD/1/{sid}_{digest}_1_{platform}`,
 `lods-unity/manifests/{sid}_{digest}_InitialSceneState.json`, `lods-unity/lods/{sid}_{digest}_1.glb`).
+The Bevy far LOD copy under `lods-bevy/lods/` has no twin: no manifest names one, and its bytes
+also depend on the Bevy encoders, which the state digest does not cover. A reused build gets its
+Bevy copy rebuilt from the copied plain GLB rather than copied.
 The scene's per-entity manifests (served `no-cache`) then get a `lods` block naming the twins:
 
 ```json
