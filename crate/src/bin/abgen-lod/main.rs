@@ -9,8 +9,6 @@ use abgen::lods;
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::PathBuf;
 
-#[cfg(feature = "bevy-variants")]
-mod farlod;
 mod qualify;
 
 const BIN_NAME: &str = "abgen-lod";
@@ -107,9 +105,6 @@ USAGE:
             [--attempts 3] [--snapshot-passes 8]
             [--shard-count N --shard-index I]
             [--reference-cdn https://ab-cdn.decentraland.org]
-  abgen-lod bevy-far-lod (--scene ID[,ID...] | --ids FILE) --out DIR
-            [--base-url URL | --glb-dir DIR] [--level 1] [-j 8]
-            [--max-side 1024] [--no-mips] [--keep-alpha] [--upload]
 compare: structural diff of two LOD bundles, each a local path or an http(s)
   URL (e.g. https://ab-cdn.decentraland.org/LOD/1/{sid}_1_mac): material,
   texture, mesh, vertex and triangle counts, bytes, and the per-texture
@@ -123,18 +118,6 @@ compare: structural diff of two LOD bundles, each a local path or an http(s)
   JPEG q85 round-trip and gltfpack's simplifier, ours do not). --json prints
   both inventories, the per-side texture/material detail, the delta and the
   material diff. Exits 0 whenever both bundles parse.
-bevy-far-lod: the Bevy copy of published far LODs (backfill). For each scene
-  id, reads the plain {sid}_{level}.glb from --glb-dir, or from
-  {base-url}/LOD/lods-unity/lods/ (default https://abgen-cdn.decentraland.org),
-  rewrites its embedded atlases as BC KTX2 with mips (atlases only OPAQUE
-  materials draw are encoded opaque, so they can take BC1), and writes the
-  copy, its .br and its stats in the key layout under
-  OUT/LOD/lods-bevy/lods/, plus OUT/bevy-far-lod-report.json (per scene and
-  totals). --upload also puts every written file into the ABGEN_S3_* bucket
-  under the same key, with the lane's headers (.br as Content-Encoding: br).
-  --max-side, --no-mips and --keep-alpha change the encode for experiments;
-  the published copy uses the defaults. A missing plain GLB is reported, not
-  an error; a failed rewrite exits 1 after the rest are done.
 qualify-corpus: snapshots active Genesis City deployments from the configured
   Catalyst and all deployed scenes from the paginated Worlds API, converts
   immutable entity hashes into scratch output with bounded workers, rechecks
@@ -387,8 +370,6 @@ fn main() {
         "generate" => cmd_generate(&argv[1..]),
         "compare" => cmd_compare(&argv[1..]),
         "qualify-corpus" => qualify::run(&argv[1..]),
-        #[cfg(feature = "bevy-variants")]
-        "bevy-far-lod" => farlod::run(&argv[1..]),
         "-h" | "--help" => abgen::clihelp::print_help(usage_text()),
         "-V" | "--version" => abgen::clihelp::print_version(BIN_NAME),
         other => {

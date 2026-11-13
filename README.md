@@ -448,9 +448,8 @@ key from the scene id (lowercase) and falls back to the plain GLB on a 404. Code
   are unchanged. No content-addressed twins (only the Unity manifests name those).
 - Built by `lodgen::generate` (`GenerateParams::bevy_far_lod`; the conversion lambda sets it from
   `ABGEN_BEVY_VARIANTS`), and on LOD reuse from the copied plain GLB, so a reused scene always
-  carries one from the current encoders. Scenes built earlier are backfilled with
-  `abgen-lod bevy-far-lod --ids FILE --out DIR [--upload]`, which reads the published plain GLBs
-  and writes the same keys (and a report with totals).
+  carries one from the current encoders (and a scene built before the copy existed gets one on
+  its next deployment).
 - Stats (`*.stats.json`): plain, Bevy and `.br` bytes; texture GPU bytes before (RGBA8) and after
   (every level), by format; mesh vertex bytes as stored and widened to f32, index bytes; every
   atlas's format, size, mips and whether its alpha was dropped. `gpu_bytes` is texture + f32
