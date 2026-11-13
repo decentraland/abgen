@@ -33,7 +33,7 @@ pub struct StageTimes {
     pub transcode_ns: u64,
     /// Zstandard compression of every level plus KTX2 assembly.
     pub zstd_ns: u64,
-    /// Brotli of a `glb-br` model variant (its `.br` sidecar).
+    /// Brotli of a `glb-br` model variant or a GLB variant (its `.br` sidecar).
     pub brotli_ns: u64,
     /// CID (sha256) plus writing the variant file (and its `.br` sidecar).
     pub hash_write_ns: u64,
@@ -195,6 +195,63 @@ pub struct ModelStat {
     pub times: StageTimes,
 }
 
+/// One model's GLB variant (`g` class) outcome.
+#[derive(Clone, Debug, Serialize)]
+pub struct GlbStat {
+    pub hash: String,
+    pub file: String,
+    /// 0 when the outcome was reused: the source was not fetched.
+    pub original_size: u64,
+    /// The variant's key (`bevy/{prefix}/{name}`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant_size: Option<u64>,
+    /// Size of the `.br` sidecar (none when it was not smaller than the variant).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub br_size: Option<u64>,
+    /// Why there is no variant: a `model::NoGlbVariant` name, or `error` / `missing` (not final).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The outcome came from the key's record (probe hit): nothing was fetched or encoded, and
+    /// `images` is empty.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub reused: bool,
+    /// Every embedded image's outcome (built outcomes only).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<super::model::EmbeddedImage>,
+    pub times: StageTimes,
+}
+
+/// The GLB variants' (`g` class) totals. Byte totals cover the models built here (reused
+/// outcomes carry no sizes of their originals or images).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct GlbSummary {
+    /// Models considered.
+    pub considered: u64,
+    /// Outcomes taken from an existing record.
+    pub reused: u64,
+    /// Models that got a variant (built or reused).
+    pub variants: u64,
+    /// Built variants: their originals' bytes, the variants' bytes, and the `.br` sidecars'
+    /// bytes (`br_count` of them).
+    pub variants_original_bytes: u64,
+    pub variant_bytes: u64,
+    pub br_count: u64,
+    pub br_bytes: u64,
+    /// No-variant reason -> count.
+    pub no_variant: BTreeMap<String, u64>,
+    /// Embedded images converted, `"<format> from <source>"` -> count, original bytes and
+    /// KTX2 bytes.
+    pub images_converted: BTreeMap<String, CountBytes>,
+    /// Embedded images left as their original bytes, by reason -> count and bytes.
+    pub images_kept: BTreeMap<String, CountBytes>,
+    /// GPU bytes of the embedded images of the models built here: as the explorer holds the
+    /// originals, and as it holds what the variants carry (only images whose size is known).
+    pub gpu_original_bytes: u64,
+    pub gpu_variant_bytes: u64,
+}
+
 /// The model variants' (`glb-br`) totals.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ModelSummary {
@@ -253,6 +310,9 @@ pub struct BuildStats {
     /// The model variants (`glb-br`): totals and one row per model.
     pub model_variants: ModelSummary,
     pub model_files: Vec<ModelStat>,
+    /// The GLB variants (`g`): totals and one row per model.
+    pub glb_variants: GlbSummary,
+    pub glb_files: Vec<GlbStat>,
 }
 
 impl BuildStats {
@@ -340,12 +400,65 @@ impl BuildStats {
         self.model_files = rows;
     }
 
+    /// Add the GLB variant rows: totals and stage times.
+    pub fn add_glbs(&mut self, rows: Vec<GlbStat>) {
+        let g = &mut self.glb_variants;
+        let name = |v: serde_json::Result<serde_json::Value>| {
+            v.ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string())
+        };
+        for m in &rows {
+            g.considered += 1;
+            self.stages.add(&m.times);
+            if m.reused {
+                g.reused += 1;
+            }
+            match (m.variant_size, &m.reason) {
+                (Some(n), _) => {
+                    g.variants += 1;
+                    if !m.reused {
+                        g.variants_original_bytes += m.original_size;
+                        g.variant_bytes += n;
+                    }
+                    if let Some(b) = m.br_size {
+                        g.br_count += 1;
+                        g.br_bytes += b;
+                    }
+                }
+                (None, r) => {
+                    let key = r.clone().unwrap_or_else(|| "unknown".to_string());
+                    *g.no_variant.entry(key).or_default() += 1;
+                }
+            }
+            for i in &m.images {
+                let src = name(serde_json::to_value(i.source));
+                let e = match (i.format, i.reason) {
+                    (Some(fmt), _) => g.images_converted.entry(format!("{fmt} from {src}")),
+                    (None, r) => g.images_kept.entry(
+                        r.map_or_else(|| "unknown".to_string(), |r| name(serde_json::to_value(r))),
+                    ),
+                }
+                .or_default();
+                e.count += 1;
+                e.original_bytes += i.original_size;
+                e.variant_bytes += i.variant_size.unwrap_or(i.original_size);
+                if let (Some(a), Some(b)) = (i.original_gpu_bytes, i.variant_gpu_bytes) {
+                    g.gpu_original_bytes += a;
+                    g.gpu_variant_bytes += b;
+                }
+            }
+        }
+        self.glb_files = rows;
+    }
+
     /// The summary as JSON without the per-file rows.
     pub fn summary_json(&self) -> serde_json::Value {
         let mut v = serde_json::to_value(self).unwrap_or_default();
         if let Some(o) = v.as_object_mut() {
             o.remove("files");
             o.remove("model_files");
+            o.remove("glb_files");
             let ms = |ns: u64| (ns as f64 / 1e6 * 10.0).round() / 10.0;
             let st = &self.stages;
             o.insert(

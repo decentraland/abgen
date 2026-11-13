@@ -19,14 +19,15 @@ pub(crate) fn run_bevy_variants(
     ids: &[String],
     store: &LocalContentStore,
     out_root: &Path,
-    glb_variants: bool,
+    glb_variants: Option<bool>,
     no_models: bool,
     precompress_br: Option<bool>,
     zstd_level: Option<i32>,
 ) -> Result<()> {
     let env = abgen::bevyvariants::BuildOptions::from_env();
     let opts = abgen::bevyvariants::BuildOptions {
-        glb_variants: glb_variants || env.glb_variants,
+        // An explicit `--bevy-[no-]glb-variants` wins over `ABGEN_BEVY_GLB_VARIANTS`.
+        glb_variants: glb_variants.unwrap_or(env.glb_variants),
         models: env.models && !no_models,
         // An explicit `--bevy-precompress` wins over `ABGEN_BEVY_PRECOMPRESS`.
         precompress_br: precompress_br.unwrap_or(env.precompress_br),
@@ -43,6 +44,7 @@ pub(crate) fn run_bevy_variants(
     let mut originals = 0usize;
     let mut variants = 0usize;
     let mut reused = 0u64;
+    let mut glbs = abgen::bevyvariants::stats::GlbSummary::default();
     // Entities with a file that could not be fetched or built: no manifest, so not done.
     let mut incomplete = 0usize;
     for id in ids {
@@ -89,7 +91,17 @@ pub(crate) fn run_bevy_variants(
                 all_stats.push(full);
                 originals += o.entries.len();
                 variants += o.stats.unique_variants as usize;
-                reused += o.stats.reused_textures + o.stats.reused_models;
+                reused +=
+                    o.stats.reused_textures + o.stats.reused_models + o.stats.glb_variants.reused;
+                let g = &o.stats.glb_variants;
+                glbs.considered += g.considered;
+                glbs.variants += g.variants;
+                glbs.variants_original_bytes += g.variants_original_bytes;
+                glbs.variant_bytes += g.variant_bytes;
+                glbs.br_count += g.br_count;
+                glbs.br_bytes += g.br_bytes;
+                glbs.gpu_original_bytes += g.gpu_original_bytes;
+                glbs.gpu_variant_bytes += g.gpu_variant_bytes;
                 if !o.incomplete.is_empty() {
                     incomplete += 1;
                     errs += 1;
@@ -121,6 +133,7 @@ pub(crate) fn run_bevy_variants(
         "zstd_level": opts.zstd_level,
         "epoch": opts.epoch,
         "models": opts.models,
+        "glb_variants": opts.glb_variants,
         "precompress": if opts.precompress_br { "br" } else { "none" },
         "libzstd": abgen::ktx2_write::LIBZSTD_VERSION,
         "threads": rayon::current_num_threads(),
@@ -136,6 +149,20 @@ pub(crate) fn run_bevy_variants(
         started.elapsed().as_millis(),
         stats_path.display()
     );
+    if opts.glb_variants {
+        let mb = |b: u64| (b as f64 / 1e5).round() / 10.0;
+        println!(
+            "DONE bevy-glb models={} variants={} download_mb={}->{} (br {} of them: {}) embedded_gpu_mb={}->{}",
+            glbs.considered,
+            glbs.variants,
+            mb(glbs.variants_original_bytes),
+            mb(glbs.variant_bytes),
+            glbs.br_count,
+            mb(glbs.br_bytes),
+            mb(glbs.gpu_original_bytes),
+            mb(glbs.gpu_variant_bytes),
+        );
+    }
     if errs > 0 {
         std::process::exit(1);
     }
@@ -147,7 +174,7 @@ pub(crate) fn run_bevy_variants(
     _: &[String],
     _: &LocalContentStore,
     _: &Path,
-    _: bool,
+    _: Option<bool>,
     _: bool,
     _: Option<bool>,
     _: Option<i32>,

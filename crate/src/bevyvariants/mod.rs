@@ -7,24 +7,29 @@
 //!   entity's models use only as normal maps, BC1 for fully opaque images whose BC1 level 0
 //!   stays within `texture::BC1_MIN_PSNR_DB` of the source (linear ORM images keep BC1
 //!   regardless), BC7 otherwise.
-//! - Every texture variant must be smaller than its original file, or the original is served
-//!   as is (`size-gate` in the stats).
+//! - Every standalone texture variant must be smaller than its original file, or the original
+//!   is served as is (`size-gate` in the stats). Images embedded in a GLB variant are not gated
+//!   (see below).
 //! - Creator UASTC KTX2 textures (standalone or embedded in a GLB) are only ever transcoded block
 //!   for block to BC7, and only the single level the explorer's local path picks (the first
 //!   level at most 1024 on a side, no mips), so remote equals localhost; anything that would
 //!   need a resize or re-encode gets no variant. Keeping the file's lower mips needs the
 //!   explorer's local path to keep them too.
-//! - Models (opt-in: `ABGEN_BEVY_GLB_VARIANTS=1` or `abgen-corpus --bevy-glb-variants`; off by
-//!   default because Bevy's glTF loader does not take them yet) become a GLB with Draco decoded,
-//!   `KHR_texture_basisu` resolved and every embedded image replaced by its KTX2 variant
-//!   (`image/ktx2`). External image URIs are left as they are: they resolve to their own
-//!   original CID, which has its own texture variant.
+//! - GLB variants ([`model`], the `g` class, on by default; `ABGEN_BEVY_GLB_VARIANTS=0` or
+//!   `abgen-corpus --bevy-no-glb-variants` turns them off): a GLB with Draco decoded,
+//!   `KHR_texture_basisu` resolved and every embedded image replaced by a BC KTX2
+//!   (`image/ktx2`), so the explorer holds it at 0.5-1 byte per pixel instead of 4. Embedded
+//!   images skip the size gate: the goal is GPU memory, and a JPEG's BC KTX2 is often larger on
+//!   the wire than the JPEG. A GLB whose embedded KTX2 cannot be transcoded gets no variant.
+//!   External image URIs are left as they are: they resolve to their own original CID, which
+//!   has its own texture variant. With `.br` sidecars on, a GLB variant also gets one when it is
+//!   smaller (the geometry inside still compresses).
 //! - Every `.glb` also gets a `glb-br` model variant (`model`, on by default,
 //!   `ABGEN_BEVY_MODELS=0` or `ABGEN_BEVY_PRECOMPRESS=none` turns it off; [`glbbr`]): the
 //!   original `.glb`, byte for byte, plus its Brotli sidecar `{key}.br`, kept only when the
 //!   sidecar is smaller than the original, and served with `Content-Encoding: br` to clients
 //!   that accept it. The CID is always of the plain bytes. A `.gltf` gets none (`not-glb`).
-//!   KTX2 variants are never Brotli'd.
+//!   Standalone KTX2 variants are never Brotli'd.
 //! - Nothing else gets a variant (scene code, audio, video, source maps, unknown files).
 //!
 //! The client contract: no manifest, no entry, or any failure means the client loads the
@@ -39,7 +44,7 @@
 //!   how the entity's models sample the image; the same image used differently in two scenes
 //!   is two variants). A non-default Zstandard level is part of the prefix (`t3z9`).
 //! - `glb-br` models: `bevy/m{MESH_GEN}/{sourceCid}`.
-//! - GLB variants (opt-in): `bevy/g{TEX_GEN}/{sourceCid}`, with the digest of the external
+//! - GLB variants: `bevy/g{GLB_GEN}/{sourceCid}`, with the digest of the external
 //!   `.bin` buffers appended for a `.gltf` source (they are inlined, so they are an input;
 //!   image URIs are not).
 //!
@@ -50,7 +55,7 @@
 //! entity needs no model bytes to pick its textures' slots). The record is what a build
 //! reads before doing any work: its output directory, then (the store-backed build) Redis and
 //! the store; a miss fetches and encodes. Records and
-//! variants are immutable within a generation: [`TEX_GEN`] and [`MESH_GEN`] are bumped by hand
+//! variants are immutable within a generation: [`TEX_GEN`], [`MESH_GEN`] and [`GLB_GEN`] are bumped by hand
 //! when an encoder's output bytes change (precision, level, size cap, codec), which moves
 //! every key of that class to a new prefix; the previous prefix is garbage and can be deleted
 //! whole. The manifest records the prefixes it was built from (`lanes`), and an entity whose
@@ -106,6 +111,12 @@ pub const TEX_GEN: u32 = 3;
 /// 2: a model variant is the original `.glb` unchanged, with its `.br` sidecar (format
 /// `glb-br`; geometry is not re-encoded, so the client needs only its glTF loader).
 pub const MESH_GEN: u32 = 2;
+/// Generation of the GLB variants: their own rewrite rules and the texture encoders inside, so
+/// bump it whenever [`TEX_GEN`] is bumped too. It starts at 4, above the `g3` the class used
+/// when it was named after [`TEX_GEN`].
+/// 4: embedded images are not size-gated; a GLB with an embedded KTX2 that does not transcode
+/// gets no variant; `.br` sidecars.
+pub const GLB_GEN: u32 = 4;
 
 /// `"abgen <crate version>"`, stamped into every manifest.
 pub fn generator() -> String {
@@ -126,7 +137,7 @@ pub enum Class {
     Texture,
     /// `m{MESH_GEN}`.
     Mesh,
-    /// `g{TEX_GEN}` (same suffix rule as textures: the KTX2 inside follow it).
+    /// `g{GLB_GEN}` (same suffix rule as textures: the KTX2 inside follow it).
     Glb,
 }
 
@@ -153,7 +164,7 @@ impl Class {
         match self {
             Class::Texture => format!("t{TEX_GEN}{z}{e}"),
             Class::Mesh => format!("m{MESH_GEN}{e}"),
-            Class::Glb => format!("g{TEX_GEN}{z}{e}"),
+            Class::Glb => format!("g{GLB_GEN}{z}{e}"),
         }
     }
 }
@@ -352,7 +363,7 @@ impl Record {
 /// texture, one `glb-br` and one `glb`), ordered, so the serialized bytes are a function
 /// of the variants alone. The class of a path is its prefix letter (`t` BC KTX2, `m`
 /// `glb-br`, `g` GLB); the KTX2 header carries the BC format and size. `lanes` names
-/// the prefix each class was built from (`{"texture":"t3","mesh":"m2"}`), read back by
+/// the prefix each class was built from (`{"texture":"t3","mesh":"m2","glb":"g4"}`), read back by
 /// [`Manifest::is_current`]. The full entry (CID, format, dimensions, size) of each variant
 /// is in its record.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -568,7 +579,9 @@ impl crate::live::Proxy {
         let build = BevyBuild {
             skipped: false,
             originals: out.entries.len(),
-            reused: out.stats.reused_textures + out.stats.reused_models,
+            reused: out.stats.reused_textures
+                + out.stats.reused_models
+                + out.stats.glb_variants.reused,
             built: out.stats.unique_variants,
             incomplete: out.incomplete.len(),
         };

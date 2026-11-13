@@ -116,7 +116,7 @@ fn usage_text() -> &'static str {
               worlds-content-server;\n               \
               fetches scene entities + content into the store, then converts)\n  \
          abgen-corpus (--world <name>[,...] | --entity-ids <ids.txt> | --pointer <p>) <out-dir> \\\n               \
-             --bevy-variants [--bevy-glb-variants] [--bevy-no-models] [--bevy-precompress br|none]\n               \
+             --bevy-variants [--bevy-no-glb-variants] [--bevy-no-models] [--bevy-precompress br|none]\n               \
              [--bevy-zstd-level 1..19] [--worlds-url <url>] [--fetch-missing] [--content-dir <dir>] [-j JOBS]\n               \
              (PROTOTYPE: builds only the Bevy variants lane - KTX2/GLB variants named by\n               \
               source CID and generation plus one manifest per entity - into <out-dir>/bevy/,\n               \
@@ -298,7 +298,7 @@ fn run() -> Result<()> {
     let mut pointer_target: Option<String> = None;
     let mut gpu_flag = false;
     let mut bevy_variants = false;
-    let mut bevy_glb_variants = false;
+    let mut bevy_glb_variants: Option<bool> = None;
     let mut bevy_no_models = false;
     let mut bevy_precompress_br: Option<bool> = None;
     let mut bevy_zstd_level: Option<i32> = None;
@@ -427,8 +427,13 @@ fn run() -> Result<()> {
                         .unwrap_or_else(|| usage()),
                 );
             }
+            // GLB variants are on by default; `--bevy-glb-variants` overrides
+            // `ABGEN_BEVY_GLB_VARIANTS=0`.
             "--bevy-glb-variants" => {
-                bevy_glb_variants = true;
+                bevy_glb_variants = Some(true);
+            }
+            "--bevy-no-glb-variants" => {
+                bevy_glb_variants = Some(false);
             }
             "--bevy-no-models" => {
                 bevy_no_models = true;
@@ -473,14 +478,14 @@ fn run() -> Result<()> {
         }
         client_mode = true;
     }
-    if (bevy_glb_variants
+    if (bevy_glb_variants.is_some()
         || bevy_no_models
         || bevy_precompress_br.is_some()
         || bevy_zstd_level.is_some())
         && !bevy_variants
     {
         eprintln!(
-            "error: --bevy-glb-variants, --bevy-no-models, --bevy-precompress and \
+            "error: --bevy-[no-]glb-variants, --bevy-no-models, --bevy-precompress and \
              --bevy-zstd-level require --bevy-variants"
         );
         usage();

@@ -1,4 +1,4 @@
-use super::model::{transform_model, KTX2_MIME};
+use super::model::{transform_model, transform_model_with, NoGlbVariant, KTX2_MIME};
 use super::stats::{NoVariant, StageTimes};
 use super::texture::{
     choose_format, decode_bc1_rgba, encode_texture, encode_texture_ungated, encode_texture_with,
@@ -281,7 +281,9 @@ fn lane_prefixes_follow_generations_and_the_zstd_level() {
     assert_eq!(Class::Texture.prefix(d, None), format!("t{TEX_GEN}"));
     assert_eq!(Class::Texture.prefix(9, None), format!("t{TEX_GEN}z9"));
     assert_eq!(Class::Mesh.prefix(9, None), format!("m{MESH_GEN}"));
-    assert_eq!(Class::Glb.prefix(3, None), format!("g{TEX_GEN}z3"));
+    assert_eq!(Class::Glb.prefix(3, None), format!("g{GLB_GEN}z3"));
+    // Off the `g3` the class had when it was named after the texture generation.
+    assert_ne!(Class::Glb.prefix(d, None), "g3");
     // The epoch goes last, on every class.
     assert_eq!(Class::Texture.prefix(d, Some(2)), format!("t{TEX_GEN}e2"));
     assert_eq!(Class::Texture.prefix(9, Some(2)), format!("t{TEX_GEN}z9e2"));
@@ -311,18 +313,13 @@ fn lane_prefixes_follow_generations_and_the_zstd_level() {
         lanes,
         [
             ("texture", format!("t{TEX_GEN}")),
-            ("mesh", format!("m{MESH_GEN}"))
+            ("mesh", format!("m{MESH_GEN}")),
+            ("glb", format!("g{GLB_GEN}"))
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect()
     );
-    assert!(BuildOptions {
-        glb_variants: true,
-        ..BuildOptions::default()
-    }
-    .lanes()
-    .contains_key("glb"));
     let m = Manifest {
         v: MANIFEST_VERSION,
         lanes: lanes.clone(),
@@ -338,13 +335,16 @@ fn lane_prefixes_follow_generations_and_the_zstd_level() {
     }
     .lanes();
     assert!(m.is_current(&textures_only));
-    assert!(!m.is_current(
-        &BuildOptions {
-            glb_variants: true,
+    // A manifest built without GLB variants (before they were on by default) is stale.
+    let no_glb = Manifest {
+        lanes: BuildOptions {
+            glb_variants: false,
             ..BuildOptions::default()
         }
-        .lanes()
-    ));
+        .lanes(),
+        ..m.clone()
+    };
+    assert!(!no_glb.is_current(&lanes));
     assert!(!m.is_current(
         &BuildOptions {
             zstd_level: 9,
@@ -811,21 +811,85 @@ fn basisu_texture_resolves_to_its_ktx2_source_as_bc7() {
     assert!(doc.get("extensionsUsed").is_none());
     let img = &doc["images"][0];
     let view = view_bytes(&doc, &bin, img["bufferView"].as_u64().unwrap() as usize);
-    match encode_texture(UASTC_8, Slot::Srgb).unwrap() {
-        // Same pure transcode and size gate as a standalone KTX2.
-        Some(t) => {
-            assert_eq!(v.images_replaced, vec![0]);
-            assert_eq!(view, &t.bytes[..]);
-            let (_, levels) = image_ktx(&doc, &bin, 0, BcFormat::Bc7);
-            assert_eq!(levels, vec![client_bc7_level(UASTC_8)]);
-        }
-        // No variant: the creator's UASTC bytes stay, under their own MIME type.
-        None => {
-            assert!(v.images_replaced.is_empty());
-            assert_eq!(img["mimeType"], "image/ktx2");
-            assert_eq!(view, UASTC_8);
-        }
-    }
+    // Same pure transcode as a standalone KTX2, without the size gate.
+    let t = ungated(UASTC_8, Slot::Srgb);
+    assert_eq!(v.images_replaced, vec![0]);
+    assert_eq!(view, &t.bytes[..]);
+    let (_, levels) = image_ktx(&doc, &bin, 0, BcFormat::Bc7);
+    assert_eq!(levels, vec![client_bc7_level(UASTC_8)]);
+}
+
+/// An embedded KTX2 that does not transcode would leave a KTX2 the explorer cannot read inside
+/// the variant: the GLB gets none, with a reason, and the client loads the original.
+#[test]
+fn glb_with_an_embedded_ktx2_that_does_not_transcode_gets_no_variant() {
+    let mut junk = crate::ktx2::KTX2_MAGIC.to_vec();
+    junk.extend_from_slice(&[0u8; 100]);
+    let png = smooth_png_bytes(32, 32);
+    let mut bin = png.clone();
+    emit::pad4(&mut bin, 0);
+    let off = bin.len();
+    bin.extend_from_slice(&junk);
+    let glb = mk_glb(
+        json!({
+            "images": [
+                {"bufferView": 0, "mimeType": "image/png"},
+                {"bufferView": 1, "mimeType": "image/ktx2"}
+            ],
+            "textures": [{"source": 0}, {"source": 1}],
+            "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}],
+            "bufferViews": [
+                {"buffer": 0, "byteOffset": 0, "byteLength": png.len()},
+                {"buffer": 0, "byteOffset": off, "byteLength": junk.len()}
+            ]
+        }),
+        &bin,
+    );
+    let o = transform_model_with(&glb, ".glb", None, TexOptions::default()).unwrap();
+    assert!(o.variant.is_none());
+    assert_eq!(o.reason, Some(NoGlbVariant::EmbeddedKtx2Kept));
+    assert_eq!(o.images.len(), 2);
+    // The PNG beside it converts (BC1 or BC7 by the PSNR rule); the KTX2 does not.
+    assert!(o.images[0].format.is_some());
+    assert_eq!(o.images[1].reason, Some(NoVariant::Ktx2HeaderGate));
+}
+
+/// Embedded images skip the size gate: an image whose BC KTX2 is larger than its PNG/JPEG
+/// (here a solid PNG; in scenes mostly JPEGs) is still replaced, because what it saves is GPU
+/// memory. The outcome rows say what each image became and its GPU bytes before and after.
+#[test]
+fn embedded_image_is_replaced_even_when_its_ktx2_is_larger() {
+    let png = png_bytes(16, 16, [10, 20, 30, 255]);
+    // The standalone texture lane keeps this image as is.
+    assert_eq!(miss(&png, Slot::Srgb).reason, NoVariant::SizeGate);
+    let glb = mk_glb(
+        json!({
+            "images": [{"bufferView": 0, "mimeType": "image/png"}],
+            "textures": [{"source": 0}],
+            "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}],
+            "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": png.len()}]
+        }),
+        &png,
+    );
+    let o = transform_model_with(&glb, ".glb", None, TexOptions::default()).unwrap();
+    assert!(o.reason.is_none());
+    let v = o.variant.unwrap();
+    assert_eq!(v.images_replaced, vec![0]);
+    let t = ungated(&png, Slot::Srgb);
+    let (doc, bin) = split(&v.glb);
+    assert_eq!(doc["images"][0]["mimeType"], KTX2_MIME);
+    image_ktx(&doc, &bin, 0, t.format.bc());
+    let row = &o.images[0];
+    assert_eq!(row.source, super::stats::SourceKind::Png);
+    assert_eq!(row.format, Some(t.format.manifest_name()));
+    assert_eq!(row.original_size, png.len() as u64);
+    assert_eq!(row.variant_size, Some(t.bytes.len() as u64));
+    assert!(t.bytes.len() >= png.len());
+    assert_eq!(row.original_gpu_bytes, Some(16 * 16 * 4));
+    assert_eq!(
+        row.variant_gpu_bytes,
+        Some(crate::ktx2_write::level_bytes(t.format.bc(), 16, 16) as u64)
+    );
 }
 
 #[test]
@@ -1079,9 +1143,9 @@ fn entity_build_adds_glb_br_model_variants() {
 
     // A second build into the same root reuses everything from the records: no model is
     // fetched, nothing is encoded, nothing is listed for upload, the manifest is identical.
-    let fetches = std::sync::atomic::AtomicUsize::new(0);
+    let fetches = std::sync::Mutex::new(Vec::<String>::new());
     let counting = |h: &str| {
-        fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        fetches.lock().unwrap().push(h.to_string());
         blobs.get(h).cloned()
     };
     let lane2 = Lane {
@@ -1101,7 +1165,9 @@ fn entity_build_adds_glb_br_model_variants() {
     )
     .unwrap();
     assert_eq!(again.manifest_bytes, built.manifest_bytes);
-    assert_eq!(fetches.load(std::sync::atomic::Ordering::Relaxed), 0);
+    // Only the `.gltf` is read again: its GLB variant's name depends on the buffers its JSON
+    // names. A `.glb` is named by its CID alone.
+    assert_eq!(*fetches.lock().unwrap(), vec!["bafkgltf".to_string()]);
     assert!(again.uploads.is_empty());
     assert_eq!(again.stats.reused_models, 3);
     assert_eq!(again.stats.reused_textures, 1);
@@ -1164,7 +1230,7 @@ fn entity_build_adds_glb_br_model_variants() {
         stored: &|_: &str| -> Option<Vec<u8>> { None },
         local_records: true,
     };
-    fetches.store(0, std::sync::atomic::Ordering::Relaxed);
+    fetches.lock().unwrap().clear();
     let probed = build_entity_variants(&scene, &lane5, &out5, BuildOptions::default()).unwrap();
     assert_eq!(probed.entries["bafkgrid"], vec![entry.clone()]);
     // The remote record says the image is a normal map, so the texture key is the normal
@@ -1177,15 +1243,19 @@ fn entity_build_adds_glb_br_model_variants() {
         .find(|f| f.hash == "bafkgridpng")
         .unwrap();
     assert!(png.reused && png.reason == Some(NoVariant::SizeGate));
-    // Only the quad and the `.gltf` (no record anywhere) were fetched.
-    assert_eq!(fetches.load(std::sync::atomic::Ordering::Relaxed), 2);
-    assert!(probed
-        .uploads
-        .iter()
-        .all(|u| u.key.contains("/bafkquad") || u.key.contains("/bafkgltf")));
+    // Only the models with a key the probe has no record for were fetched: the quad and the
+    // `.gltf` (no record anywhere), and the grid for its GLB variant (the remote answers only
+    // its `glb-br` key). Not the image.
+    let mut fetched = fetches.lock().unwrap().clone();
+    fetched.sort();
+    assert_eq!(fetched, ["bafkgltf", "bafkgrid", "bafkquad"]);
+    let grid_glb_key = format!("bevy/g{GLB_GEN}/bafkgrid");
+    assert!(probed.uploads.iter().all(|u| u.key.contains("/bafkquad")
+        || u.key.contains("/bafkgltf")
+        || u.owner == grid_glb_key));
     let _ = std::fs::remove_dir_all(&out5);
 
-    // Off: no model entries at all.
+    // Off: no `glb-br` entries at all (GLB variants are their own switch).
     let out2 = std::env::temp_dir().join(format!("abgen-bevy-models-off-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out2);
     let built2 = build_entity_variants(
@@ -1202,7 +1272,7 @@ fn entity_build_adds_glb_br_model_variants() {
         .entries
         .values()
         .flatten()
-        .all(|e| e.kind == "texture"));
+        .all(|e| e.format != glbbr::GLB_BR_FORMAT));
     assert!(built2.stats.model_files.is_empty());
     // Without `.br` sidecars there are no model variants either.
     let _ = std::fs::remove_dir_all(&out2);
@@ -1218,6 +1288,12 @@ fn entity_build_adds_glb_br_model_variants() {
     .unwrap();
     assert!(built3.stats.model_files.is_empty());
     assert!(!built3.manifest.lanes.contains_key("mesh"));
+    // GLB variants are still built, without sidecars.
+    let quad_glb = &built3.entries["bafkquad"][0];
+    assert_eq!(quad_glb.format, "glb");
+    assert!(!key_path(&out2, &format!("{}.br", quad_glb.path))
+        .unwrap()
+        .exists());
     let _ = std::fs::remove_dir_all(&out);
     let _ = std::fs::remove_dir_all(&out2);
 }
@@ -1401,12 +1477,11 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
         let built = build_entity_variants(&scene, &lane, &out, opts).unwrap();
         (out, built)
     };
-    // Default: texture and `glb-br` model variants (GLB variants with KTX2
-    // inside are opt-in).
+    // Default: texture, `glb-br` model and GLB variants.
     assert_eq!(
         BuildOptions::default(),
         BuildOptions {
-            glb_variants: false,
+            glb_variants: true,
             models: true,
             precompress_br: true,
             zstd_level: crate::ktx2_write::DEFAULT_ZSTD_LEVEL,
@@ -1416,6 +1491,7 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     // These runs look at textures only.
     let textures_only_opts = BuildOptions {
         models: false,
+        glb_variants: false,
         ..BuildOptions::default()
     };
     let (out, built) = run("a", textures_only_opts);
@@ -1564,8 +1640,8 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     }
     let _ = std::fs::remove_dir_all(&out4);
 
-    // Opt-in: the GLB with embedded images gets a model variant (no size fields); the GLB whose
-    // only image is external still gets none; the texture entries are unchanged.
+    // GLB variants: the GLB with embedded images gets one (no size fields); the GLB whose only
+    // image is external gets none; the texture entries are unchanged.
     let (out3, built3) = run(
         "g",
         BuildOptions {
@@ -1586,13 +1662,43 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
     let mut textures_only = m3.clone();
     textures_only.remove("bafkembed");
     assert_eq!(&textures_only, m);
-    assert_eq!(model.path, format!("bevy/g{TEX_GEN}/bafkembed"));
+    assert_eq!(model.path, format!("bevy/g{GLB_GEN}/bafkembed"));
     let glb = std::fs::read(key_path(&out3, &model.path).unwrap()).unwrap();
     assert_eq!(cid_v1_raw_sha256(&glb), model.cid);
+    // Its `.br` sidecar exists exactly when the record says so, and decodes to the variant.
+    let rec3 =
+        Record::parse(&std::fs::read(key_path(&out3, &record_key(&model.path)).unwrap()).unwrap())
+            .unwrap();
+    let br_path = key_path(&out3, &format!("{}.br", model.path)).unwrap();
+    assert_eq!(rec3.br, br_path.is_file());
+    if rec3.br {
+        let br = std::fs::read(&br_path).unwrap();
+        assert!(br.len() < glb.len());
+        assert_eq!(super::glbbr::brotli_decompress(&br).unwrap(), glb);
+    }
+    // Stats: one GLB row per model, the embedded images' outcomes on the built one.
+    let gs = &built3.stats.glb_variants;
+    assert_eq!((gs.considered, gs.variants), (2, 1));
+    assert_eq!(gs.no_variant["nothing-to-change"], 1);
+    assert_eq!(
+        gs.images_converted.values().map(|c| c.count).sum::<u64>(),
+        2
+    );
+    assert!(gs.images_kept.is_empty());
+    assert!(gs.gpu_variant_bytes < gs.gpu_original_bytes);
+    let embed_row = built3
+        .stats
+        .glb_files
+        .iter()
+        .find(|r| r.hash == "bafkembed")
+        .unwrap();
+    assert_eq!(embed_row.images.len(), 2);
+    assert_eq!(embed_row.br_size.is_some(), rec3.br);
+    assert!(built3.stats.summary_json().get("glb_files").is_none());
     // The GLB nothing changes in has a negative record; the `.gltf` with no external buffer
     // keeps its plain name.
     let ext_rec = Record::parse(
-        &std::fs::read(key_path(&out3, &format!("bevy/g{TEX_GEN}/bafkext.json")).unwrap()).unwrap(),
+        &std::fs::read(key_path(&out3, &format!("bevy/g{GLB_GEN}/bafkext.json")).unwrap()).unwrap(),
     )
     .unwrap();
     assert_eq!(ext_rec.reason.as_deref(), Some("nothing-to-change"));
