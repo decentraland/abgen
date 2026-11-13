@@ -96,6 +96,8 @@ pub enum NoVariant {
     Tiny,
     /// PNG/JPEG that does not decode.
     DecodeError,
+    /// PNG/JPEG over `texture::MAX_SOURCE_PIXELS` by its header.
+    TooLarge,
     /// KTX2 the UASTC header gate turns away (not UASTC, not 2D, ...).
     Ktx2HeaderGate,
     /// UASTC KTX2 without a level of at most 1024 on a side.
@@ -200,9 +202,13 @@ pub struct GlbStat {
     pub variant_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub variant_size: Option<u64>,
-    /// Size of the `.br` sidecar (none when it was not smaller than the variant).
+    /// Size of the `.br` sidecar (none when it was not smaller than the variant, or the
+    /// outcome was reused: see `br`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub br_size: Option<u64>,
+    /// The variant has a `.br` sidecar (built here or named by the reused record).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub br: bool,
     /// Why there is no variant: a `model::NoGlbVariant` name, or `error` / `missing` (not final).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -226,21 +232,23 @@ pub struct GlbSummary {
     pub reused: u64,
     /// Models that got a variant (built or reused).
     pub variants: u64,
-    /// Built variants: their originals' bytes, the variants' bytes, and the `.br` sidecars'
-    /// bytes (`br_count` of them).
+    /// Built variants: their originals' bytes and the variants' bytes.
     pub variants_original_bytes: u64,
     pub variant_bytes: u64,
+    /// Variants with a `.br` sidecar (built or reused), and the bytes of the sidecars built
+    /// here.
     pub br_count: u64,
     pub br_bytes: u64,
     /// No-variant reason -> count.
     pub no_variant: BTreeMap<String, u64>,
-    /// Embedded images converted, `"<format> from <source>"` -> count, original bytes and
-    /// KTX2 bytes.
+    /// Embedded images of the variants built here (each distinct image and slot once):
+    /// converted, `"<format> from <source>"` -> count, original bytes and KTX2 bytes.
     pub images_converted: BTreeMap<String, CountBytes>,
     /// Embedded images left as their original bytes, by reason -> count and bytes.
     pub images_kept: BTreeMap<String, CountBytes>,
-    /// GPU bytes of the embedded images of the models built here: as the explorer holds the
+    /// GPU bytes of the embedded images of the variants built here: as the explorer holds the
     /// originals, and as it holds what the variants carry (only images whose size is known).
+    /// Models without a variant are not counted: the client loads their originals.
     pub gpu_original_bytes: u64,
     pub gpu_variant_bytes: u64,
 }
@@ -402,15 +410,19 @@ impl BuildStats {
                         g.variants_original_bytes += m.original_size;
                         g.variant_bytes += n;
                     }
-                    if let Some(b) = m.br_size {
+                    if m.br {
                         g.br_count += 1;
-                        g.br_bytes += b;
                     }
+                    g.br_bytes += m.br_size.unwrap_or(0);
                 }
                 (None, r) => {
                     let key = r.clone().unwrap_or_else(|| "unknown".to_string());
                     *g.no_variant.entry(key).or_default() += 1;
                 }
+            }
+            // Only a variant that ships changes what the explorer holds.
+            if m.variant_size.is_none() {
+                continue;
             }
             for i in &m.images {
                 let src = name(serde_json::to_value(i.source));

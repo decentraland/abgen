@@ -42,7 +42,7 @@
 //!
 //! - textures: `bevy/t{TEX_GEN}/{sourceCid}_{slot}` (`slot` = `srgb` | `linear` | `normal`,
 //!   how the entity's models sample the image; the same image used differently in two scenes
-//!   is two variants). A non-default Zstandard level is part of the prefix (`t3z9`).
+//!   is two variants). A non-default Zstandard level is part of the prefix (`t4z9`).
 //! - `glb-br` models: `bevy/m{MESH_GEN}/{sourceCid}`.
 //! - GLB variants: `bevy/g{GLB_GEN}/{sourceCid}`, with the digest of the external
 //!   `.bin` buffers appended for a `.gltf` source (they are inlined, so they are an input;

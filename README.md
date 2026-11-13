@@ -286,7 +286,7 @@ the path. The client loads a variant when the manifest lists one it supports and
 the original file on anything else, so the lane can be switched off at any time. Built by
 `crate/src/bevyvariants` (feature `bevy-variants`, on with `server`).
 
-- `GET /bevy/manifest/{entity}.json` - `{"v":3,"lanes":{"glb":"g4","mesh":"m2","texture":"t3"},"files":{"<original cid>":["bevy/t3/<original cid>_srgb"]}}`
+- `GET /bevy/manifest/{entity}.json` - `{"v":3,"lanes":{"glb":"g4","mesh":"m2","texture":"t4"},"files":{"<original cid>":["bevy/t4/<original cid>_srgb"]}}`
   (at most one path per class per original: a texture, a `glb-br` and a `glb`). 404 while absent, and while every copy on disk was built from an older
   generation or schema (`X-Abgen-Reason: bevy-variants-stale`, see the asset lane below).
   Nothing is built on request: the conversion lambda builds the lane for each entity after its
@@ -311,7 +311,7 @@ doing any work and looks for its record the way the Unity lanes probe
 
 - textures: `bevy/t{TEX_GEN}/{sourceCid}_{slot}`, `slot` = `srgb` | `linear` | `normal` (how the
   entity's models sample the image; the same image used differently in two scenes is two
-  variants). A Zstandard level other than the default is part of the prefix (`t3z9`).
+  variants). A Zstandard level other than the default is part of the prefix (`t4z9`).
 - `glb-br` models: `bevy/m{MESH_GEN}/{sourceCid}` (a `.gltf` source only ever gets a `not-glb`
   record there).
 - GLB variants: `bevy/g{GLB_GEN}/{sourceCid}`; a `.gltf` source gets a digest of the
@@ -348,7 +348,7 @@ prefix, the previous prefix (`bevy/t1/`, …) is garbage and can be deleted whol
 built from it (their `lanes` name it) read as stale until the entity's next build, which re-encodes only that class.
 The generations live in code because they describe the encoders. The operator's lever is
 `ABGEN_BEVY_EPOCH` (unset by default; a number `0..=9999`): when set, every prefix gets `e{N}`
-appended (`t3e2`, `m2e2`), so every key misses, every manifest reads as stale and the lane
+appended (`t4e2`, `m2e2`), so every key misses, every manifest reads as stale and the lane
 re-encodes into the new prefixes, without a release. Setting it back finds the old prefixes again.
 No per-recipe digests: skins, animations and textures referenced by a model do not change the
 model variant's bytes, so they are not in its name. The option toggles
@@ -388,8 +388,12 @@ release, never on the machine or thread count; a new libzstd release is a `TEX_G
   every embedded image replaced by a BC KTX2 (`image/ktx2`, the format rules above, no
   size gate either: the explorer holds a PNG/JPEG as RGBA8, 4 bytes per pixel, against 0.5 for
   BC1 and 1 for BC5/BC7, and a JPEG's BC KTX2 is often larger than the JPEG). An embedded PNG/JPEG that gets no encode (tiny, undecodable, not an image)
-  keeps its bytes; a GLB whose embedded KTX2 does not transcode gets no variant
-  (`embedded-ktx2-kept`), so every KTX2 in a GLB variant is BC1, BC5 or BC7. Images embedded in
+  keeps its bytes; a GLB whose embedded KTX2 does not transcode (`embedded-ktx2-kept`) or whose
+  textures sample an external KTX2 (`external-ktx2`) gets no variant, so every KTX2 in a GLB
+  variant is BC1, BC5 or BC7. Images no texture references are dropped, each distinct embedded
+  image is encoded and stored once, and a model over 512 distinct images or 2^28 source pixels
+  (`over-limits`) or whose materials do not classify (`unclassified`) gets no variant.
+  Standalone and embedded PNG/JPEGs over 2^28 pixels by their header get none (`too-large`). Images embedded in
   GLBs never get a texture variant of their own; external image URIs are left as they are. A
   model nothing changes in gets no variant (`nothing-to-change`); models whose meshes are
   compressed by an extension other than Draco are not handled yet. With precompression on, a

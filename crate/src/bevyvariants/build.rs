@@ -708,6 +708,7 @@ pub fn build_entity_variants(
                     variant_path: None,
                     variant_size: None,
                     br_size: None,
+                    br: false,
                     reason: None,
                     reused: false,
                     images: Vec::new(),
@@ -720,6 +721,7 @@ pub fn build_entity_variants(
                         uses_known = true;
                     }
                     stat.reason = rec.reason.clone();
+                    stat.br = rec.br;
                     if let Some(v) = &rec.variant {
                         stat.variant_path = Some(v.path.clone());
                         stat.variant_size = Some(v.size);
@@ -772,6 +774,7 @@ pub fn build_entity_variants(
                                     )?);
                                     stat.variant_path = Some(key.clone());
                                     stat.variant_size = Some(e.size);
+                                    stat.br = br.is_some();
                                     stat.br_size = br.map(|b| b.len() as u64);
                                     out.row.1.push(e);
                                 }

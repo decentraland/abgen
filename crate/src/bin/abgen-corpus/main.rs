@@ -116,7 +116,7 @@ fn usage_text() -> &'static str {
               worlds-content-server;\n               \
               fetches scene entities + content into the store, then converts)\n  \
          abgen-corpus (--world <name>[,...] | --entity-ids <ids.txt> | --pointer <p>) <out-dir> \\\n               \
-             --bevy-variants [--bevy-no-glb-variants] [--bevy-no-models] [--bevy-precompress br|none]\n               \
+             --bevy-variants [--bevy-[no-]glb-variants] [--bevy-no-models] [--bevy-precompress br|none]\n               \
              [--bevy-zstd-level 1..19] [--worlds-url <url>] [--fetch-missing] [--content-dir <dir>] [-j JOBS]\n               \
              (PROTOTYPE: builds only the Bevy variants lane - KTX2/GLB variants named by\n               \
               source CID and generation plus one manifest per entity - into <out-dir>/bevy/,\n               \

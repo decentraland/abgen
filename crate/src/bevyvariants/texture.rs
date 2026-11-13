@@ -127,7 +127,7 @@ pub fn psnr_rgb_db(a: &[u8], b: &[u8]) -> f64 {
 }
 
 /// How the entity's models sample an image.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Slot {
     /// Colour data (base colour, emissive, specular colour) or unknown use: sRGB.
     Srgb,
@@ -292,6 +292,10 @@ fn sniff(bytes: &[u8]) -> Option<Source> {
     }
 }
 
+/// Most source pixels of a PNG/JPEG the lane decodes (from its header): 2^28, 1 GiB as RGBA8.
+/// Larger images get no variant (`too-large`) and the client loads the original.
+pub const MAX_SOURCE_PIXELS: u64 = 1 << 28;
+
 /// Images this small get no variant: the original is as cheap as anything we could ship.
 pub fn is_tiny(w: u32, h: u32) -> bool {
     w <= 2 || h <= 2
@@ -332,9 +336,19 @@ pub fn encode_texture_with(
         return Ok(transcode_uastc_bc7_with(bytes, opts, times).map_err(Miss::from));
     }
     debug_assert!(matches!(source, Source::Png | Source::Jpeg));
+    // The header's size first: a small, highly compressible file can decode to gigabytes.
+    if let Ok((w, h)) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r.into_dimensions().map_err(anyhow::Error::from))
+    {
+        if u64::from(w) * u64::from(h) > MAX_SOURCE_PIXELS {
+            return Ok(Err(NoVariant::TooLarge.into()));
+        }
+    }
     let img =
         timed(&mut times.decode_ns, || image::load_from_memory(bytes)).context("decode image")?;
-    let img = timed(&mut times.decode_ns, || img.to_rgba8());
+    let img = timed(&mut times.decode_ns, || img.into_rgba8());
     // Tiny at the source, or at the variant size: an elongated source (4096x8) downscales to a
     // level 0 thinner than one 4x4 BC block (1024x2), which wgpu refuses.
     let (tw, th) = target_size(img.width(), img.height());

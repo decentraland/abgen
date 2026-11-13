@@ -7,8 +7,15 @@
 //! BC1 is 0.5, BC5/BC7 1), so an image whose BC KTX2 is larger on the wire is still replaced,
 //! as standalone textures are. A PNG/JPEG that gets no BC encode (tiny, not
 //! an image, does not decode) keeps its original bytes and MIME type. An embedded KTX2 that
-//! cannot be transcoded gets no GLB variant at all (`embedded-ktx2-kept`): every KTX2 in a GLB
-//! variant is BC1, BC5 or BC7, which is all the explorer's reader takes.
+//! cannot be transcoded gets no GLB variant at all (`embedded-ktx2-kept`), nor does one whose
+//! textures sample an external KTX2 (`external-ktx2`): every KTX2 in a GLB variant is BC1, BC5
+//! or BC7, which is all the explorer's reader takes.
+//!
+//! Images no texture references (a basisu KTX2 whose PNG/JPEG fallback won) are dropped. Each
+//! distinct embedded image and slot is encoded and stored once, however many `images` point at
+//! it. A model over [`MAX_EMBEDDED_SOURCES`] distinct images or [`MAX_EMBEDDED_PIXELS`] source
+//! pixels gets no variant (`over-limits`), nor does one whose materials do not classify
+//! (`unclassified`: a normal map would be encoded as colour). All of these are final.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value as J};
@@ -27,7 +34,8 @@ pub struct ModelVariant {
     pub glb: Vec<u8>,
     pub draco_decoded: bool,
     pub basisu_resolved: bool,
-    /// Indices of the glTF images now carried as BC KTX2 variants.
+    /// Indices (in the variant's `images`) of the images now carried as BC KTX2 variants.
+    /// Images no texture referenced are dropped, so indices can differ from the original's.
     pub images_replaced: Vec<usize>,
 }
 
@@ -41,12 +49,109 @@ pub enum NoGlbVariant {
     /// An embedded KTX2 did not transcode to BC7, so the GLB would carry a KTX2 the explorer
     /// cannot read; the client loads the original.
     EmbeddedKtx2Kept,
+    /// A texture samples an external KTX2: with `KHR_texture_basisu` resolved it would be a
+    /// plain core image the explorer may not read.
+    ExternalKtx2,
+    /// The materials could not be classified, so a normal map would be encoded as colour.
+    Unclassified,
+    /// More than [`MAX_EMBEDDED_SOURCES`] distinct embedded images, or more than
+    /// [`MAX_EMBEDDED_PIXELS`] source pixels in all.
+    OverLimits,
+}
+
+/// Most distinct embedded images (by bytes and slot) one GLB variant encodes.
+pub const MAX_EMBEDDED_SOURCES: usize = 512;
+/// Most source pixels (summed over the distinct embedded images, from their headers) one GLB
+/// variant decodes: 2^28, 1 GiB as RGBA8.
+pub const MAX_EMBEDDED_PIXELS: u64 = 1 << 28;
+
+/// Where an embedded image's bytes come from: a byte range of the merged buffers, or a data
+/// URI's decoded bytes (by digest).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum SrcKey {
+    Range(usize, usize),
+    Digest([u8; 32]),
+}
+
+/// Source pixels from an image's header (0 when unknown; a KTX2 counts its largest level,
+/// though only one level of at most 1024 on a side is transcoded).
+fn source_pixels(bytes: &[u8]) -> u64 {
+    if crate::ktx2::is_ktx2(bytes) {
+        return 0;
+    }
+    rgba_bytes(bytes).map_or(0, |b| b / 4)
+}
+
+/// The image indices the textures sample: `source` and any extension's `source`
+/// (`EXT_texture_webp`, ...).
+fn texture_image_refs(gltf: &J) -> BTreeSet<usize> {
+    let mut out = BTreeSet::new();
+    for t in gltf
+        .get("textures")
+        .and_then(J::as_array)
+        .into_iter()
+        .flatten()
+    {
+        out.extend(t.get("source").and_then(J::as_u64).map(|i| i as usize));
+        for e in t
+            .get("extensions")
+            .and_then(J::as_object)
+            .into_iter()
+            .flat_map(|o| o.values())
+        {
+            out.extend(e.get("source").and_then(J::as_u64).map(|i| i as usize));
+        }
+    }
+    out
+}
+
+/// Point every texture `source` (and extension `source`) at the image's new index.
+fn remap_texture_images(gltf: &mut J, remap: &[Option<usize>]) -> Result<()> {
+    let fix = |holder: &mut J| -> Result<()> {
+        if let Some(i) = holder.get("source").and_then(J::as_u64) {
+            let to = remap
+                .get(i as usize)
+                .copied()
+                .flatten()
+                .ok_or_else(|| anyhow!("texture source {i} out of range"))?;
+            holder["source"] = json!(to);
+        }
+        Ok(())
+    };
+    for t in gltf
+        .get_mut("textures")
+        .and_then(J::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        fix(t)?;
+        if let Some(exts) = t.get_mut("extensions").and_then(J::as_object_mut) {
+            for e in exts.values_mut() {
+                fix(e)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An image with an external (not `data:`) URI that is a KTX2, by MIME type or extension.
+fn is_external_ktx2(img: &J) -> bool {
+    let Some(uri) = img.get("uri").and_then(J::as_str) else {
+        return false;
+    };
+    if uri.starts_with("data:") {
+        return false;
+    }
+    let path = uri.split(['?', '#']).next().unwrap_or(uri);
+    img.get("mimeType").and_then(J::as_str) == Some(KTX2_MIME)
+        || path.to_ascii_lowercase().ends_with(".ktx2")
 }
 
 /// One embedded image's outcome in a GLB variant build.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct EmbeddedImage {
-    /// Index in the glTF's `images`.
+    /// Index in the variant's `images` of the first image with these bytes and slot (each
+    /// distinct one is encoded once).
     pub index: usize,
     pub source: SourceKind,
     pub original_size: u64,
@@ -144,7 +249,7 @@ fn encode_embedded(
 }
 
 /// Per-image material uses of a glTF, indexed like its `images`, plus each image's external
-/// URI. `None` when the glTF does not classify (every image is then treated as colour).
+/// URI. `None` when the glTF does not classify.
 pub fn image_uses(
     bytes: &[u8],
     ext: &str,
@@ -353,41 +458,116 @@ pub fn transform_model_with(
         ranges.push((base + off, len, off % 4));
     }
 
-    // Embedded images (bufferView or data: URI) -> BC KTX2.
-    let images: Vec<J> = gltf
-        .get("images")
-        .and_then(J::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut replaced: BTreeMap<usize, TextureVariant> = BTreeMap::new();
-    let mut rows: Vec<EmbeddedImage> = Vec::new();
-    let mut times = StageTimes::default();
-    for (i, img) in images.iter().enumerate() {
-        let uri = img.get("uri").and_then(J::as_str);
-        let src: Option<Vec<u8>> = match (uri, view_index(img)) {
-            (None, Some(vi)) => ranges
-                .get(vi)
-                .map(|&(start, len, _)| merged[start..start + len].to_vec()),
-            (Some(u), _) if u.starts_with("data:") => crate::gltf::decode_data_uri(u),
-            _ => None,
-        };
-        let Some(src) = src else { continue };
-        let slot = uses
-            .as_ref()
-            .and_then(|u| u.get(i).copied())
-            .map_or(Slot::Srgb, Uses::slot);
-        let (v, row) = encode_embedded(i, &src, slot, opts, &mut times);
-        if let Some(v) = v {
-            replaced.insert(i, v);
+    // Images no texture references any more (a basisu KTX2 whose PNG/JPEG fallback won) are
+    // dropped, so nothing the explorer never samples can block the variant or ship in it.
+    let all_images: Vec<J> = match gltf.get_mut("images").map(std::mem::take) {
+        Some(J::Array(a)) => a,
+        _ => Vec::new(),
+    };
+    let referenced = texture_image_refs(&gltf);
+    let mut image_remap: Vec<Option<usize>> = vec![None; all_images.len()];
+    let mut images: Vec<J> = Vec::with_capacity(all_images.len());
+    // Kept image (new index) -> its index in the original, which `uses` is indexed by.
+    let mut original_index: Vec<usize> = Vec::with_capacity(all_images.len());
+    let mut removed_views: BTreeSet<usize> = BTreeSet::new();
+    for (i, img) in all_images.into_iter().enumerate() {
+        if referenced.contains(&i) {
+            image_remap[i] = Some(images.len());
+            original_index.push(i);
+            images.push(img);
+        } else {
+            removed_views.extend(view_index(&img));
         }
-        rows.push(row);
     }
+    remap_texture_images(&mut gltf, &image_remap)?;
+
     let none = |reason, images, times| GlbOutcome {
         variant: None,
         reason: Some(reason),
         images,
         times,
     };
+    // An external KTX2 a texture samples stays a KTX2 the explorer may not read (it has no
+    // `KHR_texture_basisu` any more): no variant.
+    if images.iter().any(is_external_ktx2) {
+        return Ok(none(
+            NoGlbVariant::ExternalKtx2,
+            Vec::new(),
+            StageTimes::default(),
+        ));
+    }
+
+    // Embedded images (bufferView or data: URI): each distinct source and slot is encoded
+    // once, within the per-model limits.
+    // (bytes, slot, first image with them).
+    let mut sources: Vec<(Vec<u8>, Slot, usize)> = Vec::new();
+    let mut source_of: BTreeMap<usize, usize> = BTreeMap::new();
+    {
+        let mut seen: std::collections::HashMap<(SrcKey, Slot), usize> =
+            std::collections::HashMap::new();
+        for (i, img) in images.iter().enumerate() {
+            let uri = img.get("uri").and_then(J::as_str);
+            let (key, src) = match (uri, view_index(img)) {
+                (None, Some(vi)) => match ranges.get(vi) {
+                    Some(&(start, len, _)) => (SrcKey::Range(start, len), None),
+                    None => continue,
+                },
+                (Some(u), _) if u.starts_with("data:") => match crate::gltf::decode_data_uri(u) {
+                    Some(b) => (SrcKey::Digest(crate::hashes::sha256(&b)), Some(b)),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            let slot = uses
+                .as_ref()
+                .and_then(|u| u.get(original_index[i]).copied())
+                .map_or(Slot::Srgb, Uses::slot);
+            let idx = *seen.entry((key, slot)).or_insert_with(|| {
+                let bytes = src.unwrap_or_else(|| match key {
+                    SrcKey::Range(start, len) => merged[start..start + len].to_vec(),
+                    SrcKey::Digest(_) => unreachable!("a data URI carries its bytes"),
+                });
+                sources.push((bytes, slot, i));
+                sources.len() - 1
+            });
+            source_of.insert(i, idx);
+        }
+    }
+    if !sources.is_empty() && uses.is_none() {
+        // Without the materials' uses a normal map would be encoded as colour data.
+        return Ok(none(
+            NoGlbVariant::Unclassified,
+            Vec::new(),
+            StageTimes::default(),
+        ));
+    }
+    if sources.len() > MAX_EMBEDDED_SOURCES
+        || sources
+            .iter()
+            .map(|(b, _, _)| source_pixels(b))
+            .sum::<u64>()
+            > MAX_EMBEDDED_PIXELS
+    {
+        return Ok(none(
+            NoGlbVariant::OverLimits,
+            Vec::new(),
+            StageTimes::default(),
+        ));
+    }
+    let mut times = StageTimes::default();
+    let mut variants: Vec<Option<TextureVariant>> = Vec::with_capacity(sources.len());
+    let mut rows: Vec<EmbeddedImage> = Vec::with_capacity(sources.len());
+    for (src, slot, first) in &sources {
+        let (v, row) = encode_embedded(*first, src, *slot, opts, &mut times);
+        variants.push(v);
+        rows.push(row);
+    }
+    drop(sources);
+    let replaced: BTreeMap<usize, usize> = source_of
+        .iter()
+        .filter(|(_, s)| variants[**s].is_some())
+        .map(|(i, s)| (*i, *s))
+        .collect();
     if rows
         .iter()
         .any(|r| r.source == SourceKind::Ktx2 && r.format.is_none())
@@ -417,6 +597,7 @@ pub fn transform_model_with(
         }
     }
     let mut dropped: BTreeSet<usize> = draco_views;
+    dropped.extend(removed_views);
     for (i, img) in images.iter().enumerate() {
         if replaced.contains_key(&i) {
             dropped.extend(view_index(img));
@@ -468,21 +649,28 @@ pub fn transform_model_with(
             }
         }
     }
+    // Each distinct variant is written once; every image that encodes to it points at it.
+    let mut variant_view: BTreeMap<usize, usize> = BTreeMap::new();
     let mut images = images;
     for (i, img) in images.iter_mut().enumerate() {
         match replaced.get(&i) {
             None => fix(img, &format!("image[{i}]"))?,
-            Some(v) => {
-                emit::pad4(&mut bin, 0);
-                let off = bin.len();
-                bin.extend_from_slice(&v.bytes);
-                let vidx = new_views.len();
-                new_views.push(json!({
-                    "buffer": 0,
-                    "byteOffset": off,
-                    "byteLength": v.bytes.len(),
-                    "name": v.format.manifest_name(),
-                }));
+            Some(&si) => {
+                let v = variants[si]
+                    .as_ref()
+                    .expect("replaced images have a variant");
+                let vidx = *variant_view.entry(si).or_insert_with(|| {
+                    emit::pad4(&mut bin, 0);
+                    let off = bin.len();
+                    bin.extend_from_slice(&v.bytes);
+                    new_views.push(json!({
+                        "buffer": 0,
+                        "byteOffset": off,
+                        "byteLength": v.bytes.len(),
+                        "name": v.format.manifest_name(),
+                    }));
+                    new_views.len() - 1
+                });
                 if let Some(o) = img.as_object_mut() {
                     o.remove("uri");
                     o.insert("bufferView".into(), json!(vidx));
@@ -512,6 +700,10 @@ pub fn transform_model_with(
         root.insert("buffers".into(), json!([{ "byteLength": bin.len() }]));
     }
     let json_bytes = serde_json::to_vec(&gltf).context("gltf serialize")?;
+    // The GLB header and chunk lengths are u32.
+    if u32::try_from(json_bytes.len() + bin.len() + 64).is_err() {
+        bail!("GLB variant would exceed 4 GiB");
+    }
     Ok(GlbOutcome {
         variant: Some(ModelVariant {
             glb: emit::glb_frame(json_bytes, &bin),
