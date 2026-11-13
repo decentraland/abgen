@@ -942,13 +942,58 @@ fn basisu_fallback_wins_and_the_unused_ktx2_is_dropped() {
     assert!(!bin.windows(junk.len()).any(|w| w == junk.as_slice()));
 }
 
+/// When every image is dropped the variant has no `images` at all (`null` is not valid glTF).
+#[test]
+fn variant_whose_images_are_all_dropped_has_no_images_key() {
+    let png = smooth_png_bytes(16, 16);
+    let glb = mk_glb(
+        json!({
+            "extensionsUsed": ["KHR_texture_basisu"],
+            "images": [{"bufferView": 0, "mimeType": "image/png"}],
+            "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": png.len()}]
+        }),
+        &png,
+    );
+    let v = transform_model(&glb, ".glb", None).unwrap().unwrap();
+    let (doc, _) = split(&v.glb);
+    assert!(doc.get("images").is_none(), "{doc}");
+    assert!(doc.get("bufferViews").is_none());
+    assert!(doc.get("extensionsUsed").is_none());
+}
+
+/// An extension that may hold image indices outside `textures` keeps every image where it was.
+#[test]
+fn unknown_extension_keeps_unreferenced_images_in_place() {
+    let png = smooth_png_bytes(16, 16);
+    let glb = mk_glb(
+        json!({
+            "extensionsUsed": ["EXT_lights_image_based"],
+            "extensions": {"EXT_lights_image_based": {"lights": [{"specularImages": [[0]]}]}},
+            "images": [
+                {"bufferView": 0, "mimeType": "image/png"},
+                {"bufferView": 0, "mimeType": "image/png"}
+            ],
+            "textures": [{"source": 1}],
+            "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}],
+            "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": png.len()}]
+        }),
+        &png,
+    );
+    let v = transform_model(&glb, ".glb", None).unwrap().unwrap();
+    let (doc, _) = split(&v.glb);
+    assert_eq!(doc["images"].as_array().unwrap().len(), 2);
+    assert_eq!(doc["textures"], json!([{"source": 1}]));
+}
+
 /// A basisu-only texture whose KTX2 is an external file would become a plain core KTX2 image
 /// the explorer may not read: no variant.
 #[test]
 fn basisu_with_an_external_ktx2_gets_no_variant() {
+    // By suffix, by MIME type, and by neither: a basisu source is a KTX2 by definition.
     for img in [
         json!({"uri": "b.ktx2"}),
         json!({"uri": "b?v=1", "mimeType": "image/ktx2"}),
+        json!({"uri": "b"}),
     ] {
         let gltf = json!({
             "asset": {"version": "2.0"},

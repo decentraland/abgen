@@ -11,7 +11,8 @@
 //! textures sample an external KTX2 (`external-ktx2`): every KTX2 in a GLB variant is BC1, BC5
 //! or BC7, which is all the explorer's reader takes.
 //!
-//! Images no texture references (a basisu KTX2 whose PNG/JPEG fallback won) are dropped. Each
+//! Images no texture references (a basisu KTX2 whose PNG/JPEG fallback won) are dropped,
+//! unless the model uses an extension that may reference images elsewhere. Each
 //! distinct embedded image and slot is encoded and stored once, however many `images` point at
 //! it. A model over [`MAX_EMBEDDED_SOURCES`] distinct images or [`MAX_EMBEDDED_PIXELS`] source
 //! pixels gets no variant (`over-limits`), nor does one whose materials do not classify
@@ -73,13 +74,62 @@ enum SrcKey {
     Digest([u8; 32]),
 }
 
-/// Source pixels from an image's header (0 when unknown; a KTX2 counts its largest level,
-/// though only one level of at most 1024 on a side is transcoded).
+/// Source pixels from an image's header (0 when unknown). A KTX2 counts its level 0 up to
+/// 1024 x 1024: only one level of at most 1024 on a side is ever transcoded.
 fn source_pixels(bytes: &[u8]) -> u64 {
     if crate::ktx2::is_ktx2(bytes) {
-        return 0;
+        return crate::ktx2::read_header(bytes).map_or(0, |h| {
+            (u64::from(h.width) * u64::from(h.height.max(1))).min(1024 * 1024)
+        });
     }
     rgba_bytes(bytes).map_or(0, |b| b / 4)
+}
+
+/// Extensions that reference images only through `textures` (or not at all), so dropping
+/// images no texture samples cannot leave a dangling index.
+fn only_known_extensions(gltf: &J) -> bool {
+    const KNOWN: &[&str] = &[
+        "KHR_draco_mesh_compression",
+        "KHR_texture_basisu",
+        "KHR_texture_transform",
+        "KHR_mesh_quantization",
+        "KHR_lights_punctual",
+        "KHR_animation_pointer",
+        "EXT_texture_webp",
+        "EXT_mesh_gpu_instancing",
+    ];
+    ["extensionsUsed", "extensionsRequired"]
+        .iter()
+        .flat_map(|k| gltf.get(*k).and_then(J::as_array).into_iter().flatten())
+        .all(|e| {
+            e.as_str()
+                .is_some_and(|e| e.starts_with("KHR_materials_") || KNOWN.contains(&e))
+        })
+}
+
+/// Images that `KHR_texture_basisu` is the only source of for some texture (no core
+/// `source`): resolving the extension makes them that texture's core `source`.
+fn basisu_promoted_images(gltf: &J) -> BTreeSet<usize> {
+    gltf.get("textures")
+        .and_then(J::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|t| t.get("source").is_none())
+        .filter_map(|t| {
+            t.get("extensions")
+                .and_then(|e| e.get(BASISU))
+                .and_then(|b| b.get("source"))
+                .and_then(J::as_u64)
+                .map(|i| i as usize)
+        })
+        .collect()
+}
+
+/// An image with an external (not `data:`) URI.
+fn is_external(img: &J) -> bool {
+    img.get("uri")
+        .and_then(J::as_str)
+        .is_some_and(|u| !u.starts_with("data:"))
 }
 
 /// The image indices the textures sample: `source` and any extension's `source`
@@ -415,6 +465,9 @@ pub fn transform_model_with(
 
     let (mut gltf, buffers) = crate::gltf::load_gltf_inputs(bytes, ext, resolve)?;
     let draco_decoded = strip_draco_markers(&mut gltf);
+    // Images a basisu texture is about to take as its core `source`: KTX2 by the extension's
+    // definition, whatever their URI says.
+    let basisu_promoted = basisu_promoted_images(&gltf);
     let basisu_resolved = resolve_texture_basisu(&mut gltf);
     if let Some(root) = gltf.as_object_mut() {
         // The Draco decode drops its name from these lists but can leave them empty.
@@ -464,7 +517,14 @@ pub fn transform_model_with(
         Some(J::Array(a)) => a,
         _ => Vec::new(),
     };
-    let referenced = texture_image_refs(&gltf);
+    // An extension this code does not know may reference images outside `textures`
+    // (`EXT_lights_image_based`, `VRMC_vrm` thumbnails): then nothing is dropped, so no index
+    // it holds moves.
+    let referenced: BTreeSet<usize> = if only_known_extensions(&gltf) {
+        texture_image_refs(&gltf)
+    } else {
+        (0..all_images.len()).collect()
+    };
     let mut image_remap: Vec<Option<usize>> = vec![None; all_images.len()];
     let mut images: Vec<J> = Vec::with_capacity(all_images.len());
     // Kept image (new index) -> its index in the original, which `uses` is indexed by.
@@ -489,7 +549,9 @@ pub fn transform_model_with(
     };
     // An external KTX2 a texture samples stays a KTX2 the explorer may not read (it has no
     // `KHR_texture_basisu` any more): no variant.
-    if images.iter().any(is_external_ktx2) {
+    if images.iter().enumerate().any(|(i, img)| {
+        is_external_ktx2(img) || (basisu_promoted.contains(&original_index[i]) && is_external(img))
+    }) {
         return Ok(none(
             NoGlbVariant::ExternalKtx2,
             Vec::new(),
@@ -498,22 +560,31 @@ pub fn transform_model_with(
     }
 
     // Embedded images (bufferView or data: URI): each distinct source and slot is encoded
-    // once, within the per-model limits.
-    // (bytes, slot, first image with them).
-    let mut sources: Vec<(Vec<u8>, Slot, usize)> = Vec::new();
+    // once, within the per-model limits, which are enforced as sources are found. A source is
+    // a key into `merged` or into the decoded data URIs (one copy per digest), never a copy:
+    // overlapping views cost nothing until they are encoded, one at a time.
+    // (key, slot, first image with it).
+    let mut sources: Vec<(SrcKey, Slot, usize)> = Vec::new();
+    let mut data_uris: std::collections::HashMap<[u8; 32], Vec<u8>> =
+        std::collections::HashMap::new();
     let mut source_of: BTreeMap<usize, usize> = BTreeMap::new();
     {
         let mut seen: std::collections::HashMap<(SrcKey, Slot), usize> =
             std::collections::HashMap::new();
+        let mut pixels: u64 = 0;
         for (i, img) in images.iter().enumerate() {
             let uri = img.get("uri").and_then(J::as_str);
-            let (key, src) = match (uri, view_index(img)) {
+            let key = match (uri, view_index(img)) {
                 (None, Some(vi)) => match ranges.get(vi) {
-                    Some(&(start, len, _)) => (SrcKey::Range(start, len), None),
+                    Some(&(start, len, _)) => SrcKey::Range(start, len),
                     None => continue,
                 },
                 (Some(u), _) if u.starts_with("data:") => match crate::gltf::decode_data_uri(u) {
-                    Some(b) => (SrcKey::Digest(crate::hashes::sha256(&b)), Some(b)),
+                    Some(b) => {
+                        let d = crate::hashes::sha256(&b);
+                        data_uris.entry(d).or_insert(b);
+                        SrcKey::Digest(d)
+                    }
                     None => continue,
                 },
                 _ => continue,
@@ -522,14 +593,35 @@ pub fn transform_model_with(
                 .as_ref()
                 .and_then(|u| u.get(original_index[i]).copied())
                 .map_or(Slot::Srgb, Uses::slot);
-            let idx = *seen.entry((key, slot)).or_insert_with(|| {
-                let bytes = src.unwrap_or_else(|| match key {
-                    SrcKey::Range(start, len) => merged[start..start + len].to_vec(),
-                    SrcKey::Digest(_) => unreachable!("a data URI carries its bytes"),
-                });
-                sources.push((bytes, slot, i));
-                sources.len() - 1
-            });
+            let idx = match seen.get(&(key, slot)) {
+                Some(&idx) => idx,
+                None => {
+                    // A new source: count it against the limits before keeping it.
+                    if seen.len() >= MAX_EMBEDDED_SOURCES {
+                        return Ok(none(
+                            NoGlbVariant::OverLimits,
+                            Vec::new(),
+                            StageTimes::default(),
+                        ));
+                    }
+                    // The same bytes under another slot decode once more: count them again.
+                    let src = match key {
+                        SrcKey::Range(start, len) => Some(&merged[start..start + len]),
+                        SrcKey::Digest(d) => data_uris.get(&d).map(Vec::as_slice),
+                    };
+                    pixels = pixels.saturating_add(src.map_or(0, source_pixels));
+                    if pixels > MAX_EMBEDDED_PIXELS {
+                        return Ok(none(
+                            NoGlbVariant::OverLimits,
+                            Vec::new(),
+                            StageTimes::default(),
+                        ));
+                    }
+                    sources.push((key, slot, i));
+                    seen.insert((key, slot), sources.len() - 1);
+                    sources.len() - 1
+                }
+            };
             source_of.insert(i, idx);
         }
     }
@@ -541,28 +633,19 @@ pub fn transform_model_with(
             StageTimes::default(),
         ));
     }
-    if sources.len() > MAX_EMBEDDED_SOURCES
-        || sources
-            .iter()
-            .map(|(b, _, _)| source_pixels(b))
-            .sum::<u64>()
-            > MAX_EMBEDDED_PIXELS
-    {
-        return Ok(none(
-            NoGlbVariant::OverLimits,
-            Vec::new(),
-            StageTimes::default(),
-        ));
-    }
     let mut times = StageTimes::default();
     let mut variants: Vec<Option<TextureVariant>> = Vec::with_capacity(sources.len());
     let mut rows: Vec<EmbeddedImage> = Vec::with_capacity(sources.len());
-    for (src, slot, first) in &sources {
-        let (v, row) = encode_embedded(*first, src, *slot, opts, &mut times);
+    for &(key, slot, first) in &sources {
+        let src: &[u8] = match key {
+            SrcKey::Range(start, len) => &merged[start..start + len],
+            SrcKey::Digest(d) => data_uris.get(&d).map_or(&[][..], Vec::as_slice),
+        };
+        let (v, row) = encode_embedded(first, src, slot, opts, &mut times);
         variants.push(v);
         rows.push(row);
     }
-    drop(sources);
+    drop(data_uris);
     let replaced: BTreeMap<usize, usize> = source_of
         .iter()
         .filter(|(_, s)| variants[**s].is_some())
@@ -691,6 +774,9 @@ pub fn transform_model_with(
     }
     if !images.is_empty() {
         root.insert("images".into(), J::Array(images));
+    } else {
+        // Every image was dropped: no `images` at all (`null` is not valid glTF).
+        root.remove("images");
     }
     if new_views.is_empty() {
         root.remove("bufferViews");
