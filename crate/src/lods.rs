@@ -206,6 +206,15 @@ pub const MANIFEST_KEY_DIR: &str = "LOD/lods-unity/manifests";
 /// Key prefix of the published GLB family (on disk: [`PUBLISHED_GLB_DIR`]).
 pub const GLB_KEY_DIR: &str = "LOD/lods-unity/lods";
 
+/// Scene-relative directory of the Bevy far LOD copies on disk (`crate::bevyvariants::farlod`):
+/// each published GLB rewritten with BC KTX2 textures, its `.br` and its stats. Derived from the
+/// published GLB after the bundles are built from it; never read by the Unity lanes.
+pub const BEVY_GLB_DIR: &str = "lods-bevy/lods";
+
+/// Key prefix of the Bevy far LOD copies (on disk: [`BEVY_GLB_DIR`]), unversioned like
+/// [`GLB_KEY_DIR`] and named the same way (`{sid}_{level}.glb`, `.glb.br`, `.stats.json`).
+pub const BEVY_GLB_KEY_DIR: &str = "LOD/lods-bevy/lods";
+
 /// File name of the published GLB: abgen lower-cases every LOD key, production
 /// names it with the verbatim entity id (identical for `bafk…` ids).
 pub fn published_glb_name(scene_id: &str, level: u32) -> String {
@@ -242,7 +251,9 @@ pub fn digest_named_key(key: &str, scene_id: &str, digest: &str) -> Option<Strin
 }
 
 /// `objects` followed by the digest-named twin of each: the same file, published under its
-/// content-addressed key as well.
+/// content-addressed key as well. The Bevy far LOD copies get none: only the Unity manifests'
+/// `lods` block names twins, and their bytes also depend on the Bevy encoders, which the state
+/// digest does not cover.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn with_digest_twins(
     mut objects: Vec<PublishedObject>,
@@ -251,6 +262,7 @@ pub fn with_digest_twins(
 ) -> Vec<PublishedObject> {
     let twins: Vec<PublishedObject> = objects
         .iter()
+        .filter(|o| !o.key.starts_with(BEVY_GLB_KEY_DIR))
         .filter_map(|o| {
             Some(PublishedObject {
                 key: digest_named_key(&o.key, scene_id, digest)?,
@@ -611,7 +623,8 @@ pub struct PublishedObject {
 /// Space objects a generated LOD scene directory publishes, keyed the way
 /// production lays them out, all under the single [`PUBLISH_ROOT`] folder: bundles at
 /// `LOD/{level}/{file}`, the ISS descriptor at `LOD/lods-unity/manifests/{file}` and the
-/// published GLB at `LOD/lods-unity/lods/{file}` — all unversioned, unlike asset bundles. Upload
+/// published GLB at `LOD/lods-unity/lods/{file}`, and its Bevy copy (with its `.br` and stats)
+/// under [`BEVY_GLB_KEY_DIR`] — all unversioned, unlike asset bundles. Upload
 /// metadata (Content-Type/Cache-Control/Content-Encoding) is derived from the
 /// key by `space::object_headers`, not carried here.
 #[cfg(not(target_arch = "wasm32"))]
@@ -642,11 +655,28 @@ pub fn published_objects(scene_dir: &Path, levels: &[u32]) -> Vec<PublishedObjec
             path: glb_dir.join(&name),
         });
     }
+    // The Bevy copies' `.br` files are published too: the explorer fetches `{key}.br` by name.
+    let bevy_dir = scene_dir.join(BEVY_GLB_DIR);
+    for name in dir_entries(&bevy_dir) {
+        out.push(PublishedObject {
+            key: format!("{BEVY_GLB_KEY_DIR}/{name}"),
+            path: bevy_dir.join(&name),
+        });
+    }
     out
 }
 
+/// Files of `dir`, sorted, without `.tmp.` files and `.br` sidecars.
 #[cfg(not(target_arch = "wasm32"))]
 fn dir_file_names(dir: &Path) -> Vec<String> {
+    let mut names = dir_entries(dir);
+    names.retain(|n| !n.ends_with(".br"));
+    names
+}
+
+/// Files of `dir`, sorted, without `.tmp.` files.
+#[cfg(not(target_arch = "wasm32"))]
+fn dir_entries(dir: &Path) -> Vec<String> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -654,7 +684,7 @@ fn dir_file_names(dir: &Path) -> Vec<String> {
         .flatten()
         .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         .filter_map(|e| e.file_name().to_str().map(str::to_string))
-        .filter(|n| !n.contains(".tmp.") && !n.ends_with(".br"))
+        .filter(|n| !n.contains(".tmp."))
         .collect();
     names.sort();
     names

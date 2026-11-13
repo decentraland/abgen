@@ -31,6 +31,9 @@
 //!   that accept it. The CID is always of the plain bytes. A `.gltf` gets none (`not-glb`).
 //!   Standalone KTX2 variants are never Brotli'd.
 //! - Nothing else gets a variant (scene code, audio, video, source maps, unknown files).
+//! - Outside the per-entity manifest: the Bevy copy of each scene's far LOD GLB ([`farlod`]),
+//!   written by the LOD lane beside the plain GLB under `LOD/lods-bevy/lods/`, with mips and
+//!   the unused-alpha rule.
 //!
 //! The client contract: no manifest, no entry, or any failure means the client loads the
 //! original file. A variant is fetched at a path its manifest lists; the path's prefix letter
@@ -73,6 +76,8 @@
 
 #[cfg(feature = "bevy-variants")]
 mod build;
+#[cfg(all(feature = "bevy-variants", not(target_arch = "wasm32")))]
+pub mod farlod;
 #[cfg(feature = "bevy-variants")]
 pub mod glbbr;
 #[cfg(feature = "bevy-variants")]

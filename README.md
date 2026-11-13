@@ -430,6 +430,35 @@ BC1/BC5/BC7 encode, the BC1 PSNR check, UASTC->BC7 transcode, zstd, brotli,
 hash+write - counts and bytes by format and source, no-variant reasons, BC1 rejections, `reused_textures` / `reused_models`, and the `model_variants` totals:
 models, variant and `.br` bytes, size-gated attempts; and the `glb_variants` totals) and writes the full stats, per-file rows included, to
 `./out/bevy-variants-stats.json`.
+### Bevy far LOD copy
+Beside every published far LOD GLB (`LOD/lods-unity/lods/{sceneId}_1.glb`, the gltfpack-layout
+file the Unity LOD bundles are built from), the LOD lane writes a Bevy copy:
+`LOD/lods-bevy/lods/{sceneId}_1.glb`, its Brotli copy `{…}_1.glb.br` (stored with
+`Content-Encoding: br`, kept when smaller) and `{sceneId}_1.stats.json`. The explorer derives the
+key from the scene id (lowercase) and falls back to the plain GLB on a 404. Code:
+`crate/src/bevyvariants/farlod.rs`.
+
+- It is the plain GLB through the GLB-variant rewrite: every embedded atlas becomes a BC1/BC7
+  KTX2 (Zstandard, not size-gated) with the **full mip chain** (far LODs are seen from 80-320 m,
+  and the sampler already asks for trilinear). Geometry, nodes, materials and extensions
+  (`KHR_mesh_quantization`, `KHR_texture_transform`) are copied byte for byte. An atlas only
+  `OPAQUE` materials draw is encoded as opaque (its alpha is never read), so it can take BC1
+  behind the same 36 dB check. A far LOD with no embedded image gets the plain bytes as its copy.
+- Derived after the bundles are built, read-only on the plain GLB: the plain GLB and the bundles
+  are unchanged. No content-addressed twins (only the Unity manifests name those).
+- Built by `lodgen::generate` (`GenerateParams::bevy_far_lod`; the conversion lambda sets it from
+  `ABGEN_BEVY_VARIANTS`), and on LOD reuse from the copied plain GLB, so a reused scene always
+  carries one from the current encoders (and a scene built before the copy existed gets one on
+  its next deployment).
+- Stats (`*.stats.json`): plain, Bevy and `.br` bytes; texture GPU bytes before (RGBA8) and after
+  (every level), by format; mesh vertex bytes as stored and widened to f32, index bytes; every
+  atlas's format, size, mips and whether its alpha was dropped. `gpu_bytes` is texture + f32
+  vertex + index bytes.
+
+Genesis Plaza sample (100 far LODs, 2026-11-12): download 23.5 MB → 10.4 MB (`.br`), texture
+memory 135 MB → 29.7 MB with mips (22.3 MB without), 68 of 87 alpha atlases drawn only by
+opaque materials and so BC1.
+
 ### LOD JIT lane
 `ABGEN_LOD_JIT=1` enables JIT LOD builds on `GET /LOD/1/...` misses (level 1 only, the production
 shape: level 0 is the client-side ISS assembly, so `LOD/0/...` answers `lod-level-unsupported` and

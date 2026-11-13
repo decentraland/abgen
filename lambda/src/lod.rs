@@ -476,6 +476,12 @@ fn republish(
             proxy.space_put_key(&twin, &bytes);
             keys.push(twin);
         }
+        // The plain GLB: derive its Bevy copy here rather than copy the previous scene's, so a
+        // reused build always carries one made by this release's encoders (and scenes built
+        // before the Bevy copy existed get one on their next deployment).
+        if !item.required && cfg.bevy_enabled {
+            keys.extend(publish_bevy_far_lod(proxy, &scene_id, item.level, &bytes));
+        }
         keys.push(item.to);
     }
 
@@ -524,6 +530,45 @@ fn republish(
     summary["lods"]["digest"] = serde_json::json!(digest);
     summary["lods"]["manifestsNamed"] = serde_json::json!(manifests_named);
     Ok(Some(summary))
+}
+
+/// Build the Bevy copy of a plain far LOD GLB and put it, its `.br` and its stats under
+/// [`abgen::lods::BEVY_GLB_KEY_DIR`]. Returns the keys written; none when it cannot be built
+/// (logged), in which case the explorer loads the plain GLB.
+fn publish_bevy_far_lod(
+    proxy: &Arc<Proxy>,
+    scene_id: &str,
+    level: u32,
+    plain: &[u8],
+) -> Vec<String> {
+    use abgen::bevyvariants::farlod;
+    let far = match farlod::build(plain, scene_id, level, farlod::options()) {
+        Ok(Some(far)) => far,
+        Ok(None) => {
+            eprintln!("lods: {scene_id}: level {level} has an embedded KTX2 that does not transcode; no Bevy far LOD");
+            return Vec::new();
+        }
+        Err(e) => {
+            eprintln!("lods: {scene_id}: Bevy far LOD for level {level} failed ({e:#})");
+            return Vec::new();
+        }
+    };
+    let dir = abgen::lods::BEVY_GLB_KEY_DIR;
+    let glb_key = format!("{dir}/{}", abgen::lods::published_glb_name(scene_id, level));
+    let mut keys = Vec::new();
+    proxy.space_put_key(&glb_key, &far.glb);
+    if let Some(br) = &far.br {
+        let br_key = format!("{glb_key}.br");
+        proxy.space_put_key(&br_key, br);
+        keys.push(br_key);
+    }
+    keys.push(glb_key);
+    if let Ok(stats) = serde_json::to_vec_pretty(&far.stats) {
+        let stats_key = format!("{dir}/{}", farlod::stats_name(scene_id, level));
+        proxy.space_put_key(&stats_key, &stats);
+        keys.push(stats_key);
+    }
+    keys
 }
 
 /// Write the `lods` block into the scene's per-entity manifests, one per LOD platform, so the
@@ -656,6 +701,7 @@ pub fn generate_params(
         workdir: Some(staging.join("work")),
         cache: Some(PathBuf::from(&cfg.cache_dir).join("lod-content")),
         iss: "auto".to_string(),
+        bevy_far_lod: cfg.bevy_enabled,
         ..Default::default()
     }
 }

@@ -17,13 +17,16 @@
 //! it. A model over [`MAX_EMBEDDED_SOURCES`] distinct images or [`MAX_EMBEDDED_PIXELS`] source
 //! pixels gets no variant (`over-limits`), nor does one whose materials do not classify
 //! (`unclassified`: a normal map would be encoded as colour). All of these are final.
+//!
+//! With `TexOptions::drop_unused_alpha` (the far LOD copy), an embedded image whose alpha no
+//! material reads ([`alpha_unused_images`]) is encoded as opaque.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value as J};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::stats::{NoVariant, SourceKind, StageTimes};
-use super::texture::{encode_texture_with, source_kind, Slot, TexOptions, TextureVariant, Uses};
+use super::texture::{encode_image, source_kind, Slot, TexOptions, TextureVariant, Uses};
 use crate::bvwebgpu::emit;
 
 pub const KTX2_MIME: &str = "image/ktx2";
@@ -214,6 +217,15 @@ pub struct EmbeddedImage {
     pub width: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
+    /// Levels the KTX2 carries (1 unless `TexOptions::mips`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mips: Option<u32>,
+    /// The source had non-opaque texels no material reads, and was encoded as opaque.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub alpha_dropped: bool,
+    /// An opaque colour image whose BC1 fell below the PSNR floor and took BC7.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub bc1_rejected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<NoVariant>,
     /// GPU bytes of the original as the explorer holds it: RGBA8 at the source size for a
@@ -252,6 +264,7 @@ fn encode_embedded(
     index: usize,
     src: &[u8],
     slot: Slot,
+    alpha_unused: bool,
     opts: TexOptions,
     times: &mut StageTimes,
 ) -> (Option<TextureVariant>, EmbeddedImage) {
@@ -264,6 +277,9 @@ fn encode_embedded(
         variant_size: None,
         width: None,
         height: None,
+        mips: None,
+        alpha_dropped: false,
+        bc1_rejected: false,
         reason: None,
         original_gpu_bytes: match source {
             SourceKind::Png | SourceKind::Jpeg => rgba_bytes(src),
@@ -271,7 +287,7 @@ fn encode_embedded(
         },
         variant_gpu_bytes: None,
     };
-    let v = match encode_texture_with(src, slot, opts, times) {
+    let v = match encode_image(src, slot, alpha_unused, opts, times) {
         Ok(Ok(v)) => v,
         Ok(Err(miss)) => {
             row.reason = Some(miss.reason);
@@ -285,11 +301,14 @@ fn encode_embedded(
             return (None, row);
         }
     };
-    let gpu = crate::ktx2_write::level_bytes(v.format.bc(), v.width, v.height) as u64;
+    let gpu = v.gpu_bytes();
     row.format = Some(v.format.manifest_name());
     row.variant_size = Some(v.bytes.len() as u64);
     row.width = Some(v.width);
     row.height = Some(v.height);
+    row.mips = Some(v.mips);
+    row.alpha_dropped = v.alpha_dropped;
+    row.bc1_rejected = v.bc1_rejected;
     row.variant_gpu_bytes = Some(gpu);
     if source == SourceKind::Ktx2 {
         // The explorer transcodes the same level to the same BC7 itself.
@@ -315,6 +334,86 @@ pub fn image_uses(
         })
         .collect();
     Some((uses, u.uris))
+}
+
+/// Material texture slots that never read a texel's alpha in core glTF. A base colour reads
+/// alpha unless its material is `OPAQUE`; every other slot (extension textures included) is
+/// taken to read it.
+const ALPHA_FREE_SLOTS: [&str; 4] = [
+    "emissiveTexture",
+    "normalTexture",
+    "occlusionTexture",
+    "pbrMetallicRoughness.metallicRoughnessTexture",
+];
+
+/// Images whose alpha channel no material reads: referenced at least once, and only as the
+/// base colour of `OPAQUE` materials or from [`ALPHA_FREE_SLOTS`]. A texture's image is its
+/// `source` and any extension's `source` (`KHR_texture_basisu`, `EXT_texture_webp`, ...). An
+/// image no material references is not in the set (its use is unknown).
+pub fn alpha_unused_images(doc: &J) -> BTreeSet<usize> {
+    fn refs(v: &J, path: &str, out: &mut Vec<(String, usize)>) {
+        match v {
+            J::Object(o) => {
+                for (k, v) in o {
+                    let here = if path.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{path}.{k}")
+                    };
+                    match v.get("index").and_then(J::as_u64) {
+                        Some(t) if k.ends_with("Texture") => out.push((here, t as usize)),
+                        _ => refs(v, &here, out),
+                    }
+                }
+            }
+            J::Array(a) => a.iter().for_each(|v| refs(v, path, out)),
+            _ => {}
+        }
+    }
+    let textures = doc.get("textures").and_then(J::as_array);
+    let tex_images = |t: usize| -> Vec<usize> {
+        let Some(t) = textures.and_then(|a| a.get(t)) else {
+            return Vec::new();
+        };
+        let mut out: Vec<usize> = texture_source(t).into_iter().collect();
+        if let Some(e) = t.get("extensions").and_then(J::as_object) {
+            out.extend(e.values().filter_map(texture_source));
+        }
+        out
+    };
+    let mut used = BTreeSet::new();
+    let mut read = BTreeSet::new();
+    for m in doc
+        .get("materials")
+        .and_then(J::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let opaque = m
+            .get("alphaMode")
+            .and_then(J::as_str)
+            .is_none_or(|a| a == "OPAQUE");
+        let mut found = Vec::new();
+        refs(m, "", &mut found);
+        for (path, t) in found {
+            let alpha_free = if path == "pbrMetallicRoughness.baseColorTexture" {
+                opaque
+            } else {
+                ALPHA_FREE_SLOTS.contains(&path.as_str())
+            };
+            for i in tex_images(t) {
+                used.insert(i);
+                if !alpha_free {
+                    read.insert(i);
+                }
+            }
+        }
+    }
+    used.difference(&read).copied().collect()
+}
+
+fn texture_source(t: &J) -> Option<usize> {
+    t.get("source").and_then(J::as_u64).map(|x| x as usize)
 }
 
 fn uses_extension(doc: &J, name: &str) -> bool {
@@ -460,6 +559,11 @@ pub fn transform_model_with(
         bail!("EXT_meshopt_compression is not handled by the prototype");
     }
     let draco_views = draco_source_views(&pre);
+    let alpha_unused = if opts.drop_unused_alpha {
+        alpha_unused_images(&pre)
+    } else {
+        BTreeSet::new()
+    };
     drop(pre);
     let uses = image_uses(bytes, ext, resolve).map(|(u, _)| u);
 
@@ -563,13 +667,15 @@ pub fn transform_model_with(
     // once, within the per-model limits, which are enforced as sources are found. A source is
     // a key into `merged` or into the decoded data URIs (one copy per digest), never a copy:
     // overlapping views cost nothing until they are encoded, one at a time.
-    // (key, slot, first image with it).
-    let mut sources: Vec<(SrcKey, Slot, usize)> = Vec::new();
+    // An image whose alpha no material reads (`TexOptions::drop_unused_alpha`) is a distinct
+    // source from the same bytes with their alpha read: it encodes differently.
+    // (key, slot, alpha unused, first image with it).
+    let mut sources: Vec<(SrcKey, Slot, bool, usize)> = Vec::new();
     let mut data_uris: std::collections::HashMap<[u8; 32], Vec<u8>> =
         std::collections::HashMap::new();
     let mut source_of: BTreeMap<usize, usize> = BTreeMap::new();
     {
-        let mut seen: std::collections::HashMap<(SrcKey, Slot), usize> =
+        let mut seen: std::collections::HashMap<(SrcKey, Slot, bool), usize> =
             std::collections::HashMap::new();
         let mut pixels: u64 = 0;
         for (i, img) in images.iter().enumerate() {
@@ -593,7 +699,8 @@ pub fn transform_model_with(
                 .as_ref()
                 .and_then(|u| u.get(original_index[i]).copied())
                 .map_or(Slot::Srgb, Uses::slot);
-            let idx = match seen.get(&(key, slot)) {
+            let no_alpha = alpha_unused.contains(&original_index[i]);
+            let idx = match seen.get(&(key, slot, no_alpha)) {
                 Some(&idx) => idx,
                 None => {
                     // A new source: count it against the limits before keeping it.
@@ -617,8 +724,8 @@ pub fn transform_model_with(
                             StageTimes::default(),
                         ));
                     }
-                    sources.push((key, slot, i));
-                    seen.insert((key, slot), sources.len() - 1);
+                    sources.push((key, slot, no_alpha, i));
+                    seen.insert((key, slot, no_alpha), sources.len() - 1);
                     sources.len() - 1
                 }
             };
@@ -636,12 +743,12 @@ pub fn transform_model_with(
     let mut times = StageTimes::default();
     let mut variants: Vec<Option<TextureVariant>> = Vec::with_capacity(sources.len());
     let mut rows: Vec<EmbeddedImage> = Vec::with_capacity(sources.len());
-    for &(key, slot, first) in &sources {
+    for &(key, slot, no_alpha, first) in &sources {
         let src: &[u8] = match key {
             SrcKey::Range(start, len) => &merged[start..start + len],
             SrcKey::Digest(d) => data_uris.get(&d).map_or(&[][..], Vec::as_slice),
         };
-        let (v, row) = encode_embedded(first, src, slot, opts, &mut times);
+        let (v, row) = encode_embedded(first, src, slot, no_alpha, opts, &mut times);
         variants.push(v);
         rows.push(row);
     }

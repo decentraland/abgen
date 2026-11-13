@@ -175,9 +175,10 @@ fn parse_iso8601_epoch(s: &str) -> Option<u64> {
 pub struct ObjectHeaders {
     pub content_type: &'static str,
     pub cache_control: &'static str,
-    /// `br` for a Bevy variant's Brotli sidecar (`bevy/{prefix}/{name}.br`), whose bytes are the
-    /// encoded representation of the plain object; anything reading the bucket directly then
-    /// decodes it like the edge's negotiated answer.
+    /// `br` for a Bevy variant's Brotli sidecar (`bevy/{prefix}/{name}.br`) and a Bevy far LOD's
+    /// (`LOD/lods-bevy/lods/{file}.br`), whose bytes are the encoded representation of the plain
+    /// object; anything reading the bucket directly then decodes it like the edge's negotiated
+    /// answer.
     pub content_encoding: Option<&'static str>,
 }
 
@@ -208,7 +209,11 @@ pub fn object_headers(key: &str) -> ObjectHeaders {
     // Bevy variants (`bevy/{prefix}/{name}`, their `.br` sidecars and `.json` records) are
     // immutable within their prefix; only the manifests are rewritten in place.
     let bevy_variant = lower.starts_with("bevy/") && !lower.starts_with("bevy/manifest/");
-    let content_type = if bevy_variant && !lower.ends_with(".json") {
+    // The Bevy far LOD copies (`LOD/lods-bevy/lods/…`): a `.glb.br` is the GLB, Brotli-encoded.
+    let bevy_far_lod = key.starts_with("LOD/lods-bevy/");
+    let content_type = if bevy_far_lod && lower.ends_with(".glb.br") {
+        "model/gltf-binary"
+    } else if bevy_variant && !lower.ends_with(".json") {
         "application/octet-stream"
     } else if lower.ends_with(".json") {
         "application/json"
@@ -235,14 +240,15 @@ pub fn object_headers(key: &str) -> ObjectHeaders {
         // SatelliteMaps/) are deleted by their consumer, and a deleted record must not
         // outlive itself at the edge.
         NO_CACHE
-    } else if key.starts_with("LOD/lods-unity/") {
+    } else if key.starts_with("LOD/lods-unity/") || bevy_far_lod {
         PUBLIC_ONE_YEAR
     } else if uploader_lane {
         IMMUTABLE_BUNDLE
     } else {
         IMMUTABLE_SOURCE
     };
-    let content_encoding = (bevy_variant && lower.ends_with(".br")).then_some("br");
+    let content_encoding =
+        ((bevy_variant || bevy_far_lod) && lower.ends_with(".br")).then_some("br");
     ObjectHeaders {
         content_type,
         cache_control,
@@ -770,6 +776,23 @@ mod tests {
                 "model/gltf-binary",
                 PUBLIC_ONE_YEAR,
             ),
+            // The Bevy far LOD copy follows the plain GLB's headers; its `.br` is the GLB,
+            // Brotli-encoded.
+            (
+                "LOD/lods-bevy/lods/bafkscene_1.glb",
+                "model/gltf-binary",
+                PUBLIC_ONE_YEAR,
+            ),
+            (
+                "LOD/lods-bevy/lods/bafkscene_1.glb.br",
+                "model/gltf-binary",
+                PUBLIC_ONE_YEAR,
+            ),
+            (
+                "LOD/lods-bevy/lods/bafkscene_1.stats.json",
+                "application/json",
+                PUBLIC_ONE_YEAR,
+            ),
             (
                 "v41/bafkScene/scene.json",
                 "application/json",
@@ -838,7 +861,8 @@ mod tests {
             let h = object_headers(key);
             assert_eq!(h.content_type, ct, "content type for {key}");
             assert_eq!(h.cache_control, cc, "cache control for {key}");
-            let br = key.starts_with("bevy/") && key.ends_with(".br");
+            let br = (key.starts_with("bevy/") || key.starts_with("LOD/lods-bevy/"))
+                && key.ends_with(".br");
             assert_eq!(
                 h.content_encoding,
                 br.then_some("br"),
