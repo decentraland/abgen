@@ -7,9 +7,10 @@
 //!   entity's models use only as normal maps, BC1 for fully opaque images whose BC1 level 0
 //!   stays within `texture::BC1_MIN_PSNR_DB` of the source (linear ORM images keep BC1
 //!   regardless), BC7 otherwise.
-//! - Every standalone texture variant must be smaller than its original file, or the original
-//!   is served as is (`size-gate` in the stats). Images embedded in a GLB variant are not gated
-//!   (see below).
+//! - No size gate: a variant larger than its original file is still served. The explorer never
+//!   draws a PNG/JPEG as is: it decodes it to RGBA8 (4 bytes per pixel) and converts it to BC on
+//!   the player's CPU, so dropping a variant to save a little download costs the full memory on
+//!   a first visit.
 //! - Creator UASTC KTX2 textures (standalone or embedded in a GLB) are only ever transcoded block
 //!   for block to BC7, and only the single level the explorer's local path picks (the first
 //!   level at most 1024 on a side, no mips), so remote equals localhost; anything that would
@@ -18,9 +19,8 @@
 //! - GLB variants ([`model`], the `g` class, on by default; `ABGEN_BEVY_GLB_VARIANTS=0` or
 //!   `abgen-corpus --bevy-no-glb-variants` turns them off): a GLB with Draco decoded,
 //!   `KHR_texture_basisu` resolved and every embedded image replaced by a BC KTX2
-//!   (`image/ktx2`), so the explorer holds it at 0.5-1 byte per pixel instead of 4. Embedded
-//!   images skip the size gate: the goal is GPU memory, and a JPEG's BC KTX2 is often larger on
-//!   the wire than the JPEG. A GLB whose embedded KTX2 cannot be transcoded gets no variant.
+//!   (`image/ktx2`), so the explorer holds it at 0.5-1 byte per pixel instead of 4. A GLB whose
+//!   embedded KTX2 cannot be transcoded gets no variant.
 //!   External image URIs are left as they are: they resolve to their own original CID, which
 //!   has its own texture variant. With `.br` sidecars on, a GLB variant also gets one when it is
 //!   smaller (the geometry inside still compresses).
@@ -50,7 +50,7 @@
 //!
 //! Beside every name sits its **record**, `{key}.json` ([`Record`]): the manifest entry the
 //! variant gets (its CID, format, size, dimensions, whether a `.br` sidecar exists), or the
-//! reason there is no variant (so a size-gated or tiny image is not retried by every entity
+//! reason there is no variant (so a tiny or undecodable image is not retried by every entity
 //! that references it), plus, for models, how the model samples each image URI (so a warm
 //! entity needs no model bytes to pick its textures' slots). The record is what a build
 //! reads before doing any work: its output directory, then (the store-backed build) Redis and
@@ -106,7 +106,8 @@ pub const MANIFEST_PREFIX: &str = "bevy/manifest";
 /// UASTC transcode). Bump when any of them changes its output bytes.
 /// 2: sources whose variant size would be under 4 px on a side get no variant (`tiny`).
 /// 3: texture variants are single-level, no mip chain.
-pub const TEX_GEN: u32 = 3;
+/// 4: no size gate (a variant larger than its original is kept).
+pub const TEX_GEN: u32 = 4;
 /// Generation of the model variants. Bump when their output bytes change.
 /// 2: a model variant is the original `.glb` unchanged, with its `.br` sidecar (format
 /// `glb-br`; geometry is not re-encoded, so the client needs only its glTF loader).
@@ -114,8 +115,8 @@ pub const MESH_GEN: u32 = 2;
 /// Generation of the GLB variants: their own rewrite rules and the texture encoders inside, so
 /// bump it whenever [`TEX_GEN`] is bumped too. It starts at 4, above the `g3` the class used
 /// when it was named after [`TEX_GEN`].
-/// 4: embedded images are not size-gated; a GLB with an embedded KTX2 that does not transcode
-/// gets no variant; `.br` sidecars.
+/// 4: no size gate on embedded images (as for textures from `TEX_GEN` 4); a GLB with an
+/// embedded KTX2 that does not transcode gets no variant; `.br` sidecars.
 pub const GLB_GEN: u32 = 4;
 
 /// `"abgen <crate version>"`, stamped into every manifest.
@@ -335,7 +336,7 @@ pub struct ImageUse {
 
 /// The record beside a variant key (`{key}.json`): the outcome of building that key, final
 /// within its generation. Either `variant` (the manifest entry) or `reason` (why there is
-/// none; a stats reason name such as `size-gate`). `uses` is set on model records: image URI
+/// none; a stats reason name such as `tiny`). `uses` is set on model records: image URI
 /// -> how the model samples it, so textures' slots are known without the model's bytes.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct Record {
@@ -363,7 +364,7 @@ impl Record {
 /// texture, one `glb-br` and one `glb`), ordered, so the serialized bytes are a function
 /// of the variants alone. The class of a path is its prefix letter (`t` BC KTX2, `m`
 /// `glb-br`, `g` GLB); the KTX2 header carries the BC format and size. `lanes` names
-/// the prefix each class was built from (`{"texture":"t3","mesh":"m2","glb":"g4"}`), read back by
+/// the prefix each class was built from (`{"texture":"t4","mesh":"m2","glb":"g4"}`), read back by
 /// [`Manifest::is_current`]. The full entry (CID, format, dimensions, size) of each variant
 /// is in its record.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -391,7 +392,7 @@ impl Manifest {
 mod tests;
 
 /// The disk-cache key of a Bevy-lane file under `root`: its path below the root with `/`
-/// separators (`bevy/t3/{name}`, `bevy/t3/{name}.json`, `bevy/manifest/{entity}.json`). `None`
+/// separators (`bevy/t4/{name}`, `bevy/t4/{name}.json`, `bevy/manifest/{entity}.json`). `None`
 /// for a path that is not under `{root}/bevy/`.
 pub fn cache_key(root: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;

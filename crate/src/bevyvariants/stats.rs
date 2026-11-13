@@ -104,8 +104,6 @@ pub enum NoVariant {
     Ktx2NotWholeBlocks,
     /// The transcoder refused or failed.
     Ktx2TranscodeFailed,
-    /// The variant is not smaller than the original (any source, any format).
-    SizeGate,
     /// Encode or write failed.
     EncodeError,
 }
@@ -144,11 +142,6 @@ pub struct FileStat {
     pub height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mips: Option<u32>,
-    /// The variant's size and format when the size gate dropped it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gated_size: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gated_format: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<NoVariant>,
     /// Opaque sRGB images only: PSNR (dB, RGB) of the BC1 encode's level 0 against the source
@@ -292,9 +285,6 @@ pub struct BuildStats {
     pub variants: BTreeMap<String, CountBytes>,
     /// No-variant reason -> count and original bytes.
     pub no_variant: BTreeMap<String, CountBytes>,
-    /// Size-gated variants by the format that was tried -> count, original bytes and the
-    /// dropped variants' bytes.
-    pub size_gated: BTreeMap<String, CountBytes>,
     /// Opaque sRGB images whose BC1 fell below the PSNR floor and became BC7.
     pub bc1_rejected: u64,
     /// Outcomes taken from an existing record (probe hits): standalone textures and models
@@ -346,15 +336,6 @@ impl BuildStats {
             e.count += 1;
             e.original_bytes += f.original_size;
             e.variant_bytes += f.variant_size.unwrap_or(0);
-            if f.reason == Some(NoVariant::SizeGate) {
-                let g = s
-                    .size_gated
-                    .entry(f.gated_format.unwrap_or("unknown").to_string())
-                    .or_default();
-                g.count += 1;
-                g.original_bytes += f.original_size;
-                g.variant_bytes += f.gated_size.unwrap_or(0);
-            }
             if f.bc1_rejected == Some(true) {
                 s.bc1_rejected += 1;
             }

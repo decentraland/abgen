@@ -3,9 +3,9 @@
 //! pure UASTC -> BC7 transcode for an embedded creator KTX2). External image URIs and everything
 //! else in the JSON are left as they are; external buffers are inlined.
 //!
-//! Embedded images skip the texture lane's size gate: the point of a GLB variant is GPU memory
-//! (a PNG/JPEG is held as RGBA8, 4 bytes per pixel; BC1 is 0.5, BC5/BC7 1), so a JPEG whose BC
-//! KTX2 is larger on the wire is still replaced. A PNG/JPEG that gets no BC encode (tiny, not
+//! The point of a GLB variant is GPU memory (a PNG/JPEG is held as RGBA8, 4 bytes per pixel;
+//! BC1 is 0.5, BC5/BC7 1), so an image whose BC KTX2 is larger on the wire is still replaced,
+//! as standalone textures are. A PNG/JPEG that gets no BC encode (tiny, not
 //! an image, does not decode) keeps its original bytes and MIME type. An embedded KTX2 that
 //! cannot be transcoded gets no GLB variant at all (`embedded-ktx2-kept`): every KTX2 in a GLB
 //! variant is BC1, BC5 or BC7, which is all the explorer's reader takes.
@@ -15,7 +15,7 @@ use serde_json::{json, Value as J};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::stats::{NoVariant, SourceKind, StageTimes};
-use super::texture::{encode_texture_ungated, source_kind, Slot, TexOptions, TextureVariant, Uses};
+use super::texture::{encode_texture_with, source_kind, Slot, TexOptions, TextureVariant, Uses};
 use crate::bvwebgpu::emit;
 
 pub const KTX2_MIME: &str = "image/ktx2";
@@ -92,7 +92,7 @@ fn rgba_bytes(bytes: &[u8]) -> Option<u64> {
     Some(u64::from(w) * u64::from(h) * 4)
 }
 
-/// One embedded image: its BC KTX2, ungated (see the module docs), and its outcome row.
+/// One embedded image: its BC KTX2 and its outcome row.
 fn encode_embedded(
     index: usize,
     src: &[u8],
@@ -116,7 +116,7 @@ fn encode_embedded(
         },
         variant_gpu_bytes: None,
     };
-    let v = match encode_texture_ungated(src, slot, opts, times) {
+    let v = match encode_texture_with(src, slot, opts, times) {
         Ok(Ok(v)) => v,
         Ok(Err(miss)) => {
             row.reason = Some(miss.reason);
@@ -353,7 +353,7 @@ pub fn transform_model_with(
         ranges.push((base + off, len, off % 4));
     }
 
-    // Embedded images (bufferView or data: URI) -> BC KTX2, ungated.
+    // Embedded images (bufferView or data: URI) -> BC KTX2.
     let images: Vec<J> = gltf
         .get("images")
         .and_then(J::as_array)

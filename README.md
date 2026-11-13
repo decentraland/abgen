@@ -319,7 +319,7 @@ doing any work and looks for its record the way the Unity lanes probe
   different `.bin` files being two variants. Image URIs are left untouched, so they are not inputs.
 
 Beside every variant sits its record, `{name}.json`: the manifest entry (`variant`) or the reason
-there is none (`reason`: `size-gate`, `tiny`, `decode-error`, …, so a file that cannot have a
+there is none (`reason`: `tiny`, `decode-error`, `not-an-image`, …, so a file that cannot have a
 variant is not retried by every entity that references it), whether a `.br` sidecar exists
 (`br`), and on model records how the model samples each image URI (`uses`), so a warm entity
 needs no model bytes to pick its textures' slots.
@@ -342,7 +342,8 @@ in its output directory.
 Versioning is three integers in `crate/src/bevyvariants/mod.rs`: `TEX_GEN` (BC encoders, levels,
 size cap, KTX2 writer, UASTC transcode), `MESH_GEN` (model variants: 2 = the original `.glb`
 plus its `.br` sidecar) and `GLB_GEN` (GLB variants: their rewrite rules and the encoders inside,
-so it moves whenever `TEX_GEN` does; 4 = ungated embedded images plus `.br` sidecars). Bump one when its encoder's output bytes change: every key of that class moves to a new
+so it moves whenever `TEX_GEN` does; 4 = no size gate on embedded images plus `.br` sidecars).
+`TEX_GEN` 4 drops the size gate. Bump one when its encoder's output bytes change: every key of that class moves to a new
 prefix, the previous prefix (`bevy/t1/`, …) is garbage and can be deleted whole, and manifests
 built from it (their `lanes` name it) read as stale until the entity's next build, which re-encodes only that class.
 The generations live in code because they describe the encoders. The operator's lever is
@@ -369,9 +370,11 @@ release, never on the machine or thread count; a new libzstd release is a `TEX_G
   level 0, decoded, is within 36 dB PSNR (RGB) of the source at the variant size; below that
   (posters, text, hard-edged art) it gets `ktx2-bc7` instead (`bc1_rejected` in the stats).
   Linear (metallic-roughness, occlusion) images keep BC1. Images 2 px or less on a side get none.
-- Every standalone texture variant must be smaller than its original file; otherwise the
-  original is served as is (`size-gate` in the stats, with the dropped variant's format and
-  size). Images embedded in a GLB variant are not gated (below).
+- No size gate: a variant larger than its original file is still served. The explorer never
+  draws a PNG/JPEG as is: it decodes it to RGBA8 (4 bytes per pixel) and converts it to BC on
+  the player's CPU, so dropping a variant to save a little download costs the full memory on a
+  first visit. On Genesis Plaza's 285 standalone PNGs the gate dropped 54 files (19% of the
+  pixels); converted anyway they grow about 1.2x on the wire.
 - creator UASTC KTX2 (standalone or embedded in a GLB): a pure block-for-block UASTC -> BC7
   transcode (`ktx2-bc7`) of one level only - the first level no larger than 1024, at its own
   size, exactly what the explorer's local path transcodes (same vendored basisu sources, one
@@ -382,10 +385,9 @@ release, never on the machine or thread count; a new libzstd release is a `TEX_G
   (`ABGEN_BEVY_GLB_VARIANTS=0` on the server, `--bevy-no-glb-variants` on `abgen-corpus`): every
   `.glb`/`.gltf` with something to change becomes a GLB with Draco decoded, `KHR_texture_basisu`
   resolved to a core `source` (an existing PNG/JPEG `source` wins), external buffers inlined and
-  every embedded image replaced by a BC KTX2 (`image/ktx2`, the format rules above). Embedded
-  images skip the size gate: the goal is GPU memory (the explorer holds a PNG/JPEG as RGBA8, 4
-  bytes per pixel, against 0.5 for BC1 and 1 for BC5/BC7), and a JPEG's BC KTX2 is often larger
-  than the JPEG. An embedded PNG/JPEG that gets no encode (tiny, undecodable, not an image)
+  every embedded image replaced by a BC KTX2 (`image/ktx2`, the format rules above, no
+  size gate either: the explorer holds a PNG/JPEG as RGBA8, 4 bytes per pixel, against 0.5 for
+  BC1 and 1 for BC5/BC7, and a JPEG's BC KTX2 is often larger than the JPEG). An embedded PNG/JPEG that gets no encode (tiny, undecodable, not an image)
   keeps its bytes; a GLB whose embedded KTX2 does not transcode gets no variant
   (`embedded-ktx2-kept`), so every KTX2 in a GLB variant is BC1, BC5 or BC7. Images embedded in
   GLBs never get a texture variant of their own; external image URIs are left as they are. A
@@ -418,9 +420,8 @@ A second run into the same `./out` (or another entity sharing files) reuses ever
 record is there and encodes only the rest. `abgen-corpus --bevy-variants` prints one
 `BEVY_STATS {json}` line per entity (stage times summed over files - probe, fetch, decode, resize,
 BC1/BC5/BC7 encode, the BC1 PSNR check, UASTC->BC7 transcode, zstd, brotli,
-hash+write - counts and bytes by format and source, no-variant reasons, size-gated variants by
-format, BC1 rejections, `reused_textures` / `reused_models`, and the `model_variants` totals:
-models, variant and `.br` bytes, size-gated attempts) and writes the full stats, per-file rows included, to
+hash+write - counts and bytes by format and source, no-variant reasons, BC1 rejections, `reused_textures` / `reused_models`, and the `model_variants` totals:
+models, variant and `.br` bytes, size-gated attempts; and the `glb_variants` totals) and writes the full stats, per-file rows included, to
 `./out/bevy-variants-stats.json`.
 ### LOD JIT lane
 `ABGEN_LOD_JIT=1` enables JIT LOD builds on `GET /LOD/1/...` misses (level 1 only, the production

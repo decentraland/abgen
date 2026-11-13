@@ -1,7 +1,9 @@
 //! Texture variants: PNG / JPEG in, KTX2 (BC1 / BC5 / BC7 payload, Zstandard-supercompressed,
 //! level 0 only with no mip chain, at most [`BEVY_TEXTURE_MAX`] on a side, top-down rows) out;
-//! creator UASTC KTX2 in, a single-level pure block transcode to BC7 KTX2 out. Every variant
-//! must be smaller than its original ([`size_gate`]). See the module docs of [`super`].
+//! creator UASTC KTX2 in, a single-level pure block transcode to BC7 KTX2 out. There is no
+//! size gate: a variant larger than its original is still the one served, because the explorer
+//! never draws a PNG/JPEG as is (it decodes it to RGBA8 and converts it on the player's CPU).
+//! See the module docs of [`super`].
 
 use anyhow::{Context, Result};
 use image::RgbaImage;
@@ -26,40 +28,15 @@ impl Default for TexOptions {
     }
 }
 
-/// No variant, and why. `gated_size` and `gated_format` describe the variant the size gate
-/// dropped (it was not smaller than the original).
+/// No variant, and why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Miss {
     pub reason: NoVariant,
-    pub gated_size: Option<u64>,
-    pub gated_format: Option<&'static str>,
 }
 
 impl From<NoVariant> for Miss {
     fn from(reason: NoVariant) -> Self {
-        Miss {
-            reason,
-            gated_size: None,
-            gated_format: None,
-        }
-    }
-}
-
-/// The size gate every texture variant passes: it must be smaller than the original file, or
-/// the client is better off loading the original (`Err` carries the dropped variant's size
-/// and format as `NoVariant::SizeGate`).
-pub fn size_gate(
-    v: TextureVariant,
-    original_len: usize,
-) -> std::result::Result<TextureVariant, Miss> {
-    if v.bytes.len() < original_len {
-        Ok(v)
-    } else {
-        Err(Miss {
-            reason: NoVariant::SizeGate,
-            gated_size: Some(v.bytes.len() as u64),
-            gated_format: Some(v.format.manifest_name()),
-        })
+        Miss { reason }
     }
 }
 
@@ -329,7 +306,7 @@ pub fn target_size(w: u32, h: u32) -> (u32, u32) {
 
 /// Build the texture variant of `bytes` for `slot`. `Ok(None)` means "no variant": not a PNG,
 /// JPEG or UASTC KTX2 (sniffed by bytes, never by name), tiny, or a KTX2 the pure transcode
-/// does not take or does not make smaller. `Err` is a PNG/JPEG that does not decode.
+/// does not take. `Err` is a PNG/JPEG that does not decode.
 pub fn encode_texture(bytes: &[u8], slot: Slot) -> Result<Option<TextureVariant>> {
     encode_texture_with(
         bytes,
@@ -341,18 +318,8 @@ pub fn encode_texture(bytes: &[u8], slot: Slot) -> Result<Option<TextureVariant>
 }
 
 /// [`encode_texture`] with explicit settings, adding each stage's time to `times` and saying
-/// why there is no variant: [`encode_texture_ungated`] followed by the [`size_gate`].
+/// why there is no variant. Not gated on size (see the module docs).
 pub fn encode_texture_with(
-    bytes: &[u8],
-    slot: Slot,
-    opts: TexOptions,
-    times: &mut StageTimes,
-) -> Result<std::result::Result<TextureVariant, Miss>> {
-    Ok(encode_texture_ungated(bytes, slot, opts, times)?.and_then(|v| size_gate(v, bytes.len())))
-}
-
-/// The encode alone, before the size gate (for tests and checks that need the bytes).
-pub fn encode_texture_ungated(
     bytes: &[u8],
     slot: Slot,
     opts: TexOptions,
@@ -386,8 +353,7 @@ pub fn encode_texture_ungated(
 ///
 /// `None` (no variant: the client loads the original) when the file is not a UASTC KTX2 the
 /// header gate takes, has no such level, that level is not whole 4x4 blocks (the explorer
-/// would decode and re-encode it), or it fails to transcode. The size gate against the
-/// original is applied by the caller.
+/// would decode and re-encode it), or it fails to transcode.
 pub fn transcode_uastc_bc7(raw: &[u8]) -> Option<TextureVariant> {
     transcode_uastc_bc7_with(raw, TexOptions::default(), &mut StageTimes::default()).ok()
 }

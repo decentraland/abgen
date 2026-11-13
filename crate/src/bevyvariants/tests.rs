@@ -1,9 +1,9 @@
 use super::model::{transform_model, transform_model_with, NoGlbVariant, KTX2_MIME};
 use super::stats::{NoVariant, StageTimes};
 use super::texture::{
-    choose_format, decode_bc1_rgba, encode_texture, encode_texture_ungated, encode_texture_with,
-    psnr_rgb_db, transcode_uastc_bc7, EncodePath, Slot, TexFormat, TexOptions, TextureVariant,
-    Uses, BC1_MIN_PSNR_DB,
+    choose_format, decode_bc1_rgba, encode_texture, encode_texture_with, psnr_rgb_db,
+    transcode_uastc_bc7, EncodePath, Slot, TexFormat, TexOptions, TextureVariant, Uses,
+    BC1_MIN_PSNR_DB,
 };
 use super::*;
 use crate::bvwebgpu::emit;
@@ -161,9 +161,9 @@ fn bc1_exact_png_bytes(w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-/// The encode before the size gate.
+/// The encode, which must give a variant.
 fn ungated(bytes: &[u8], slot: Slot) -> TextureVariant {
-    match encode_texture_ungated(
+    match encode_texture_with(
         bytes,
         slot,
         TexOptions::default(),
@@ -379,7 +379,7 @@ fn records_round_trip_and_refuse_other_versions() {
     let none = Record {
         v: RECORD_VERSION,
         variant: None,
-        reason: Some("size-gate".into()),
+        reason: Some("tiny".into()),
         br: false,
         uses: [(
             "tex.png".to_string(),
@@ -392,7 +392,7 @@ fn records_round_trip_and_refuse_other_versions() {
         .collect(),
     };
     let raw: J = serde_json::from_slice(&serde_json::to_vec(&none).unwrap()).unwrap();
-    assert_eq!(raw["reason"], "size-gate");
+    assert_eq!(raw["reason"], "tiny");
     assert_eq!(raw["uses"]["tex.png"], json!({"normal": true}));
     assert!(raw.get("variant").is_none() && raw.get("br").is_none());
     assert_eq!(
@@ -535,24 +535,25 @@ fn bc1_decoder_and_psnr() {
     assert!((psnr_rgb_db(&solid, &off) - expect).abs() < 1e-9);
 }
 
+/// No size gate: a variant larger than its original is still the variant, because the
+/// explorer would otherwise decode the PNG to RGBA8 and convert it itself.
 #[test]
-fn size_gate_drops_a_variant_not_smaller_than_its_original() {
+fn a_variant_larger_than_its_original_is_kept() {
     // A solid 16x16 PNG is a few dozen bytes; any KTX2 of it is larger.
     let solid = png_bytes(16, 16, [10, 20, 30, 255]);
-    let m = miss(&solid, Slot::Srgb);
-    assert_eq!(m.reason, NoVariant::SizeGate);
-    assert_eq!(m.gated_format, Some("ktx2-bc1"));
-    assert!(m.gated_size.unwrap() as usize >= solid.len());
-    let m = miss(&solid, Slot::Normal);
-    assert_eq!(
-        (m.reason, m.gated_format),
-        (NoVariant::SizeGate, Some("ktx2-bc5"))
-    );
-    let m = miss(&png_bytes(16, 16, [10, 20, 30, 128]), Slot::Srgb);
-    assert_eq!(
-        (m.reason, m.gated_format),
-        (NoVariant::SizeGate, Some("ktx2-bc7"))
-    );
+    for (bytes, slot, format) in [
+        (solid.clone(), Slot::Srgb, TexFormat::Bc1),
+        (solid.clone(), Slot::Normal, TexFormat::Bc5),
+        (
+            png_bytes(16, 16, [10, 20, 30, 128]),
+            Slot::Srgb,
+            TexFormat::Bc7,
+        ),
+    ] {
+        let v = encode_texture(&bytes, slot).unwrap().expect("a variant");
+        assert_eq!(v.format, format);
+        assert!(v.bytes.len() >= bytes.len());
+    }
 }
 
 #[test]
@@ -677,10 +678,10 @@ fn uastc_is_a_single_level_pure_transcode_matching_the_client() {
 }
 
 #[test]
-fn uastc_variant_only_when_not_larger_than_the_original() {
+fn uastc_variant_is_its_transcode_whatever_its_size() {
     let v = transcode_uastc_bc7(UASTC_8).unwrap();
-    let gated = encode_texture(UASTC_8, Slot::Srgb).unwrap();
-    assert_eq!(gated.is_some(), v.bytes.len() < UASTC_8.len());
+    let e = encode_texture(UASTC_8, Slot::Srgb).unwrap().unwrap();
+    assert_eq!(e.bytes, v.bytes);
 }
 
 #[test]
@@ -854,14 +855,11 @@ fn glb_with_an_embedded_ktx2_that_does_not_transcode_gets_no_variant() {
     assert_eq!(o.images[1].reason, Some(NoVariant::Ktx2HeaderGate));
 }
 
-/// Embedded images skip the size gate: an image whose BC KTX2 is larger than its PNG/JPEG
-/// (here a solid PNG; in scenes mostly JPEGs) is still replaced, because what it saves is GPU
-/// memory. The outcome rows say what each image became and its GPU bytes before and after.
+/// No size gate inside a GLB either: an image whose BC KTX2 is larger than its PNG/JPEG (here a
+/// solid PNG; in scenes mostly JPEGs) is still replaced, because what it saves is GPU memory. The outcome rows say what each image became and its GPU bytes before and after.
 #[test]
 fn embedded_image_is_replaced_even_when_its_ktx2_is_larger() {
     let png = png_bytes(16, 16, [10, 20, 30, 255]);
-    // The standalone texture lane keeps this image as is.
-    assert_eq!(miss(&png, Slot::Srgb).reason, NoVariant::SizeGate);
     let glb = mk_glb(
         json!({
             "images": [{"bufferView": 0, "mimeType": "image/png"}],
@@ -1216,7 +1214,7 @@ fn entity_build_adds_glb_br_model_variants() {
             Some(Record {
                 v: RECORD_VERSION,
                 variant: None,
-                reason: Some("size-gate".into()),
+                reason: Some("tiny".into()),
                 br: false,
                 uses: Default::default(),
             })
@@ -1242,7 +1240,7 @@ fn entity_build_adds_glb_br_model_variants() {
         .iter()
         .find(|f| f.hash == "bafkgridpng")
         .unwrap();
-    assert!(png.reused && png.reason == Some(NoVariant::SizeGate));
+    assert!(png.reused && png.reason == Some(NoVariant::Tiny));
     // Only the models with a key the probe has no record for were fetched: the quad and the
     // `.gltf` (no record anywhere), and the grid for its GLB variant (the remote answers only
     // its `glb-br` key). Not the image.
@@ -1506,13 +1504,9 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
             .map(|(k, es)| (k.clone(), es.iter().map(|e| e.path.clone()).collect()))
             .collect::<std::collections::BTreeMap<String, Vec<String>>>()
     );
-    let ktx_variant = encode_texture(UASTC_8, Slot::Srgb).unwrap();
     let keys: Vec<&str> = m.keys().map(String::as_str).collect();
-    let mut expected = vec!["bafkcolor", "bafknormal"];
-    if ktx_variant.is_some() {
-        expected.insert(1, "bafkktx");
-        assert_eq!(m["bafkktx"][0].format, "ktx2-bc7");
-    }
+    let expected = vec!["bafkcolor", "bafkktx", "bafknormal"];
+    assert_eq!(m["bafkktx"][0].format, "ktx2-bc7");
     assert_eq!(keys, expected);
     assert_eq!(m["bafkcolor"][0].format, "ktx2-bc1");
     assert_eq!(m["bafknormal"][0].format, "ktx2-bc5");
@@ -1595,19 +1589,13 @@ fn entity_build_writes_cid_addressed_variants_and_a_deterministic_manifest() {
         reason("bafkmissing"),
         Some(super::stats::NoVariant::Missing)
     );
-    assert_eq!(
-        reason("bafkktx"),
-        ktx_variant.is_none().then_some(NoVariant::SizeGate)
-    );
+    assert_eq!(reason("bafkktx"), None);
     assert_eq!(st.variants["ktx2-bc1 from png"].count, 1);
     assert_eq!(st.variants["ktx2-bc5 from png"].count, 1);
     assert_eq!(st.bc1_rejected, 0);
     let color = st.files.iter().find(|f| f.hash == "bafkcolor").unwrap();
     // Linear: BC1 without the PSNR check.
     assert!(color.bc1_rejected.is_none() && color.bc1_psnr_db.is_none());
-    if ktx_variant.is_none() {
-        assert_eq!(st.size_gated["ktx2-bc7"].count, 1);
-    }
     assert_eq!(st.unique_variants as usize, written.len());
     assert!(st.stages.bc1_ns > 0 && st.stages.bc5_ns > 0 && st.stages.zstd_ns > 0);
     assert!(st.summary_json().get("files").is_none());

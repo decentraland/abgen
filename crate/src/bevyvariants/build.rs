@@ -21,8 +21,7 @@ use crate::catalyst::Scene;
 /// What a build produces besides texture variants, and how.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BuildOptions {
-    /// GLB variants (the `g` class, [`super::model`]): every embedded image as a BC KTX2,
-    /// not size-gated. On by default; `ABGEN_BEVY_GLB_VARIANTS=0` turns them off. Images
+    /// GLB variants (the `g` class, [`super::model`]): every embedded image as a BC KTX2. On by default; `ABGEN_BEVY_GLB_VARIANTS=0` turns them off. Images
     /// embedded in GLBs never get a texture variant of their own either way. With
     /// [`BuildOptions::precompress_br`] a GLB variant also gets a `.br` sidecar when smaller.
     pub glb_variants: bool,
@@ -855,8 +854,6 @@ pub fn build_entity_variants(
                 width: None,
                 height: None,
                 mips: None,
-                gated_size: None,
-                gated_format: None,
                 reason: None,
                 bc1_psnr_db: None,
                 bc1_rejected: None,
@@ -895,14 +892,8 @@ pub fn build_entity_variants(
             stat.original_size = bytes.len() as u64;
             let v = match encode_texture_with(&bytes, slot, tex_opts, &mut times) {
                 Ok(Ok(v)) => v,
-                Ok(Err(Miss {
-                    reason,
-                    gated_size,
-                    gated_format,
-                })) => {
+                Ok(Err(Miss { reason })) => {
                     stat.reason = Some(reason);
-                    stat.gated_size = gated_size;
-                    stat.gated_format = gated_format;
                     let uploads = if texture_reason_is_final(reason) {
                         let rec = Record {
                             v: RECORD_VERSION,
