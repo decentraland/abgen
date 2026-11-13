@@ -750,7 +750,10 @@ pub fn build_entity_variants(
                                     // point is GPU memory, not download).
                                     let br = if opts.precompress_br {
                                         let br = timed(&mut gt.brotli_ns, || {
-                                            glbbr::brotli_compress(&v.glb)
+                                            glbbr::brotli_compress_with(
+                                                &v.glb,
+                                                glbbr::GLB_VARIANT_BROTLI_QUALITY,
+                                            )
                                         })?;
                                         (br.len() < v.glb.len()).then_some(br)
                                     } else {

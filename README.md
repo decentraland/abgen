@@ -397,7 +397,8 @@ release, never on the machine or thread count; a new libzstd release is a `TEX_G
   GLBs never get a texture variant of their own; external image URIs are left as they are. A
   model nothing changes in gets no variant (`nothing-to-change`); models whose meshes are
   compressed by an extension other than Draco are not handled yet. With precompression on, a
-  GLB variant also gets a Brotli `{name}.br` sidecar when it is smaller (the geometry inside
+  GLB variant also gets a Brotli `{name}.br` sidecar (quality 5: the zstd KTX2 inside does not
+  compress, so a higher quality only costs CPU) when it is smaller (the geometry inside
   still compresses about 2x); the variant is kept either way. The stats count GLB variants,
   embedded images converted per format and source, images kept and why, and the embedded
   images' GPU bytes before and after (`glb_variants` in `BEVY_STATS`, one `glb_files` row per
