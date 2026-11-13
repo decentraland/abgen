@@ -1372,6 +1372,17 @@ fn entity_build_adds_glb_br_model_variants() {
     assert!(again.uploads.is_empty());
     assert_eq!(again.stats.reused_models, 3);
     assert_eq!(again.stats.reused_textures, 1);
+    // A GLB with both lists its GLB variant first: clients take the first they support.
+    let quad = &built.manifest.files["bafkquad"];
+    assert_eq!(quad.len(), 2);
+    assert!(
+        quad[0].starts_with(&format!("bevy/g{GLB_GEN}/")),
+        "{quad:?}"
+    );
+    assert!(
+        quad[1].starts_with(&format!("bevy/m{MESH_GEN}/")),
+        "{quad:?}"
+    );
     // Every GLB outcome is reused too (grid and `.gltf` negative, quad with a variant).
     let g = &again.stats.glb_variants;
     assert_eq!((g.considered, g.reused, g.variants), (3, 3, 1));

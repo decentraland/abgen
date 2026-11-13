@@ -287,7 +287,9 @@ the original file on anything else, so the lane can be switched off at any time.
 `crate/src/bevyvariants` (feature `bevy-variants`, on with `server`).
 
 - `GET /bevy/manifest/{entity}.json` - `{"v":3,"lanes":{"glb":"g4","mesh":"m2","texture":"t4"},"files":{"<original cid>":["bevy/t4/<original cid>_srgb"]}}`
-  (at most one path per class per original: a texture, a `glb-br` and a `glb`). 404 while absent, and while every copy on disk was built from an older
+  (at most one path per class per original: a texture, a `glb-br` and a `glb`, in order of
+  preference: clients load the first they support, so a `.glb` lists its `glb` variant before
+  its `glb-br` copy). 404 while absent, and while every copy on disk was built from an older
   generation or schema (`X-Abgen-Reason: bevy-variants-stale`, see the asset lane below).
   Nothing is built on request: the conversion lambda builds the lane for each entity after its
   asset bundles (`lambda/src/bevy.rs`), and `abgen-corpus --bevy-variants` builds it offline. The

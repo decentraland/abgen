@@ -361,8 +361,9 @@ impl Record {
 
 /// The per-entity manifest (`v: 3`): what the client needs and nothing else. `files` maps
 /// each original content CID to the paths of its variants (one per class, so at most one
-/// texture, one `glb-br` and one `glb`), ordered, so the serialized bytes are a function
-/// of the variants alone. The class of a path is its prefix letter (`t` BC KTX2, `m`
+/// texture, one `glb-br` and one `glb`), in order of preference: a client loads the first it
+/// supports, so a GLB lists its `glb` variant (BC textures) before its `glb-br` copy. The
+/// serialized bytes are a function of the variants alone. The class of a path is its prefix letter (`t` BC KTX2, `m`
 /// `glb-br`, `g` GLB); the KTX2 header carries the BC format and size. `lanes` names
 /// the prefix each class was built from (`{"texture":"t4","mesh":"m2","glb":"g4"}`), read back by
 /// [`Manifest::is_current`]. The full entry (CID, format, dimensions, size) of each variant

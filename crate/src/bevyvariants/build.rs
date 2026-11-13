@@ -829,6 +829,10 @@ pub fn build_entity_variants(
             if let Some(s) = out.stat.as_mut() {
                 s.times = times;
             }
+            // The manifest lists a file's variants in order of preference, and clients take the
+            // first they support: the GLB variant (BC textures, the memory saving) goes before
+            // the `glb-br` copy of the original, which only saves download.
+            out.row.1.sort_by_key(|e| class_preference(&e.path));
             Ok(out)
         })
         .collect::<Result<_>>()?;
@@ -1040,6 +1044,16 @@ pub fn build_entity_variants(
         uploads,
         stats,
     })
+}
+
+/// Where a variant goes in its file's manifest list, by its class (the prefix letter):
+/// `g` (GLB with BC textures) first, then `m` (`glb-br`), then anything else.
+fn class_preference(path: &str) -> u8 {
+    match path.split('/').nth(1).and_then(|p| p.bytes().next()) {
+        Some(b'g') => 0,
+        Some(b'm') => 1,
+        _ => 2,
+    }
 }
 
 /// The model's bytes, fetched once (the first caller pays the fetch time).
