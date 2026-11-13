@@ -122,8 +122,9 @@ pub(super) async fn bevy_serve_local(
         // Served above.
         BevyTarget::Manifest(_) => serve::not_found(),
         BevyTarget::Variant { prefix, name } => {
-            // A `glb-br` model variant has a Brotli sidecar (`{name}.br`): clients that
-            // accept `br` get those bytes as the encoded representation of the same resource.
+            // A `glb-br` model variant, and a GLB variant, can have a Brotli sidecar
+            // (`{name}.br`): clients that accept `br` get those bytes as the encoded
+            // representation of the same resource.
             let br = bevyvariants::glbbr::br_sidecar(&exact);
             let has_br = br.is_file();
             let send_br = has_br && accepts_br(headers);

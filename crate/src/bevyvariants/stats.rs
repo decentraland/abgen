@@ -33,7 +33,7 @@ pub struct StageTimes {
     pub transcode_ns: u64,
     /// Zstandard compression of every level plus KTX2 assembly.
     pub zstd_ns: u64,
-    /// Brotli of a `glb-br` model variant (its `.br` sidecar).
+    /// Brotli of a `glb-br` model variant or a GLB variant (its `.br` sidecar).
     pub brotli_ns: u64,
     /// CID (sha256) plus writing the variant file (and its `.br` sidecar).
     pub hash_write_ns: u64,
@@ -96,6 +96,8 @@ pub enum NoVariant {
     Tiny,
     /// PNG/JPEG that does not decode.
     DecodeError,
+    /// PNG/JPEG over `texture::MAX_SOURCE_PIXELS` by its header.
+    TooLarge,
     /// KTX2 the UASTC header gate turns away (not UASTC, not 2D, ...).
     Ktx2HeaderGate,
     /// UASTC KTX2 without a level of at most 1024 on a side.
@@ -104,8 +106,6 @@ pub enum NoVariant {
     Ktx2NotWholeBlocks,
     /// The transcoder refused or failed.
     Ktx2TranscodeFailed,
-    /// The variant is not smaller than the original (any source, any format).
-    SizeGate,
     /// Encode or write failed.
     EncodeError,
 }
@@ -144,11 +144,6 @@ pub struct FileStat {
     pub height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mips: Option<u32>,
-    /// The variant's size and format when the size gate dropped it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gated_size: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gated_format: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<NoVariant>,
     /// Opaque sRGB images only: PSNR (dB, RGB) of the BC1 encode's level 0 against the source
@@ -195,6 +190,69 @@ pub struct ModelStat {
     pub times: StageTimes,
 }
 
+/// One model's GLB variant (`g` class) outcome.
+#[derive(Clone, Debug, Serialize)]
+pub struct GlbStat {
+    pub hash: String,
+    pub file: String,
+    /// 0 when the outcome was reused: the source was not fetched.
+    pub original_size: u64,
+    /// The variant's key (`bevy/{prefix}/{name}`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant_size: Option<u64>,
+    /// Size of the `.br` sidecar (none when it was not smaller than the variant, or the
+    /// outcome was reused: see `br`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub br_size: Option<u64>,
+    /// The variant has a `.br` sidecar (built here or named by the reused record).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub br: bool,
+    /// Why there is no variant: a `model::NoGlbVariant` name, or `error` / `missing` (not final).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The outcome came from the key's record (probe hit): nothing was fetched or encoded, and
+    /// `images` is empty.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub reused: bool,
+    /// Every embedded image's outcome (built outcomes only).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<super::model::EmbeddedImage>,
+    pub times: StageTimes,
+}
+
+/// The GLB variants' (`g` class) totals. Byte totals cover the models built here (reused
+/// outcomes carry no sizes of their originals or images).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct GlbSummary {
+    /// Models considered.
+    pub considered: u64,
+    /// Outcomes taken from an existing record.
+    pub reused: u64,
+    /// Models that got a variant (built or reused).
+    pub variants: u64,
+    /// Built variants: their originals' bytes and the variants' bytes.
+    pub variants_original_bytes: u64,
+    pub variant_bytes: u64,
+    /// Variants with a `.br` sidecar (built or reused), and the bytes of the sidecars built
+    /// here.
+    pub br_count: u64,
+    pub br_bytes: u64,
+    /// No-variant reason -> count.
+    pub no_variant: BTreeMap<String, u64>,
+    /// Embedded images of the variants built here (each distinct image and slot once):
+    /// converted, `"<format> from <source>"` -> count, original bytes and KTX2 bytes.
+    pub images_converted: BTreeMap<String, CountBytes>,
+    /// Embedded images left as their original bytes, by reason -> count and bytes.
+    pub images_kept: BTreeMap<String, CountBytes>,
+    /// GPU bytes of the embedded images of the variants built here: as the explorer holds the
+    /// originals, and as it holds what the variants carry (only images whose size is known).
+    /// Models without a variant are not counted: the client loads their originals.
+    pub gpu_original_bytes: u64,
+    pub gpu_variant_bytes: u64,
+}
+
 /// The model variants' (`glb-br`) totals.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ModelSummary {
@@ -235,9 +293,6 @@ pub struct BuildStats {
     pub variants: BTreeMap<String, CountBytes>,
     /// No-variant reason -> count and original bytes.
     pub no_variant: BTreeMap<String, CountBytes>,
-    /// Size-gated variants by the format that was tried -> count, original bytes and the
-    /// dropped variants' bytes.
-    pub size_gated: BTreeMap<String, CountBytes>,
     /// Opaque sRGB images whose BC1 fell below the PSNR floor and became BC7.
     pub bc1_rejected: u64,
     /// Outcomes taken from an existing record (probe hits): standalone textures and models
@@ -253,6 +308,9 @@ pub struct BuildStats {
     /// The model variants (`glb-br`): totals and one row per model.
     pub model_variants: ModelSummary,
     pub model_files: Vec<ModelStat>,
+    /// The GLB variants (`g`): totals and one row per model.
+    pub glb_variants: GlbSummary,
+    pub glb_files: Vec<GlbStat>,
 }
 
 impl BuildStats {
@@ -286,15 +344,6 @@ impl BuildStats {
             e.count += 1;
             e.original_bytes += f.original_size;
             e.variant_bytes += f.variant_size.unwrap_or(0);
-            if f.reason == Some(NoVariant::SizeGate) {
-                let g = s
-                    .size_gated
-                    .entry(f.gated_format.unwrap_or("unknown").to_string())
-                    .or_default();
-                g.count += 1;
-                g.original_bytes += f.original_size;
-                g.variant_bytes += f.gated_size.unwrap_or(0);
-            }
             if f.bc1_rejected == Some(true) {
                 s.bc1_rejected += 1;
             }
@@ -340,12 +389,69 @@ impl BuildStats {
         self.model_files = rows;
     }
 
+    /// Add the GLB variant rows: totals and stage times.
+    pub fn add_glbs(&mut self, rows: Vec<GlbStat>) {
+        let g = &mut self.glb_variants;
+        let name = |v: serde_json::Result<serde_json::Value>| {
+            v.ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string())
+        };
+        for m in &rows {
+            g.considered += 1;
+            self.stages.add(&m.times);
+            if m.reused {
+                g.reused += 1;
+            }
+            match (m.variant_size, &m.reason) {
+                (Some(n), _) => {
+                    g.variants += 1;
+                    if !m.reused {
+                        g.variants_original_bytes += m.original_size;
+                        g.variant_bytes += n;
+                    }
+                    if m.br {
+                        g.br_count += 1;
+                    }
+                    g.br_bytes += m.br_size.unwrap_or(0);
+                }
+                (None, r) => {
+                    let key = r.clone().unwrap_or_else(|| "unknown".to_string());
+                    *g.no_variant.entry(key).or_default() += 1;
+                }
+            }
+            // Only a variant that ships changes what the explorer holds.
+            if m.variant_size.is_none() {
+                continue;
+            }
+            for i in &m.images {
+                let src = name(serde_json::to_value(i.source));
+                let e = match (i.format, i.reason) {
+                    (Some(fmt), _) => g.images_converted.entry(format!("{fmt} from {src}")),
+                    (None, r) => g.images_kept.entry(
+                        r.map_or_else(|| "unknown".to_string(), |r| name(serde_json::to_value(r))),
+                    ),
+                }
+                .or_default();
+                e.count += 1;
+                e.original_bytes += i.original_size;
+                e.variant_bytes += i.variant_size.unwrap_or(i.original_size);
+                if let (Some(a), Some(b)) = (i.original_gpu_bytes, i.variant_gpu_bytes) {
+                    g.gpu_original_bytes += a;
+                    g.gpu_variant_bytes += b;
+                }
+            }
+        }
+        self.glb_files = rows;
+    }
+
     /// The summary as JSON without the per-file rows.
     pub fn summary_json(&self) -> serde_json::Value {
         let mut v = serde_json::to_value(self).unwrap_or_default();
         if let Some(o) = v.as_object_mut() {
             o.remove("files");
             o.remove("model_files");
+            o.remove("glb_files");
             let ms = |ns: u64| (ns as f64 / 1e6 * 10.0).round() / 10.0;
             let st = &self.stages;
             o.insert(

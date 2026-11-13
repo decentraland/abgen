@@ -13,6 +13,10 @@ pub const GLB_BR_FORMAT: &str = "glb-br";
 /// size for a small fraction of its CPU time.
 pub const BROTLI_QUALITY: u32 = 9;
 pub const BROTLI_LGWIN: u32 = 22;
+/// Brotli quality of a GLB variant's (`g` class) `.br` sidecar. Most of such a GLB is
+/// zstd-compressed KTX2, which Brotli cannot shrink, so a higher quality spends its CPU on
+/// bytes that do not compress; quality 5 still takes the geometry's redundancy.
+pub const GLB_VARIANT_BROTLI_QUALITY: u32 = 5;
 
 /// Why a model got no `glb-br` variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -31,10 +35,15 @@ pub enum NoModelVariant {
 
 /// Brotli (quality [`BROTLI_QUALITY`], window [`BROTLI_LGWIN`]) of `data`: the `.br` sidecar.
 pub fn brotli_compress(data: &[u8]) -> Result<Vec<u8>> {
+    brotli_compress_with(data, BROTLI_QUALITY)
+}
+
+/// [`brotli_compress`] at another quality (window [`BROTLI_LGWIN`]).
+pub fn brotli_compress_with(data: &[u8], quality: u32) -> Result<Vec<u8>> {
     use std::io::Write;
     let mut out = Vec::with_capacity(data.len() / 2);
     {
-        let mut w = brotli::CompressorWriter::new(&mut out, 1 << 16, BROTLI_QUALITY, BROTLI_LGWIN);
+        let mut w = brotli::CompressorWriter::new(&mut out, 1 << 16, quality, BROTLI_LGWIN);
         w.write_all(data).context("brotli")?;
         w.flush().context("brotli flush")?;
     }

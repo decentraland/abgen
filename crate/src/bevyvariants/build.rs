@@ -7,8 +7,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use super::glbbr::{self, NoModelVariant};
-use super::model::{image_uses, transform_model_with};
-use super::stats::{elapsed_ns, timed, BuildStats, FileStat, ModelStat, NoVariant, StageTimes};
+use super::model::{image_uses, transform_model_with, NoGlbVariant};
+use super::stats::{
+    elapsed_ns, timed, BuildStats, FileStat, GlbStat, ModelStat, NoVariant, StageTimes,
+};
 use super::texture::{encode_texture_with, source_kind, Miss, Slot, TexOptions, Uses};
 use super::{
     cid_v1_raw_sha256, key_path, manifest_path, record_key, variant_key, Class, ImageUse, Manifest,
@@ -19,18 +21,19 @@ use crate::catalyst::Scene;
 /// What a build produces besides texture variants, and how.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BuildOptions {
-    /// Also build GLB model variants. Off by default: Bevy's glTF loader does not take them yet
-    /// (it rejects `KHR_texture_basisu` in `extensionsRequired`, so a GLB embedding KTX2 cannot
-    /// load), so the manifest lists texture variants only. Images embedded in GLBs never get a
-    /// texture variant of their own either way.
+    /// GLB variants (the `g` class, [`super::model`]): every embedded image as a BC KTX2. On by default; `ABGEN_BEVY_GLB_VARIANTS=0` turns them off. Images
+    /// embedded in GLBs never get a texture variant of their own either way. With
+    /// [`BuildOptions::precompress_br`] a GLB variant also gets a `.br` sidecar when smaller.
     pub glb_variants: bool,
     /// Model variants (`glb-br`, the `m` class, [`super::glbbr`]): each `.glb` stored
     /// unchanged with a Brotli `.br` sidecar, kept when the sidecar is smaller than the
     /// original. On by default, independent of `glb_variants`.
     pub models: bool,
-    /// Store `.br` sidecars of model variants. On by default. A model variant is only worth
-    /// anything through its sidecar, so with this off no model variants are built at all
-    /// ([`BuildOptions::builds_models`]). A reused variant whose record has no sidecar gets one added.
+    /// Store `.br` sidecars of model and GLB variants. On by default. A model variant is only
+    /// worth anything through its sidecar, so with this off no model variants are built at all
+    /// ([`BuildOptions::builds_models`]); GLB variants are still built, without sidecars. A
+    /// reused model variant whose record has no sidecar gets one added (a GLB variant does not:
+    /// its record says `br` only when the sidecar was smaller).
     pub precompress_br: bool,
     /// Zstandard level of every KTX2 level ([`crate::ktx2_write::DEFAULT_ZSTD_LEVEL`] by
     /// default). Part of the variant bytes, so part of the texture prefix.
@@ -43,7 +46,7 @@ pub struct BuildOptions {
 impl Default for BuildOptions {
     fn default() -> Self {
         BuildOptions {
-            glb_variants: false,
+            glb_variants: true,
             models: true,
             precompress_br: true,
             zstd_level: crate::ktx2_write::DEFAULT_ZSTD_LEVEL,
@@ -54,6 +57,8 @@ impl Default for BuildOptions {
 
 /// The env var that sets [`BuildOptions::zstd_level`].
 pub const ZSTD_LEVEL_ENV: &str = "ABGEN_BEVY_ZSTD_LEVEL";
+/// `0` turns [`BuildOptions::glb_variants`] off.
+pub const GLB_VARIANTS_ENV: &str = "ABGEN_BEVY_GLB_VARIANTS";
 /// `0` turns [`BuildOptions::models`] off.
 pub const MODELS_ENV: &str = "ABGEN_BEVY_MODELS";
 /// `none` turns [`BuildOptions::precompress_br`] off; `br` (the default) keeps it on.
@@ -76,7 +81,7 @@ fn precompress_from_env() -> bool {
 }
 
 impl BuildOptions {
-    /// `ABGEN_BEVY_GLB_VARIANTS=1` turns GLB variants on (default off);
+    /// `ABGEN_BEVY_GLB_VARIANTS=0` turns GLB variants off (default on);
     /// `ABGEN_BEVY_MODELS=0` turns `glb-br` model variants off (default on);
     /// `ABGEN_BEVY_PRECOMPRESS=none` stops storing `.br` sidecars, so model variants too
     /// (default on);
@@ -99,7 +104,7 @@ impl BuildOptions {
             Err(_) => crate::ktx2_write::DEFAULT_ZSTD_LEVEL,
         };
         BuildOptions {
-            glb_variants: crate::clihelp::env_bool("ABGEN_BEVY_GLB_VARIANTS", false),
+            glb_variants: crate::clihelp::env_bool(GLB_VARIANTS_ENV, true),
             models: crate::clihelp::env_bool(MODELS_ENV, true),
             precompress_br: precompress_from_env(),
             zstd_level,
@@ -485,6 +490,8 @@ struct ModelOut {
     uploads: Vec<Upload>,
     /// Image URI -> use, from the mesh record or the bytes.
     uses: BTreeMap<String, ImageUse>,
+    /// The GLB variant's outcome, when one was asked for.
+    glb: Option<GlbStat>,
     /// Some outcome of this model is not final (see [`BuildOutput::incomplete`]).
     incomplete: bool,
 }
@@ -559,6 +566,7 @@ pub fn build_entity_variants(
                 stat: None,
                 uploads: Vec::new(),
                 uses: BTreeMap::new(),
+                glb: None,
                 incomplete: false,
             };
             let mut uses_known = false;
@@ -681,6 +689,8 @@ pub fn build_entity_variants(
             }
 
             if opts.glb_variants {
+                // Its own stage times: `times` is the `glb-br` row's (and pays the fetch).
+                let mut gt = StageTimes::default();
                 // A `.gltf` names its buffers in its JSON: read it to name the variant.
                 let name = if ext == ".gltf" {
                     let b = ensure_bytes(&mut bytes, &mut fetched, fetch, hash, &mut times);
@@ -691,15 +701,36 @@ pub fn build_entity_variants(
                     hash.to_string()
                 };
                 let key = variant_key(&glb_prefix, &name);
-                if let Some(rec) = probe(lane, out_root, &key, &mut times) {
+                let mut stat = GlbStat {
+                    hash: hash.to_string(),
+                    file: file.to_string(),
+                    original_size: 0,
+                    variant_path: None,
+                    variant_size: None,
+                    br_size: None,
+                    br: false,
+                    reason: None,
+                    reused: false,
+                    images: Vec::new(),
+                    times: StageTimes::default(),
+                };
+                if let Some(rec) = probe(lane, out_root, &key, &mut gt) {
+                    stat.reused = true;
                     if !uses_known {
                         out.uses = rec.uses.clone();
                         uses_known = true;
+                    }
+                    stat.reason = rec.reason.clone();
+                    stat.br = rec.br;
+                    if let Some(v) = &rec.variant {
+                        stat.variant_path = Some(v.path.clone());
+                        stat.variant_size = Some(v.size);
                     }
                     out.row.1.extend(rec.variant);
                 } else if let Some(b) =
                     ensure_bytes(&mut bytes, &mut fetched, fetch, hash, &mut times)
                 {
+                    stat.original_size = b.len() as u64;
                     if !uses_known {
                         out.uses = uses_by_uri(b, ext, Some(&resolve));
                         uses_known = true;
@@ -707,50 +738,84 @@ pub fn build_entity_variants(
                     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         transform_model_with(b, ext, Some(&resolve), tex_opts)
                     }));
-                    // A variant, or "nothing to change", is a final answer; a failure is not.
+                    // A variant, or a reason there is none, is a final answer; a failure is not.
                     match caught {
-                        Ok(Ok(Some(v))) => {
-                            let e = entry(&key, &v.glb, "model", "glb");
-                            let rec = Record {
-                                v: RECORD_VERSION,
-                                variant: Some(e.clone()),
-                                reason: None,
-                                br: false,
-                                uses: out.uses.clone(),
-                            };
-                            out.uploads.extend(store(out_root,
-                                &key,
-                                Some(&v.glb),
-                                None,
-                                &rec,
-                                &mut times,
-                            )?);
-                            out.row.1.push(e);
-                        }
-                        Ok(Ok(None)) => {
-                            let rec = Record {
-                                v: RECORD_VERSION,
-                                variant: None,
-                                reason: Some("nothing-to-change".to_string()),
-                                br: false,
-                                uses: out.uses.clone(),
-                            };
-                            out.uploads
-                                .extend(store(out_root, &key, None, None, &rec, &mut times)?);
+                        Ok(Ok(o)) => {
+                            gt.add(&o.times);
+                            stat.images = o.images;
+                            match o.variant {
+                                Some(v) => {
+                                    // The geometry inside still compresses: a `.br` sidecar
+                                    // when it is smaller. The variant is kept either way (its
+                                    // point is GPU memory, not download).
+                                    let br = if opts.precompress_br {
+                                        let br = timed(&mut gt.brotli_ns, || {
+                                            glbbr::brotli_compress_with(
+                                                &v.glb,
+                                                glbbr::GLB_VARIANT_BROTLI_QUALITY,
+                                            )
+                                        })?;
+                                        (br.len() < v.glb.len()).then_some(br)
+                                    } else {
+                                        None
+                                    };
+                                    let e = entry(&key, &v.glb, "model", "glb");
+                                    let rec = Record {
+                                        v: RECORD_VERSION,
+                                        variant: Some(e.clone()),
+                                        reason: None,
+                                        br: br.is_some(),
+                                        uses: out.uses.clone(),
+                                    };
+                                    out.uploads.extend(store(
+                                        out_root,
+                                        &key,
+                                        Some(&v.glb),
+                                        br.as_deref(),
+                                        &rec,
+                                        &mut gt,
+                                    )?);
+                                    stat.variant_path = Some(key.clone());
+                                    stat.variant_size = Some(e.size);
+                                    stat.br = br.is_some();
+                                    stat.br_size = br.map(|b| b.len() as u64);
+                                    out.row.1.push(e);
+                                }
+                                None => {
+                                    let reason = reason_name(
+                                        o.reason.unwrap_or(NoGlbVariant::NothingToChange),
+                                    );
+                                    let rec = Record {
+                                        v: RECORD_VERSION,
+                                        variant: None,
+                                        reason: Some(reason.clone()),
+                                        br: false,
+                                        uses: out.uses.clone(),
+                                    };
+                                    out.uploads
+                                        .extend(store(out_root, &key, None, None, &rec, &mut gt)?);
+                                    stat.reason = Some(reason);
+                                }
+                            }
                         }
                         Ok(Err(e)) => {
-                            tracing::warn!(entity = %entity, file = %file, error = %format!("{e:#}"), "bevy model variant skipped");
+                            tracing::warn!(entity = %entity, file = %file, error = %format!("{e:#}"), "bevy glb variant skipped");
+                            stat.reason = Some("error".to_string());
                             out.incomplete = true;
                         }
                         Err(_) => {
-                            tracing::warn!(entity = %entity, file = %file, "bevy model variant panicked; skipped");
+                            tracing::warn!(entity = %entity, file = %file, "bevy glb variant panicked; skipped");
+                            stat.reason = Some("error".to_string());
                             out.incomplete = true;
                         }
                     }
                 } else {
                     // Not fetched: no outcome for this key.
+                    stat.reason = Some("missing".to_string());
                     out.incomplete = true;
                 }
+                stat.times = gt;
+                out.glb = Some(stat);
             }
 
             if !uses_known {
@@ -764,6 +829,10 @@ pub fn build_entity_variants(
             if let Some(s) = out.stat.as_mut() {
                 s.times = times;
             }
+            // The manifest lists a file's variants in order of preference, and clients take the
+            // first they support: the GLB variant (BC textures, the memory saving) goes before
+            // the `glb-br` copy of the original, which only saves download.
+            out.row.1.sort_by_key(|e| class_preference(&e.path));
             Ok(out)
         })
         .collect::<Result<_>>()?;
@@ -795,8 +864,6 @@ pub fn build_entity_variants(
                 width: None,
                 height: None,
                 mips: None,
-                gated_size: None,
-                gated_format: None,
                 reason: None,
                 bc1_psnr_db: None,
                 bc1_rejected: None,
@@ -835,14 +902,8 @@ pub fn build_entity_variants(
             stat.original_size = bytes.len() as u64;
             let v = match encode_texture_with(&bytes, slot, tex_opts, &mut times) {
                 Ok(Ok(v)) => v,
-                Ok(Err(Miss {
-                    reason,
-                    gated_size,
-                    gated_format,
-                })) => {
+                Ok(Err(Miss { reason })) => {
                     stat.reason = Some(reason);
-                    stat.gated_size = gated_size;
-                    stat.gated_format = gated_format;
                     let uploads = if texture_reason_is_final(reason) {
                         let rec = Record {
                             v: RECORD_VERSION,
@@ -912,6 +973,7 @@ pub fn build_entity_variants(
     let mut files: BTreeMap<String, Vec<VariantEntry>> = BTreeMap::new();
     let mut uploads: Vec<Upload> = tex_uploads.into_iter().flatten().collect();
     let mut model_stats: Vec<ModelStat> = Vec::with_capacity(model_outs.len());
+    let mut glb_stats: Vec<GlbStat> = Vec::new();
     let mut incomplete: Vec<String> = file_stats
         .iter()
         .filter(|s| s.reason.is_some_and(|r| !texture_reason_is_final(r)))
@@ -934,6 +996,7 @@ pub fn build_entity_variants(
         }
         uploads.extend(m.uploads);
         model_stats.extend(m.stat);
+        glb_stats.extend(m.glb);
     }
     let manifest = Manifest {
         v: MANIFEST_VERSION,
@@ -961,6 +1024,7 @@ pub fn build_entity_variants(
     let mut stats = BuildStats::from_files(file_stats, opts.zstd_level, started.elapsed());
     stats.models = models.len() as u64;
     stats.add_models(model_stats);
+    stats.add_glbs(glb_stats);
     let built: BTreeMap<&str, u64> = uploads
         .iter()
         .filter(|u| !u.record && !u.key.ends_with(".br"))
@@ -980,6 +1044,16 @@ pub fn build_entity_variants(
         uploads,
         stats,
     })
+}
+
+/// Where a variant goes in its file's manifest list, by its class (the prefix letter):
+/// `g` (GLB with BC textures) first, then `m` (`glb-br`), then anything else.
+fn class_preference(path: &str) -> u8 {
+    match path.split('/').nth(1).and_then(|p| p.bytes().next()) {
+        Some(b'g') => 0,
+        Some(b'm') => 1,
+        _ => 2,
+    }
 }
 
 /// The model's bytes, fetched once (the first caller pays the fetch time).

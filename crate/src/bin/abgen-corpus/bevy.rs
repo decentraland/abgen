@@ -14,19 +14,19 @@ use abgen::Result;
 use anyhow::Context;
 use std::path::Path;
 
+/// The build options from the environment's (`BuildOptions::from_env`) and the flags: an
+/// explicit flag wins over its env var; `--bevy-no-models` can only turn models off.
 #[cfg(feature = "bevy-variants")]
-pub(crate) fn run_bevy_variants(
-    ids: &[String],
-    store: &LocalContentStore,
-    out_root: &Path,
-    glb_variants: bool,
+fn bevy_options(
+    env: abgen::bevyvariants::BuildOptions,
+    glb_variants: Option<bool>,
     no_models: bool,
     precompress_br: Option<bool>,
     zstd_level: Option<i32>,
-) -> Result<()> {
-    let env = abgen::bevyvariants::BuildOptions::from_env();
-    let opts = abgen::bevyvariants::BuildOptions {
-        glb_variants: glb_variants || env.glb_variants,
+) -> Result<abgen::bevyvariants::BuildOptions> {
+    Ok(abgen::bevyvariants::BuildOptions {
+        // An explicit `--bevy-[no-]glb-variants` wins over `ABGEN_BEVY_GLB_VARIANTS`.
+        glb_variants: glb_variants.unwrap_or(env.glb_variants),
         models: env.models && !no_models,
         // An explicit `--bevy-precompress` wins over `ABGEN_BEVY_PRECOMPRESS`.
         precompress_br: precompress_br.unwrap_or(env.precompress_br),
@@ -35,7 +35,26 @@ pub(crate) fn run_bevy_variants(
             None => env.zstd_level,
         },
         epoch: env.epoch,
-    };
+    })
+}
+
+#[cfg(feature = "bevy-variants")]
+pub(crate) fn run_bevy_variants(
+    ids: &[String],
+    store: &LocalContentStore,
+    out_root: &Path,
+    glb_variants: Option<bool>,
+    no_models: bool,
+    precompress_br: Option<bool>,
+    zstd_level: Option<i32>,
+) -> Result<()> {
+    let opts = bevy_options(
+        abgen::bevyvariants::BuildOptions::from_env(),
+        glb_variants,
+        no_models,
+        precompress_br,
+        zstd_level,
+    )?;
     let started = std::time::Instant::now();
     let mut all_stats: Vec<serde_json::Value> = Vec::new();
     std::fs::create_dir_all(out_root).with_context(|| format!("mkdir {}", out_root.display()))?;
@@ -43,6 +62,7 @@ pub(crate) fn run_bevy_variants(
     let mut originals = 0usize;
     let mut variants = 0usize;
     let mut reused = 0u64;
+    let mut glbs = abgen::bevyvariants::stats::GlbSummary::default();
     // Entities with a file that could not be fetched or built: no manifest, so not done.
     let mut incomplete = 0usize;
     for id in ids {
@@ -89,7 +109,17 @@ pub(crate) fn run_bevy_variants(
                 all_stats.push(full);
                 originals += o.entries.len();
                 variants += o.stats.unique_variants as usize;
-                reused += o.stats.reused_textures + o.stats.reused_models;
+                reused +=
+                    o.stats.reused_textures + o.stats.reused_models + o.stats.glb_variants.reused;
+                let g = &o.stats.glb_variants;
+                glbs.considered += g.considered;
+                glbs.variants += g.variants;
+                glbs.variants_original_bytes += g.variants_original_bytes;
+                glbs.variant_bytes += g.variant_bytes;
+                glbs.br_count += g.br_count;
+                glbs.br_bytes += g.br_bytes;
+                glbs.gpu_original_bytes += g.gpu_original_bytes;
+                glbs.gpu_variant_bytes += g.gpu_variant_bytes;
                 if !o.incomplete.is_empty() {
                     incomplete += 1;
                     errs += 1;
@@ -121,6 +151,7 @@ pub(crate) fn run_bevy_variants(
         "zstd_level": opts.zstd_level,
         "epoch": opts.epoch,
         "models": opts.models,
+        "glb_variants": opts.glb_variants,
         "precompress": if opts.precompress_br { "br" } else { "none" },
         "libzstd": abgen::ktx2_write::LIBZSTD_VERSION,
         "threads": rayon::current_num_threads(),
@@ -136,6 +167,20 @@ pub(crate) fn run_bevy_variants(
         started.elapsed().as_millis(),
         stats_path.display()
     );
+    if opts.glb_variants {
+        let mb = |b: u64| (b as f64 / 1e5).round() / 10.0;
+        println!(
+            "DONE bevy-glb models={} variants={} download_mb={}->{} (br {} of them: {}) embedded_gpu_mb={}->{}",
+            glbs.considered,
+            glbs.variants,
+            mb(glbs.variants_original_bytes),
+            mb(glbs.variant_bytes),
+            glbs.br_count,
+            mb(glbs.br_bytes),
+            mb(glbs.gpu_original_bytes),
+            mb(glbs.gpu_variant_bytes),
+        );
+    }
     if errs > 0 {
         std::process::exit(1);
     }
@@ -147,10 +192,60 @@ pub(crate) fn run_bevy_variants(
     _: &[String],
     _: &LocalContentStore,
     _: &Path,
-    _: bool,
+    _: Option<bool>,
     _: bool,
     _: Option<bool>,
     _: Option<i32>,
 ) -> Result<()> {
     anyhow::bail!("--bevy-variants requires the bevy-variants feature (on by default via `server`)")
+}
+
+#[cfg(all(test, feature = "bevy-variants"))]
+mod tests {
+    use super::bevy_options;
+    use abgen::bevyvariants::BuildOptions;
+
+    #[test]
+    fn flags_win_over_the_environment() {
+        let on = BuildOptions::default();
+        let off = BuildOptions {
+            glb_variants: false,
+            models: false,
+            precompress_br: false,
+            zstd_level: 9,
+            epoch: Some(3),
+        };
+        // No flags: the environment's options as they are.
+        assert_eq!(bevy_options(on, None, false, None, None).unwrap(), on);
+        assert_eq!(bevy_options(off, None, false, None, None).unwrap(), off);
+        // `--bevy-glb-variants` / `--bevy-no-glb-variants` win over ABGEN_BEVY_GLB_VARIANTS.
+        assert!(
+            bevy_options(off, Some(true), false, None, None)
+                .unwrap()
+                .glb_variants
+        );
+        assert!(
+            !bevy_options(on, Some(false), false, None, None)
+                .unwrap()
+                .glb_variants
+        );
+        // `--bevy-precompress br|none` wins over ABGEN_BEVY_PRECOMPRESS.
+        assert!(
+            bevy_options(off, None, false, Some(true), None)
+                .unwrap()
+                .precompress_br
+        );
+        assert!(
+            !bevy_options(on, None, false, Some(false), None)
+                .unwrap()
+                .precompress_br
+        );
+        // `--bevy-no-models` only turns models off; ABGEN_BEVY_MODELS=0 stays off.
+        assert!(!bevy_options(on, None, true, None, None).unwrap().models);
+        assert!(!bevy_options(off, None, false, None, None).unwrap().models);
+        // `--bevy-zstd-level` wins and is checked; the epoch is the environment's alone.
+        let o = bevy_options(off, None, false, None, Some(19)).unwrap();
+        assert_eq!((o.zstd_level, o.epoch), (19, Some(3)));
+        assert!(bevy_options(on, None, false, None, Some(0)).is_err());
+    }
 }
