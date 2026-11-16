@@ -532,7 +532,7 @@ fn republish(
     Ok(Some(summary))
 }
 
-/// Build the Bevy copy of a plain far LOD GLB and put it, its `.br` and its stats under
+/// Build the Bevy copy of a plain far LOD GLB and put it and its `.br` under
 /// [`abgen::lods::BEVY_GLB_KEY_DIR`]. Returns the keys written; none when it cannot be built
 /// (logged), in which case the explorer loads the plain GLB.
 fn publish_bevy_far_lod(
@@ -542,7 +542,7 @@ fn publish_bevy_far_lod(
     plain: &[u8],
 ) -> Vec<String> {
     use abgen::bevyvariants::farlod;
-    let far = match farlod::build(plain, scene_id, level, farlod::options()) {
+    let far = match farlod::build(plain, farlod::options()) {
         Ok(Ok(far)) => far,
         Ok(Err(reason)) => {
             eprintln!(
@@ -555,19 +555,16 @@ fn publish_bevy_far_lod(
             return Vec::new();
         }
     };
-    let dir = abgen::lods::BEVY_GLB_KEY_DIR;
-    let glb_key = format!("{dir}/{}", abgen::lods::published_glb_name(scene_id, level));
+    let glb_key = format!(
+        "{}/{}",
+        abgen::lods::BEVY_GLB_KEY_DIR,
+        abgen::lods::published_glb_name(scene_id, level)
+    );
     // The `.br` always goes up, so it is overwritten with the GLB it was made from.
     let br_key = format!("{glb_key}.br");
     proxy.space_put_key(&glb_key, &far.glb);
     proxy.space_put_key(&br_key, &far.br);
-    let mut keys = vec![br_key, glb_key];
-    if let Ok(stats) = serde_json::to_vec_pretty(&far.stats) {
-        let stats_key = format!("{dir}/{}", farlod::stats_name(scene_id, level));
-        proxy.space_put_key(&stats_key, &stats);
-        keys.push(stats_key);
-    }
-    keys
+    vec![br_key, glb_key]
 }
 
 /// Write the `lods` block into the scene's per-entity manifests, one per LOD platform, so the
@@ -1055,8 +1052,8 @@ mod follow_up_tests {
         assert_eq!(err["error"], "gate failed");
     }
 
-    /// What the reuse path publishes for each copied plain GLB: its Bevy copy, `.br` and stats
-    /// under the Bevy key directory, and nothing for a GLB that will not rewrite.
+    /// What the reuse path publishes for each copied plain GLB: its Bevy copy and `.br` under
+    /// the Bevy key directory, and nothing for a GLB that will not rewrite.
     #[test]
     fn a_reused_build_publishes_a_bevy_far_lod_beside_the_plain_glb() {
         let (host, seen) = crate::output::tests::serve(vec![(
@@ -1090,7 +1087,6 @@ mod follow_up_tests {
             vec![
                 format!("{dir}/bafkscene_1.glb.br"),
                 format!("{dir}/bafkscene_1.glb"),
-                format!("{dir}/bafkscene_1.stats.json"),
             ]
         );
         let mut puts = seen.lock().unwrap().clone();
@@ -1101,7 +1097,7 @@ mod follow_up_tests {
 
         // A plain GLB that will not rewrite publishes nothing.
         assert!(publish_bevy_far_lod(&proxy, "bafkscene", 1, b"not a glb").is_empty());
-        assert_eq!(seen.lock().unwrap().len(), 3);
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
     /// The city trigger against a fake space: a reuse miss writes one record and returns

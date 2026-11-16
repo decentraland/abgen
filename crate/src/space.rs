@@ -789,11 +789,6 @@ mod tests {
                 PUBLIC_ONE_YEAR,
             ),
             (
-                "LOD/lods-bevy/lods/bafkscene_1.stats.json",
-                "application/json",
-                PUBLIC_ONE_YEAR,
-            ),
-            (
                 "v41/bafkScene/scene.json",
                 "application/json",
                 IMMUTABLE_SOURCE,

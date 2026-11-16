@@ -1031,19 +1031,18 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
         levels.sort_unstable();
         for level in levels {
             let (path, _, _) = &published[level];
-            if let Some(st) =
+            if let Some(far) =
                 crate::bevyvariants::farlod::write_from_plain(&scene_dir, &sid, *level, path)
             {
+                let formats: Vec<&str> = far
+                    .images
+                    .iter()
+                    .map(|i| i.format.unwrap_or("kept"))
+                    .collect();
                 log.push(format!(
-                    "bevy-far-lod[{level}]: {} -> {} bytes (br {:?}), texture GPU {} -> {} bytes, mesh {} f32 + {} index bytes, {} ms",
-                    st.plain_bytes,
-                    st.bevy_bytes,
-                    st.br_bytes,
-                    st.plain_texture_gpu_bytes,
-                    st.texture_gpu_bytes,
-                    st.mesh.vertex_bytes_f32,
-                    st.mesh.index_bytes,
-                    st.encode_ms
+                    "bevy-far-lod[{level}]: {} bytes (br {}), atlases {formats:?}",
+                    far.glb.len(),
+                    far.br.len(),
                 ));
             }
         }

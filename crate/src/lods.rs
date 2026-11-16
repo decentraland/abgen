@@ -212,7 +212,7 @@ pub const GLB_KEY_DIR: &str = "LOD/lods-unity/lods";
 pub const BEVY_GLB_DIR: &str = "lods-bevy/lods";
 
 /// Key prefix of the Bevy far LOD copies (on disk: [`BEVY_GLB_DIR`]), unversioned like
-/// [`GLB_KEY_DIR`] and named the same way (`{sid}_{level}.glb`, `.glb.br`, `.stats.json`).
+/// [`GLB_KEY_DIR`] and named the same way (`{sid}_{level}.glb` and its `.glb.br`).
 pub const BEVY_GLB_KEY_DIR: &str = "LOD/lods-bevy/lods";
 
 /// File name of the published GLB: abgen lower-cases every LOD key, production

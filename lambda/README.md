@@ -340,7 +340,7 @@ extra dimensions.
 | LOD bundles, `ENABLE_LODS=1` | `LOD/{level}/{sceneId}_{level}_{platform}` |
 | ISS descriptor, `ENABLE_LODS=1` | `lods-unity/manifests/{sceneId}_InitialSceneState.json` |
 | published LOD GLB (gltfpack layout, level 1 only), `ENABLE_LODS=1` | `lods-unity/lods/{sceneId}_1.glb` |
-| Bevy far LOD copy (BC KTX2 atlases with mips, `.br`, stats), `ENABLE_LODS=1` and `ABGEN_BEVY_VARIANTS` on | `lods-bevy/lods/{sceneId}_1.glb`, `…_1.glb.br`, `…_1.stats.json` |
+| Bevy far LOD copy (BC KTX2 atlases with mips, `.br`), `ENABLE_LODS=1` and `ABGEN_BEVY_VARIANTS` on | `lods-bevy/lods/{sceneId}_1.glb`, `…_1.glb.br` |
 | satellite rebuild records | `SatelliteMaps/rebuild/{rebuiltAt}-{entityId}.json` |
 | LOD reuse index, `ENABLE_LODS=1` | `lod-reuse/by-inputs/{digest}.json`, `lod-reuse/by-state/{digest}.json` (see [Reusing an unchanged build](#reusing-an-unchanged-build)) |
 

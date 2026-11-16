@@ -1,20 +1,21 @@
 //! The Bevy copy of a scene's far LOD: the published `{sceneId}_1.glb` (gltfpack layout, see
 //! `crate::lodgen::quantize`) run through the GLB rewrite ([`super::model`]), so every embedded
-//! atlas is a BC1 / BC5 / BC7 KTX2 (Zstandard) instead of a JPEG/PNG the explorer holds as
-//! RGBA8, plus a Brotli `.br` copy. Geometry, nodes, materials and extensions
-//! (`KHR_mesh_quantization`, `KHR_texture_transform`) are copied as they are.
+//! atlas is a BC1 / BC5 / BC7 KTX2 (Zstandard, with mips) instead of a JPEG/PNG the explorer
+//! holds as RGBA8, plus a Brotli `.br` copy. Geometry, nodes, materials
+//! and extensions (`KHR_mesh_quantization`, `KHR_texture_transform`) are copied as they are.
 //!
 //! It is derived from the plain GLB only, after the Unity bundles are built from that same
 //! file, and written beside it under its own directory; the plain GLB and the bundles are never
-//! touched. Differences from the scene lane's GLB variants, all because a far LOD is seen from
+//! touched. Differences from the scene lane's GLB variants, because a far LOD is seen from
 //! 80-320 m:
 //!
-//! - **Mips.** The full chain down to 1x1 (+33% memory). Level 0 alone shimmers at that
-//!   distance and samples more texture memory than the screen needs; the published GLB's
+//! - **Mips.** The full chain down to 1x1 (+33% texture memory). At that distance many atlases
+//!   are minified, and level 0 alone would shimmer as the camera moves; the published GLB's
 //!   sampler already asks for `LINEAR_MIPMAP_LINEAR`.
 //! - **Unused alpha.** An atlas drawn only by `OPAQUE` materials is encoded as opaque, so it
 //!   can take BC1 (behind the same PSNR check). The LOD bake gives most atlases an alpha
-//!   channel whether or not any material reads it.
+//!   channel whether or not any material reads it. An atlas a `BLEND` or `MASK` material
+//!   draws keeps its alpha (BC7).
 //! - **Always written.** A far LOD with nothing to rewrite (no embedded image) gets the plain
 //!   bytes as its Bevy copy, so the explorer finds one at the key it derives from the scene id.
 //!   Only a GLB whose rewrite fails, or that gets no GLB variant for another reason
@@ -24,26 +25,19 @@
 //!   stale `.br` can outlive the GLB it was made from (objects are only ever uploaded, never
 //!   deleted).
 //!
-//! On disk: `{scene_dir}/`[`GLB_DIR`]`/{sid}_{level}.glb`, its `.br` and
-//! `{sid}_{level}.stats.json` ([`FarLodStats`]: download and GPU sizes). Published under
+//! On disk: `{scene_dir}/`[`GLB_DIR`]`/{sid}_{level}.glb` and its `.br`. Published under
 //! [`KEY_DIR`] with the same file names, unversioned like the plain GLB.
 
 use anyhow::{Context, Result};
-use serde::Serialize;
-use serde_json::Value as J;
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::glbbr::brotli_compress;
 use super::model::{transform_model_with, EmbeddedImage, NoGlbVariant};
 use super::texture::TexOptions;
 
-/// Generation of the far LOD copy's encode rules, stamped into its stats. Bump when its bytes
-/// change for the same plain GLB.
-pub const FAR_LOD_GEN: u32 = 1;
 pub use crate::lods::{BEVY_GLB_DIR as GLB_DIR, BEVY_GLB_KEY_DIR as KEY_DIR};
 
-/// The far LOD copy's texture rules: mips, unused alpha dropped, the scene lane's size cap.
+/// The far LOD copy's texture rules: the scene lane's, plus mips and unused alpha dropped.
 pub fn options() -> TexOptions {
     TexOptions {
         mips: true,
@@ -52,143 +46,22 @@ pub fn options() -> TexOptions {
     }
 }
 
-/// File name of the stats beside a far LOD copy.
-pub fn stats_name(scene_id: &str, level: u32) -> String {
-    format!("{}_{}.stats.json", scene_id.to_lowercase(), level)
-}
-
-/// Vertex and index sizes of a GLB's mesh primitives (each accessor counted once).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
-pub struct MeshBytes {
-    pub vertices: u64,
-    pub indices: u64,
-    /// Vertex attributes as stored (quantized), each element padded to 4 bytes as a GPU vertex
-    /// format requires.
-    pub vertex_bytes: u64,
-    /// Vertex attributes widened to `f32` per component, as Bevy's glTF loader holds them.
-    pub vertex_bytes_f32: u64,
-    pub index_bytes: u64,
-}
-
-/// Download and GPU sizes of one far LOD's Bevy copy against its plain GLB.
-#[derive(Clone, Debug, Serialize)]
-pub struct FarLodStats {
-    pub v: u32,
-    pub generator: String,
-    pub scene_id: String,
-    pub level: u32,
-    /// The rewrite ran and changed nothing (no embedded image): the Bevy copy is the plain GLB.
-    pub copied: bool,
-    pub plain_bytes: u64,
-    pub bevy_bytes: u64,
-    pub br_bytes: u64,
-    /// Texture memory of the plain GLB (RGBA8 level 0, as the explorer loads it today).
-    pub plain_texture_gpu_bytes: u64,
-    /// Texture memory of the Bevy copy, every level.
-    pub texture_gpu_bytes: u64,
-    /// `texture_gpu_bytes` by format (`ktx2-bc1` / `ktx2-bc5` / `ktx2-bc7`, `rgba8` for an
-    /// image that kept its original bytes).
-    pub texture_gpu_by_format: BTreeMap<String, u64>,
-    pub mesh: MeshBytes,
-    /// `texture_gpu_bytes` + the widened vertex bytes + index bytes: what the explorer budgets.
-    pub gpu_bytes: u64,
-    pub images: Vec<EmbeddedImage>,
-    pub encode_ms: u64,
-}
-
 /// A built far LOD copy.
 #[derive(Debug)]
 pub struct FarLod {
     pub glb: Vec<u8>,
     /// The Brotli copy of `glb`, always (see the module docs).
     pub br: Vec<u8>,
-    pub stats: FarLodStats,
-}
-
-fn component_bytes(component_type: u64) -> u64 {
-    match component_type {
-        5120 | 5121 => 1,
-        5122 | 5123 => 2,
-        _ => 4,
-    }
-}
-
-fn type_components(ty: &str) -> u64 {
-    match ty {
-        "SCALAR" => 1,
-        "VEC2" => 2,
-        "VEC3" => 3,
-        "VEC4" | "MAT2" => 4,
-        "MAT3" => 9,
-        "MAT4" => 16,
-        _ => 1,
-    }
-}
-
-/// [`MeshBytes`] of a parsed glTF.
-pub fn mesh_bytes(doc: &J) -> MeshBytes {
-    let accessors = doc.get("accessors").and_then(J::as_array);
-    let accessor = |i: usize| accessors.and_then(|a| a.get(i));
-    let count = |a: &J| a.get("count").and_then(J::as_u64).unwrap_or(0);
-    let mut attrs: BTreeSet<usize> = BTreeSet::new();
-    let mut indices: BTreeSet<usize> = BTreeSet::new();
-    let mut out = MeshBytes::default();
-    for m in doc
-        .get("meshes")
-        .and_then(J::as_array)
-        .into_iter()
-        .flatten()
-    {
-        for p in m
-            .get("primitives")
-            .and_then(J::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if let Some(a) = p.get("attributes").and_then(J::as_object) {
-                attrs.extend(a.values().filter_map(J::as_u64).map(|x| x as usize));
-                if let Some(pos) = a.get("POSITION").and_then(J::as_u64) {
-                    out.vertices = out
-                        .vertices
-                        .saturating_add(accessor(pos as usize).map_or(0, count));
-                }
-            }
-            if let Some(i) = p.get("indices").and_then(J::as_u64) {
-                indices.insert(i as usize);
-            }
-        }
-    }
-    for a in attrs.iter().filter_map(|&i| accessor(i)) {
-        let comps = type_components(a.get("type").and_then(J::as_str).unwrap_or("SCALAR"));
-        let size = component_bytes(a.get("componentType").and_then(J::as_u64).unwrap_or(5126));
-        let n = count(a);
-        out.vertex_bytes = out
-            .vertex_bytes
-            .saturating_add(n.saturating_mul((comps * size).next_multiple_of(4)));
-        out.vertex_bytes_f32 = out
-            .vertex_bytes_f32
-            .saturating_add(n.saturating_mul(comps * 4));
-    }
-    for a in indices.iter().filter_map(|&i| accessor(i)) {
-        let size = component_bytes(a.get("componentType").and_then(J::as_u64).unwrap_or(5125));
-        out.indices = out.indices.saturating_add(count(a));
-        out.index_bytes = out
-            .index_bytes
-            .saturating_add(count(a).saturating_mul(size));
-    }
-    out
+    /// The rewrite ran and changed nothing (no embedded image): `glb` is the plain GLB.
+    pub copied: bool,
+    /// Each embedded atlas's outcome (format, size, whether its alpha was dropped).
+    pub images: Vec<EmbeddedImage>,
 }
 
 /// Build the Bevy copy of the far LOD `plain` (a published `{sid}_{level}.glb`). `Ok(Err)`
 /// with the reason when it gets none (any [`NoGlbVariant`] but `NothingToChange`, which copies
 /// the plain bytes). `Err` when the GLB cannot be rewritten.
-pub fn build(
-    plain: &[u8],
-    scene_id: &str,
-    level: u32,
-    opts: TexOptions,
-) -> Result<std::result::Result<FarLod, NoGlbVariant>> {
-    let started = std::time::Instant::now();
+pub fn build(plain: &[u8], opts: TexOptions) -> Result<std::result::Result<FarLod, NoGlbVariant>> {
     let outcome = transform_model_with(plain, ".glb", None, opts)?;
     let (glb, copied) = match (outcome.variant, outcome.reason) {
         (Some(v), _) => (v.glb, false),
@@ -196,60 +69,31 @@ pub fn build(
         (None, reason) => return Ok(Err(reason.unwrap_or(NoGlbVariant::NothingToChange))),
     };
     let br = brotli_compress(&glb)?;
-    let doc = crate::naming::parse_gltf_doc(&glb, ".glb").context("far lod json parse")?;
-    let mesh = mesh_bytes(&doc);
-    let mut by_format: BTreeMap<String, u64> = BTreeMap::new();
-    let mut plain_tex = 0u64;
-    for img in &outcome.images {
-        plain_tex += img.original_gpu_bytes.unwrap_or(0);
-        *by_format
-            .entry(img.format.unwrap_or("rgba8").to_string())
-            .or_default() += img.variant_gpu_bytes.unwrap_or(0);
-    }
-    let tex: u64 = by_format.values().sum();
-    let stats = FarLodStats {
-        v: FAR_LOD_GEN,
-        generator: super::generator(),
-        scene_id: scene_id.to_lowercase(),
-        level,
+    Ok(Ok(FarLod {
+        glb,
+        br,
         copied,
-        plain_bytes: plain.len() as u64,
-        bevy_bytes: glb.len() as u64,
-        br_bytes: br.len() as u64,
-        plain_texture_gpu_bytes: plain_tex,
-        texture_gpu_bytes: tex,
-        texture_gpu_by_format: by_format,
-        gpu_bytes: tex + mesh.vertex_bytes_f32 + mesh.index_bytes,
-        mesh,
         images: outcome.images,
-        encode_ms: started.elapsed().as_millis() as u64,
-    };
-    Ok(Ok(FarLod { glb, br, stats }))
+    }))
 }
 
-/// Write a built copy under `{scene_dir}/`[`GLB_DIR`]: the GLB, its `.br` and its stats.
-/// Returns the GLB's path.
-pub fn write(scene_dir: &Path, far: &FarLod) -> Result<PathBuf> {
+/// The files a copy of `level` writes under `{scene_dir}/`[`GLB_DIR`]: the `.br`, the GLB.
+fn level_files(scene_dir: &Path, scene_id: &str, level: u32) -> [PathBuf; 2] {
+    let glb = scene_dir
+        .join(GLB_DIR)
+        .join(crate::lods::published_glb_name(scene_id, level));
+    [super::glbbr::br_sidecar(&glb), glb]
+}
+
+/// Write a built copy of `scene_id`'s `level` under `{scene_dir}/`[`GLB_DIR`]: the GLB and its
+/// `.br`. Returns the GLB's path.
+pub fn write(scene_dir: &Path, scene_id: &str, level: u32, far: &FarLod) -> Result<PathBuf> {
     let dir = scene_dir.join(GLB_DIR);
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
-    let (sid, level) = (&far.stats.scene_id, far.stats.level);
-    let path = dir.join(crate::lods::published_glb_name(sid, level));
+    let [br_path, path] = level_files(scene_dir, scene_id, level);
     crate::lods::write_atomic(&path, &far.glb)?;
-    crate::lods::write_atomic(&super::glbbr::br_sidecar(&path), &far.br)?;
-    let stats = serde_json::to_vec_pretty(&far.stats)?;
-    crate::lods::write_atomic(&dir.join(stats_name(sid, level)), &stats)?;
+    crate::lods::write_atomic(&br_path, &far.br)?;
     Ok(path)
-}
-
-/// The files a copy of `level` writes under `{scene_dir}/`[`GLB_DIR`]: GLB, `.br`, stats.
-fn level_files(scene_dir: &Path, scene_id: &str, level: u32) -> [PathBuf; 3] {
-    let dir = scene_dir.join(GLB_DIR);
-    let glb = dir.join(crate::lods::published_glb_name(scene_id, level));
-    [
-        super::glbbr::br_sidecar(&glb),
-        dir.join(stats_name(scene_id, level)),
-        glb,
-    ]
 }
 
 /// Build and write the Bevy copy of the plain far LOD GLB at `plain_path`. A copy that cannot
@@ -261,13 +105,13 @@ pub fn write_from_plain(
     scene_id: &str,
     level: u32,
     plain_path: &Path,
-) -> Option<FarLodStats> {
+) -> Option<FarLod> {
     let result = std::fs::read(plain_path)
         .with_context(|| format!("read {}", plain_path.display()))
-        .and_then(|plain| build(&plain, scene_id, level, options()));
+        .and_then(|plain| build(&plain, options()));
     let failure = match result {
-        Ok(Ok(far)) => match write(scene_dir, &far) {
-            Ok(_) => return Some(far.stats),
+        Ok(Ok(far)) => match write(scene_dir, scene_id, level, &far) {
+            Ok(_) => return Some(far),
             Err(e) => format!("write failed: {e:#}"),
         },
         Ok(Err(reason)) => format!("no GLB variant ({reason:?})"),
@@ -284,7 +128,7 @@ pub fn write_from_plain(
 mod tests {
     use super::*;
     use crate::lodgen::model::{AlphaClass, LodImage, LodMaterial, LodModel, LodPrimitive};
-    use serde_json::json;
+    use serde_json::{json, Value as J};
 
     /// A smooth gradient (BC1 holds it above the PSNR floor) with an alpha channel that is not
     /// all 255, so only the unused-alpha rule can make it BC1.
@@ -398,7 +242,7 @@ mod tests {
     #[test]
     fn far_lod_copy_keeps_geometry_and_replaces_atlases_with_mipped_bc_ktx2() {
         let plain = published_far_lod(true);
-        let far = build(&plain, "BafkScene", 1, options()).unwrap().unwrap();
+        let far = build(&plain, options()).unwrap().unwrap();
         let (p, b) = (doc(&plain), doc(&far.glb));
 
         // Geometry, nodes, materials and extensions are the plain file's.
@@ -420,7 +264,7 @@ mod tests {
 
         // Both atlases are KTX2 with a full mip chain; the opaque one dropped its alpha and
         // took BC1, the blended one kept it (BC7).
-        let rows = &far.stats.images;
+        let rows = &far.images;
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].format, Some("ktx2-bc1"));
         assert!(rows[0].alpha_dropped);
@@ -435,32 +279,23 @@ mod tests {
             let levels = crate::ktx2_write::read_levels(bytes).unwrap();
             assert_eq!(levels.len() as u32, rows[i].mips.unwrap());
         }
+        // Texture memory counts every level.
+        assert_eq!(
+            rows[0].variant_gpu_bytes,
+            Some(super::super::texture::chain_gpu_bytes(
+                crate::ktx2_write::BcFormat::Bc1Rgb,
+                64,
+                64,
+                7
+            ))
+        );
+        assert!(!far.copied);
 
-        // Brotli round-trips; stats add up.
-        let br = &far.br;
-        assert!(br.len() < far.glb.len());
-        assert_eq!(super::super::glbbr::brotli_decompress(br).unwrap(), far.glb);
-        let s = &far.stats;
-        assert_eq!(s.scene_id, "bafkscene");
-        assert!(!s.copied);
-        assert_eq!(s.plain_bytes, plain.len() as u64);
-        assert_eq!(s.br_bytes, br.len() as u64);
-        assert_eq!(s.plain_texture_gpu_bytes, (64 * 64 + 32 * 32) * 4);
+        // Brotli round-trips.
+        assert!(far.br.len() < far.glb.len());
         assert_eq!(
-            s.texture_gpu_by_format["ktx2-bc1"],
-            super::super::texture::chain_gpu_bytes(crate::ktx2_write::BcFormat::Bc1Rgb, 64, 64, 7)
-        );
-        assert_eq!(
-            s.texture_gpu_bytes,
-            s.texture_gpu_by_format.values().sum::<u64>()
-        );
-        assert!(s.texture_gpu_bytes < s.plain_texture_gpu_bytes);
-        assert_eq!(s.mesh, mesh_bytes(&p));
-        assert_eq!(s.mesh.vertices, 8);
-        assert_eq!(s.mesh.indices, 12);
-        assert_eq!(
-            s.gpu_bytes,
-            s.texture_gpu_bytes + s.mesh.vertex_bytes_f32 + s.mesh.index_bytes
+            super::super::glbbr::brotli_decompress(&far.br).unwrap(),
+            far.glb
         );
     }
 
@@ -472,19 +307,18 @@ mod tests {
             drop_unused_alpha: false,
             ..options()
         };
-        let far = build(&plain, "bafkscene", 1, opts).unwrap().unwrap();
-        assert_eq!(far.stats.images[0].format, Some("ktx2-bc7"));
-        assert!(!far.stats.images[0].alpha_dropped);
-        assert_eq!(far.stats.images[0].mips, Some(1));
+        let far = build(&plain, opts).unwrap().unwrap();
+        assert_eq!(far.images[0].format, Some("ktx2-bc7"));
+        assert!(!far.images[0].alpha_dropped);
+        assert_eq!(far.images[0].mips, Some(1));
     }
 
     #[test]
     fn far_lod_without_images_is_copied_and_published_beside_the_plain_glb() {
         let plain = published_far_lod(false);
-        let far = build(&plain, "bafkscene", 1, options()).unwrap().unwrap();
-        assert!(far.stats.copied);
+        let far = build(&plain, options()).unwrap().unwrap();
+        assert!(far.copied);
         assert_eq!(far.glb, plain);
-        assert_eq!(far.stats.texture_gpu_bytes, 0);
 
         let base = std::env::temp_dir().join(format!("farlod-pub-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -492,7 +326,7 @@ mod tests {
         let plain_dir = scene.join(crate::lods::PUBLISHED_GLB_DIR);
         std::fs::create_dir_all(&plain_dir).unwrap();
         std::fs::write(plain_dir.join("bafkscene_1.glb"), &plain).unwrap();
-        let path = write(&scene, &far).unwrap();
+        let path = write(&scene, "bafkscene", 1, &far).unwrap();
         assert_eq!(path, scene.join("lods-bevy/lods/bafkscene_1.glb"));
 
         let objs = crate::lods::published_objects(&scene, &[1]);
@@ -501,7 +335,6 @@ mod tests {
             "LOD/lods-unity/lods/bafkscene_1.glb",
             "LOD/lods-bevy/lods/bafkscene_1.glb",
             "LOD/lods-bevy/lods/bafkscene_1.glb.br",
-            "LOD/lods-bevy/lods/bafkscene_1.stats.json",
         ];
         assert_eq!(keys, want);
         // Only the requested levels' Bevy files are listed.
