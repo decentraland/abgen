@@ -331,15 +331,17 @@ pub(crate) mod tests {
     }
 
     /// Points the S3 space at a fake server for the duration of the returned guard, which
-    /// also holds the process-wide env lock so tests do not race on the variables.
-    pub(crate) fn point_space_at(host: &str) -> (std::sync::MutexGuard<'static, ()>, EnvGuard) {
+    /// also holds the process-wide env lock so tests do not race on the variables. The tuple's
+    /// fields drop in order: the variables are cleared first, then the lock is released, so the
+    /// next test to take the lock never has its variables cleared under it.
+    pub(crate) fn point_space_at(host: &str) -> (EnvGuard, std::sync::MutexGuard<'static, ()>) {
         let lock = crate::convert::TEST_SPACE_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("ABGEN_S3_ENDPOINT", format!("http://{host}"));
         std::env::set_var("AWS_ACCESS_KEY_ID", "AKIATEST");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
-        (lock, EnvGuard)
+        (EnvGuard, lock)
     }
 
     pub(crate) struct EnvGuard;

@@ -336,6 +336,11 @@ pub struct GenerateParams {
     pub bake_after_simplify: bool,
     pub emissive_channel: bool,
     pub fidelity: bool,
+    /// Write the Bevy copy of every published GLB (`crate::bevyvariants::farlod`) once the
+    /// bundles are built from it. Off by default: each caller opts in from its Bevy lane switch
+    /// (`ABGEN_BEVY_VARIANTS`: the lambda, the abcdn LOD JIT, `abgen-lod generate`). Needs the
+    /// `bevy-variants` feature; ignored without it.
+    pub bevy_far_lod: bool,
 }
 
 impl Default for GenerateParams {
@@ -366,6 +371,7 @@ impl Default for GenerateParams {
             bake_after_simplify: false,
             emissive_channel: false,
             fidelity: false,
+            bevy_far_lod: false,
         }
     }
 }
@@ -1016,6 +1022,30 @@ pub fn generate(params: &GenerateParams) -> Result<GenerateOutcome> {
     }
     if conv.results.is_empty() {
         bail!("convert_lods produced no result");
+    }
+    // The bundles are built from the published GLBs; only now derive their Bevy copies, which
+    // read those files and write beside them, never over them.
+    #[cfg(feature = "bevy-variants")]
+    if params.bevy_far_lod {
+        let mut levels: Vec<&u32> = published.keys().collect();
+        levels.sort_unstable();
+        for level in levels {
+            let (path, _, _) = &published[level];
+            if let Some(far) =
+                crate::bevyvariants::farlod::write_from_plain(&scene_dir, &sid, *level, path)
+            {
+                let formats: Vec<&str> = far
+                    .images
+                    .iter()
+                    .map(|i| i.format.unwrap_or("kept"))
+                    .collect();
+                log.push(format!(
+                    "bevy-far-lod[{level}]: {} bytes (br {}), atlases {formats:?}",
+                    far.glb.len(),
+                    far.br.len(),
+                ));
+            }
+        }
     }
     let mut gate: Vec<GateCheck> = Vec::new();
     push_check(

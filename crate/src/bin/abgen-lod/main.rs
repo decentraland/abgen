@@ -1096,7 +1096,11 @@ fn cmd_generate(argv: &[String]) -> Result<i32> {
         abgen::texencode_cache::CacheProfile::Batch,
     );
     abgen::decode_cache::enable();
-    let mut params = abgen::lodgen::GenerateParams::default();
+    let mut params = abgen::lodgen::GenerateParams {
+        // The Bevy far LOD copy follows the Bevy lane switch, as in the lambda and the JIT.
+        bevy_far_lod: abgen::clihelp::env_bool("ABGEN_BEVY_VARIANTS", true),
+        ..Default::default()
+    };
     let mut scene: Option<String> = None;
     let mut out: Option<String> = None;
     let mut gpu_flag = false;

@@ -388,8 +388,9 @@ async fn lod_space_read_through(
 
 /// Server-lane write-back. The key set and the upload metadata are shared with
 /// the lambda lane: `lods::published_objects` lists the production families
-/// (`LOD/{level}/…` bundles, the `lods-unity/manifests/…` ISS descriptor and
-/// the `lods-unity/lods/{sid}_1.glb` published GLB). Native artifacts are
+/// (`LOD/{level}/…` bundles, the `lods-unity/manifests/…` ISS descriptor,
+/// the `lods-unity/lods/{sid}_1.glb` published GLB and, with `ABGEN_BEVY_VARIANTS` on, its
+/// Bevy copy under `lods-bevy/lods/`). Native artifacts are
 /// never transport-wrapped; `space::object_headers` derives Content-Type, Cache-Control and
 /// Content-Encoding from the key, so origin objects match their production
 /// writers no matter which lane wrote them.

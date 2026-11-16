@@ -120,6 +120,7 @@ impl BuildOptions {
     fn tex(self) -> TexOptions {
         TexOptions {
             zstd_level: self.zstd_level,
+            ..TexOptions::default()
         }
     }
 

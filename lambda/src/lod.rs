@@ -476,6 +476,12 @@ fn republish(
             proxy.space_put_key(&twin, &bytes);
             keys.push(twin);
         }
+        // The plain GLB: derive its Bevy copy here rather than copy the previous scene's, so a
+        // reused build always carries one made by this release's encoders (and scenes built
+        // before the Bevy copy existed get one on their next deployment).
+        if !item.required && cfg.bevy_enabled {
+            keys.extend(publish_bevy_far_lod(proxy, &scene_id, item.level, &bytes));
+        }
         keys.push(item.to);
     }
 
@@ -524,6 +530,41 @@ fn republish(
     summary["lods"]["digest"] = serde_json::json!(digest);
     summary["lods"]["manifestsNamed"] = serde_json::json!(manifests_named);
     Ok(Some(summary))
+}
+
+/// Build the Bevy copy of a plain far LOD GLB and put it and its `.br` under
+/// [`abgen::lods::BEVY_GLB_KEY_DIR`]. Returns the keys written; none when it cannot be built
+/// (logged), in which case the explorer loads the plain GLB.
+fn publish_bevy_far_lod(
+    proxy: &Arc<Proxy>,
+    scene_id: &str,
+    level: u32,
+    plain: &[u8],
+) -> Vec<String> {
+    use abgen::bevyvariants::farlod;
+    let far = match farlod::build(plain, farlod::options()) {
+        Ok(Ok(far)) => far,
+        Ok(Err(reason)) => {
+            eprintln!(
+                "lods: {scene_id}: level {level} gets no GLB variant ({reason:?}); no Bevy far LOD"
+            );
+            return Vec::new();
+        }
+        Err(e) => {
+            eprintln!("lods: {scene_id}: Bevy far LOD for level {level} failed ({e:#})");
+            return Vec::new();
+        }
+    };
+    let glb_key = format!(
+        "{}/{}",
+        abgen::lods::BEVY_GLB_KEY_DIR,
+        abgen::lods::published_glb_name(scene_id, level)
+    );
+    // The `.br` always goes up, so it is overwritten with the GLB it was made from.
+    let br_key = format!("{glb_key}.br");
+    proxy.space_put_key(&glb_key, &far.glb);
+    proxy.space_put_key(&br_key, &far.br);
+    vec![br_key, glb_key]
 }
 
 /// Write the `lods` block into the scene's per-entity manifests, one per LOD platform, so the
@@ -656,6 +697,7 @@ pub fn generate_params(
         workdir: Some(staging.join("work")),
         cache: Some(PathBuf::from(&cfg.cache_dir).join("lod-content")),
         iss: "auto".to_string(),
+        bevy_far_lod: cfg.bevy_enabled,
         ..Default::default()
     }
 }
@@ -1008,6 +1050,54 @@ mod follow_up_tests {
         );
         let err = follow_up_summary(Err(anyhow::anyhow!("gate failed")));
         assert_eq!(err["error"], "gate failed");
+    }
+
+    /// What the reuse path publishes for each copied plain GLB: its Bevy copy and `.br` under
+    /// the Bevy key directory, and nothing for a GLB that will not rewrite.
+    #[test]
+    fn a_reused_build_publishes_a_bevy_far_lod_beside_the_plain_glb() {
+        let (host, seen) = crate::output::tests::serve(vec![(
+            format!("/{}/", abgen::lods::BEVY_GLB_KEY_DIR),
+            200,
+            Vec::new(),
+        )]);
+        let _space = crate::output::tests::point_space_at(&host);
+        let proxy = crate::convert::make_proxy(&tests::cfg(), "https://c/content");
+        let model = abgen::lodgen::model::LodModel {
+            root_name: "bafkscene_1".to_string(),
+            primitives: vec![abgen::lodgen::model::LodPrimitive {
+                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                normals: vec![[0.0, 0.0, 1.0]; 3],
+                uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+                indices: vec![0, 1, 2],
+                material: 0,
+                ..Default::default()
+            }],
+            materials: vec![abgen::lodgen::model::LodMaterial::default()],
+            images: Vec::new(),
+            log: Vec::new(),
+        };
+        let float = abgen::lodgen::emit::emit_glb(&model).unwrap();
+        let plain = abgen::lodgen::quantize::write_gltfpack_layout(&float, "bafkscene").unwrap();
+
+        let keys = publish_bevy_far_lod(&proxy, "bafkscene", 1, &plain);
+        let dir = abgen::lods::BEVY_GLB_KEY_DIR;
+        assert_eq!(
+            keys,
+            vec![
+                format!("{dir}/bafkscene_1.glb.br"),
+                format!("{dir}/bafkscene_1.glb"),
+            ]
+        );
+        let mut puts = seen.lock().unwrap().clone();
+        puts.sort();
+        let mut want: Vec<String> = keys.iter().map(|k| format!("PUT /{k}")).collect();
+        want.sort();
+        assert_eq!(puts, want);
+
+        // A plain GLB that will not rewrite publishes nothing.
+        assert!(publish_bevy_far_lod(&proxy, "bafkscene", 1, b"not a glb").is_empty());
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
     /// The city trigger against a fake space: a reuse miss writes one record and returns
