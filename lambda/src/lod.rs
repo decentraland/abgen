@@ -1055,9 +1055,8 @@ mod follow_up_tests {
         assert_eq!(err["error"], "gate failed");
     }
 
-    /// The city trigger against a fake space: a reuse miss writes one record and returns
-    /// its key, and the key rides the build summary into the flattened follow-up; a world
-    /// at the same point writes nothing, its record being the conversion job's.
+    /// What the reuse path publishes for each copied plain GLB: its Bevy copy, `.br` and stats
+    /// under the Bevy key directory, and nothing for a GLB that will not rewrite.
     #[test]
     fn a_reused_build_publishes_a_bevy_far_lod_beside_the_plain_glb() {
         let (host, seen) = crate::output::tests::serve(vec![(
@@ -1105,6 +1104,9 @@ mod follow_up_tests {
         assert_eq!(seen.lock().unwrap().len(), 3);
     }
 
+    /// The city trigger against a fake space: a reuse miss writes one record and returns
+    /// its key, and the key rides the build summary into the flattened follow-up; a world
+    /// at the same point writes nothing, its record being the conversion job's.
     #[test]
     fn a_reuse_miss_writes_a_city_record_and_not_a_world_one() {
         let (host, seen) = crate::output::tests::serve(vec![(
