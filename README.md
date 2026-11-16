@@ -434,7 +434,7 @@ models, variant and `.br` bytes, size-gated attempts; and the `glb_variants` tot
 Beside every published far LOD GLB (`LOD/lods-unity/lods/{sceneId}_1.glb`, the gltfpack-layout
 file the Unity LOD bundles are built from), the LOD lane writes a Bevy copy:
 `LOD/lods-bevy/lods/{sceneId}_1.glb`, its Brotli copy `{…}_1.glb.br` (stored with
-`Content-Encoding: br`, kept when smaller) and `{sceneId}_1.stats.json`. The explorer derives the
+`Content-Encoding: br`, always written so it never outlives its GLB) and `{sceneId}_1.stats.json`. The explorer derives the
 key from the scene id (lowercase) and falls back to the plain GLB on a 404. Code:
 `crate/src/bevyvariants/farlod.rs`.
 
@@ -446,10 +446,15 @@ key from the scene id (lowercase) and falls back to the plain GLB on a 404. Code
   behind the same 36 dB check. A far LOD with no embedded image gets the plain bytes as its copy.
 - Derived after the bundles are built, read-only on the plain GLB: the plain GLB and the bundles
   are unchanged. No content-addressed twins (only the Unity manifests name those).
-- Built by `lodgen::generate` (`GenerateParams::bevy_far_lod`; the conversion lambda sets it from
-  `ABGEN_BEVY_VARIANTS`), and on LOD reuse from the copied plain GLB, so a reused scene always
-  carries one from the current encoders (and a scene built before the copy existed gets one on
-  its next deployment).
+- Built by `lodgen::generate` when `GenerateParams::bevy_far_lod` is set (off by default). The
+  conversion lambda, the abcdn LOD JIT and `abgen-lod generate` set it from `ABGEN_BEVY_VARIANTS`,
+  so it follows the Bevy lane's switch everywhere. The lambda also builds it on LOD reuse from the
+  copied plain GLB, so a reused scene always carries one from the current encoders (and a scene
+  built before the copy existed gets one on its next deployment).
+- A copy that cannot be built (its GLB gets no variant, or the rewrite fails) is logged and
+  skipped, and the scene directory's previous copy of that level is removed (the JIT replaces the
+  whole `lods-bevy/` folder on promote), so nothing older is published. Objects already in the
+  bucket are not deleted: a failed rebuild of the same entity leaves the earlier copy there.
 - Stats (`*.stats.json`): plain, Bevy and `.br` bytes; texture GPU bytes before (RGBA8) and after
   (every level), by format; mesh vertex bytes as stored and widened to f32, index bytes; every
   atlas's format, size, mips and whether its alpha was dropped. `gpu_bytes` is texture + f32

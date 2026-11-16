@@ -1,6 +1,6 @@
 //! Texture variants: PNG / JPEG in, KTX2 (BC1 / BC5 / BC7 payload, Zstandard-supercompressed,
 //! level 0 only with no mip chain unless `TexOptions::mips`, at most [`BEVY_TEXTURE_MAX`] on a
-//! side by default, top-down rows) out; creator UASTC KTX2 in, a single-level pure block
+//! side, top-down rows) out; creator UASTC KTX2 in, a single-level pure block
 //! transcode to BC7 KTX2 out. There is no size gate: a variant larger than its original is still
 //! the one served, because the explorer never draws a PNG/JPEG as is (it decodes it to RGBA8 and
 //! converts it on the player's CPU). See the module docs of [`super`].
@@ -20,9 +20,6 @@ use crate::ktx2_write::{split_chain, write_ktx2, BcFormat, DEFAULT_ZSTD_LEVEL};
 pub struct TexOptions {
     /// Zstandard level of every KTX2 level (`crate::ktx2_write::check_zstd_level`).
     pub zstd_level: i32,
-    /// Longest side of a PNG/JPEG encode (powers of two). The UASTC transcode ignores it: it
-    /// picks the level the explorer's local path picks.
-    pub max_side: u32,
     /// Write the full mip chain down to 1x1 instead of level 0 only (PNG/JPEG encodes only).
     pub mips: bool,
     /// GLB rewrites only: an embedded image whose alpha channel no material reads (see
@@ -35,7 +32,6 @@ impl Default for TexOptions {
     fn default() -> Self {
         TexOptions {
             zstd_level: DEFAULT_ZSTD_LEVEL,
-            max_side: BEVY_TEXTURE_MAX,
             mips: false,
             drop_unused_alpha: false,
         }
@@ -387,9 +383,9 @@ pub fn encode_image(
     let img = timed(&mut times.decode_ns, || img.into_rgba8());
     // Tiny at the source, or at the variant size: an elongated source (4096x8) downscales to a
     // level 0 thinner than one 4x4 BC block (1024x2), which wgpu refuses.
-    // Capped to `opts.max_side` and snapped to powers of two, as the bvwebgpu lane does: powers
+    // Capped to `BEVY_TEXTURE_MAX` and snapped to powers of two, as the bvwebgpu lane does: powers
     // of two of at least 4 are whole 4x4 blocks, which wgpu requires of a BC level 0.
-    let (tw, th) = crate::texprofile::bc7_target_size(img.width(), img.height(), opts.max_side);
+    let (tw, th) = crate::texprofile::bc7_target_size(img.width(), img.height(), BEVY_TEXTURE_MAX);
     if is_tiny(img.width(), img.height()) || tw < 4 || th < 4 {
         return Ok(Err(NoVariant::Tiny.into()));
     }
@@ -477,7 +473,7 @@ fn encode_rgba(
 ) -> Result<TextureVariant> {
     let levels = if opts.mips { None } else { LEVELS };
     let (w, h) = img.dimensions();
-    let (tw, th) = crate::texprofile::bc7_target_size(w, h, opts.max_side);
+    let (tw, th) = crate::texprofile::bc7_target_size(w, h, BEVY_TEXTURE_MAX);
     let srgb = slot == Slot::Srgb;
     let mut buf = if (tw, th) != (w, h) {
         timed(&mut times.resize_ns, || {

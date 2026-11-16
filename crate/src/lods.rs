@@ -655,9 +655,15 @@ pub fn published_objects(scene_dir: &Path, levels: &[u32]) -> Vec<PublishedObjec
             path: glb_dir.join(&name),
         });
     }
-    // The Bevy copies' `.br` files are published too: the explorer fetches `{key}.br` by name.
+    // The Bevy copies of the requested levels, `.br` included: the explorer fetches `{key}.br`
+    // by name.
     let bevy_dir = scene_dir.join(BEVY_GLB_DIR);
-    for name in dir_entries(&bevy_dir) {
+    // Names are `{sid}_{level}.…` and scene ids are alphanumeric, so `_{level}.` is the level.
+    let level_marks: Vec<String> = levels.iter().map(|l| format!("_{l}.")).collect();
+    for name in dir_entries(&bevy_dir)
+        .into_iter()
+        .filter(|n| level_marks.iter().any(|m| n.contains(m.as_str())))
+    {
         out.push(PublishedObject {
             key: format!("{BEVY_GLB_KEY_DIR}/{name}"),
             path: bevy_dir.join(&name),

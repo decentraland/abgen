@@ -337,7 +337,9 @@ pub struct GenerateParams {
     pub emissive_channel: bool,
     pub fidelity: bool,
     /// Write the Bevy copy of every published GLB (`crate::bevyvariants::farlod`) once the
-    /// bundles are built from it. Needs the `bevy-variants` feature; ignored without it.
+    /// bundles are built from it. Off by default: each caller opts in from its Bevy lane switch
+    /// (`ABGEN_BEVY_VARIANTS`: the lambda, the abcdn LOD JIT, `abgen-lod generate`). Needs the
+    /// `bevy-variants` feature; ignored without it.
     pub bevy_far_lod: bool,
 }
 
@@ -369,7 +371,7 @@ impl Default for GenerateParams {
             bake_after_simplify: false,
             emissive_channel: false,
             fidelity: false,
-            bevy_far_lod: true,
+            bevy_far_lod: false,
         }
     }
 }

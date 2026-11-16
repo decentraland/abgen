@@ -333,6 +333,8 @@ impl LodJit {
             gltfpack: self.gltfpack.clone(),
             catalyst: catalyst_url.to_string(),
             crop: true,
+            // The Bevy far LOD copy follows the server's Bevy lane switch, like its read-through.
+            bevy_far_lod: crate::clihelp::env_bool("ABGEN_BEVY_VARIANTS", true),
             ..Default::default()
         };
         let runner = self.runner.clone();
@@ -414,6 +416,9 @@ impl BuildFinish {
         let dst = self.out_root.join(scene_id);
         let stage = self.stage_root.clone();
         tokio::task::spawn_blocking(move || {
+            // The Bevy far LOD copies are derived from this build alone: replace them rather than
+            // merge, so a copy this build did not write is never published beside it.
+            let _ = std::fs::remove_dir_all(dst.join(crate::lods::BEVY_GLB_DIR));
             let r = promote_tree(&src, &dst);
             let _ = std::fs::remove_dir_all(&stage);
             r

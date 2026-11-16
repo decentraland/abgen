@@ -17,10 +17,14 @@
 //!   channel whether or not any material reads it.
 //! - **Always written.** A far LOD with nothing to rewrite (no embedded image) gets the plain
 //!   bytes as its Bevy copy, so the explorer finds one at the key it derives from the scene id.
-//!   Only a GLB whose rewrite fails (or whose embedded KTX2 will not transcode) gets none, and
-//!   the explorer falls back to the plain file.
+//!   Only a GLB whose rewrite fails, or that gets no GLB variant for another reason
+//!   ([`NoGlbVariant`]), gets none, and the explorer falls back to the plain file.
+//! - **Always a `.br`.** The explorer fetches `{key}.br` by name, so it is written even in the
+//!   unlikely case it is not smaller: a rebuild then always overwrites the previous one, and no
+//!   stale `.br` can outlive the GLB it was made from (objects are only ever uploaded, never
+//!   deleted).
 //!
-//! On disk: `{scene_dir}/`[`GLB_DIR`]`/{sid}_{level}.glb`, its `.br` (when smaller) and
+//! On disk: `{scene_dir}/`[`GLB_DIR`]`/{sid}_{level}.glb`, its `.br` and
 //! `{sid}_{level}.stats.json` ([`FarLodStats`]: download and GPU sizes). Published under
 //! [`KEY_DIR`] with the same file names, unversioned like the plain GLB.
 
@@ -77,8 +81,7 @@ pub struct FarLodStats {
     pub copied: bool,
     pub plain_bytes: u64,
     pub bevy_bytes: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub br_bytes: Option<u64>,
+    pub br_bytes: u64,
     /// Texture memory of the plain GLB (RGBA8 level 0, as the explorer loads it today).
     pub plain_texture_gpu_bytes: u64,
     /// Texture memory of the Bevy copy, every level.
@@ -97,8 +100,8 @@ pub struct FarLodStats {
 #[derive(Debug)]
 pub struct FarLod {
     pub glb: Vec<u8>,
-    /// The Brotli copy, when smaller than `glb`.
-    pub br: Option<Vec<u8>>,
+    /// The Brotli copy of `glb`, always (see the module docs).
+    pub br: Vec<u8>,
     pub stats: FarLodStats,
 }
 
@@ -145,7 +148,9 @@ pub fn mesh_bytes(doc: &J) -> MeshBytes {
             if let Some(a) = p.get("attributes").and_then(J::as_object) {
                 attrs.extend(a.values().filter_map(J::as_u64).map(|x| x as usize));
                 if let Some(pos) = a.get("POSITION").and_then(J::as_u64) {
-                    out.vertices += accessor(pos as usize).map_or(0, count);
+                    out.vertices = out
+                        .vertices
+                        .saturating_add(accessor(pos as usize).map_or(0, count));
                 }
             }
             if let Some(i) = p.get("indices").and_then(J::as_u64) {
@@ -156,30 +161,41 @@ pub fn mesh_bytes(doc: &J) -> MeshBytes {
     for a in attrs.iter().filter_map(|&i| accessor(i)) {
         let comps = type_components(a.get("type").and_then(J::as_str).unwrap_or("SCALAR"));
         let size = component_bytes(a.get("componentType").and_then(J::as_u64).unwrap_or(5126));
-        out.vertex_bytes += count(a) * (comps * size).next_multiple_of(4);
-        out.vertex_bytes_f32 += count(a) * comps * 4;
+        let n = count(a);
+        out.vertex_bytes = out
+            .vertex_bytes
+            .saturating_add(n.saturating_mul((comps * size).next_multiple_of(4)));
+        out.vertex_bytes_f32 = out
+            .vertex_bytes_f32
+            .saturating_add(n.saturating_mul(comps * 4));
     }
     for a in indices.iter().filter_map(|&i| accessor(i)) {
         let size = component_bytes(a.get("componentType").and_then(J::as_u64).unwrap_or(5125));
-        out.indices += count(a);
-        out.index_bytes += count(a) * size;
+        out.indices = out.indices.saturating_add(count(a));
+        out.index_bytes = out
+            .index_bytes
+            .saturating_add(count(a).saturating_mul(size));
     }
     out
 }
 
-/// Build the Bevy copy of the far LOD `plain` (a published `{sid}_{level}.glb`). `Ok(None)`
-/// when it gets none: an embedded KTX2 that does not transcode. `Err` when the GLB cannot be
-/// rewritten.
-pub fn build(plain: &[u8], scene_id: &str, level: u32, opts: TexOptions) -> Result<Option<FarLod>> {
+/// Build the Bevy copy of the far LOD `plain` (a published `{sid}_{level}.glb`). `Ok(Err)`
+/// with the reason when it gets none (any [`NoGlbVariant`] but `NothingToChange`, which copies
+/// the plain bytes). `Err` when the GLB cannot be rewritten.
+pub fn build(
+    plain: &[u8],
+    scene_id: &str,
+    level: u32,
+    opts: TexOptions,
+) -> Result<std::result::Result<FarLod, NoGlbVariant>> {
     let started = std::time::Instant::now();
     let outcome = transform_model_with(plain, ".glb", None, opts)?;
     let (glb, copied) = match (outcome.variant, outcome.reason) {
         (Some(v), _) => (v.glb, false),
         (None, Some(NoGlbVariant::NothingToChange)) => (plain.to_vec(), true),
-        (None, _) => return Ok(None),
+        (None, reason) => return Ok(Err(reason.unwrap_or(NoGlbVariant::NothingToChange))),
     };
     let br = brotli_compress(&glb)?;
-    let br = (br.len() < glb.len()).then_some(br);
     let doc = crate::naming::parse_gltf_doc(&glb, ".glb").context("far lod json parse")?;
     let mesh = mesh_bytes(&doc);
     let mut by_format: BTreeMap<String, u64> = BTreeMap::new();
@@ -199,7 +215,7 @@ pub fn build(plain: &[u8], scene_id: &str, level: u32, opts: TexOptions) -> Resu
         copied,
         plain_bytes: plain.len() as u64,
         bevy_bytes: glb.len() as u64,
-        br_bytes: br.as_ref().map(|b| b.len() as u64),
+        br_bytes: br.len() as u64,
         plain_texture_gpu_bytes: plain_tex,
         texture_gpu_bytes: tex,
         texture_gpu_by_format: by_format,
@@ -208,7 +224,7 @@ pub fn build(plain: &[u8], scene_id: &str, level: u32, opts: TexOptions) -> Resu
         images: outcome.images,
         encode_ms: started.elapsed().as_millis() as u64,
     };
-    Ok(Some(FarLod { glb, br, stats }))
+    Ok(Ok(FarLod { glb, br, stats }))
 }
 
 /// Write a built copy under `{scene_dir}/`[`GLB_DIR`]: the GLB, its `.br` and its stats.
@@ -219,21 +235,27 @@ pub fn write(scene_dir: &Path, far: &FarLod) -> Result<PathBuf> {
     let (sid, level) = (&far.stats.scene_id, far.stats.level);
     let path = dir.join(crate::lods::published_glb_name(sid, level));
     crate::lods::write_atomic(&path, &far.glb)?;
-    let br_path = super::glbbr::br_sidecar(&path);
-    match &far.br {
-        Some(br) => crate::lods::write_atomic(&br_path, br)?,
-        None => {
-            let _ = std::fs::remove_file(&br_path);
-        }
-    }
+    crate::lods::write_atomic(&super::glbbr::br_sidecar(&path), &far.br)?;
     let stats = serde_json::to_vec_pretty(&far.stats)?;
     crate::lods::write_atomic(&dir.join(stats_name(sid, level)), &stats)?;
     Ok(path)
 }
 
+/// The files a copy of `level` writes under `{scene_dir}/`[`GLB_DIR`]: GLB, `.br`, stats.
+fn level_files(scene_dir: &Path, scene_id: &str, level: u32) -> [PathBuf; 3] {
+    let dir = scene_dir.join(GLB_DIR);
+    let glb = dir.join(crate::lods::published_glb_name(scene_id, level));
+    [
+        super::glbbr::br_sidecar(&glb),
+        dir.join(stats_name(scene_id, level)),
+        glb,
+    ]
+}
+
 /// Build and write the Bevy copy of the plain far LOD GLB at `plain_path`. A copy that cannot
-/// be built is logged and skipped: the explorer falls back to the plain GLB, and the LOD
-/// build it follows stands.
+/// be built is logged and skipped, and any copy of that level already in `scene_dir` is
+/// removed, so nothing older is published beside the new plain GLB: the explorer falls back to
+/// the plain GLB, and the LOD build it follows stands.
 pub fn write_from_plain(
     scene_dir: &Path,
     scene_id: &str,
@@ -243,27 +265,19 @@ pub fn write_from_plain(
     let result = std::fs::read(plain_path)
         .with_context(|| format!("read {}", plain_path.display()))
         .and_then(|plain| build(&plain, scene_id, level, options()));
-    match result {
-        Ok(Some(far)) => match write(scene_dir, &far) {
-            Ok(_) => Some(far.stats),
-            Err(e) => {
-                tracing::warn!(scene = scene_id, level, error = %format!("{e:#}"), "bevy far lod: write failed");
-                None
-            }
+    let failure = match result {
+        Ok(Ok(far)) => match write(scene_dir, &far) {
+            Ok(_) => return Some(far.stats),
+            Err(e) => format!("write failed: {e:#}"),
         },
-        Ok(None) => {
-            tracing::warn!(
-                scene = scene_id,
-                level,
-                "bevy far lod: an embedded KTX2 does not transcode; no Bevy copy"
-            );
-            None
-        }
-        Err(e) => {
-            tracing::warn!(scene = scene_id, level, error = %format!("{e:#}"), "bevy far lod: build failed");
-            None
-        }
+        Ok(Err(reason)) => format!("no GLB variant ({reason:?})"),
+        Err(e) => format!("build failed: {e:#}"),
+    };
+    tracing::warn!(scene = scene_id, level, %failure, "bevy far lod: no Bevy copy");
+    for f in level_files(scene_dir, scene_id, level) {
+        let _ = std::fs::remove_file(f);
     }
+    None
 }
 
 #[cfg(test)]
@@ -423,13 +437,14 @@ mod tests {
         }
 
         // Brotli round-trips; stats add up.
-        let br = far.br.as_ref().expect("br smaller than the glb");
+        let br = &far.br;
+        assert!(br.len() < far.glb.len());
         assert_eq!(super::super::glbbr::brotli_decompress(br).unwrap(), far.glb);
         let s = &far.stats;
         assert_eq!(s.scene_id, "bafkscene");
         assert!(!s.copied);
         assert_eq!(s.plain_bytes, plain.len() as u64);
-        assert_eq!(s.br_bytes, Some(br.len() as u64));
+        assert_eq!(s.br_bytes, br.len() as u64);
         assert_eq!(s.plain_texture_gpu_bytes, (64 * 64 + 32 * 32) * 4);
         assert_eq!(
             s.texture_gpu_by_format["ktx2-bc1"],
@@ -482,15 +497,17 @@ mod tests {
 
         let objs = crate::lods::published_objects(&scene, &[1]);
         let keys: Vec<&str> = objs.iter().map(|o| o.key.as_str()).collect();
-        let mut want = vec![
+        let want = vec![
             "LOD/lods-unity/lods/bafkscene_1.glb",
             "LOD/lods-bevy/lods/bafkscene_1.glb",
+            "LOD/lods-bevy/lods/bafkscene_1.glb.br",
+            "LOD/lods-bevy/lods/bafkscene_1.stats.json",
         ];
-        if far.br.is_some() {
-            want.push("LOD/lods-bevy/lods/bafkscene_1.glb.br");
-        }
-        want.push("LOD/lods-bevy/lods/bafkscene_1.stats.json");
         assert_eq!(keys, want);
+        // Only the requested levels' Bevy files are listed.
+        assert!(!crate::lods::published_objects(&scene, &[0])
+            .iter()
+            .any(|o| o.key.starts_with(KEY_DIR)));
         // Only the Unity objects get content-addressed twins.
         let twins = crate::lods::with_digest_twins(objs, "bafkscene", "d1");
         assert_eq!(twins.len(), want.len() + 1);
@@ -498,6 +515,26 @@ mod tests {
             twins.last().unwrap().key,
             "LOD/lods-unity/lods/bafkscene_d1_1.glb"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_failed_copy_removes_the_previous_one_of_its_level() {
+        let base = std::env::temp_dir().join(format!("farlod-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let scene = base.join("bafkscene");
+        let plain = scene.join("plain.glb");
+        std::fs::create_dir_all(&scene).unwrap();
+        std::fs::write(&plain, published_far_lod(true)).unwrap();
+        assert!(write_from_plain(&scene, "bafkscene", 1, &plain).is_some());
+        let files = level_files(&scene, "bafkscene", 1);
+        assert!(files.iter().all(|f| f.exists()));
+
+        // A rebuild whose plain GLB will not rewrite leaves no copy of the earlier build behind.
+        std::fs::write(&plain, b"not a glb").unwrap();
+        assert!(write_from_plain(&scene, "bafkscene", 1, &plain).is_none());
+        assert!(files.iter().all(|f| !f.exists()));
+        assert!(crate::lods::published_objects(&scene, &[1]).is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 
