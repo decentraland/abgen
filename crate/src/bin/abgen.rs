@@ -2,8 +2,9 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tower_http::trace::TraceLayer;
 
 use abgen::abcdn::config::Config;
@@ -97,24 +98,15 @@ fn env_filter() -> tracing_subscriber::EnvFilter {
         .unwrap_or_else(|_| "abgen=info,tower_http=info".into())
 }
 
-async fn registry_state(out_root: &str) -> Option<abgen::registry::AppState> {
-    let cfg = match abgen::registry::config::Config::from_env() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::info!(error = %e, "registry surface disabled: config unavailable");
-            return None;
-        }
-    };
-    match abgen::registry::build_state(&cfg, out_root).await {
-        Ok(s) => {
-            tracing::info!("registry surface enabled (signed status, queues, denylist, admin)");
-            Some(s)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "registry surface disabled: state build failed");
-            None
-        }
-    }
+async fn registry_state(
+    contents: &dcl_contents::registry::RegistryAppState,
+) -> Result<abgen::registry::AppState> {
+    let cfg = abgen::registry::config::Config::from_env()?;
+    // A configured moderation store must not silently disappear on a connection
+    // or migration error while unsigned world reads continue without its policy.
+    let state = abgen::registry::build_state(&cfg, contents).await?;
+    tracing::info!("registry surface enabled (signed status, queues, denylist, admin)");
+    Ok(state)
 }
 
 fn main() -> Result<()> {
@@ -148,14 +140,50 @@ async fn serve() -> Result<()> {
     }
 
     let cfg = Config::from_env()?;
-    let state = build_state(&cfg).await?;
+    let mut state = build_state(&cfg).await?;
+    let mut registry = match state.contents_registry.as_ref() {
+        Some(contents) => Some(registry_state(contents).await?),
+        None => None,
+    };
+    if let Some(registry) = registry.as_mut() {
+        let signed = Arc::get_mut(registry).context("registry state shared before routing")?;
+        let unsigned = Arc::get_mut(&mut state).context("abgen state shared before routing")?;
+        unsigned.registry_store = Some(signed.registry.clone());
+        if let Some(contents) = unsigned.contents_registry.as_ref() {
+            signed.manifests = contents.manifests.clone();
+            let content = Arc::new(abgen::registry::source::RegisteredSource {
+                content: contents.content.clone(),
+                registry: signed.registry.clone(),
+                manifests: contents.manifests.clone(),
+            });
+            signed.content = content.clone();
+            unsigned.contents_registry =
+                Some(Arc::new(dcl_contents::registry::RegistryStateInner {
+                    content,
+                    manifests: contents.manifests.clone(),
+                    profile_images_url: contents.profile_images_url.clone(),
+                    world_policy: Arc::new(signed.registry.clone()),
+                }));
+        }
+    }
 
+    let _registry_worker = registry.as_ref().and_then(|registry| {
+        abgen::registry::worker::spawn_worker(state.clone(), registry.clone())
+    });
     let app = build_app(state);
-    let app = match registry_state(&cfg.abgen_out_root).await {
-        Some(reg) => app.merge(abgen::registry::signed_router().with_state(reg)),
+    let app = match registry {
+        Some(reg) => {
+            let admin_enabled = reg
+                .admin_token
+                .as_deref()
+                .is_some_and(|token| !token.is_empty());
+            app.merge(abgen::registry::signed_router(admin_enabled).with_state(reg))
+        }
         None => app,
     };
-    let app = app.layer(TraceLayer::new_for_http());
+    let app = app
+        .layer(tower_http::cors::CorsLayer::permissive())
+        .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = format!("{}:{}", cfg.http_host, cfg.http_port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr)

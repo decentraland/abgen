@@ -214,6 +214,15 @@ impl AbManifestStore {
         m
     }
 
+    /// Reconcile an explicit registration with current conversion output.
+    pub async fn refresh(&self, entity_id: &str) -> Arc<AbManifests> {
+        let manifests = Arc::new(self.read_from_disk(entity_id));
+        self.cache
+            .insert(entity_id.to_string(), manifests.clone())
+            .await;
+        manifests
+    }
+
     fn read_from_disk(&self, entity_id: &str) -> AbManifests {
         if !valid_entity_id(entity_id) {
             return AbManifests::default();

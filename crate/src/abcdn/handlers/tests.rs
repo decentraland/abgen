@@ -836,83 +836,36 @@ async fn lock_private_base_url_env() -> tokio::sync::MutexGuard<'static, ()> {
     PRIVATE_BASE_URL_ENV.lock().await
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn entities_active_honors_world_name_param() {
-    use axum::extract::{Query, State};
-    use axum::http::StatusCode;
-    let _env = lock_private_base_url_env().await;
-    let dir = lane_temp_dir("worlds");
-    let cid = "bafkworldscene";
-    std::env::set_var("ABGEN_ALLOW_PRIVATE_BASE_URL", "1");
-
-    let entity = serde_json::json!({
-        "id": cid,
-        "type": "scene",
-        "timestamp": 1234567i64,
-        "pointers": ["0,0"],
-        "content": [{"file": "model.glb", "hash": "Qmworldglb"}],
-        "metadata": {"worldConfiguration": {"name": "test.dcl.eth"}},
-    });
-    let (chost, _cseen) = crate::live::stub::serve(vec![(
-        format!("/contents/{cid}"),
-        200,
-        entity.to_string().into_bytes(),
-    )]);
-    let about = serde_json::json!({
-        "configurations": {
-            "scenesUrn": [format!(
-                "urn:decentraland:entity:{cid}?=&baseUrl=http://{chost}/contents/"
-            )]
-        }
-    });
-    let (whost, _wseen) = crate::live::stub::serve(vec![(
-        "/world/test.dcl.eth/about".to_string(),
-        200,
-        about.to_string().into_bytes(),
-    )]);
-
-    let state = mk_lane_state_worlds(&dir, None, Some(format!("http://{whost}")));
-
-    let mut q = std::collections::HashMap::new();
-    q.insert("world_name".to_string(), "test.dcl.eth".to_string());
-    let resp = super::post_entities_active(
+#[tokio::test]
+async fn registry_entity_queries_require_native_state_and_validate_pointers() {
+    use axum::response::IntoResponse;
+    use axum::{
+        extract::{Query, State},
+        http::StatusCode,
+    };
+    let dir = lane_temp_dir("registry-unconfigured");
+    let state = mk_lane_state(&dir, None);
+    let missing = super::post_entities_active(
         State(state.clone()),
-        Query(q),
-        axum::response::Json(serde_json::json!({"pointers": ["0,0"]})),
+        Query(Default::default()),
+        axum::Json(serde_json::json!({"pointers":["0,0"]})),
     )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    let arr = body.as_array().unwrap();
-    assert_eq!(arr.len(), 1);
-    let rec = &arr[0];
-    assert_eq!(rec["id"], cid);
-    assert_eq!(rec["type"], "scene");
-    assert_eq!(rec["timestamp"], 1234567);
-    assert_eq!(rec["pointers"], serde_json::json!(["0,0"]));
-    assert_eq!(rec["content"][0]["hash"], "Qmworldglb");
-    assert_eq!(rec["versions"]["assets"]["windows"]["version"], "v41");
-    assert_eq!(rec["deployer"], "");
-
-    let plain = super::post_entities_active(
-        State(state.clone()),
-        Query(std::collections::HashMap::new()),
-        axum::response::Json(serde_json::json!({"pointers": ["0,0"]})),
+    .await
+    .into_response();
+    assert_eq!(missing.status(), StatusCode::NOT_IMPLEMENTED);
+    let invalid = super::post_entities_active(
+        State(state),
+        Query(Default::default()),
+        axum::Json(serde_json::json!({"pointers":[]})),
     )
-    .await;
-    assert_eq!(plain.status(), StatusCode::OK);
-    let plain_body: serde_json::Value = serde_json::from_slice(&body_bytes(plain).await).unwrap();
-    assert_eq!(plain_body, serde_json::json!([]));
-
-    let bad = super::post_entities_active(
-        State(state.clone()),
-        Query(std::collections::HashMap::new()),
-        axum::response::Json(serde_json::json!({"pointers": []})),
-    )
-    .await;
-    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
-    std::env::remove_var("ABGEN_ALLOW_PRIVATE_BASE_URL");
-    let _ = std::fs::remove_dir_all(&dir);
+    .await
+    .into_response();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body_bytes(invalid).await).unwrap(),
+        serde_json::json!({"ok":false,"message":"No pointers provided"})
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 fn mk_registry_state(
@@ -991,18 +944,13 @@ async fn registry_proxy_status_resolves_ids_and_reads_manifests() {
         )
         .unwrap();
     }
-    let upstream = serde_json::json!([{
-        "id": id,
-        "type": "scene",
-        "timestamp": 5i64,
-        "pointers": ["0,0"],
-        "content": [],
-        "metadata": {},
-    }]);
+    let upstream = serde_json::json!({"deployments":[{
+        "entityId": id, "entityType": "scene", "entityTimestamp":5,
+        "pointers":["0,0"], "content":[], "metadata":{}, "deployedBy":"0xabc"
+    }],"pagination":{"moreData":false}});
     let (chost, _cseen) = crate::live::stub::serve(vec![(
-        "/entities/active".to_string(),
-        200,
-        upstream.to_string().into_bytes(),
+        format!("/deployments?entityId={id}&sortingField=entityTimestamp&sortingOrder=DESC&limit=1000&fields=pointers,content,metadata"),
+        200, upstream.to_string().into_bytes(),
     )]);
     let state = mk_registry_state(&dir, &format!("http://{chost}"), None);
 
@@ -1026,7 +974,6 @@ async fn registry_proxy_status_resolves_ids_and_reads_manifests() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn registry_proxy_world_manifest_from_worlds_server() {
     use axum::extract::{Path, State};
-    use axum::response::IntoResponse;
     let _env = lock_private_base_url_env().await;
     let dir = lane_temp_dir("regworld");
     let cid = "bafkworldproxy";
@@ -1036,30 +983,37 @@ async fn registry_proxy_world_manifest_from_worlds_server() {
         "id": cid,
         "type": "scene",
         "timestamp": 777i64,
-        "pointers": ["myworld.dcl.eth"],
+        "pointers": ["1,1", "1,2"],
         "content": [],
         "metadata": {
             "worldConfiguration": {"name": "myworld.dcl.eth"},
             "scene": {"base": "1,1", "parcels": ["1,1", "1,2"]},
         },
     });
-    let (chost, _cseen) = crate::live::stub::serve(vec![(
-        format!("/contents/{cid}"),
-        200,
-        entity.to_string().into_bytes(),
-    )]);
     let about = serde_json::json!({
-        "configurations": {
-            "scenesUrn": [format!(
-                "urn:decentraland:entity:{cid}?=&baseUrl=http://{chost}/contents/"
-            )]
-        }
+        "configurations": {"scenesUrn": [format!("urn:decentraland:entity:{cid}")]}
     });
-    let (whost, _wseen) = crate::live::stub::serve(vec![(
-        "/world/myworld.dcl.eth/about".to_string(),
-        200,
-        about.to_string().into_bytes(),
-    )]);
+    let (whost, _wseen) = crate::live::stub::serve(vec![
+        (
+            "/world/myworld.dcl.eth/about".to_string(),
+            200,
+            about.to_string().into_bytes(),
+        ),
+        (
+            format!("/contents/{cid}"),
+            200,
+            entity.to_string().into_bytes(),
+        ),
+    ]);
+    let manifest_dir = dir.join(cid);
+    std::fs::create_dir_all(&manifest_dir).unwrap();
+    for platform in ["windows", "mac"] {
+        std::fs::write(
+            manifest_dir.join(format!("{platform}.manifest.json")),
+            br#"{"exitCode":0,"version":"v41"}"#,
+        )
+        .unwrap();
+    }
     let state = mk_registry_state(&dir, "http://127.0.0.1:9", Some(format!("http://{whost}")));
 
     let axum::Json(m) = dcl_contents::handlers::worlds::get_world_manifest(
@@ -1077,9 +1031,8 @@ async fn registry_proxy_world_manifest_from_worlds_server() {
         Path("nosuch.dcl.eth".to_string()),
     )
     .await
-    .err()
     .unwrap();
-    assert_eq!(missing.into_response().status().as_u16(), 404);
+    assert!(missing.0.occupied.is_empty());
     std::env::remove_var("ABGEN_ALLOW_PRIVATE_BASE_URL");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1103,7 +1056,7 @@ async fn registry_proxy_maps_upstream_failures() {
     assert_eq!(err.into_response().status().as_u16(), 502);
 
     let (ehost, _eseen) =
-        crate::live::stub::serve(vec![("/entities/active".to_string(), 200, b"[]".to_vec())]);
+        crate::live::stub::serve(vec![("/deployments?entityId=bafkmissingentity&sortingField=entityTimestamp&sortingOrder=DESC&limit=1000&fields=pointers,content,metadata".to_string(), 200, br#"{"deployments":[],"pagination":{"moreData":false}}"#.to_vec()), ("/deployments?pointer=bafkmissingentity&sortingField=entityTimestamp&sortingOrder=DESC&limit=1000&fields=pointers,content,metadata".to_string(), 200, br#"{"deployments":[],"pagination":{"moreData":false}}"#.to_vec())]);
     let empty = mk_registry_state(&dir, &format!("http://{ehost}"), None);
     let miss = dcl_contents::handlers::status::get_entity_status(
         State(empty),
@@ -1229,102 +1182,27 @@ async fn upstream_runs_before_jit_build_lanes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn registry_records_pass_through_upstream_versions() {
-    use axum::extract::State;
-    let dir = lane_temp_dir("regupstream");
-
-    let resolved = serde_json::json!([
-        {
-            "id": "bafkremoteemote",
-            "type": "emote",
-            "timestamp": 10i64,
-            "pointers": ["urn:decentraland:test:emote:1"],
-            "content": [{"file": "emote.glb", "hash": "Qmglb1"}],
-            "metadata": {},
-        },
-        {
-            "id": "bafkunknownwearable",
-            "type": "wearable",
-            "timestamp": 11i64,
-            "pointers": ["urn:decentraland:test:wearable:2"],
-            "content": [{"file": "wearable.glb", "hash": "Qmglb2"}],
-            "metadata": {},
-        },
-        {
-            "id": "b64-localscene",
-            "type": "scene",
-            "timestamp": 12i64,
-            "pointers": ["0,0"],
-            "content": [{"file": "scene.glb", "hash": "Qmglb3"}],
-            "metadata": {},
-        },
-    ]);
-    let (chost, _cseen) = crate::live::stub::serve(vec![(
-        "/entities/active".to_string(),
-        200,
-        resolved.to_string().into_bytes(),
-    )]);
-
-    let upstream_records = serde_json::json!([{
-        "id": "bafkremoteemote",
-        "pointers": ["urn:decentraland:test:emote:1"],
-        "versions": {"assets": {"mac": {"version": "v33", "buildDate": "d"}}},
-        "bundles": {"assets": {"mac": "complete"}},
-        "status": "complete",
-    }]);
-    let (rhost, rseen) = crate::live::stub::serve(vec![(
-        "/entities/active".to_string(),
-        200,
-        upstream_records.to_string().into_bytes(),
-    )]);
-
-    let state: super::super::state::AppState = {
-        std::sync::Arc::new(
-            base_inner(
-                &dir,
-                "http://127.0.0.1:9",
-                None,
-                lane_jit(false, None, "/tmp/abgen-handlers-lane"),
-            )
-            .with_registry_state(Some(mk_registry_state(
-                &dir,
-                &format!("http://{chost}"),
-                None,
-            )))
-            .with_upstream_ab_registry(Some(format!("http://{rhost}"))),
-        )
+#[tokio::test]
+async fn registry_never_reads_external_registry_without_native_state() {
+    use axum::response::IntoResponse;
+    use axum::{
+        extract::{Query, State},
+        http::StatusCode,
     };
-
-    let body = serde_json::json!({ "pointers": [
-        "urn:decentraland:test:emote:1",
-        "urn:decentraland:test:wearable:2",
-        "0,0",
-    ]});
-    let resp = super::post_entities_versions(State(state.clone()), axum::Json(body.clone())).await;
-    let out: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    let recs = out.as_array().unwrap();
-
-    let by_pointer = |p: &str| {
-        recs.iter()
-            .find(|r| r["pointers"].as_array().unwrap().iter().any(|v| v == p))
-    };
-    let emote = by_pointer("urn:decentraland:test:emote:1").expect("emote record");
-    assert_eq!(emote["versions"]["assets"]["mac"]["version"], "v33");
-    assert_eq!(emote["status"], "complete");
-    assert!(by_pointer("urn:decentraland:test:wearable:2").is_none());
-    let scene = by_pointer("0,0").expect("local scene record");
-    assert_eq!(scene["versions"]["assets"]["mac"]["version"], "v41");
-
-    let _ = super::post_entities_versions(State(state.clone()), axum::Json(body)).await;
-    let posts = rseen.lock().unwrap().clone();
-    assert_eq!(
-        posts
-            .iter()
-            .filter(|l| l.as_str() == "POST /entities/active")
-            .count(),
-        1,
-        "{posts:?}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = lane_temp_dir("registry-local-only");
+    let state = std::sync::Arc::new(base_inner(
+        &dir,
+        "http://127.0.0.1:9",
+        None,
+        lane_jit(false, None, "/tmp/abgen-handlers-lane"),
+    ));
+    let response = super::post_entities_versions(
+        State(state),
+        Query(Default::default()),
+        axum::Json(serde_json::json!({"pointers":["0,0"]})),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let _ = std::fs::remove_dir_all(dir);
 }

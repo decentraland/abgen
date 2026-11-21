@@ -6,7 +6,6 @@ use axum::Json;
 use dcl_contents::errors::{ApiError, ApiResult};
 
 use crate::registry::handlers::status::require_signed_fetch;
-use crate::registry::http::auth::has_valid_bearer;
 use crate::registry::ports::registry::DenylistEntry;
 use crate::registry::AppState;
 
@@ -27,13 +26,8 @@ pub async fn add_denylist(
     Path(entity_id): Path<String>,
     body: Option<Json<DenylistBody>>,
 ) -> ApiResult<Response> {
-    let signer = if has_valid_bearer(&state, &headers) {
-        "admin-bearer".to_string()
-    } else {
-        let signer = require_signed_fetch(&headers, "post", &format!("/denylist/{entity_id}"))?;
-        require_moderator(&state, &signer)?;
-        signer
-    };
+    let signer = require_signed_fetch(&headers, "post", &format!("/denylist/{entity_id}"))?;
+    require_moderator(&state, &signer)?;
     if !state.registry.enabled() {
         return Err(ApiError::not_implemented(
             "denylist persistence requires the ab_registry DB",
@@ -53,10 +47,8 @@ pub async fn remove_denylist(
     headers: HeaderMap,
     Path(entity_id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    if !has_valid_bearer(&state, &headers) {
-        let signer = require_signed_fetch(&headers, "delete", &format!("/denylist/{entity_id}"))?;
-        require_moderator(&state, &signer)?;
-    }
+    let signer = require_signed_fetch(&headers, "delete", &format!("/denylist/{entity_id}"))?;
+    require_moderator(&state, &signer)?;
     if !state.registry.enabled() {
         return Err(ApiError::not_implemented(
             "denylist persistence requires the ab_registry DB",

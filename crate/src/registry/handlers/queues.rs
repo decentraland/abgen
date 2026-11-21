@@ -1,81 +1,39 @@
-use std::collections::HashSet;
-
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::Json;
 use serde_json::json;
 
 use dcl_contents::errors::{ApiError, ApiResult};
-use dcl_contents::registry::EntitySource;
-use dcl_contents::types::{BuildStatus, QueuesStatus};
+use dcl_contents::types::QueuesStatus;
 
-use crate::registry::http::auth::{has_valid_bearer, require_bearer};
+use crate::registry::http::auth::require_bearer;
 use crate::registry::AppState;
 
-const QUEUE_SCAN_LIMIT: i64 = 2000;
-
-pub async fn get_queues_status(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> ApiResult<Json<QueuesStatus>> {
-    let ids = state
-        .content
-        .active_entity_ids_of_types(&["scene", "wearable", "emote"], QUEUE_SCAN_LIMIT)
-        .await?;
-
-    let (windows_forced, mac_forced, webgl_forced, linux_forced) = if state.registry.enabled() {
-        (
-            state.registry.pending_jobs_for("windows").await?,
-            state.registry.pending_jobs_for("mac").await?,
-            state.registry.pending_jobs_for("webgl").await?,
-            state.registry.pending_jobs_for("linux").await?,
-        )
-    } else {
-        Default::default()
-    };
-
-    let mut q = QueuesStatus::default();
-    let mut windows_seen: HashSet<String> = HashSet::new();
-    let mut mac_seen: HashSet<String> = HashSet::new();
-    let mut webgl_seen: HashSet<String> = HashSet::new();
-    let mut linux_seen: HashSet<String> = HashSet::new();
-    for id in ids {
-        let m = state.manifests.get(&id).await;
-        if !matches!(m.windows_status(), BuildStatus::Complete) || windows_forced.contains(&id) {
-            windows_seen.insert(id.clone());
-            q.windows_pending_jobs.push(id.clone());
-        }
-        if !matches!(m.mac_status(), BuildStatus::Complete) || mac_forced.contains(&id) {
-            mac_seen.insert(id.clone());
-            q.mac_pending_jobs.push(id.clone());
-        }
-        if !matches!(m.webgl_status(), BuildStatus::Complete) || webgl_forced.contains(&id) {
-            webgl_seen.insert(id.clone());
-            q.webgl_pending_jobs.push(id.clone());
-        }
-        if !matches!(m.linux_status(), BuildStatus::Complete) || linux_forced.contains(&id) {
-            linux_seen.insert(id.clone());
-            q.linux_pending_jobs.push(id);
-        }
+pub async fn get_queues_status(State(state): State<AppState>) -> ApiResult<Json<QueuesStatus>> {
+    if !state.registry.enabled() {
+        return Err(ApiError::not_implemented(
+            "queue status requires the ab_registry DB",
+        ));
     }
-
-    for id in windows_forced.difference(&windows_seen) {
-        q.windows_pending_jobs.push(id.clone());
-    }
-    for id in mac_forced.difference(&mac_seen) {
-        q.mac_pending_jobs.push(id.clone());
-    }
-    for id in webgl_forced.difference(&webgl_seen) {
-        q.webgl_pending_jobs.push(id.clone());
-    }
-    for id in linux_forced.difference(&linux_seen) {
-        q.linux_pending_jobs.push(id.clone());
-    }
-
-    if has_valid_bearer(&state, &headers) {
-        q.paused = Some(state.registry.queue_paused().await?);
-    }
-    Ok(Json(q))
+    // Missing or failed bundles do not imply that a conversion job is queued.
+    let mut windows_pending_jobs: Vec<_> = state
+        .registry
+        .pending_jobs_for("windows")
+        .await?
+        .into_iter()
+        .collect();
+    let mut mac_pending_jobs: Vec<_> = state
+        .registry
+        .pending_jobs_for("mac")
+        .await?
+        .into_iter()
+        .collect();
+    windows_pending_jobs.sort();
+    mac_pending_jobs.sort();
+    Ok(Json(QueuesStatus {
+        windows_pending_jobs,
+        mac_pending_jobs,
+    }))
 }
 
 pub async fn post_queues_retry(

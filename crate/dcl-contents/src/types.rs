@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BuildStatus {
     Pending,
@@ -9,13 +9,14 @@ pub enum BuildStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RegistryStatus {
     Complete,
     Fallback,
     Pending,
     Failed,
+    Obsolete,
 }
 
 impl RegistryStatus {
@@ -24,19 +25,19 @@ impl RegistryStatus {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PlatformVersion {
     pub version: String,
     #[serde(rename = "buildDate")]
     pub build_date: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Versions {
     pub assets: PlatformVersions,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PlatformVersions {
     pub windows: PlatformVersion,
     pub mac: PlatformVersion,
@@ -53,14 +54,14 @@ impl Versions {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Bundles {
     pub assets: BundlePlatformStatuses,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lods: Option<BundlePlatformStatuses>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundlePlatformStatuses {
     pub windows: BuildStatus,
     pub mac: BuildStatus,
@@ -149,7 +150,6 @@ pub struct EntityStatus {
 pub struct PlatformStatuses {
     pub mac: BuildStatus,
     pub windows: BuildStatus,
-    pub linux: BuildStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -158,13 +158,6 @@ pub struct QueuesStatus {
     pub windows_pending_jobs: Vec<String>,
     #[serde(rename = "macPendingJobs")]
     pub mac_pending_jobs: Vec<String>,
-    #[serde(rename = "webglPendingJobs")]
-    pub webgl_pending_jobs: Vec<String>,
-    #[serde(rename = "linuxPendingJobs")]
-    pub linux_pending_jobs: Vec<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub paused: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

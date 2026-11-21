@@ -44,16 +44,16 @@ Served routes - the full asset-bundle delivery surface an explorer needs:
 - `POST /entities/active`, `POST /entities/versions` - the asset-bundle registry index routes the explorer's registry client calls to resolve bundle versions
 - `GET /health`, `/readyz`, `/livez`, `/metrics`, `/ping`
 
-An explorer can point both its asset-bundle CDN base and its registry base at this one host (what the
-`optimized-assets` client flag targets). The unsigned registry surface from the in-tree
-[`dcl-contents`](crate/dcl-contents) crate is always mounted (`POST /profiles`,
-`POST /profiles/metadata`, `GET /entities/status/{id}`, `GET /worlds/{world_name}/manifest`), sourced
-from a connected content DB or proxied from `ABGEN_CATALYST_URL`. The signed/write registry routes
-(`/denylist*`, `/queues/*`, `/registry`, `/flush-cache`) **do** mount, but only when
-`CONTENT_PG_CONNECTION_STRING` is set in URL form - so a converter deployment that leaves it unset
-serves none of them. Setting it exposes admin surface: gate it with `API_ADMIN_TOKEN` and
-`DENYLIST_MODERATORS`, and do not put it on a public listener unauthenticated. Route-by-route parity,
-header semantics, and the DB-vs-proxy source selection: [docs/ROUTES.md](docs/ROUTES.md).
+An explorer can point its asset-bundle CDN and Registry bases at this host.
+Registry entity data comes through the configured Catalyst and worlds APIs;
+DCL One uses its existing Rust implementations. Native Registry persistence
+(`AB_REGISTRY_PG_CONNECTION_STRING`) stores conversion/fallback state, moderation
+and queues. The signed router shares the entity source and manifest reader;
+`CONTENT_PG_CONNECTION_STRING` is not required to mount it. `API_ADMIN_TOKEN`
+enables `/registry` and `/flush-cache`, while signed denylist mutations require
+`DENYLIST_MODERATORS`. Registry entity queries and writes require native
+persistence. See [route behavior and limitations](docs/ROUTES.md) and
+[native state](docs/REGISTRY-STATE.md).
 ## Tests
 ```bash
 ABGEN_ROOT="$PWD" cargo test --workspace --lib -- --test-threads=1
@@ -135,9 +135,11 @@ restore it - it never fetches or re-downloads:
 | `ABGEN_JIT_FAIL_TTL_S` | `60` | failure negative-cache TTL for entity JIT builds; concurrent identical requests single-flight per `{entity}:{platform}` |
 | `ABGEN_JIT_CONTENT_DIGEST` | `0` | freshness for content servers whose declared hashes are not content-addressed (the `@dcl/sdk-commands` preview server keys them by file path). Defaults to ON when `ABGEN_CATALYST_URL` points at a loopback host (a dev preview server), OFF otherwise; explicit values always win. When on, manifest requests re-download the entity's convertible content, sha256 it, and prune stale conversions when bytes changed under an unchanged hash. Changed non-glb files (textures/`.bin`) also invalidate every glb bundle of the entity. Debounced per entity via `ABGEN_REVALIDATE_DEBOUNCE_S` (default `2`) |
 | `ABGEN_UPSTREAM_AB_CDN` | unset | read-through to a production ab-cdn (e.g. `https://ab-cdn.decentraland.org`): manifest/bundle/LOD/ISS requests that 404 through every local and JIT lane are streamed from upstream without persisting anything locally. Lets a client point its whole optimized-assets base URL here (wearables/emotes keep working) while only local scene entities are built locally. Paths containing `b64-` preview ids are never proxied |
-| `ABGEN_UPSTREAM_AB_REGISTRY` | see right | upstream registry URL: records for entities without local bundles are answered with its versions. Default: `asset-bundle-registry.<domain>` when the CDN is `ab-cdn.<domain>`. `off` disables |
 | `RUST_LOG` | `abgen=info,tower_http=info` | tracing filter |
-| `CONTENT_PG_CONNECTION_STRING` (or `POSTGRES_*` parts) | unset | content DB; URL form also mounts the signed registry routes |
+| `CONTENT_PG_CONNECTION_STRING` (or `POSTGRES_*` parts) | unset | optional converter content index; Registry entity authority remains the configured Catalyst APIs |
+| `AB_REGISTRY_PG_CONNECTION_STRING` | unset | native Registry persistence; SQLx migrations create moderation, queue and conversion-state tables |
+| `API_ADMIN_TOKEN` | unset | enables `/registry` and `/flush-cache`; also authorizes additional queue controls |
+| `DENYLIST_MODERATORS` | empty | comma-separated Ethereum addresses permitted to mutate Registry denylist using signed fetch; loaded at startup |
 ### S3 space cache (read-through + write-back)
 Enabled when `ABGEN_S3_BUCKET` is non-empty (or `ABGEN_USE_SPACE=1`):
 - credentials, first match wins: `ABGEN_S3_ACCESS_KEY`/`ABGEN_S3_SECRET_KEY`, `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, or the ECS container role (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `_FULL_URI`)

@@ -64,6 +64,8 @@ pub struct AppStateInner {
 
     pub contents_registry: Option<dcl_contents::registry::RegistryAppState>,
 
+    pub registry_store: Option<crate::registry::ports::registry::RegistryStore>,
+
     pub catalyst_url: String,
 
     pub out_root_writable: bool,
@@ -86,20 +88,9 @@ pub struct AppStateInner {
 
     pub upstream_ab_cdn: Option<String>,
 
-    pub upstream_ab_registry: Option<String>,
-
-    pub upstream_registry_cache: Cache<String, Option<UpstreamAbRecord>>,
-
     pub revalidate_recent: Cache<String, ()>,
 
     pub revalidate_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
-}
-
-#[derive(Clone, Debug)]
-pub struct UpstreamAbRecord {
-    pub versions: serde_json::Value,
-    pub bundles: serde_json::Value,
-    pub status: serde_json::Value,
 }
 
 pub type AppState = Arc<AppStateInner>;
@@ -148,6 +139,7 @@ impl AppStateInner {
             ab_date,
             content_db: None,
             contents_registry: None,
+            registry_store: None,
             catalyst_url,
             out_root_writable,
             lod_jit,
@@ -165,11 +157,6 @@ impl AppStateInner {
             jit_inflight: tokio::sync::Mutex::new(HashMap::new()),
             jit_content_digest: false,
             upstream_ab_cdn: None,
-            upstream_ab_registry: None,
-            upstream_registry_cache: Cache::builder()
-                .max_capacity(100_000)
-                .time_to_live(env_ttl("ABGEN_UPSTREAM_REGISTRY_TTL_S", 300))
-                .build(),
             revalidate_recent: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(env_ttl("ABGEN_REVALIDATE_DEBOUNCE_S", 2))
@@ -185,11 +172,6 @@ impl AppStateInner {
     ) -> Self {
         self.jit_content_digest = jit_content_digest;
         self.upstream_ab_cdn = upstream_ab_cdn;
-        self
-    }
-
-    pub fn with_upstream_ab_registry(mut self, url: Option<String>) -> Self {
-        self.upstream_ab_registry = url;
         self
     }
 
