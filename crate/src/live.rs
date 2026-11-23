@@ -513,9 +513,14 @@ impl Proxy {
             if !seen_hashes.insert(c.hash.as_str()) {
                 continue;
             }
-            if is_glb {
+            // Scripts are read by the scan for `bumpTexture` normal maps (`scriptrefs`).
+            if is_glb || crate::scriptrefs::is_scene_script(&c.file) {
                 to_fetch.push((c.hash.as_str(), c.file.as_str()));
             } else if is_image {
+                // A normal-map-named image no glTF uses is classified from its pixels.
+                if crate::scriptrefs::has_normal_map_name(&c.file) {
+                    to_fetch.push((c.hash.as_str(), c.file.as_str()));
+                }
                 img_files += 1;
             }
         }
@@ -537,7 +542,7 @@ impl Proxy {
         });
 
         eprintln!(
-            "download: {cid}: {dl_files} glb(s) in {:.1}s ({workers} worker(s)); \
+            "download: {cid}: {dl_files} glb/script/hinted file(s) in {:.1}s ({workers} worker(s)); \
              {img_files} image(s) deferred until probe results",
             dl_started.elapsed().as_secs_f64()
         );

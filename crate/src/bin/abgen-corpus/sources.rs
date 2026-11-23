@@ -614,7 +614,16 @@ pub(crate) fn from_collection_urn(
             }
         }
         let model_refs = collect_model_referenced_hashes(&store, &content_by_file);
-        let (linear_refs, normal_refs) = collect_linear_texture_hashes(&store, &content_by_file);
+        let (mut linear_refs, mut normal_refs) =
+            collect_linear_texture_hashes(&store, &content_by_file);
+        let code_normals = abgen::scriptrefs::code_normal_hashes(
+            &content_by_file,
+            &model_refs,
+            &normal_refs,
+            |h| store.fetch(h).ok(),
+        );
+        linear_refs.extend(code_normals.iter().cloned());
+        normal_refs.extend(code_normals);
 
         let mut bundles: Vec<BundleSpec> = Vec::new();
         for c in &content_items {

@@ -102,6 +102,7 @@ pub mod resize;
 pub mod resolver;
 pub mod ress;
 pub mod sbp_order;
+pub mod scriptrefs;
 pub mod skeleton;
 pub mod skinbounds;
 #[cfg(not(target_arch = "wasm32"))]

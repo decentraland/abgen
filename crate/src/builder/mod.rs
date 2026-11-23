@@ -652,6 +652,14 @@ fn is_font_input(bytes: &[u8], opts: &BuildOpts<'_>) -> Result<bool> {
     Ok(true)
 }
 
+/// Whether an encoded image (PNG, JPEG, PSD, KTX2) decodes to normal-map-shaped texels:
+/// opaque, with nearly every texel a unit vector facing out of the surface. The decode is
+/// cached, so the builder reuses it.
+pub fn image_looks_like_normal_map(raw: &[u8]) -> bool {
+    texture::decode_source_image(raw)
+        .is_some_and(|img| texture::looks_like_normal_map(img.as_raw()))
+}
+
 pub fn build_bundle(
     bytes: &[u8],
     bundle_name: &str,

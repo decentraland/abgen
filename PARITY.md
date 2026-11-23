@@ -49,6 +49,21 @@ dimensions and mip counts**: our encoder and upstream's pick different blocks/pa
 input. Not closable byte-wise — two compliant BC7 encoders may disagree — and it lands in the
 render-noise class, not a change in what a texture depicts.
 
+## Normal maps bound from scene code are linear, unlike upstream
+
+The legacy converter classifies a standalone image only by how the entity's glTFs use it, so an
+image the scene binds solely through an SDK `Material` (`bumpTexture`) ships as an sRGB colour
+texture. The explorer loads that same file as a linear normal map when it fetches it raw (local
+preview, or with bundles off), so the bundled copy renders differently from what the creator saw.
+`abgen` also reads the scene's scripts for `bumpTexture` bindings (`crate/src/scriptrefs.rs`) and
+builds those images as linear, packed normal maps, the same output a glTF-referenced normal map
+gets. The classification is part of the image bundle's digest, so affected bundles are renamed and
+rebuilt rather than reused. The scan is lexical: a path held in a constant declared elsewhere, or a
+file name assembled from fragments, is not resolved. As a fallback for those, an image no glTF
+references whose name ends in a normal-map suffix (`_n`, `_normal`, `_normalmap`, `_nrm`) *and* whose
+pixels decode as a normal map is classified the same way. Upstream reads neither file names nor
+scene code.
+
 ## KTX2 ingest: no upstream to match, and no change for PNG/JPEG
 
 The legacy converter never decoded KTX2 (`KHR_texture_basisu`), so a UASTC KTX2 texture has no
