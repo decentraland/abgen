@@ -562,6 +562,10 @@ pub struct BuildOpts<'a> {
 
     pub standalone_normal: bool,
 
+    /// A standalone image named `*_skybox` in a world: capped to
+    /// `texprofile::SKYBOX_MAX_WIDTH`x`SKYBOX_MAX_HEIGHT` instead of the platform cap.
+    pub standalone_skybox: bool,
+
     pub force_default_material: bool,
 
     pub magenta_missing: bool,
@@ -625,6 +629,7 @@ impl<'a> Default for BuildOpts<'a> {
             expect_hash: None,
             standalone_color_space: None,
             standalone_normal: false,
+            standalone_skybox: false,
             force_default_material: false,
             magenta_missing: false,
             collection_mode: false,
@@ -696,6 +701,7 @@ pub fn build_bundle(
             opts.model_referenced,
             opts.standalone_color_space,
             opts.standalone_normal,
+            opts.standalone_skybox,
             Toggles::from_opts(opts),
         );
         let data = b.build(bytes, &mut bundle, None)?;
@@ -878,6 +884,7 @@ pub fn build_bundle_multi(
             opts.model_referenced,
             opts.standalone_color_space,
             opts.standalone_normal,
+            opts.standalone_skybox,
             Toggles::from_opts(opts),
         );
         let mut memo = unity::bundle_file::ChunkMemo::default();

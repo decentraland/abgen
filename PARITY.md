@@ -60,9 +60,19 @@ builds those images as linear, packed normal maps, the same output a glTF-refere
 gets. The classification is part of the image bundle's digest, so affected bundles are renamed and
 rebuilt rather than reused. The scan is lexical: a path held in a constant declared elsewhere, or a
 file name assembled from fragments, is not resolved. As a fallback for those, an image no glTF
-references whose name ends in a normal-map suffix (`_n`, `_normal`, `_normalmap`, `_nrm`) *and* whose
+references whose name ends in `_normalMap` (case-insensitive) *and* whose
 pixels decode as a normal map is classified the same way. Upstream reads neither file names nor
 scene code.
+
+## Skybox textures in worlds keep 4096x2048
+
+The legacy converter caps every standalone image at the platform size (1024 on desktop), which
+blurs a texture that fills the whole view. In a world entity (`metadata.worldConfiguration.name`),
+`abgen` caps an image named `*_skybox` (case-insensitive) to fit 4096x2048 instead, keeping its aspect
+ratio. The cap is part of the image bundle's name (`naming::SKYBOX_CAP_POLICY`), so a world's copy
+never collides with a city scene's capped copy of the same file in the shared corpus. Only the
+standalone lane applies it: an image a GLB embeds or resolves keeps the platform cap inside that
+GLB's bundle, and the offline corpus tools do not apply it.
 
 ## KTX2 ingest: no upstream to match, and no change for PNG/JPEG
 

@@ -18,11 +18,10 @@
 //! catches them.
 //!
 //! The name rule is the fallback for bindings the lexical scan cannot resolve: an image no
-//! glTF references, whose file name ends in a normal-map suffix ([`NORMAL_NAME_SUFFIXES`],
-//! the `_N` of the creator docs' texture naming among them), and whose pixels decode to
-//! normal-map-shaped texels ([`crate::builder::image_looks_like_normal_map`]). Both
-//! conditions are required: the name alone would turn a UI sprite called `button_n.png` into
-//! a linear texture, the pixels alone a flat sky-blue albedo. An image a glTF does reference
+//! glTF references, whose file name ends in `_normalMap` ([`NORMAL_NAME_SUFFIX`]), and whose
+//! pixels decode to normal-map-shaped texels ([`crate::builder::image_looks_like_normal_map`]).
+//! Both conditions are required: the name alone would turn a colour image that happens to
+//! carry the suffix into a linear texture, the pixels alone a flat sky-blue albedo. An image a glTF does reference
 //! is classified by that use, whatever it is called.
 //!
 //! Normal maps are the only slot that needs this. The SDK material's other image slots
@@ -40,9 +39,9 @@ const MAX_EXPR_BYTES: usize = 4096;
 
 const IMAGE_EXTENSIONS: [&str; 4] = [".png", ".jpg", ".jpeg", ".ktx2"];
 
-/// File-name stem endings that mark a normal map, compared case-insensitively. `_n` is the
-/// creator docs' `T_<Name>_N`; the rest are the common exporter spellings.
-pub const NORMAL_NAME_SUFFIXES: [&str; 4] = ["_n", "_normal", "_normalmap", "_nrm"];
+/// File-name stem ending that marks a normal map, compared case-insensitively
+/// (`Water_normalMap.png`).
+pub const NORMAL_NAME_SUFFIX: &str = "_normalmap";
 
 /// Whether a content file is scene code the normal-map scan reads.
 pub fn is_scene_script(file: &str) -> bool {
@@ -189,7 +188,7 @@ pub fn resolve_literal<'a>(
         .collect()
 }
 
-/// Whether an image's file name ends in a normal-map suffix ([`NORMAL_NAME_SUFFIXES`]).
+/// Whether an image's file name ends in the normal-map suffix ([`NORMAL_NAME_SUFFIX`]).
 pub fn has_normal_map_name(file: &str) -> bool {
     if !is_image_path(file) {
         return false;
@@ -199,9 +198,7 @@ pub fn has_normal_map_name(file: &str) -> bool {
         .rsplit_once('.')
         .map_or(base, |(s, _)| s)
         .to_ascii_lowercase();
-    NORMAL_NAME_SUFFIXES
-        .iter()
-        .any(|sfx| stem.len() > sfx.len() && stem.ends_with(sfx))
+    stem.len() > NORMAL_NAME_SUFFIX.len() && stem.ends_with(NORMAL_NAME_SUFFIX)
 }
 
 /// Content hashes of the images to build as linear normal maps beyond what the glTFs
@@ -335,20 +332,20 @@ mod tests {
     #[test]
     fn normal_map_names() {
         for f in [
-            "assets/water/PoolBake_normal.png",
-            "T_BrickWall_N.png",
-            "rock_nrm.JPG",
+            "assets/water/PoolBake_normalMap.png",
             "floor_NormalMap.ktx2",
+            "rock_normalmap.JPG",
         ] {
             assert!(has_normal_map_name(f), "{f}");
         }
         for f in [
-            "assets/normal.png",
-            "_n.png",
-            "button_on.png",
-            "abnormal.png",
-            "PoolBake_normal.glb",
-            "notes_n.txt",
+            "assets/water/PoolBake_normal.png",
+            "T_BrickWall_N.png",
+            "rock_nrm.png",
+            "_normalMap.png",
+            "normalMap.png",
+            "PoolBake_normalMap.glb",
+            "notes_normalMap.txt",
         ] {
             assert!(!has_normal_map_name(f), "{f}");
         }
@@ -365,9 +362,9 @@ mod tests {
     #[test]
     fn name_rule_needs_normal_pixels_and_no_gltf_use() {
         let c = files(&[
-            ("a/flat_n.png", "FLAT"),
-            ("a/sprite_n.png", "SPRITE"),
-            ("a/used_normal.png", "USED"),
+            ("a/flat_normalMap.png", "FLAT"),
+            ("a/sprite_normalMap.png", "SPRITE"),
+            ("a/used_normalMap.png", "USED"),
             ("a/plain.png", "PLAIN"),
         ]);
         let normal_px = png([128, 128, 255, 255]);
