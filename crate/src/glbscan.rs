@@ -92,6 +92,13 @@ pub fn scan_entity(
             uris_map.insert(k, v);
         }
     }
+    // Normal maps no glTF names: bound from scene code, or named and shaped like one.
+    let code_normals =
+        crate::scriptrefs::code_normal_hashes(content_by_file, &model_refs, &normal_refs, |h| {
+            store.fetch(h).ok()
+        });
+    linear_refs.extend(code_normals.iter().cloned());
+    normal_refs.extend(code_normals);
     EntityScan {
         model_refs,
         linear_refs,

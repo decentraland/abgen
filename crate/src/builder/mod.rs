@@ -562,6 +562,10 @@ pub struct BuildOpts<'a> {
 
     pub standalone_normal: bool,
 
+    /// A standalone image named `*_skybox` in a world: capped to
+    /// `texprofile::SKYBOX_MAX_WIDTH`x`SKYBOX_MAX_HEIGHT` instead of the platform cap.
+    pub standalone_skybox: bool,
+
     pub force_default_material: bool,
 
     pub magenta_missing: bool,
@@ -625,6 +629,7 @@ impl<'a> Default for BuildOpts<'a> {
             expect_hash: None,
             standalone_color_space: None,
             standalone_normal: false,
+            standalone_skybox: false,
             force_default_material: false,
             magenta_missing: false,
             collection_mode: false,
@@ -650,6 +655,14 @@ fn is_font_input(bytes: &[u8], opts: &BuildOpts<'_>) -> Result<bool> {
         .into());
     }
     Ok(true)
+}
+
+/// Whether an encoded image (PNG, JPEG, PSD, KTX2) decodes to normal-map-shaped texels:
+/// opaque, with nearly every texel a unit vector facing out of the surface. The decode is
+/// cached, so the builder reuses it.
+pub fn image_looks_like_normal_map(raw: &[u8]) -> bool {
+    texture::decode_source_image(raw)
+        .is_some_and(|img| texture::looks_like_normal_map(img.as_raw()))
 }
 
 pub fn build_bundle(
@@ -688,6 +701,7 @@ pub fn build_bundle(
             opts.model_referenced,
             opts.standalone_color_space,
             opts.standalone_normal,
+            opts.standalone_skybox,
             Toggles::from_opts(opts),
         );
         let data = b.build(bytes, &mut bundle, None)?;
@@ -870,6 +884,7 @@ pub fn build_bundle_multi(
             opts.model_referenced,
             opts.standalone_color_space,
             opts.standalone_normal,
+            opts.standalone_skybox,
             Toggles::from_opts(opts),
         );
         let mut memo = unity::bundle_file::ChunkMemo::default();

@@ -46,6 +46,15 @@ pub struct Scene {
 }
 
 impl Scene {
+    /// Whether this entity is deployed to a world (`metadata.worldConfiguration.name`), the
+    /// same test the registry's `ActiveEntity::is_world` applies.
+    pub fn is_world(&self) -> bool {
+        self.metadata
+            .get("worldConfiguration")
+            .and_then(|w| w.get("name"))
+            .is_some_and(|n| n.is_string())
+    }
+
     pub fn content_by_file(&self) -> HashMap<String, String> {
         self.content
             .iter()

@@ -263,7 +263,13 @@ impl EntityCtx {
             self.scan.linear_refs.contains(hash),
             self.scan.normal_refs.contains(hash),
             &naming::image_key_extension(file),
+            self.is_skybox_image(file),
         )
+    }
+
+    /// A standalone image built under the skybox cap: named `*_skybox` in a world entity.
+    fn is_skybox_image(&self, file: &str) -> bool {
+        self.scene.is_world() && crate::texprofile::is_skybox_name(file)
     }
 
     /// The recipes that govern an image bundle's bytes, for the union a manifest records.
@@ -513,9 +519,14 @@ impl Proxy {
             if !seen_hashes.insert(c.hash.as_str()) {
                 continue;
             }
-            if is_glb {
+            // Scripts are read by the scan for `bumpTexture` normal maps (`scriptrefs`).
+            if is_glb || crate::scriptrefs::is_scene_script(&c.file) {
                 to_fetch.push((c.hash.as_str(), c.file.as_str()));
             } else if is_image {
+                // A normal-map-named image no glTF uses is classified from its pixels.
+                if crate::scriptrefs::has_normal_map_name(&c.file) {
+                    to_fetch.push((c.hash.as_str(), c.file.as_str()));
+                }
                 img_files += 1;
             }
         }
@@ -537,7 +548,7 @@ impl Proxy {
         });
 
         eprintln!(
-            "download: {cid}: {dl_files} glb(s) in {:.1}s ({workers} worker(s)); \
+            "download: {cid}: {dl_files} glb/script/hinted file(s) in {:.1}s ({workers} worker(s)); \
              {img_files} image(s) deferred until probe results",
             dl_started.elapsed().as_secs_f64()
         );
@@ -831,6 +842,7 @@ impl Proxy {
             None
         };
         let standalone_normal = is_image && ctx.scan.normal_refs.contains(hash);
+        let standalone_skybox = is_image && ctx.is_skybox_image(&file);
 
         let content_by_file = &ctx.content_by_file;
         let resolve_fn = |uri: &str| -> Option<Vec<u8>> {
@@ -873,6 +885,7 @@ impl Proxy {
             expect_hash: None,
             standalone_color_space,
             standalone_normal,
+            standalone_skybox,
             force_default_material: false,
             magenta_missing: self.magenta_missing,
             collection_mode: self.collection_mode,
@@ -3047,7 +3060,7 @@ mod tests {
         ]);
         let (space_host, space_seen, store) = super::stub::serve_store(vec![]);
 
-        let digest = naming::image_class_digest(false, false, false, ".png");
+        let digest = naming::image_class_digest(false, false, false, ".png", false);
         let good_name = format!("qmgoodimg_{digest}_windows");
 
         let dir_a = fresh_cache("redeploy-a");
@@ -3206,8 +3219,8 @@ mod tests {
         ]);
         let (space_host, _space_seen, store) = super::stub::serve_store(vec![]);
 
-        let d_c = naming::image_class_digest(true, false, false, ".png");
-        let d_d = naming::image_class_digest(false, false, false, ".png");
+        let d_c = naming::image_class_digest(true, false, false, ".png", false);
+        let d_d = naming::image_class_digest(false, false, false, ".png", false);
         assert_ne!(d_c, d_d);
         let key_c = format!("/v41/assets/qmsharedimg_{d_c}_windows");
         let key_d = format!("/v41/assets/qmsharedimg_{d_d}_windows");

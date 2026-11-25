@@ -402,8 +402,8 @@ pub fn image_key_extension(file: &str) -> String {
 /// beyond its content hash and the platform suffix: `model_referenced`,
 /// the `linear` color-space classification, the `normal`-map
 /// classification, and the asset-key extension
-/// ([`image_key_extension`]), and the generation of the texture recipe
-/// ([`crate::recipes::image_recipes`]).
+/// ([`image_key_extension`]), the skybox cap ([`SKYBOX_CAP_POLICY`], only when it
+/// applies), and the generation of the texture recipe ([`crate::recipes::image_recipes`]).
 /// Process-wide toggles are excluded — they are fixed per bundle version,
 /// which already prefixes every space key.
 pub fn image_class_digest(
@@ -411,30 +411,61 @@ pub fn image_class_digest(
     linear: bool,
     normal: bool,
     key_ext: &str,
+    skybox: bool,
 ) -> String {
     let recipes = recipes::digest_generations(&recipes::image_recipes());
+    // The skybox cap is folded in only when it applies, so every other image keeps the name it
+    // is published under; a skybox image gets a name of its own, which also keeps a world's
+    // 4096x2048 copy apart from a city scene's capped copy of the same file in the shared
+    // corpus.
+    let skybox = skybox.then_some(SKYBOX_CAP_POLICY);
     if key_ext.eq_ignore_ascii_case(".ktx2") {
         // Standalone KTX2 bundles are named under the UASTC header gate's policy, so a bundle
         // stored before the gate (or under another policy) is never reused: a probe hit means
         // the gate already took this file, and only a miss needs to look at its bytes.
-        return digest_inputs(
-            (
-                model_referenced,
-                linear,
-                normal,
-                key_ext,
-                STANDALONE_KTX2_POLICY,
+        return match skybox {
+            None => digest_inputs(
+                (
+                    model_referenced,
+                    linear,
+                    normal,
+                    key_ext,
+                    STANDALONE_KTX2_POLICY,
+                ),
+                &recipes,
+                "image class",
             ),
+            Some(sky) => digest_inputs(
+                (
+                    model_referenced,
+                    linear,
+                    normal,
+                    key_ext,
+                    STANDALONE_KTX2_POLICY,
+                    sky,
+                ),
+                &recipes,
+                "image class",
+            ),
+        };
+    }
+    match skybox {
+        None => digest_inputs(
+            (model_referenced, linear, normal, key_ext),
             &recipes,
             "image class",
-        );
+        ),
+        Some(sky) => digest_inputs(
+            (model_referenced, linear, normal, key_ext, sky),
+            &recipes,
+            "image class",
+        ),
     }
-    digest_inputs(
-        (model_referenced, linear, normal, key_ext),
-        &recipes,
-        "image class",
-    )
 }
+
+/// The skybox cap as a name input of the image bundles it applies to ([`image_class_digest`]):
+/// `crate::texprofile::SKYBOX_MAX_WIDTH`x`SKYBOX_MAX_HEIGHT`. Change it with those bounds.
+pub const SKYBOX_CAP_POLICY: &str = "skybox-4096x2048";
 
 /// Which standalone `.ktx2` files the Unity lanes convert, as a name input of their bundles
 /// ([`image_class_digest`]). 1: only what `crate::ktx2::ktx2_header_ok` takes (UASTC LDR 2D
@@ -719,7 +750,7 @@ mod tests {
                 .as_bytes(),
         );
         assert_eq!(
-            image_class_digest(false, false, false, ".png") == legacy,
+            image_class_digest(false, false, false, ".png", false) == legacy,
             recipes::digest_generations(&recipes::image_recipes()).is_empty()
         );
     }
@@ -783,21 +814,24 @@ mod tests {
 
     #[test]
     fn image_class_digest_folds_each_input() {
-        let base = image_class_digest(false, false, false, ".png");
+        let base = image_class_digest(false, false, false, ".png", false);
         // The pre-recipes digest, reproduced exactly while the texture recipe sits at
         // baseline; a bump of it is the one thing allowed to move this name.
         assert_eq!(
             base == "f698278562d3edf9245f7b57f39575b0",
             recipes::digest_generations(&recipes::image_recipes()).is_empty()
         );
-        assert_eq!(base, image_class_digest(false, false, false, ".png"));
+        assert_eq!(base, image_class_digest(false, false, false, ".png", false));
         let variants = [
             base.clone(),
-            image_class_digest(true, false, false, ".png"),
-            image_class_digest(false, true, false, ".png"),
-            image_class_digest(false, false, true, ".png"),
-            image_class_digest(false, false, false, ".jpg"),
-            image_class_digest(false, false, false, ".PNG"),
+            image_class_digest(true, false, false, ".png", false),
+            image_class_digest(false, true, false, ".png", false),
+            image_class_digest(false, false, true, ".png", false),
+            image_class_digest(false, false, false, ".jpg", false),
+            image_class_digest(false, false, false, ".PNG", false),
+            image_class_digest(false, false, false, ".png", true),
+            image_class_digest(false, false, false, ".ktx2", true),
+            image_class_digest(false, false, false, ".ktx2", false),
         ];
         for (i, a) in variants.iter().enumerate() {
             assert_eq!(a.len(), 32);

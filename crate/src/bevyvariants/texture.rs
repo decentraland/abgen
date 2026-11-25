@@ -26,6 +26,10 @@ pub struct TexOptions {
     /// `model::alpha_unused_images`) is encoded as opaque, so it can take BC1. Standalone
     /// texture variants never see it: their key does not say how the alpha is used.
     pub drop_unused_alpha: bool,
+    /// A standalone `*_skybox` image in a world: fit inside
+    /// `texprofile::SKYBOX_MAX_WIDTH`x`SKYBOX_MAX_HEIGHT` instead of [`BEVY_TEXTURE_MAX`], as
+    /// the Unity lanes do. PNG/JPEG encodes only; a creator KTX2 keeps its own level rule.
+    pub skybox: bool,
 }
 
 impl Default for TexOptions {
@@ -34,7 +38,17 @@ impl Default for TexOptions {
             zstd_level: DEFAULT_ZSTD_LEVEL,
             mips: false,
             drop_unused_alpha: false,
+            skybox: false,
         }
+    }
+}
+
+/// The longest-side cap a `w`x`h` PNG/JPEG source is encoded under.
+fn size_cap(w: u32, h: u32, opts: TexOptions) -> u32 {
+    if opts.skybox {
+        crate::texprofile::skybox_max_size(w, h)
+    } else {
+        BEVY_TEXTURE_MAX
     }
 }
 
@@ -385,7 +399,11 @@ pub fn encode_image(
     // level 0 thinner than one 4x4 BC block (1024x2), which wgpu refuses.
     // Capped to `BEVY_TEXTURE_MAX` and snapped to powers of two, as the bvwebgpu lane does: powers
     // of two of at least 4 are whole 4x4 blocks, which wgpu requires of a BC level 0.
-    let (tw, th) = crate::texprofile::bc7_target_size(img.width(), img.height(), BEVY_TEXTURE_MAX);
+    let (tw, th) = crate::texprofile::bc7_target_size(
+        img.width(),
+        img.height(),
+        size_cap(img.width(), img.height(), opts),
+    );
     if is_tiny(img.width(), img.height()) || tw < 4 || th < 4 {
         return Ok(Err(NoVariant::Tiny.into()));
     }
@@ -473,7 +491,7 @@ fn encode_rgba(
 ) -> Result<TextureVariant> {
     let levels = if opts.mips { None } else { LEVELS };
     let (w, h) = img.dimensions();
-    let (tw, th) = crate::texprofile::bc7_target_size(w, h, BEVY_TEXTURE_MAX);
+    let (tw, th) = crate::texprofile::bc7_target_size(w, h, size_cap(w, h, opts));
     let srgb = slot == Slot::Srgb;
     let mut buf = if (tw, th) != (w, h) {
         timed(&mut times.resize_ns, || {

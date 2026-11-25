@@ -31,6 +31,37 @@ pub const LINUX_MAX_TEXTURE_SIZE: u32 = 512;
 
 pub const TEXTURE_IMPORTER_DEFAULT_MAX: u32 = 2048;
 
+/// Bounds of a skybox texture in a world: a 2:1 equirectangular panorama keeps 4096x2048
+/// instead of the platform cap ([`max_texture_size_for`]), which would blur a texture that
+/// fills the whole view. Applies to a standalone image named `*_skybox` in a world entity.
+pub const SKYBOX_MAX_WIDTH: u32 = 4096;
+pub const SKYBOX_MAX_HEIGHT: u32 = 2048;
+
+/// File-name stem ending that marks a skybox texture, compared case-insensitively.
+pub const SKYBOX_NAME_SUFFIX: &str = "_skybox";
+
+/// Whether an image's file name ends in [`SKYBOX_NAME_SUFFIX`] (`Night_skybox.png`).
+pub fn is_skybox_name(file: &str) -> bool {
+    let base = file.rsplit(['/', '\\']).next().unwrap_or(file);
+    let Some((stem, _ext)) = base.rsplit_once('.') else {
+        return false;
+    };
+    let stem = stem.to_ascii_lowercase();
+    stem.len() > SKYBOX_NAME_SUFFIX.len() && stem.ends_with(SKYBOX_NAME_SUFFIX)
+}
+
+/// The longest-side cap that fits a `w`x`h` source inside
+/// [`SKYBOX_MAX_WIDTH`]x[`SKYBOX_MAX_HEIGHT`] with its aspect ratio kept, in the single-number
+/// form [`bc7_target_size`] and the profiles take. A source already inside the box gets its
+/// own longest side, so it is not scaled.
+pub fn skybox_max_size(w: u32, h: u32) -> u32 {
+    let (w, h) = (w.max(1), h.max(1));
+    let factor = (SKYBOX_MAX_WIDTH as f64 / w as f64)
+        .min(SKYBOX_MAX_HEIGHT as f64 / h as f64)
+        .min(1.0);
+    ((w.max(h) as f64 * factor) as u32).max(1)
+}
+
 /// Unity's maximum texture dimension, and so the largest image
 /// `Texture2D.LoadImage` can materialize. The fork's `ReduceTextureSizeIfNeeded`
 /// bails out (leaving the source untouched) only when `LoadImage` itself fails,
@@ -355,6 +386,29 @@ pub fn texture_profile_dxt1(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skybox_names() {
+        assert!(is_skybox_name("sky/Night_Skybox.png"));
+        assert!(is_skybox_name("day_skybox.JPG"));
+        assert!(!is_skybox_name("_skybox.png"));
+        assert!(!is_skybox_name("skybox.png"));
+        assert!(!is_skybox_name("night_skybox_old.png"));
+        assert!(!is_skybox_name("night_skybox"));
+    }
+
+    #[test]
+    fn skybox_cap_fits_the_4096x2048_box() {
+        let fit = |w, h| bc7_target_size(w, h, skybox_max_size(w, h));
+        assert_eq!(fit(8192, 4096), (4096, 2048));
+        assert_eq!(fit(4096, 2048), (4096, 2048));
+        assert_eq!(fit(2048, 1024), (2048, 1024));
+        // Square and portrait sources are bounded by the height.
+        assert_eq!(fit(8192, 8192), (2048, 2048));
+        assert_eq!(fit(4096, 8192), (1024, 2048));
+        // Wider than 2:1 is bounded by the width.
+        assert_eq!(fit(16384, 4096), (4096, 1024));
+    }
 
     /// The 7340x8563 JPEG embedded in wearable
     /// `QmXisDGjquRHzGrZMkTEjwXM1h9eq2APZLmB7Yea8NNWhE` ("Strawberry rabbit lolita

@@ -49,6 +49,35 @@ dimensions and mip counts**: our encoder and upstream's pick different blocks/pa
 input. Not closable byte-wise — two compliant BC7 encoders may disagree — and it lands in the
 render-noise class, not a change in what a texture depicts.
 
+## Normal maps bound from scene code are linear, unlike upstream
+
+The legacy converter classifies a standalone image only by how the entity's glTFs use it, so an
+image the scene binds solely through an SDK `Material` (`bumpTexture`) ships as an sRGB colour
+texture. The explorer loads that same file as a linear normal map when it fetches it raw (local
+preview, or with bundles off), so the bundled copy renders differently from what the creator saw.
+`abgen` also reads the scene's scripts for `bumpTexture` bindings (`crate/src/scriptrefs.rs`) and
+builds those images as linear, packed normal maps, the same output a glTF-referenced normal map
+gets. The classification is part of the image bundle's digest, so affected bundles are renamed and
+rebuilt rather than reused. The scan is lexical: a path held in a constant declared elsewhere, or a
+file name assembled from fragments, is not resolved. As a fallback for those, an image no glTF
+references whose name ends in `_normalMap` (case-insensitive) *and* whose
+pixels decode as a normal map is classified the same way. Upstream reads neither file names nor
+scene code.
+
+## Skybox textures in worlds keep 4096x2048
+
+The legacy converter caps every standalone image at the platform size (1024 on desktop), which
+blurs a texture that fills the whole view. In a world entity (`metadata.worldConfiguration.name`),
+`abgen` caps an image named `*_skybox` (case-insensitive) to fit 4096x2048 instead, keeping its aspect
+ratio. The cap is part of the image bundle's name (`naming::SKYBOX_CAP_POLICY`), so a world's copy
+never collides with a city scene's capped copy of the same file in the shared corpus. Only the
+standalone lane applies it: an image a GLB embeds or resolves keeps the platform cap inside that
+GLB's bundle, and the offline corpus tools do not apply it.
+
+The Bevy variants lane follows both rules: a code-bound or `_normalMap` image takes the `normal` slot
+(BC5), and a world `*_skybox` image is encoded under the same 4096x2048 box as a variant of its own
+(`{cid}_{slot}_skybox`) instead of `BEVY_TEXTURE_MAX`.
+
 ## KTX2 ingest: no upstream to match, and no change for PNG/JPEG
 
 The legacy converter never decoded KTX2 (`KHR_texture_basisu`), so a UASTC KTX2 texture has no

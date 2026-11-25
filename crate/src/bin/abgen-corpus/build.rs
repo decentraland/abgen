@@ -93,6 +93,8 @@ fn build_group(
         expect_hash: spec.expect_hash.as_deref(),
         standalone_color_space: spec.standalone_color_space,
         standalone_normal: spec.standalone_normal,
+        // The corpus tools build without the world/city distinction the skybox cap needs.
+        standalone_skybox: false,
         force_default_material: spec.force_default_material,
         magenta_missing: toggles.magenta_missing,
         collection_mode: toggles.collection_mode,

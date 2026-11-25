@@ -20,6 +20,7 @@ pub(super) struct StandaloneTextureBuilder<'a> {
     model_referenced: bool,
     color_space_override: Option<i64>,
     standalone_normal: bool,
+    standalone_skybox: bool,
     toggles: Toggles,
     objects: BTreeMap<i64, (String, Value)>,
     order: Vec<i64>,
@@ -36,6 +37,7 @@ impl<'a> StandaloneTextureBuilder<'a> {
         model_referenced: bool,
         color_space_override: Option<i64>,
         standalone_normal: bool,
+        standalone_skybox: bool,
         toggles: Toggles,
     ) -> Self {
         let target = target_from_bundle_name(&bundle_name);
@@ -49,6 +51,7 @@ impl<'a> StandaloneTextureBuilder<'a> {
             model_referenced,
             color_space_override,
             standalone_normal,
+            standalone_skybox,
             toggles,
             objects: BTreeMap::new(),
             order: Vec::new(),
@@ -125,7 +128,9 @@ impl<'a> StandaloneTextureBuilder<'a> {
                 has_real_alpha,
             };
             let load_image_ok = texprofile::unity_load_image_would_succeed(&src);
-            let cap = if load_image_ok {
+            let cap = if self.standalone_skybox {
+                texprofile::skybox_max_size(w, h)
+            } else if load_image_ok {
                 texprofile::max_texture_size_for(self.target)
             } else {
                 texprofile::TEXTURE_IMPORTER_DEFAULT_MAX
@@ -166,7 +171,11 @@ impl<'a> StandaloneTextureBuilder<'a> {
             };
 
             let real_textures = self.toggles.real_textures;
-            let max_size = texprofile::max_texture_size_for(self.target);
+            let max_size = if self.standalone_skybox {
+                texprofile::skybox_max_size(w, h)
+            } else {
+                texprofile::max_texture_size_for(self.target)
+            };
             let oversized = (w > max_size || h > max_size) && load_image_ok;
             let stub_canonical = oversized
                 && !real_textures

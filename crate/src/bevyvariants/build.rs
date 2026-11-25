@@ -847,6 +847,29 @@ pub fn build_entity_variants(
             }
         }
     }
+    // Normal maps no model names: bound as `bumpTexture` by scene code, or named `_normalMap`
+    // and shaped like one. The same classification the Unity lanes take (`crate::scriptrefs`).
+    {
+        let model_images: std::collections::HashSet<String> = uses.keys().cloned().collect();
+        let model_normals: std::collections::HashSet<String> = uses
+            .iter()
+            .filter(|(_, u)| u.normal)
+            .map(|(h, _)| h.clone())
+            .collect();
+        let code_normals = crate::scriptrefs::code_normal_hashes(
+            &content_by_file,
+            &model_images,
+            &model_normals,
+            |h| fetch(h),
+        );
+        for h in code_normals {
+            uses.entry(h).or_default().merge(Uses {
+                normal: true,
+                ..Uses::default()
+            });
+        }
+    }
+    let is_world = scene.is_world();
 
     // Pass 2: standalone textures, keyed by source and slot.
     let (textures, file_stats, tex_uploads): (Vec<Row>, Vec<FileStat>, Vec<Vec<Upload>>) = images
@@ -872,7 +895,14 @@ pub fn build_entity_variants(
                 times,
             };
             let slot: Slot = uses.get(hash).copied().unwrap_or_default().slot();
-            let key = variant_key(&tex_prefix, &format!("{hash}_{}", slot.name()));
+            // A world skybox is encoded under its own cap, so it is a variant of its own.
+            let skybox = is_world && crate::texprofile::is_skybox_name(file);
+            let tex_opts = TexOptions { skybox, ..tex_opts };
+            let key = if skybox {
+                variant_key(&tex_prefix, &format!("{hash}_{}_skybox", slot.name()))
+            } else {
+                variant_key(&tex_prefix, &format!("{hash}_{}", slot.name()))
+            };
             let row = |e: Option<VariantEntry>| (hash.to_string(), e.into_iter().collect());
             if let Some(rec) = probe(lane, out_root, &key, &mut times) {
                 stat.reused = true;
