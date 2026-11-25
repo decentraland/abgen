@@ -1866,7 +1866,7 @@ fn standalone_texture_fields(data: &[u8]) -> (i64, i64, i64, i64) {
         let FileContent::Serialized(sf) = &f.content else {
             continue;
         };
-        for o in sf.objects.iter().filter(|o| o.class_id == 28) {
+        if let Some(o) = sf.objects.iter().find(|o| o.class_id == 28) {
             let v = sf.read_typetree(o).unwrap();
             let i = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(-1);
             return (
