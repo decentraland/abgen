@@ -74,6 +74,10 @@ never collides with a city scene's capped copy of the same file in the shared co
 standalone lane applies it: an image a GLB embeds or resolves keeps the platform cap inside that
 GLB's bundle, and the offline corpus tools do not apply it.
 
+The Bevy variants lane follows both rules: a code-bound or `_normalMap` image takes the `normal` slot
+(BC5), and a world `*_skybox` image is encoded under the same 4096x2048 box as a variant of its own
+(`{cid}_{slot}_skybox`) instead of `BEVY_TEXTURE_MAX`.
+
 ## KTX2 ingest: no upstream to match, and no change for PNG/JPEG
 
 The legacy converter never decoded KTX2 (`KHR_texture_basisu`), so a UASTC KTX2 texture has no

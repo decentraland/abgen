@@ -1858,3 +1858,116 @@ fn lod_tiny_texture_padded_to_bc7() {
         }
     }
 }
+
+/// `(m_Width, m_Height, m_ColorSpace, m_LightmapFormat)` of the one Texture2D in a bundle.
+fn standalone_texture_fields(data: &[u8]) -> (i64, i64, i64, i64) {
+    let b = ReadBundle::load_bytes(data).expect("bundle parses");
+    for f in &b.files {
+        let FileContent::Serialized(sf) = &f.content else {
+            continue;
+        };
+        for o in sf.objects.iter().filter(|o| o.class_id == 28) {
+            let v = sf.read_typetree(o).unwrap();
+            let i = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(-1);
+            return (
+                i("m_Width"),
+                i("m_Height"),
+                i("m_ColorSpace"),
+                i("m_LightmapFormat"),
+            );
+        }
+    }
+    panic!("no Texture2D in bundle");
+}
+
+fn flat_png(w: u32, h: u32, px: [u8; 4]) -> Vec<u8> {
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(RgbaImage::from_pixel(w, h, image::Rgba(px)))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encode test png");
+    png
+}
+
+/// End to end through the Unity standalone lane, the way `live` wires it: the entity scan
+/// finds the `bumpTexture` image in the scene's code, and the bundle built from that
+/// classification is a linear normal map; a `*_skybox` image in a world keeps 4096 wide.
+#[test]
+fn scene_code_bump_texture_and_world_skybox_reach_the_bundle() {
+    use crate::glbscan::{scan_entity, UriCache};
+    use crate::local_store::LocalContentStore;
+    let root = std::env::temp_dir().join(format!("abgen-scan-bump-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let store = LocalContentStore::new(&root);
+    let js = br#"x={pbr:{texture:je.Texture.Common({src:"water/water.png"}),bumpTexture:je.Texture.Common({src:ge.dir+"PoolBake_normal.png"})}}"#;
+    let bump_png = flat_png(16, 16, [128, 128, 255, 255]);
+    let albedo_png = flat_png(16, 16, [40, 120, 110, 255]);
+    store.write("bafkjs", js).unwrap();
+    store.write("bafkbump", &bump_png).unwrap();
+    store.write("bafkalbedo", &albedo_png).unwrap();
+    let content_by_file: HashMap<String, String> = [
+        ("bin/index.js", "bafkjs"),
+        ("assets/water/poolbake_normal.png", "bafkbump"),
+        ("assets/water/water.png", "bafkalbedo"),
+    ]
+    .iter()
+    .map(|(f, h)| (f.to_string(), h.to_string()))
+    .collect();
+    let scan = scan_entity(&store, &content_by_file, &UriCache::new());
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(scan.normal_refs.contains("bafkbump") && scan.linear_refs.contains("bafkbump"));
+    assert!(!scan.normal_refs.contains("bafkalbedo") && !scan.linear_refs.contains("bafkalbedo"));
+
+    // The flags live derives from the scan for each image.
+    let build = |png: &[u8], file: &str, hash: &str, skybox: bool| {
+        let opts = BuildOpts {
+            source_file: Some(file),
+            standalone_color_space: Some(if scan.linear_refs.contains(hash) {
+                0
+            } else {
+                1
+            }),
+            standalone_normal: scan.normal_refs.contains(hash),
+            standalone_skybox: skybox,
+            ..BuildOpts::default()
+        };
+        let name = format!("{hash}_windows");
+        standalone_texture_fields(&build_bundle(png, &name, hash, &opts).expect("build").data)
+    };
+    assert_eq!(
+        build(
+            &bump_png,
+            "assets/water/PoolBake_normal.png",
+            "bafkbump",
+            false
+        ),
+        (16, 16, 0, 3),
+        "bumpTexture image: linear normal map"
+    );
+    assert_eq!(
+        build(&albedo_png, "assets/water/water.png", "bafkalbedo", false),
+        (16, 16, 1, 0),
+        "albedo stays sRGB colour"
+    );
+
+    // Skybox: a 8192x2048 panorama fits 4096x1024 under the skybox cap, 1024x256 without it.
+    let sky = flat_png(8192, 2048, [90, 140, 220, 255]);
+    let mut world = crate::catalyst::Scene {
+        entity_id: "bafkworld".into(),
+        entity_type: "scene".into(),
+        pointers: vec![],
+        content: vec![],
+        metadata: serde_json::json!({"worldConfiguration": {"name": "test.dcl.eth"}}),
+    };
+    let skybox = world.is_world() && texprofile::is_skybox_name("sky/Night_Skybox.png");
+    assert!(skybox);
+    assert_eq!(
+        build(&sky, "sky/Night_Skybox.png", "bafksky", skybox),
+        (4096, 1024, 1, 0)
+    );
+    world.metadata = serde_json::json!({});
+    assert!(!world.is_world());
+    assert_eq!(
+        build(&sky, "sky/Night_Skybox.png", "bafksky", false),
+        (1024, 256, 1, 0)
+    );
+}

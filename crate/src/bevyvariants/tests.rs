@@ -2150,3 +2150,61 @@ fn model_fetch_failure_writes_no_manifest_until_a_rebuild_completes() {
     assert_eq!(std::fs::read(&mpath).unwrap(), again.manifest_bytes);
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// The Bevy lane classifies normal maps no model names the way the Unity lanes do
+/// (`crate::scriptrefs`), and a world's `*_skybox` image keeps up to 4096x2048 under a key of
+/// its own while a city scene's copy keeps the usual cap.
+#[test]
+fn entity_build_code_bound_normal_and_world_skybox() {
+    let js = br#"x={pbr:{texture:je.Texture.Common({src:"water/water.png"}),bumpTexture:je.Texture.Common({src:ge.dir+"PoolBake_normal.png"})}}"#;
+    let mut blobs: HashMap<&str, Vec<u8>> = HashMap::new();
+    blobs.insert("bafkjs", js.to_vec());
+    blobs.insert("bafkbump", noise_png_bytes(32, 32));
+    blobs.insert("bafkalbedo", smooth_png_bytes(64, 64));
+    blobs.insert("bafksky", smooth_png_bytes(2048, 128));
+    let content = [
+        ("bin/index.js", "bafkjs"),
+        ("assets/water/PoolBake_normal.png", "bafkbump"),
+        ("assets/water/water.png", "bafkalbedo"),
+        ("sky/Night_Skybox.png", "bafksky"),
+    ];
+    let fetch = |h: &str| blobs.get(h).cloned();
+    let probe = |_: &str| None;
+    let lane = Lane {
+        fetch: &fetch,
+        probe: &probe,
+        stored: &|_: &str| -> Option<Vec<u8>> { None },
+        local_records: true,
+    };
+    let opts = BuildOptions {
+        models: false,
+        glb_variants: false,
+        ..BuildOptions::default()
+    };
+    let run = |tag: &str, scene: &Scene| {
+        let out =
+            std::env::temp_dir().join(format!("abgen-bevy-skybox-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        let built = build_entity_variants(scene, &lane, &out, opts).unwrap();
+        let _ = std::fs::remove_dir_all(&out);
+        built
+    };
+
+    let mut world = scene_of("bafkworld", &content);
+    world.metadata = json!({"worldConfiguration": {"name": "test.dcl.eth"}});
+    let w = run("world", &world);
+    let bump = &w.entries["bafkbump"][0];
+    assert!(bump.path.ends_with("bafkbump_normal"), "{}", bump.path);
+    assert_eq!(bump.format, "ktx2-bc5");
+    assert!(w.entries["bafkalbedo"][0].path.ends_with("bafkalbedo_srgb"));
+    let sky = &w.entries["bafksky"][0];
+    assert!(sky.path.ends_with("bafksky_srgb_skybox"), "{}", sky.path);
+    assert_eq!((sky.width, sky.height), (Some(2048), Some(128)));
+
+    let city = scene_of("bafkcity", &content);
+    let c = run("city", &city);
+    assert!(c.entries["bafkbump"][0].path.ends_with("bafkbump_normal"));
+    let sky = &c.entries["bafksky"][0];
+    assert!(sky.path.ends_with("bafksky_srgb"), "{}", sky.path);
+    assert_eq!((sky.width, sky.height), (Some(1024), Some(64)));
+}
